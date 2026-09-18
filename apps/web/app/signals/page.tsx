@@ -1,0 +1,3 @@
+export default function SignalsPage() {
+  return <main style={{ padding: 32, color: "#e6f2f3", background: "#06141c", minHeight: "100vh", fontFamily: "Manrope, sans-serif" }}><p style={{ color: "#30d4ca", letterSpacing: 2 }}>DECISION SUPPORT</p><h1>Live Signals</h1><p>Signals are evaluated through the deterministic risk gate before assisted or live submission.</p><a href="/" style={{ color: "#30d4ca" }}>Back to dashboard</a></main>;
+}

@@ -1,0 +1,3 @@
+export default function TradeDetailPage() {
+  return <main style={{ padding: 32, color: "#e6f2f3", background: "#06141c", minHeight: "100vh", fontFamily: "Manrope, sans-serif" }}><p style={{ color: "#30d4ca", letterSpacing: 2 }}>TRADE DETAIL</p><h1>NIFTY 24,900 CE</h1><p>Entry, stop, targets, options context, risk decision, and order lifecycle are shown here.</p><a href="/signals" style={{ color: "#30d4ca" }}>Back to signals</a></main>;
+}

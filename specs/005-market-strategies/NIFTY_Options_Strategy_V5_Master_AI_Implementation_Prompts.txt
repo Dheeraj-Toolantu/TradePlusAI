@@ -1,0 +1,1794 @@
+NIFTY OPTIONS ALGO STRATEGY V5
+MASTER AI IMPLEMENTATION PROMPT PACK
+=====================================
+
+PURPOSE
+-------
+This document is a professional, task-by-task implementation prompt for an AI
+coding agent or software development team.
+
+It is based on:
+1. NIFTY OPTIONS ALGO STRATEGY — V5 (Merged Specification)
+2. Code Review, Validation & Implementation Recommendations
+3. The identified deficiencies in the current engine.py and orb.py prototype.
+
+The objective is to transform the existing prototype into a modular,
+deterministic, testable, fail-closed, production-grade NIFTY options algo
+platform suitable for paper trading first and eventual controlled broker
+execution.
+
+IMPORTANT SAFETY / IMPLEMENTATION PRINCIPLES
+---------------------------------------------
+- Do not connect the implementation to live capital merely because tests pass.
+- Do not assume any strategy threshold is profitable; all thresholds are
+  configurable and must be backtested.
+- Never hard-code lot size, tick size, freeze quantity or expiry weekday.
+- Never use unrestricted market orders for normal entry.
+- Never bypass risk controls because a signal has a high score.
+- Never average down, martingale, revenge trade or auto-re-enter after a broker
+  forced exit.
+- Fail closed: uncertainty must result in NO_TRADE or SAFE_MODE.
+- Keep signal generation, option selection, risk planning and execution
+  completely separate.
+- Preserve deterministic behavior: identical input data must produce identical
+  decisions.
+- Every decision must be explainable and auditable.
+
+GLOBAL ACCEPTANCE RULE
+----------------------
+Do not claim a task is complete unless:
+1. The implementation exists.
+2. Automated tests exist.
+3. Tests pass.
+4. Edge cases are covered.
+5. No hidden manual override is required.
+6. The behavior is deterministic.
+7. The implementation is documented.
+8. The task's acceptance criteria are explicitly demonstrated.
+
+Do not silently weaken or remove a V5 requirement to make tests pass.
+
+STRICT REPOSITORY STATUS
+------------------------
+Under the above rule, none of the tasks in this V5 checklist are currently marked
+complete because the repository does not yet contain a complete implementation with
+passing automated tests for the required V5 behavior. Every task below remains
+unchecked until acceptance evidence is present.
+
+=========================================================
+[ ] TASK 00 — ANALYZE THE EXISTING REPOSITORY BEFORE CHANGING CODE
+=========================================================
+
+PROMPT
+------
+Act as a senior Python quantitative-trading architect, NIFTY options trader,
+risk-engineering specialist and production software engineer.
+
+First inspect the complete repository and understand:
+- Existing project structure
+- engine.py
+- orb.py
+- Data models
+- Existing tests
+- Configuration
+- Broker integrations
+- API abstractions
+- Logging
+- Persistence
+- Backtesting components
+- UI/API interfaces
+
+Compare the existing implementation against every requirement in the supplied
+NIFTY V5 specification.
+
+Create:
+1. Architecture map.
+2. Existing-module dependency map.
+3. V5 requirement-to-code traceability matrix.
+4. Missing functionality list.
+5. Incorrect calculation list.
+6. Risk/safety deficiencies.
+7. Recommended migration plan.
+
+Do NOT make destructive changes during this task.
+
+DELIVERABLES
+------------
+- REQUIREMENTS_TRACEABILITY.md
+- ARCHITECTURE_REVIEW.md
+- GAP_ANALYSIS.md
+
+ACCEPTANCE
+----------
+Every V5 section must be mapped to:
+IMPLEMENTED / PARTIAL / MISSING / INCORRECT.
+
+=========================================================
+[ ] TASK 01 — CREATE THE CONFIGURATION AND DOMAIN MODEL
+=========================================================
+
+PROMPT
+------
+Create a strongly typed configuration and domain-model layer.
+
+Implement configuration for all strategy parameters, including:
+- Trading windows
+- ORB duration
+- Gap threshold
+- Gap-day OR duration
+- ADX enter/exit thresholds
+- ATR period
+- EMA periods
+- Volume multiplier
+- ORS thresholds
+- OI/PCR thresholds
+- VIX percentile thresholds
+- Liquidity thresholds
+- Score thresholds
+- RR minimum
+- Risk percentages
+- Daily loss limit
+- Maximum trades
+- Consecutive-loss limit
+- Cooldown
+- Profit protection
+- Stop buffers
+- Trail parameters
+- Entry timeout
+- Maximum slippage
+- Data staleness limits
+- Expiry-day adjustments
+
+All values must be configurable.
+
+Do not hard-code exchange contract specifications.
+
+Create domain objects for:
+- Candle
+- MarketSnapshot
+- OptionQuote
+- OptionChainSnapshot
+- ContractMetadata
+- Signal
+- TradePlan
+- Position
+- OrderPlan
+- OrderState
+- RiskState
+- TradeRecord
+
+Use Decimal where monetary precision is important.
+
+ACCEPTANCE
+----------
+- Configuration is validated at startup.
+- Invalid configuration fails fast.
+- No strategy constant is duplicated across modules.
+- Domain objects are immutable where practical.
+- All required fields are explicitly represented.
+
+=========================================================
+[ ] TASK 02 — BUILD THE DATA QUALITY GATE
+=========================================================
+
+PROMPT
+------
+Implement a fail-closed DataQualityGate.
+
+Requirements:
+- Underlying data older than 1.5 seconds disables signal generation.
+- Option quote older than 1.5 seconds rejects entry.
+- Reject missing critical fields.
+- Reject invalid OHLC values.
+- Reject negative/zero prices where invalid.
+- Detect duplicate timestamps.
+- Detect out-of-order candles.
+- Detect large timestamp mismatch.
+- Detect stale bid/ask.
+- Detect crossed or invalid markets.
+- Detect abnormal option price divergence.
+- Track feed connection state.
+- On reconnect require full synchronization before new entries.
+- Existing positions must remain under risk supervision during data outages.
+
+Return machine-readable rejection reasons.
+
+Example:
+DATA_STALE
+OPTION_QUOTE_STALE
+MISSING_FIELD
+TIMESTAMP_MISMATCH
+INVALID_OHLC
+INVALID_MARKET
+RECONNECT_SYNC_REQUIRED
+
+ACCEPTANCE
+----------
+Write tests for every failure condition and recovery path.
+
+=========================================================
+[ ] TASK 03 — CORRECT ATR(14), ADX(14), EMA AND VWAP
+=========================================================
+
+PROMPT
+------
+Replace incorrect indicator implementations.
+
+ATR:
+- Implement true range.
+- Implement verified ATR(14), preferably Wilder smoothing.
+- Ensure adequate warm-up.
+- Do not use average high-low as ATR.
+
+ADX:
+- Implement proper Wilder-style +DM/-DM/TR smoothing.
+- Calculate +DI/-DI.
+- Calculate DX.
+- Calculate ADX.
+- Ensure adequate warm-up.
+- Test against known reference values.
+
+EMA:
+- Use sufficient warm-up history.
+- Do not initialize EMA50 from only 50 observations unless the chosen
+  implementation explicitly handles initialization correctly.
+
+VWAP:
+- Implement session VWAP from 09:15 onward.
+- Reset at each trading session.
+- Use a consistent price convention.
+- Never accidentally use a rolling 20-candle VWAP when session VWAP is required.
+
+All timestamps must be normalized to Asia/Kolkata.
+
+ACCEPTANCE
+----------
+Create reference-value tests for ATR, ADX, EMA and VWAP.
+Document calculation methodology.
+
+=========================================================
+[ ] TASK 04 — BUILD THE SESSION AND TRADING-WINDOW ENGINE
+=========================================================
+
+PROMPT
+------
+Implement an Asia/Kolkata session engine.
+
+Default schedule:
+- 09:15 market open
+- 09:30 normal OR completion
+- 09:35–14:45 new entries permitted
+- 14:45 no new entries
+- 15:15 mandatory square-off
+
+All times configurable.
+
+The engine must:
+- Reject signals before the appropriate OR is complete.
+- Reject new entries after cutoff.
+- Trigger mandatory square-off.
+- Continue emergency exits after entry cutoff.
+- Validate only completed candles.
+- Correctly handle weekends/holidays using market calendar data where available.
+
+Do not infer time from system local timezone.
+
+ACCEPTANCE
+----------
+Test exact boundaries:
+09:14:59
+09:15:00
+09:29:59
+09:30:00
+09:34:59
+09:35:00
+14:44:59
+14:45:00
+15:14:59
+15:15:00
+
+=========================================================
+[ ] TASK 05 — IMPLEMENT GAP-DAY ENGINE
+=========================================================
+
+PROMPT
+------
+Implement V5 gap-day handling.
+
+Inputs:
+- Today's open
+- Previous-day high
+- Previous-day low
+- Previous-day close
+- ATR14
+
+Default:
+gap threshold = 0.5 × ATR14
+
+Flag GAP DAY if today's open is outside the previous day's high-low range
+by more than the configured threshold.
+
+Gap-day behavior:
+1. Expand OR confirmation window to 30 minutes by default.
+2. Require gap HOLD or FILL before any entry.
+3. Reject ambiguous transition.
+4. Reduce first-trade position size to 50%.
+5. Track gap-day trades separately.
+6. After one full confirmed cycle, restore normal configured sizing subject
+   to all other risk rules.
+
+Implement explicit states:
+NORMAL_DAY
+GAP_UP_UNRESOLVED
+GAP_DOWN_UNRESOLVED
+GAP_HOLD_CONFIRMED
+GAP_FILL_CONFIRMED
+GAP_INVALIDATED
+
+ACCEPTANCE
+----------
+Tests must cover gap-up, gap-down, hold, fill, ambiguity and recovery.
+
+=========================================================
+[ ] TASK 06 — IMPLEMENT THE REGIME ENGINE WITH HYSTERESIS
+=========================================================
+
+PROMPT
+------
+Implement a stateful regime engine.
+
+States:
+UNKNOWN
+TRENDING_BULL
+TRENDING_BEAR
+RANGE
+CHOP
+
+Trending entry:
+- ADX >= 22
+- Directional price/EMA alignment
+- 15m directional confirmation
+
+Trending exit:
+- ADX < 16
+
+Range:
+- ADX < 18
+- Repeated VWAP crossings
+- Opening range intact
+
+CHOP:
+- ADX 16–22 without clear prior state
+- Conflicting timeframe signals
+- Abnormal liquidity/spreads
+- Unreliable data
+- Unresolved gap day
+
+Implement hysteresis so the regime does not flap around one threshold.
+
+Expose:
+- Current state
+- Previous state
+- Transition reason
+- ADX
+- Directional alignment
+
+ACCEPTANCE
+----------
+Test:
+- UNKNOWN → TRENDING
+- TRENDING → TRENDING despite ADX 17
+- TRENDING → non-trending below 16
+- RANGE
+- CHOP
+- conflicting timeframe
+- gap-day override
+
+=========================================================
+[ ] TASK 07 — IMPLEMENT INDEPENDENT 15-MINUTE TREND ANALYSIS
+=========================================================
+
+PROMPT
+------
+Build an independent 15-minute trend engine.
+
+Required information:
+- 15m OHLC
+- EMA20
+- EMA50
+- Trend direction
+- Structure
+- Optional slope/confirmation metrics
+
+Bullish structural state:
+- NIFTY > session VWAP
+- EMA20 > EMA50
+- 15m trend bullish
+- Regime TRENDING
+
+Bearish is the mirror image.
+
+Do not derive the 15m trend by simply copying 5m state.
+
+ACCEPTANCE
+----------
+Tests must prove 5m and 15m calculations are independent and correctly aligned.
+
+=========================================================
+[ ] TASK 08 — REBUILD THE 15-MINUTE ORB ENGINE
+=========================================================
+
+PROMPT
+------
+Implement deterministic ORB.
+
+Normal day:
+ORH = highest high from 09:15:00 through 09:29:59.
+ORL = lowest low from 09:15:00 through 09:29:59.
+
+Gap day:
+Use configured widened OR window, default 30 minutes.
+
+Breakout:
+- Bullish candidate requires completed 5m candle close > ORH.
+- Bearish candidate requires completed 5m candle close < ORL.
+
+Extension:
+Reject if breakout has exceeded:
+min(0.35% of relevant NIFTY spot, 1.0 × ATR5m)
+
+Use breakout-time underlying price.
+
+Do not chase after excessive extension.
+
+Return:
+- ORH
+- ORL
+- breakout index/time
+- direction
+- breakout price
+- extension
+- maximum extension
+- status
+- reason
+
+ACCEPTANCE
+----------
+No signal before OR completion.
+Test both directions and boundary cases.
+
+=========================================================
+[ ] TASK 09 — IMPLEMENT THE 5-MINUTE RETEST ENGINE
+=========================================================
+
+PROMPT
+------
+After a valid breakout:
+
+Bullish:
+- Price retests ORH or configured breakout zone.
+- Retest holds above level.
+- Confirmation candle closes bullish.
+
+Bearish:
+- Mirror image.
+
+Retest timeout:
+- Maximum 3 completed 5m candles.
+
+Failed retest:
+- Close back through breakout level AND VWAP loss.
+- Permanently invalidate that breakout attempt.
+- Do not automatically re-enter on the same failed breakout.
+
+Return explicit states:
+WAITING
+RETESTING
+CONFIRMED
+FAILED
+TIMED_OUT
+INVALIDATED
+
+ACCEPTANCE
+----------
+Test:
+- successful retest
+- failed retest with VWAP loss
+- close through level without VWAP loss
+- timeout
+- multiple breakout attempts
+- no duplicate re-entry after invalidation
+
+=========================================================
+[ ] TASK 10 — IMPLEMENT CORRELATION-AWARE SIGNAL SCORING
+=========================================================
+
+PROMPT
+------
+Implement the V5 10-point scoring model.
+
+TREND CLUSTER:
+- Full VWAP + EMA20/EMA50 + 15m agreement = 3
+- 2 of 3 = 1
+- otherwise = 0
+
+STRUCTURE CLUSTER:
+- ORB breakout/retest confirmation = 2
+- PDH/PDL confirmation = 1
+
+INDEPENDENT:
+- Volume >= 1.5 × prior 20 completed candles = 2
+- ORS confirms = 1
+- OI/PCR direction supportive = 1
+
+Maximum = 10.
+
+Minimum default trade score = 8.
+
+VIX/IV is a gate, not a score.
+
+Do not assign separate points to highly correlated trend components.
+
+Make score breakdown completely transparent.
+
+Also build a historical correlation-analysis utility to test whether
+supposedly independent components should be clustered.
+
+ACCEPTANCE
+----------
+Score must never exceed 10.
+A score of 8 must be genuinely achievable only when all required evidence
+exists.
+No missing component may silently count as a positive point.
+
+=========================================================
+[ ] TASK 11 — IMPLEMENT OPTION PREMIUM RELATIVE STRENGTH (ORS)
+=========================================================
+
+PROMPT
+------
+Implement:
+
+ORS = abs(option % change) / abs(underlying % change)
+
+Use ORS only as confirmation.
+
+Handle near-zero underlying movement safely.
+
+Reject or flag:
+- material option underperformance
+- abnormal spread widening
+- inconsistent option/underlying movement
+- stale/bad prints
+- liquidity events
+
+Use configurable thresholds.
+
+ACCEPTANCE
+----------
+Tests must cover:
+- normal participation
+- strong participation
+- underperformance
+- zero/near-zero denominator
+- stale option
+- abnormal spread
+
+=========================================================
+[ ] TASK 12 — IMPLEMENT OI/PCR STRUCTURE ENGINE
+=========================================================
+
+PROMPT
+------
+Build an OI/PCR engine.
+
+Track:
+- ATM CE OI
+- ATM PE OI
+- ±1 strikes
+- ±2 strikes
+- OI change
+- price change
+- volume
+- PCR
+- PCR change over 5m
+- PCR change over 30m
+- OI concentration
+- OI migration
+
+Never use absolute PCR alone.
+
+Return:
+- Direction score from -2 to +2
+- Evidence breakdown
+- PCR
+- PCR changes
+- Concentration
+- Migration
+- Confidence/quality state
+
+Thresholds must be configurable and backtestable.
+
+ACCEPTANCE
+----------
+No single PCR cutoff may independently generate a trade.
+
+=========================================================
+[ ] TASK 13 — IMPLEMENT INDIA VIX / IV REGIME ENGINE
+=========================================================
+
+PROMPT
+------
+Implement VIX regime classification using level plus percentile/change.
+
+Default:
+<20% = LOW
+20–80% = NORMAL
+80–95% = HIGH
+>95% = EXTREME
+
+Behavior:
+LOW:
+- Require stronger breakout/volume confirmation.
+
+NORMAL:
+- Standard rules.
+
+HIGH:
+- Reduce position size.
+- Widen structural noise allowance where configured.
+- Prefer liquid ITM/near-ATM or defined-risk structures.
+
+EXTREME:
+- NO TRADE by default.
+- Only permit an explicitly configured, separately backtested exception.
+
+ACCEPTANCE
+----------
+VIX regime must be a hard gate and must not be counted as a score point.
+
+=========================================================
+[ ] TASK 14 — IMPLEMENT LIQUIDITY SCORING
+=========================================================
+
+PROMPT
+------
+Create a 0–3 liquidity score.
+
+Inputs:
+- Spread %
+- Volume
+- OI
+- Bid/ask depth
+- Trade frequency
+- LTP stability
+
+Score:
+0 unacceptable
+1 poor
+2 acceptable
+3 excellent
+
+Minimum trade liquidity score = 2.
+
+Make scoring deterministic and configurable.
+
+Reject abnormal markets even if the signal score is high.
+
+=========================================================
+[ ] TASK 15 — IMPLEMENT THE OPTION SELECTION ENGINE
+=========================================================
+
+PROMPT
+------
+Create an option selector that operates only on valid contracts from the
+live contract master.
+
+Candidate filters:
+- Valid instrument
+- Correct underlying
+- Correct expiry
+- Correct CE/PE direction
+- Adequate OI
+- Adequate volume
+- Acceptable spread
+- Acceptable liquidity
+
+Selection inputs:
+- Delta
+- Gamma
+- Theta
+- IV
+- ORS
+- Spread
+- OI
+- Volume
+- Liquidity
+
+Preference:
+- ATM
+- Slightly ITM
+- Near-ATM liquid options
+
+Avoid:
+- Far OTM cheap options
+- Wide spreads
+- Low OI
+- Low volume
+- unstable quotes
+
+Do not hard-code "always ATM."
+
+Return ranked candidates and deterministic selection reason.
+
+=========================================================
+[ ] TASK 16 — IMPLEMENT CONTRACT MASTER INTEGRATION
+=========================================================
+
+PROMPT
+------
+Build a contract metadata provider.
+
+Never hard-code:
+- Lot size
+- Tick size
+- Freeze quantity
+- Expiry weekday
+- Expiry calendar
+
+Resolve expiry date from live contract metadata.
+
+Validate:
+- contract active status
+- expiry
+- strike
+- option type
+- lot size
+- tick size
+- freeze quantity
+
+Cache safely but refresh according to metadata validity.
+
+ACCEPTANCE
+----------
+A change in exchange contract specifications must not require source-code
+changes.
+
+=========================================================
+[ ] TASK 17 — IMPLEMENT STRUCTURAL STOP AND TARGET ENGINE
+=========================================================
+
+PROMPT
+------
+Build a structural stop engine.
+
+Bullish:
+stop = retest low - configured ATR(5m) buffer
+
+Bearish:
+stop = retest high + configured ATR(5m) buffer
+
+Default buffer:
+0.15–0.25 × ATR5m, configurable.
+
+Premium-loss stop:
+- May exist as emergency circuit breaker.
+- Must not replace structural invalidation.
+
+Target engine must consider:
+- OR width
+- ATR
+- PDH
+- PDL
+- VWAP
+- Market structure
+- Liquidity zones
+
+Do not force 2R if structural resistance/support makes it unrealistic.
+
+If achievable RR < 2.0, return NO_TRADE.
+
+ACCEPTANCE
+----------
+Stop and target must be deterministic from the supplied snapshot.
+
+=========================================================
+[ ] TASK 18 — IMPLEMENT OPTION-BASED RISK ENGINE AND POSITION SIZING
+=========================================================
+
+PROMPT
+------
+Implement risk sizing only after option selection.
+
+Default:
+risk per trade = 0.5% of strategy capital.
+Maximum normal = 0.75%.
+Exceptional = 1.0% only if explicitly enabled and fully backtested.
+
+Scale down for:
+- high VIX
+- expiry day
+- gap day
+- wide spread
+- poor liquidity
+- weak score
+- recent drawdown
+
+Effective risk per lot:
+option stop-loss loss
++ expected slippage
++ spread cost
++ transaction costs
+
+Lots:
+floor(risk budget / effective risk per lot)
+
+Then:
+- round to valid lot size
+- respect freeze quantity
+- apply all risk multipliers
+- never exceed daily limits
+
+Do not calculate option quantity from NIFTY spot points.
+
+=========================================================
+[ ] TASK 19 — IMPLEMENT EXPIRY-DAY GAMMA PROTOCOL
+=========================================================
+
+PROMPT
+------
+Determine expiry using:
+current_date == contract.expiry_date
+
+Never infer expiry from weekday.
+
+On expiry:
+- Increase minimum score.
+- Reduce risk.
+- Avoid far OTM.
+- Reject wide spreads.
+- Require strong ORS/premium confirmation.
+- Prefer ITM/near-ATM or defined-risk structures.
+- Apply stricter entry cutoff.
+
+All adjustments must be configurable.
+
+=========================================================
+[ ] TASK 20 — IMPLEMENT DAILY RISK MANAGER
+=========================================================
+
+PROMPT
+------
+Create a persistent daily RiskManager.
+
+Rules:
+- Daily loss limit = 2% strategy capital.
+- Maximum trades = 3.
+- Maximum consecutive losses = 2.
+- After loss #1: minimum 15-minute cooldown.
+- After loss #2: stop new entries for the day.
+- Daily P&L >= +1.5R: reduce subsequent risk.
+- Configurable profit lock.
+- Daily loss limit immediately disables new entries.
+
+Never increase position size to recover losses.
+
+Track:
+- realized P&L
+- unrealized P&L
+- R
+- trade count
+- consecutive losses
+- cooldown end
+- daily state
+
+=========================================================
+[ ] TASK 21 — IMPLEMENT POSITION MANAGER
+=========================================================
+
+PROMPT
+------
+Maximum concurrent NIFTY directional position = 1.
+
+Prohibit:
+- averaging down
+- martingale
+- adding to losing position
+
+Opposite signals must not automatically reverse the position.
+
+A reversal requires an independent full validation.
+
+Implement position lifecycle:
+FLAT
+ENTRY_PENDING
+OPEN
+EXIT_PENDING
+CLOSED
+BROKER_FORCED_EXIT
+RECONCILIATION_REQUIRED
+
+=========================================================
+[ ] TASK 22 — IMPLEMENT POSITION MANAGEMENT: BE, TRAILING AND PARTIAL EXIT
+=========================================================
+
+PROMPT
+------
+Implement:
+
++1R:
+Move stop to breakeven after transaction-cost allowance.
+
++1.5R:
+Activate trailing logic.
+
++2R:
+Optional 25–50% partial exit.
+
+Remaining position:
+Trail using prior 5m structure + ATR buffer.
+
+Rule:
+Never loosen a stop.
+
+Every stop change must be logged.
+
+=========================================================
+[ ] TASK 23 — IMPLEMENT ORDER EXECUTION STATE MACHINE
+=========================================================
+
+PROMPT
+------
+Implement:
+
+NEW
+→ VALIDATING
+→ SUBMITTED
+→ ACKNOWLEDGED
+→ PARTIALLY_FILLED
+→ FILLED
+→ EXIT_PENDING
+→ EXIT_SUBMITTED
+→ EXIT_FILLED
+→ RECONCILED
+
+Unexpected broker state:
+→ SAFE_MODE
+→ Reconcile
+→ Block new entries
+
+Every order requires a unique client reference ID.
+
+Normal entry:
+- Reference best ask for buy.
+- Reference best bid for sell.
+- Use marketable limit.
+- Enforce maximum slippage.
+
+Do not use unrestricted market orders for normal entry.
+
+=========================================================
+[ ] TASK 24 — IMPLEMENT ORDER TIMEOUT, CANCEL AND REPRICE
+=========================================================
+
+PROMPT
+------
+Default initial timeout = 3 seconds.
+
+If unfilled:
+1. Cancel.
+2. Refresh quote.
+3. Revalidate signal.
+4. Recalculate spread/slippage.
+5. Reprice only within strict configured limits.
+6. Otherwise abandon.
+
+If underlying signal becomes invalid before fill:
+cancel immediately.
+
+Retry behavior must be deterministic and bounded.
+
+=========================================================
+[ ] TASK 25 — IMPLEMENT FREEZE-QUANTITY CHILD ORDERS
+=========================================================
+
+PROMPT
+------
+If requested quantity exceeds live exchange freeze quantity:
+- Split into child orders.
+- Store parent_trade_id.
+- Store child_sequence.
+- Unique broker reference per child.
+- Track each child independently.
+- Verify aggregate fill quantity.
+- Reconcile aggregate average price.
+
+Never assume every child fills.
+
+=========================================================
+[ ] TASK 26 — IMPLEMENT BROKER RECONCILIATION
+=========================================================
+
+PROMPT
+------
+While a position is active, reconcile at least once per second.
+
+Compare:
+- Expected position
+- Broker position
+- Filled quantity
+- Average price
+- Pending orders
+- Exit orders
+
+On mismatch:
+- Stop new entries.
+- Keep risk supervisor active.
+- Resolve discrepancy.
+- Enter SAFE_MODE if required.
+
+After reconnect:
+- Synchronize positions.
+- Synchronize orders.
+- Synchronize pending signals.
+- Only then enable entries.
+
+=========================================================
+[ ] TASK 27 — IMPLEMENT BROKER-FORCED-EXIT HANDLING
+=========================================================
+
+PROMPT
+------
+Detect:
+- Margin call
+- SPAN shortfall
+- RMS square-off
+- Broker-forced liquidation
+
+Log distinct event:
+BROKER_FORCED_EXIT
+
+Behavior:
+- Immediately halt new signals for remainder of session.
+- Do not auto-re-enter.
+- Require manual review/reset.
+
+=========================================================
+[ ] TASK 28 — IMPLEMENT EMERGENCY RISK SUPERVISOR
+=========================================================
+
+PROMPT
+------
+Create a risk supervisor independent from the signal engine.
+
+Emergency exit conditions:
+- Underlying invalidation
+- Broker forced exit condition
+- Severe API failure
+- Market data stale beyond safe limit
+- Position mismatch
+- Daily loss limit exceeded
+- Manual kill switch
+
+Risk supervisor must continue operating even if the signal engine is disabled.
+
+=========================================================
+[ ] TASK 29 — IMPLEMENT KILL SWITCH AND SAFE MODE
+=========================================================
+
+PROMPT
+------
+Kill switch must:
+1. Cancel pending entry orders.
+2. Safely exit active positions.
+3. Disable new entries.
+4. Require explicit manual reset.
+
+SAFE_MODE must:
+- block new entries
+- allow reconciliation
+- maintain risk supervision
+- expose clear reason
+- persist state where appropriate
+
+Test all kill-switch paths.
+
+=========================================================
+[ ] TASK 30 — IMPLEMENT RANGE STRATEGY SAFELY
+=========================================================
+
+PROMPT
+------
+When regime = RANGE:
+- Do not force directional ORB trades.
+- Route to a separately defined-risk range strategy only if enabled.
+- Apply same data, liquidity, volatility and risk gates.
+- Extreme volatility overrides to NO_TRADE.
+
+If the range strategy is not implemented and tested:
+return NO_TRADE rather than inventing a trade.
+
+=========================================================
+[ ] TASK 31 — IMPLEMENT OPTIONAL VWAP REVERSAL STRATEGY
+=========================================================
+
+PROMPT
+------
+If enabled, implement V5 secondary VWAP reversal.
+
+Bullish:
+NIFTY falls below VWAP
+→ significant support/PDL
+→ selling pressure rejection
+→ higher low
+→ VWAP reclaim
+→ volume/price confirmation
+→ CE validation
+
+Bearish is mirror image using PDH/resistance.
+
+Do not enter simply because price touches support/resistance.
+
+Apply all common:
+- data gates
+- regime gates
+- VIX gates
+- liquidity
+- ORS
+- OI/PCR
+- risk
+- theta-realistic backtest requirements
+
+=========================================================
+[ ] TASK 32 — IMPLEMENT THE CENTRAL NO-TRADE ENGINE
+=========================================================
+
+PROMPT
+------
+Create one authoritative NoTradeEngine.
+
+Reject if ANY:
+- Score below minimum
+- CHOP
+- unresolved gap day
+- stale data
+- missing critical data
+- option spread too wide
+- insufficient OI/volume
+- liquidity < 2
+- excessive breakout extension
+- failed retest
+- retest timeout
+- RR < 2
+- daily loss limit
+- consecutive-loss lock
+- daily trade limit
+- extreme volatility
+- expiry restriction
+- broker/API unhealthy
+- correlated position conflict
+- abnormal orderbook/depth
+- option/underlying divergence without explanation
+
+Return all applicable rejection reasons, but decision must remain deterministic.
+
+=========================================================
+[ ] TASK 33 — IMPLEMENT COMPLETE SIGNAL → TRADE PLAN PIPELINE
+=========================================================
+
+PROMPT
+------
+Create the central orchestration pipeline:
+
+LIVE DATA
+→ DATA QUALITY
+→ SESSION/TIME
+→ GAP
+→ REGIME
+→ ORB
+→ BREAKOUT
+→ RETEST
+→ SCORE
+→ ORS
+→ OI/PCR
+→ VIX
+→ NO-TRADE
+→ OPTION SELECTION
+→ LIQUIDITY
+→ STRUCTURAL STOP
+→ TARGET
+→ RR
+→ RISK
+→ POSITION SIZE
+→ EXECUTION VALIDATION
+→ ORDER PLAN
+
+Do not place orders inside signal calculation functions.
+
+Return a complete explainable TradePlan.
+
+=========================================================
+[ ] TASK 34 — IMPLEMENT COMPLETE TRADE JOURNAL / AUDIT TRAIL
+=========================================================
+
+PROMPT
+------
+Every trade must store:
+
+- timestamp
+- regime
+- ORH/ORL
+- breakout candle
+- retest candle
+- score
+- cluster breakdown
+- OI score
+- PCR
+- VIX regime
+- selected contract
+- strike
+- expiry
+- delta
+- gamma
+- theta
+- IV
+- entry LTP
+- bid
+- ask
+- order price
+- fill price
+- slippage
+- quantity
+- stop
+- target
+- exit reason
+- exit price
+- P&L
+- R multiple
+- broker order IDs
+
+Also log:
+- rejection reasons
+- SAFE_MODE events
+- broker forced exits
+- reconciliation events
+- kill-switch events
+- configuration version
+- strategy version
+
+Use append-only or otherwise auditable persistence.
+
+=========================================================
+[ ] TASK 35 — IMPLEMENT REALISTIC BACKTEST ENGINE
+=========================================================
+
+PROMPT
+------
+Build a backtester that uses actual historical option contracts.
+
+Required data where available:
+- Actual option contracts
+- Historical expiry calendar
+- Historical OI
+- Historical IV
+- Bid/ask
+- Volume
+- Slippage
+- Brokerage/taxes
+- Latency
+- Rejections
+- Partial fills
+
+Never reconstruct historical option P&L solely from NIFTY spot using theoretical
+pricing.
+
+Avoid look-ahead bias.
+
+The backtest must reproduce the same decision logic used by paper/live mode.
+
+=========================================================
+[ ] TASK 36 — IMPLEMENT THETA-REALISTIC P&L ACCOUNTING
+=========================================================
+
+PROMPT
+------
+Report separately:
+1. Spot-move-implied expectancy.
+2. Actual option-chain expectancy.
+3. Theta-realistic expectancy.
+4. Execution-cost impact.
+5. IV-change impact.
+6. Spread impact.
+7. Slippage impact.
+
+If theta-realistic expectancy is materially worse than spot-implied expectancy,
+flag the strategy as unreliable for sizing decisions.
+
+=========================================================
+[ ] TASK 37 — IMPLEMENT WALK-FORWARD AND ROBUSTNESS VALIDATION
+=========================================================
+
+PROMPT
+------
+Implement validation for:
+- In-sample
+- Out-of-sample
+- Walk-forward
+- Monte Carlo trade reshuffling
+- Parameter sensitivity
+- Volatility regimes
+- Expiry vs non-expiry
+- Gap-up vs gap-down
+- Trend vs range
+- Time-of-day
+
+Do not optimize and evaluate on the same data.
+
+Report overfitting indicators.
+
+=========================================================
+[ ] TASK 38 — IMPLEMENT PERFORMANCE METRICS AND EDGE-DECAY DASHBOARD
+=========================================================
+
+PROMPT
+------
+Track:
+- Total trades
+- Win rate
+- Average win/loss
+- Profit factor
+- Expectancy
+- Max drawdown
+- Recovery factor
+- Sharpe
+- Sortino
+- Average R/trade
+- Holding time
+- Slippage
+- Fill rate
+- Rejection rate
+- Signal-to-fill delay
+
+Break down by:
+- score
+- VIX regime
+- expiry/non-expiry
+- delta bucket
+- time of day
+- gap day
+
+Track:
+- theta-realistic vs spot-implied expectancy
+- live vs backtest divergence
+- rolling edge decay
+- broker forced exits
+
+=========================================================
+[ ] TASK 39 — BUILD COMPLETE AUTOMATED TEST SUITE
+=========================================================
+
+PROMPT
+------
+Create comprehensive unit, integration and state-machine tests.
+
+At minimum:
+- Time boundaries
+- Session boundaries
+- ORH/ORL
+- Breakout
+- Extension
+- Retest hold
+- Retest failure
+- Retest timeout
+- Gap up/down
+- Gap hold/fill
+- ADX regime entry/exit
+- Hysteresis
+- Conflicting timeframes
+- Score
+- ORS
+- OI/PCR
+- VIX
+- Liquidity
+- Option selection
+- Structural SL
+- Target
+- RR
+- Position sizing
+- Daily loss
+- Consecutive losses
+- Expiry restrictions
+- Order timeout
+- Cancel/reprice
+- Partial fill
+- Freeze quantity
+- Broker forced exit
+- Reconciliation mismatch
+- Kill switch
+- Mandatory square-off
+
+Use deterministic fixtures.
+
+=========================================================
+[ ] TASK 40 — PROPERTY / INVARIANT TESTING
+=========================================================
+
+PROMPT
+------
+Add invariant tests.
+
+Examples:
+- Score is always between 0 and 10.
+- Position size can never exceed configured risk.
+- Stop cannot move farther from safety.
+- Daily loss limit can never be bypassed.
+- No trade can occur with stale data.
+- No trade can occur with liquidity score < 2.
+- No trade can occur when RR < 2.
+- No trade can occur in unresolved gap state.
+- No normal order exceeds freeze quantity.
+- No live order is generated in SAFE_MODE.
+- Broker forced exit cannot trigger auto-reentry.
+- Mandatory square-off always closes positions.
+
+=========================================================
+[ ] TASK 41 — IMPLEMENT OBSERVABILITY AND ALERTING
+=========================================================
+
+PROMPT
+------
+Add structured logging and metrics.
+
+Every important state transition must include:
+- timestamp
+- strategy version
+- config version
+- symbol
+- state
+- reason
+- correlation/trade/order ID
+
+Provide alerts for:
+- SAFE_MODE
+- stale data
+- reconciliation mismatch
+- broker forced exit
+- kill switch
+- rejected order
+- repeated API errors
+- daily risk limit
+- strategy edge degradation
+
+=========================================================
+[ ] TASK 42 — IMPLEMENT PAPER-TRADING MODE
+=========================================================
+
+PROMPT
+------
+Create a paper broker adapter implementing the same interface as the real
+broker adapter.
+
+Paper mode must simulate:
+- acknowledgements
+- partial fills
+- slippage
+- cancellations
+- rejected orders
+- latency
+- order state transitions
+
+The same TradePlan and OrderPlan logic must be used in paper and live modes.
+
+=========================================================
+[ ] TASK 43 — IMPLEMENT BROKER ADAPTER AS AN ISOLATED INTERFACE
+=========================================================
+
+PROMPT
+------
+Create a Broker interface.
+
+It should expose abstract operations for:
+- quotes
+- contract metadata
+- order submission
+- cancellation
+- order status
+- positions
+- open orders
+- account/risk information
+
+Do not couple strategy logic directly to Groww-specific APIs.
+
+Create:
+- PaperBroker
+- Broker implementation/adapter for the selected live broker
+
+Live execution must remain disabled by default.
+
+=========================================================
+[ ] TASK 44 — IMPLEMENT CONFIGURATIOND/ENVIRONMENT SAFETY
+=========================================================
+
+PROMPT
+------
+Create explicit modes:
+BACKTEST
+PAPER
+LIVE_DISABLED
+LIVE
+
+Default startup mode must not be live.
+
+Require explicit configuration to enable live trading.
+
+Prevent:
+- accidental live API credentials in test mode
+- live order calls from unit tests
+- live execution while SAFE_MODE
+- live execution without reconciliation
+- live execution without risk-manager approval
+
+=========================================================
+[ ] TASK 45 — IMPLEMENT PRODUCTION READINESS CHECK
+=========================================================
+
+PROMPT
+------
+Create an automated production-readiness checker.
+
+It must verify:
+- configuration validity
+- contract metadata availability
+- data feeds
+- clock/timezone
+- broker health
+- risk manager
+- reconciliation
+- kill switch
+- journal
+- tests
+- paper mode
+- backtest artifacts
+- strategy version
+- audit configuration
+
+Output:
+READY_FOR_PAPER
+NOT_READY
+READY_FOR_CONTROLLED_LIVE
+
+Never output READY_FOR_CONTROLLED_LIVE solely because code compiles.
+
+=========================================================
+[ ] TASK 46 — FINAL V5 TRACEABILITY AND CODE AUDIT
+=========================================================
+
+PROMPT
+------
+Perform a final audit against every V5 requirement.
+
+For every requirement produce:
+- V5 section
+- Requirement
+- Module
+- Function/class
+- Test
+- Status
+- Evidence
+
+Statuses:
+PASS
+PARTIAL
+FAIL
+NOT_APPLICABLE
+
+There must be no unexplained PARTIAL or FAIL status before controlled-live
+approval.
+
+=========================================================
+[ ] TASK 47 — FINAL END-TO-END SIMULATION
+=========================================================
+
+PROMPT
+------
+Create deterministic end-to-end scenarios for:
+
+Scenario A:
+Normal bullish ORB + retest + CE selection.
+
+Scenario B:
+Normal bearish ORB + retest + PE selection.
+
+Scenario C:
+Gap-up unresolved → NO_TRADE.
+
+Scenario D:
+Gap-down fill → eligible after confirmation.
+
+Scenario E:
+CHOP regime → NO_TRADE.
+
+Scenario F:
+Extreme VIX → NO_TRADE.
+
+Scenario G:
+Liquidity failure → NO_TRADE.
+
+Scenario H:
+RR < 2 → NO_TRADE.
+
+Scenario I:
+Daily loss limit → NO_TRADE.
+
+Scenario J:
+Partial fill → correct state management.
+
+Scenario K:
+Broker forced exit → halt remainder of session.
+
+Scenario L:
+Reconciliation mismatch → SAFE_MODE.
+
+Scenario M:
+Kill switch → cancel and exit safely.
+
+Scenario N:
+15:15 mandatory square-off.
+
+Verify complete audit records for every scenario.
+
+=========================================================
+TASK 48 — FINAL CODE QUALITY AND DOCUMENTATION
+=========================================================
+
+PROMPT
+------
+Perform final engineering cleanup.
+
+Requirements:
+- Type hints
+- Docstrings
+- Clear naming
+- Small deterministic functions
+- No duplicated strategy constants
+- No dead code
+- No silent exception handling
+- Structured error types
+- Input validation
+- Dependency injection where appropriate
+- Testable interfaces
+- No broker logic inside strategy calculations
+
+Produce:
+- README
+- Architecture document
+- Configuration reference
+- API/interface documentation
+- Runbook
+- Paper-trading guide
+- Incident/recovery guide
+- Production deployment checklist
+
+=========================================================
+MASTER END-STATE REQUIREMENTS
+=========================================================
+
+The final system must implement this pipeline:
+
+NIFTY LIVE DATA
+↓
+DATA QUALITY GATE
+↓
+SESSION/TIME GATE
+↓
+GAP-DAY CHECK
+↓
+MARKET REGIME
+↓
+BULLISH / BEARISH / RANGE
+↓
+ORB
+↓
+BREAKOUT
+↓
+RETEST
+↓
+CORRELATION-AWARE SCORE
+↓
+ORS
+↓
+OI/PCR
+↓
+VIX/IV GATE
+↓
+NO-TRADE ENGINE
+↓
+OPTION SELECTION
+↓
+LIQUIDITY SCORE
+↓
+STRUCTURAL STOP
+↓
+TARGET / RR
+↓
+RISK ENGINE
+↓
+POSITION SIZE
+↓
+EXECUTION VALIDATION
+↓
+MARKETABLE LIMIT
+↓
+ORDER STATE MACHINE
+↓
+POSITION SUPERVISOR
+↓
+STOP / BE / TRAILING / PARTIAL
+↓
+RECONCILIATION
+↓
+TRADE JOURNAL
+↓
+PERFORMANCE / EDGE DECAY
+
+NON-NEGOTIABLE RULES
+--------------------
+1. No stale-data entry.
+2. No unresolved-gap entry.
+3. No CHOP entry.
+4. No extreme-VIX entry unless separately backtested exception is enabled.
+5. No liquidity score below 2.
+6. No RR below 2.
+7. No risk-limit violation.
+8. No far-OTM cheap-option selection.
+9. No naked uncontrolled option selling.
+10. No averaging down.
+11. No martingale.
+12. No revenge trading.
+13. No auto-reentry after broker forced exit.
+14. No normal unrestricted market orders.
+15. No hard-coded expiry weekday.
+16. No hard-coded lot/freeze/tick specifications.
+17. No spot-based option position sizing.
+18. No hidden manual override.
+19. No live execution without reconciliation.
+20. No live deployment based solely on an in-sample profitable backtest.
+
+DEPLOYMENT GATE
+---------------
+The deployment sequence is mandatory:
+
+1. Backtest
+2. Out-of-sample validation
+3. Walk-forward validation
+4. Monte Carlo / sensitivity testing
+5. Paper trading
+6. Controlled small-capital deployment
+7. Stable live statistics
+8. Only then consider increasing risk
+
+FINAL AI CODING AGENT INSTRUCTION
+---------------------------------
+Implement the tasks sequentially.
+
+After each task:
+1. Inspect existing code.
+2. Make the smallest safe architectural changes necessary.
+3. Write/update tests.
+4. Run tests.
+5. Report exactly what changed.
+6. Report remaining gaps.
+7. Do not claim completion without evidence.
+
+Never sacrifice correctness, determinism, risk controls or testability for speed.
+
+If a required data source is unavailable, do not fabricate it. Create a clear
+interface/adapter and fail closed until the required data is available.
+
+If a specification appears ambiguous, preserve the stated V5 behavior, expose
+the ambiguity through configuration or documentation, and do not silently invent
+a trading rule.
+
+The final implementation must be suitable for audit, backtesting, paper
+trading and controlled production evolution—not merely for producing BUY/SELL
+signals.

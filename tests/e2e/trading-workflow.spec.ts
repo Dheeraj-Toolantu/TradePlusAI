@@ -1,0 +1,5 @@
+import { describe, expect, it } from "vitest";
+import { evaluateRisk } from "../../services/risk/src/risk-gate";
+import { simulateOrder } from "../../services/paper-trading/src/paper-engine";
+
+describe("paper trading workflow", () => { it("keeps the safe path risk-gated and simulated", () => { const risk = evaluateRisk({ signalId: "s", mode: "PAPER", capital: 100000, riskPercent: 1, entry: 100, stop: 90, target: 120, candidateQuantity: 50, lotSize: 50, dailyLoss: 0, maxDailyLoss: 3000, openPositions: 0, maxOpenPositions: 2, tradesToday: 0, maxTradesToday: 5, minRiskReward: 2, marketFreshness: "FRESH", killSwitch: false }); expect(risk.decision).toBe("ALLOW"); const account = simulateOrder({ id: "p", capital: 100000, balance: 100000, realizedPnl: 0, orders: [] }, { symbol: "NIFTY", side: "BUY", quantity: 50, price: 100 }); expect(account.orders).toHaveLength(1); }); });

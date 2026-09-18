@@ -1,0 +1,1 @@
+CALCULATION_VERSION = "analysis-v1"

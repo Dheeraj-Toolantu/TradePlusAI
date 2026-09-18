@@ -1,0 +1,1 @@
+export function RuleGroup({ operator, children }: { operator: "AND" | "OR" | "NOT"; children: React.ReactNode }) { return <section aria-label={`${operator} rule group`}><strong>{operator}</strong>{children}</section>; }

@@ -1,0 +1,8 @@
+{
+  "alerts": [
+    { "name": "execution_failures", "query": "execution.failure", "severity": "critical" },
+    { "name": "reconciliation_discrepancy", "query": "reconciliation.unexpected_position", "severity": "critical" },
+    { "name": "stale_market_data", "query": "market.quality=STALE", "severity": "high" },
+    { "name": "risk_latency", "query": "risk.decision.p95_ms > 200", "severity": "high" }
+  ]
+}

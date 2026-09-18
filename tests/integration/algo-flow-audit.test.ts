@@ -1,0 +1,4 @@
+import { describe, expect, it } from "vitest";
+import { AlgoFlowService } from "../../services/strategy/src/algo-flow-service";
+
+describe("flow audit", () => { it("persists the gate stage and reason", () => { const evaluation = new AlgoFlowService().evaluate("candidate-1", { newsImpact: 80, minimumNewsImpact: 70, regimeAllowed: false, technicalConfirmed: true, optionsConfirmed: true, liquidityConfirmed: true, risk: { signalId: "s", mode: "PAPER", capital: 100000, riskPercent: 1, entry: 100, stop: 90, target: 120, candidateQuantity: 50, lotSize: 50, dailyLoss: 0, maxDailyLoss: 3000, openPositions: 0, maxOpenPositions: 2, tradesToday: 0, maxTradesToday: 5, minRiskReward: 2, marketFreshness: "FRESH", killSwitch: false } }, "PAPER", "Paper Broker"); expect(evaluation.currentStage).toBe("REGIME"); expect(evaluation.gateResults).toHaveLength(1); }); });

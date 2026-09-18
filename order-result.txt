@@ -1,0 +1,2 @@
+﻿EX: The remote server returned an error: (400) Bad Request.
+BODY: {"error":"Paper entry requires the V5 minimum expected reward of 2.0R."}

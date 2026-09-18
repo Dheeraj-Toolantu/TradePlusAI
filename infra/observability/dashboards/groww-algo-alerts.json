@@ -1,0 +1,9 @@
+{
+  "alerts": [
+    { "name": "algo_gate_latency", "query": "algo.gate.p95_ms > 200", "severity": "high" },
+    { "name": "groww_provider_errors", "query": "groww.http.error >= 1", "severity": "critical" },
+    { "name": "unknown_orders", "query": "order.status=UNKNOWN", "severity": "critical" },
+    { "name": "protection_failures", "query": "protection.status=FAILED", "severity": "critical" },
+    { "name": "reconciliation_required", "query": "reconciliation.required=true", "severity": "critical" }
+  ]
+}

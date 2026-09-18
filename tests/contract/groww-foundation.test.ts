@@ -1,0 +1,6 @@
+import { describe, expect, it } from "vitest";
+import { ALGO_FLOW_STAGES } from "../../packages/domain-contracts/src/algo-flow";
+import { modeCan, livePreconditions } from "../../packages/domain-contracts/src/execution-modes";
+import { assertServerOnlyConfig } from "../../services/execution/src/groww-config";
+
+describe("Groww foundation", () => { it("preserves the flow order", () => { expect(ALGO_FLOW_STAGES).toEqual(["NEWS", "REGIME", "TECHNICAL", "OPTIONS", "LIQUIDITY", "RR", "RISK", "EXECUTION"]); }); it("isolates Paper mode", () => { expect(modeCan("PAPER", "PAPER_SIMULATE")).toBe(true); expect(modeCan("PAPER", "BROKER_SUBMIT")).toBe(false); }); it("requires both live flags", () => { expect(livePreconditions({ LIVE_EXECUTION_ENABLED: "true" })).toBe(false); expect(livePreconditions({ LIVE_EXECUTION_ENABLED: "true", LIVE_COMPLIANCE_APPROVED: "true" })).toBe(true); }); it("rejects public Groww variables", () => { expect(() => assertServerOnlyConfig({ NEXT_PUBLIC_GROWW_ACCESS_TOKEN: "x" })).toThrow(); }); });

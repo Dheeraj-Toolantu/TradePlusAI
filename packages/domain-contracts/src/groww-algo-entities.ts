@@ -1,0 +1,6 @@
+export type BrokerConnection = { id: string; userId: string; broker: string; credentialReference: string; apiVersion: string; permissions: string[]; health: string; complianceApproval: boolean };
+export type BrokerOrder = { id: string; mode: string; broker: string; instrument: string; side: "BUY" | "SELL"; quantity: number; internalReference: string; providerOrderId?: string; status: string; filledQuantity: number; remainingQuantity: number; retryCount: number };
+export type ProtectionPlan = { id: string; positionId: string; type: "OCO" | "SL" | "TARGET"; quantity: number; targetLeg?: unknown; stopLossLeg?: unknown; providerReference?: string; status: string };
+export type PaperAccount = { id: string; ownerId: string; capital: number; balance: number; margin: number; realizedPnl: number; unrealizedPnl: number };
+export type NewsOutcome = { eventId: string; predictionId: string; predictedDirection: string; predictedImpact: number; confidence: number; horizon: string; realizedMove?: number; accuracy?: number; calibrationState?: string };
+export type PromotionEvidence = { strategyVersion: string; outOfSample: boolean; walkForward: boolean; paperValidated: boolean; assistedApproved: boolean; cappedLive: boolean; consent: boolean; complianceApproved: boolean };

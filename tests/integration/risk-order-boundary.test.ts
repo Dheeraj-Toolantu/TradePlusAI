@@ -1,0 +1,4 @@
+import { describe, expect, it } from "vitest";
+import { SignalService } from "../../services/signal/src/signal-service";
+
+describe("risk order boundary", () => { it("returns a block before any order side effect", () => { const result = new SignalService().evaluate({ id: "s1", strategyVersion: "v1", instrumentId: "nifty", state: "ENTRY_CONFIRMED", score: 80, rationale: "test", createdAt: "" }, { signalId: "s1", mode: "ALGO_LIVE", capital: 100000, riskPercent: 1, entry: 100, stop: 99, target: 100.5, candidateQuantity: 50, lotSize: 50, dailyLoss: 0, maxDailyLoss: 3000, openPositions: 0, maxOpenPositions: 2, tradesToday: 0, maxTradesToday: 5, minRiskReward: 2, marketFreshness: "FRESH", killSwitch: false }); expect(result.decision.decision).toBe("BLOCK"); }); });

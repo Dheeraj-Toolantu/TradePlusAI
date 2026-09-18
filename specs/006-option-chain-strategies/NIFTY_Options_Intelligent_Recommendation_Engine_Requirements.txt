@@ -1,0 +1,1258 @@
+NIFTY OPTIONS INTELLIGENT RECOMMENDATION ENGINE
+==================================================
+COMPLETE IMPLEMENTATION REQUIREMENTS
+Version: 1.0
+
+PURPOSE
+-------
+Build a deterministic, explainable, configurable and auditable NIFTY Options
+Recommendation Engine for CALL and PUT candidates.
+
+The engine must identify the strongest risk-adjusted setup from available
+market data. It must NOT claim that any option guarantees profit or produces
+"maximum profit". Recommendations must be analytical signals based on the
+configured scoring, feasibility and risk framework.
+
+==================================================
+TASK 1 — RECOMMENDATION PIPELINE
+==================================================
+
+Implement this complete pipeline:
+
+LIVE MARKET DATA
+      |
+      v
+NIFTY MARKET DIRECTION
+      |
+      v
+TREND CONFIRMATION
+      |
+      v
+OPTION CHAIN ANALYSIS
+      |
+      v
+OPTION CANDIDATE FILTERING
+      |
+      v
+7-FACTOR SCORING ENGINE
+      |
+      v
+MOVE FEASIBILITY CHECK
+      |
+      v
+RISK/REWARD VALIDATION
+      |
+      v
+CONFIDENCE CALCULATION
+      |
+      v
+OPTION RANKING
+      |
+      v
+RECOMMENDED CONTRACT
+      |
+      v
+EXPLANATION + WARNINGS
+
+The engine must evaluate multiple strikes and must not automatically select
+only the nearest ATM option.
+
+==================================================
+TASK 2 — DIRECTIONAL SCORE
+==================================================
+
+Create a normalized Directional Score from 0–100.
+
+Evaluate, where data is available:
+- Trend direction
+- Price action
+- EMA alignment
+- VWAP relationship
+- RSI
+- MACD
+- ADX
+- Market structure
+- Support/resistance
+- Higher-timeframe confirmation
+
+Determine:
+- BULLISH
+- BEARISH
+- NEUTRAL
+
+Example:
+Direction = BULLISH
+Directional Score = 82
+
+For CALL candidates:
+- Bullish direction = positive
+- Neutral direction = reduced
+- Strong bearish direction = reject or heavily penalize
+
+For PUT candidates:
+- Bearish direction = positive
+- Neutral direction = reduced
+- Strong bullish direction = reject or heavily penalize
+
+If the market is neutral or conflicting, the engine should be able to return
+NO TRADE / WAIT instead of forcing a CALL or PUT.
+
+The engine must store the reasons supporting the directional score.
+
+Example structure:
+{
+  "direction": "BULLISH",
+  "directional_score": 82,
+  "reason": [
+    "Price above VWAP",
+    "20 EMA above 50 EMA",
+    "Higher timeframe trend bullish"
+  ]
+}
+
+==================================================
+TASK 3 — SEVEN-FACTOR SCORING MODEL
+==================================================
+
+Use the following default weights:
+
+Directional Score       25%
+Trend Confirmation      20%
+Delta Quality            15%
+IV / IV Rank             10%
+OI / Change in OI        10%
+Volume / Liquidity       10%
+Risk / Reward             10%
+--------------------------------
+TOTAL                    100%
+
+Every factor must produce a normalized score from 0–100.
+
+Final Score:
+
+Final Score =
+    Directional Score  * 0.25
+  + Trend Score        * 0.20
+  + Delta Score        * 0.15
+  + IV Score           * 0.10
+  + OI Score           * 0.10
+  + Liquidity Score    * 0.10
+  + RiskReward Score   * 0.10
+
+The final score must remain between 0 and 100.
+
+Missing data must not silently be treated as a valid score. Apply a defined
+missing-data policy and generate a data-quality warning.
+
+==================================================
+TASK 4 — TREND CONFIRMATION (20%)
+==================================================
+
+Create a multi-timeframe trend engine.
+
+Minimum timeframes:
+- 5m
+- 15m
+- 30m
+- 1H
+
+Determine trend for each timeframe:
+- BULLISH
+- BEARISH
+- NEUTRAL
+
+Example:
+5m  = BULLISH
+15m = BULLISH
+30m = BULLISH
+1H  = NEUTRAL
+
+Detect:
+- Trend alignment
+- Trend conflict
+- Trend reversal
+- Range-bound market
+- Breakout
+- Breakdown
+
+Higher-timeframe confirmation should have greater importance than very
+short-term noise.
+
+Generate a normalized Trend Confirmation Score from 0–100.
+
+==================================================
+TASK 5 — DELTA QUALITY (15%)
+==================================================
+
+Do not treat higher delta as automatically better.
+
+Evaluate delta relative to the selected strategy profile.
+
+Default preferred ranges for directional long options:
+
+0.45–0.65 = preferred
+0.30–0.45 = acceptable
+0.20–0.30 = aggressive
+<0.20       = high risk / reject by default
+
+For PUTs use absolute delta values.
+
+These ranges must be configurable.
+
+Example:
+{
+  "delta": 0.54,
+  "delta_score": 92,
+  "delta_category": "ATM_BALANCED"
+}
+
+==================================================
+TASK 6 — IV / IV RANK (10%)
+==================================================
+
+Evaluate:
+- Current IV
+- IV Rank
+- IV Percentile
+- Historical IV
+- Relative IV versus nearby strikes
+
+Do not assume low IV is always better or high IV is always bad.
+
+For long options:
+- Extremely high IV can be penalized
+- Moderate IV may be favorable
+- Low IV may be favorable
+- Event risk and expected IV changes must be considered where data exists
+
+Example:
+{
+  "iv": 10.7,
+  "iv_rank": 28,
+  "iv_score": 84
+}
+
+If IV Rank or another input is unavailable, do not fabricate it.
+
+==================================================
+TASK 7 — OI / CHANGE IN OI (10%)
+==================================================
+
+Analyze:
+- Call OI
+- Put OI
+- Change in Call OI
+- Change in Put OI
+- OI concentration
+- Nearby-strike OI
+- OI-derived support/resistance
+- PCR
+
+Detect, where the data supports the classification:
+- Call writing
+- Call unwinding
+- Put writing
+- Put unwinding
+- OI buildup
+- Short covering
+- Long buildup
+- Long unwinding
+
+For CALL candidates, assess whether option-chain structure supports upside.
+For PUT candidates, assess whether option-chain structure supports downside.
+
+Do not use PCR alone to generate a recommendation.
+
+==================================================
+TASK 8 — VOLUME / LIQUIDITY (10%)
+==================================================
+
+Evaluate:
+- Volume
+- Average volume
+- Bid price
+- Ask price
+- Bid-ask spread
+- Open Interest
+- OI change
+- Market depth if available
+- Quote freshness
+
+Calculate:
+
+Spread % =
+(Ask - Bid) / Mid Price * 100
+
+Penalize:
+- Low volume
+- Low OI
+- Large bid/ask spread
+- Poor liquidity
+- Stale quotes
+
+Prefer executable contracts over theoretically attractive but illiquid
+contracts.
+
+==================================================
+TASK 9 — RISK / REWARD (10%)
+==================================================
+
+For every candidate calculate:
+- Entry Premium
+- Stop Loss
+- Target
+- Maximum Premium Risk
+- Potential Reward
+- Risk/Reward Ratio
+- Breakeven
+
+For a long CALL:
+Expiry Breakeven = Strike + Premium
+
+For a long PUT:
+Expiry Breakeven = Strike - Premium
+
+Where applicable, include:
+- Brokerage
+- Exchange charges
+- Taxes
+- Slippage
+
+Do not display an R:R merely because a configured value says 2.0.
+Calculate it from the actual entry, stop and target.
+
+Example:
+Entry = 112.40
+Stop = 84.00
+Target = 169.20
+
+Risk   = Entry - Stop
+Reward = Target - Entry
+R:R    = Reward / Risk
+
+==================================================
+TASK 10 — MOVE FEASIBILITY CHECK
+==================================================
+
+This is a mandatory component.
+
+Do not select an option purely because it has the highest score.
+
+For every candidate perform:
+
+Expected NIFTY Move
+        |
+        v
+Required Move to Breakeven
+        |
+        v
+Required Move to Target
+        |
+        v
+Option Sensitivity
+        |
+        v
+Probability / Confidence Estimate
+        |
+        v
+Feasibility
+
+The feasibility result must influence the final candidate selection.
+
+==================================================
+TASK 11 — EXPECTED NIFTY MOVE
+==================================================
+
+Estimate the expected underlying move using available market data.
+
+Possible inputs:
+- ATR
+- Historical volatility
+- Implied volatility
+- Option-derived expected move
+- Recent trading range
+- Support/resistance
+- Current trend
+- Time remaining to expiry
+
+Do not blindly combine all methods.
+
+Create a configurable methodology, for example:
+- ATR-based expected move
+- IV-based expected move
+- Realized-volatility expected move
+
+These may be combined using configurable weights.
+
+Return:
+{
+  "expected_move_points": 180,
+  "expected_range": {
+    "lower": 23100,
+    "upper": 23460
+  }
+}
+
+The methodology and weights must be configurable.
+
+==================================================
+TASK 12 — BREAKEVEN FEASIBILITY
+==================================================
+
+For every option calculate the required NIFTY movement to reach expiry
+breakeven.
+
+CALL:
+Breakeven = Strike + Premium
+Required Move = Breakeven - Current NIFTY
+
+PUT:
+Breakeven = Strike - Premium
+Required Move = Current NIFTY - Breakeven
+
+Required Move % =
+Required Move / NIFTY Spot * 100
+
+Compare:
+Required Move
+versus
+Expected Move
+
+Create a Breakeven Feasibility Score.
+
+Example:
+Required Move = 142 points
+Expected Move = 180 points
+Feasibility = FAVORABLE
+
+If:
+Required Move > Expected Move
+
+apply a meaningful penalty.
+
+==================================================
+TASK 13 — TARGET FEASIBILITY
+==================================================
+
+Estimate what underlying NIFTY movement may be required for the option to
+reach the configured premium target.
+
+Use, where available:
+- Delta
+- Gamma
+- Theta
+- IV
+- Time to expiry
+- Underlying movement
+
+Do not simply assume that an option premium will rise by a fixed percentage
+without checking underlying sensitivity.
+
+Clearly label target calculations as ESTIMATED.
+
+Targets are not guaranteed.
+
+==================================================
+TASK 14 — CONFIDENCE MODEL
+==================================================
+
+Maintain separate concepts:
+
+SETUP SCORE
+CONFIDENCE
+
+Example:
+Setup Score: 91/100
+Confidence: HIGH
+
+Never convert:
+91 score = 91% probability
+
+That conversion is invalid unless a statistically validated probability model
+has been developed and calibrated.
+
+Confidence should depend on:
+- Directional alignment
+- Trend alignment
+- Move feasibility
+- Liquidity
+- Option-chain confirmation
+- Risk/reward
+- Data quality
+
+If a validated statistical probability model exists, show the methodology,
+sample size, calibration and limitations.
+
+==================================================
+TASK 15 — CANDIDATE FILTERING
+==================================================
+
+Before scoring, reject or heavily penalize unsuitable candidates.
+
+Reject by default when:
+- Option is illiquid
+- Bid/ask spread exceeds configured limit
+- OI is below minimum
+- Volume is below minimum
+- Data is stale
+- Required move is unrealistic
+- Delta is outside allowed range
+- R:R is below minimum
+- Market direction strongly conflicts with option direction
+
+Example configuration:
+{
+  "minimum_rr": 1.5,
+  "maximum_spread_percent": 2.0,
+  "minimum_oi": 10000,
+  "minimum_volume": 5000,
+  "minimum_delta": 0.20
+}
+
+All thresholds must be configurable.
+
+==================================================
+TASK 16 — STRIKE SELECTION
+==================================================
+
+Evaluate multiple strikes around ATM.
+
+Default candidate window:
+- ATM - 3 strikes
+- ATM - 2 strikes
+- ATM - 1 strike
+- ATM
+- ATM + 1 strike
+- ATM + 2 strikes
+- ATM + 3 strikes
+
+Evaluate:
+- ITM
+- ATM
+- OTM
+
+Do not automatically select:
+- Cheapest premium
+- Highest delta
+- Highest raw score
+- Nearest ATM
+
+unless the selected strategy profile explicitly requires it.
+
+Selection must result from the complete scoring + feasibility + risk process.
+
+==================================================
+TASK 17 — FINAL RECOMMENDATION LOGIC
+==================================================
+
+The final decision must consider:
+
+Base Score
++
+Move Feasibility
++
+Risk/Reward
++
+Liquidity
++
+Data Quality
+
+Select based on risk-adjusted suitability rather than maximum theoretical
+profit.
+
+Support configurable strategy profiles:
+
+- BALANCED
+- AGGRESSIVE
+- CONSERVATIVE
+- HIGH_MOMENTUM
+- INTRADAY
+- SWING
+
+Each profile may modify:
+- Factor weights
+- Delta preference
+- Minimum R:R
+- Maximum spread
+- Move-feasibility threshold
+- Candidate range
+- Risk limits
+
+Weights must always sum to 100%.
+
+==================================================
+TASK 18 — RECOMMENDATION OUTPUT
+==================================================
+
+Return structured data similar to:
+
+{
+  "recommendation": {
+    "symbol": "NIFTY",
+    "option_type": "CE",
+    "strike": 23300,
+    "expiry": "YYYY-MM-DD",
+    "entry_premium": 112.40
+  },
+
+  "market": {
+    "spot": 23270.00,
+    "direction": "BULLISH",
+    "directional_score": 82
+  },
+
+  "scoring": {
+    "directional": 82,
+    "trend": 90,
+    "delta": 92,
+    "iv": 84,
+    "oi": 88,
+    "liquidity": 93,
+    "risk_reward": 86,
+    "final_score": 87.9
+  },
+
+  "feasibility": {
+    "breakeven": 23412.40,
+    "required_move": 142.40,
+    "expected_move": 180,
+    "breakeven_feasibility": "FAVORABLE",
+    "target_feasibility": "FAVORABLE"
+  },
+
+  "risk": {
+    "stop_loss": 84.00,
+    "target": 169.20,
+    "risk_reward": 2.0,
+    "max_premium_risk": 7306
+  },
+
+  "confidence": {
+    "level": "HIGH",
+    "score": 88
+  },
+
+  "explanation": [
+    "Bullish directional bias",
+    "Multi-timeframe trend alignment",
+    "Delta within preferred range",
+    "Acceptable IV conditions",
+    "Strong option-chain confirmation",
+    "Good liquidity",
+    "Breakeven is within estimated move range",
+    "Target is feasible based on current model inputs"
+  ],
+
+  "warnings": [
+    "Market conditions can change rapidly",
+    "Target and probability estimates are not guaranteed",
+    "Option premium is sensitive to IV and time decay"
+  ]
+}
+
+The actual application must populate this structure from real data, not use
+the example values as hard-coded market values.
+
+==================================================
+TASK 19 — UI RECOMMENDATION CARD
+==================================================
+
+Replace a basic recommendation card with a transparent analytical card.
+
+Recommended fields:
+
+SUGGESTED OPTION
+
+NIFTY 23,300 CE
+
+Premium           ₹112.40
+Setup Score       88/100
+Confidence        HIGH
+Direction         BULLISH
+Delta             0.54
+IV                10.7%
+
+Breakeven         23,412.40
+Expected Range    23,100–23,460
+Required Move     142 pts
+
+Target            ₹169.20
+Stop Loss         ₹84.00
+Risk / Reward     2.0 : 1
+
+Capital / Lot     ₹7,306
+Maximum Premium Risk ₹7,306
+
+Add:
+[ USE SUGGESTION ]
+[ WHY THIS OPTION? ]
+
+The UI must clearly distinguish:
+- Current market data
+- Calculated values
+- Estimates
+- Model scores
+- Warnings
+
+==================================================
+TASK 20 — WHY THIS OPTION?
+==================================================
+
+Implement an explainability panel.
+
+Show contribution by factor:
+
+Directional       20.5 / 25
+Trend             18.0 / 20
+Delta             13.8 / 15
+IV                  8.4 / 10
+OI                  8.8 / 10
+Liquidity           9.3 / 10
+Risk/Reward         8.6 / 10
+--------------------------------
+TOTAL              87.4 / 100
+
+Also explain:
+- Why this option qualified
+- Why neighboring strikes scored differently
+- Which factors increased the score
+- Which factors reduced the score
+- What could invalidate the setup
+- What data is missing
+
+All explanations must be generated from actual calculations.
+
+==================================================
+TASK 21 — ALTERNATIVE OPTIONS
+==================================================
+
+Do not hide other viable candidates.
+
+Display:
+PRIMARY CANDIDATE
+23,300 CE
+Score: 87.4
+
+ALTERNATIVES
+23,250 CE
+Score: 84.7
+
+23,350 CE
+Score: 82.9
+
+Show trade-offs such as:
+- Delta
+- Premium
+- Breakeven
+- Expected move feasibility
+- Liquidity
+- Risk/reward
+
+Do not describe an option as guaranteed to be the most profitable.
+
+==================================================
+TASK 22 — NO-TRADE CONDITION
+==================================================
+
+The engine MUST support:
+
+NO TRADE / WAIT
+
+Possible reasons:
+- Weak directional signal
+- Conflicting timeframes
+- Low liquidity
+- Poor R:R
+- Required move exceeds expected move
+- Extreme IV
+- Insufficient option-chain confirmation
+- Insufficient market data
+- Stale market data
+- Risk limits exceeded
+
+Never force a CALL or PUT recommendation.
+
+==================================================
+TASK 23 — EXPLAINABILITY REQUIREMENTS
+==================================================
+
+Every recommendation must answer:
+
+WHY THIS OPTION?
+WHY NOT THE NEIGHBORING STRIKES?
+WHAT MARKET CONDITION SUPPORTS IT?
+WHAT INVALIDATES THE TRADE?
+WHAT IS THE EXPECTED MOVE?
+HOW FAR IS BREAKEVEN?
+IS THE TARGET FEASIBLE?
+WHAT IS THE MAXIMUM PREMIUM RISK?
+WHAT DATA IS MISSING?
+
+Do not generate generic AI explanations.
+
+Every statement must be traceable to a calculated input or rule.
+
+==================================================
+TASK 24 — AUDIT TRAIL
+==================================================
+
+Store every recommendation calculation.
+
+Required fields should include:
+- Timestamp
+- Spot
+- Expiry
+- Strike
+- Option type
+- Premium
+- Delta
+- Gamma if available
+- Theta if available
+- IV
+- IV Rank if available
+- OI
+- Volume
+- Bid
+- Ask
+- Spread
+- Directional score
+- Trend score
+- Delta score
+- IV score
+- OI score
+- Liquidity score
+- R:R score
+- Final score
+- Expected move
+- Expected range
+- Breakeven
+- Required move
+- Target
+- Stop loss
+- R:R
+- Confidence
+- Decision
+- Data-quality status
+- Reasons
+- Warnings
+
+The audit record must allow developers to reproduce why a recommendation
+was generated.
+
+==================================================
+TASK 25 — BACKTESTING
+==================================================
+
+Create a historical backtesting module.
+
+Calculate:
+- Total trades
+- Winning trades
+- Losing trades
+- Win rate
+- Average profit
+- Average loss
+- Profit factor
+- Maximum drawdown
+- Expectancy
+- Average R:R
+- Maximum consecutive losses
+- Total return where applicable
+- Transaction costs
+- Slippage impact
+
+Separate:
+- Training/optimization period
+- Validation period
+- Out-of-sample test period
+
+Do not optimize and evaluate on exactly the same historical data.
+
+Include protection against:
+- Look-ahead bias
+- Survivorship bias where applicable
+- Data leakage
+- Overfitting
+- Unrealistic fills
+- Ignoring transaction costs
+
+==================================================
+TASK 26 — UNIT TESTS
+==================================================
+
+Create automated tests for:
+
+- CALL breakeven
+- PUT breakeven
+- Delta scoring
+- IV scoring
+- OI scoring
+- Liquidity scoring
+- Spread calculation
+- R:R calculation
+- Expected move
+- Required move
+- Move feasibility
+- Target feasibility
+- Candidate filtering
+- Final weighted score
+- Strike selection
+- No-trade condition
+- Missing data
+- Stale data
+- Zero premium
+- Negative/invalid premium
+- Invalid option-chain records
+- Weight validation
+
+Include:
+- Normal cases
+- Boundary cases
+- Invalid inputs
+- Missing inputs
+- Extreme market conditions
+
+==================================================
+TASK 27 — MATHEMATICAL SAFETY RULES
+==================================================
+
+Never:
+
+1. Convert score directly into probability.
+2. Assume higher delta automatically means better.
+3. Assume lower premium automatically means better.
+4. Assume high IV automatically means bad.
+5. Assume high PCR automatically means bullish.
+6. Assume high OI automatically means support/resistance.
+7. Select the cheapest option merely because percentage return can be higher.
+8. Guarantee profit.
+9. Guarantee target achievement.
+10. Fabricate missing market data.
+11. Use future information in historical backtests.
+12. Ignore transaction costs and slippage when evaluating backtest results.
+
+==================================================
+TASK 28 — CONFIGURATION
+==================================================
+
+Move all strategy parameters into configuration.
+
+Example:
+
+{
+  "weights": {
+    "directional": 0.25,
+    "trend": 0.20,
+    "delta": 0.15,
+    "iv": 0.10,
+    "oi": 0.10,
+    "liquidity": 0.10,
+    "risk_reward": 0.10
+  },
+
+  "risk": {
+    "minimum_rr": 1.5,
+    "preferred_rr": 2.0
+  },
+
+  "delta": {
+    "preferred_min": 0.45,
+    "preferred_max": 0.65,
+    "absolute_min": 0.20
+  },
+
+  "liquidity": {
+    "maximum_spread_percent": 2.0,
+    "minimum_oi": 10000,
+    "minimum_volume": 5000
+  },
+
+  "feasibility": {
+    "minimum_expected_move_ratio": 0.8
+  }
+}
+
+All parameters must be configurable without modifying business logic.
+
+Validate that all weights sum to 1.0 / 100%.
+
+==================================================
+TASK 29 — DATA QUALITY ENGINE
+==================================================
+
+Implement a dedicated data-quality layer.
+
+Validate:
+- Timestamp freshness
+- Spot validity
+- Premium validity
+- Bid/ask validity
+- OI validity
+- Volume validity
+- Expiry validity
+- Strike validity
+- Duplicate records
+- Missing fields
+- Outlier values
+
+Assign:
+DATA_QUALITY = HIGH / MEDIUM / LOW
+
+A low-quality dataset must reduce confidence or cause NO TRADE depending
+on configured thresholds.
+
+==================================================
+TASK 30 — REAL-TIME UPDATE BEHAVIOR
+==================================================
+
+When market data changes, recalculate:
+- Direction
+- Trend
+- Option score
+- Expected move
+- Breakeven feasibility
+- Target feasibility
+- Confidence
+- Recommendation
+
+Do not repeatedly show stale recommendations.
+
+Display:
+- Last calculation timestamp
+- Data timestamp
+- Recommendation age
+- Recalculation status
+
+==================================================
+TASK 31 — API / SERVICE DESIGN
+==================================================
+
+Separate business logic from UI.
+
+Recommended components:
+
+MarketDataService
+OptionChainService
+IndicatorService
+TrendService
+DirectionalScoringService
+DeltaScoringService
+IVScoringService
+OIScoringService
+LiquidityScoringService
+RiskRewardService
+ExpectedMoveService
+FeasibilityService
+CandidateFilterService
+RecommendationService
+ConfidenceService
+BacktestService
+AuditService
+ConfigurationService
+
+The scoring engine must be independently testable.
+
+==================================================
+TASK 32 — LOGGING AND DEBUGGING
+==================================================
+
+Log:
+- Input snapshot
+- Candidate strikes
+- Rejected candidates
+- Rejection reason
+- Individual factor scores
+- Weight calculations
+- Expected move calculation
+- Breakeven calculation
+- Feasibility calculation
+- Final ranking
+- Selected candidate
+- Confidence
+- Warnings
+
+Support DEBUG mode for developers.
+
+Example:
+
+Candidate: NIFTY 23300 CE
+Directional: 82 * 25% = 20.50
+Trend:       90 * 20% = 18.00
+Delta:       92 * 15% = 13.80
+IV:          84 * 10% = 8.40
+OI:          88 * 10% = 8.80
+Liquidity:   93 * 10% = 9.30
+R:R:         86 * 10% = 8.60
+
+Base Score = 87.40
+
+Then apply the documented feasibility/risk/data-quality methodology.
+
+==================================================
+TASK 33 — ACCEPTANCE CRITERIA
+==================================================
+
+Implementation is complete only when:
+
+1. Multiple strikes are evaluated.
+2. CALL and PUT candidates are evaluated independently.
+3. Seven scoring factors are calculated.
+4. Every factor is normalized.
+5. Weighted score is mathematically correct.
+6. Breakeven is calculated correctly.
+7. Expected NIFTY move is calculated.
+8. Required move is calculated.
+9. Breakeven feasibility is calculated.
+10. Target feasibility is calculated.
+11. Liquidity is considered.
+12. OI and change in OI are considered.
+13. IV/IV Rank are considered when available.
+14. Multi-timeframe trend is considered.
+15. R:R is calculated from actual SL/target.
+16. Score is not treated as probability.
+17. NO TRADE is supported.
+18. Alternative strikes are displayed.
+19. Recommendations are explainable.
+20. Recommendations are auditable.
+21. Historical backtesting is supported.
+22. Unit tests cover mathematical calculations.
+23. Missing market values are never fabricated.
+24. Parameters are configurable.
+25. Real-time recalculation is supported.
+26. Data quality affects confidence/eligibility.
+27. Backtesting avoids look-ahead bias.
+28. Transaction costs and slippage are considered.
+29. UI clearly distinguishes estimates from live values.
+30. Recommendation logic is independent from presentation/UI.
+
+==================================================
+TASK 34 — IMPLEMENTATION WORKFLOW FOR AI CODING AGENT
+==================================================
+
+If implementing this specification in an existing codebase:
+
+PHASE 1
+Inspect the complete repository before changing code.
+
+Identify:
+- Existing option-chain model
+- Existing NIFTY market-data service
+- Existing technical indicator calculations
+- Existing scoring logic
+- Existing recommendation logic
+- Existing UI recommendation card
+- Existing risk/reward calculation
+- Existing API endpoints
+- Existing database models
+- Existing tests
+
+Do not rewrite working modules unnecessarily.
+
+PHASE 2
+Create a technical implementation plan.
+
+List:
+- Files to modify
+- Files to create
+- Classes/services
+- Data models
+- APIs
+- Configuration
+- Test coverage
+
+PHASE 3
+Implement the calculation engine independently.
+
+PHASE 4
+Integrate with existing market data.
+
+PHASE 5
+Integrate with the UI.
+
+PHASE 6
+Add audit logging.
+
+PHASE 7
+Add unit tests.
+
+PHASE 8
+Add backtesting.
+
+PHASE 9
+Run regression tests.
+
+PHASE 10
+Provide an implementation report containing:
+- What was changed
+- Why it was changed
+- Formulas implemented
+- Configuration added
+- Tests created
+- Known limitations
+- Remaining work
+
+Do not break existing functionality.
+
+==================================================
+TASK 35 — REQUIRED FINAL DEVELOPER REPORT
+==================================================
+
+After implementation, provide:
+
+1. Architecture summary
+2. Files created
+3. Files modified
+4. Data flow
+5. Calculation formulas
+6. Scoring methodology
+7. Move feasibility methodology
+8. Risk/reward methodology
+9. Confidence methodology
+10. Candidate-selection methodology
+11. No-trade conditions
+12. Configuration parameters
+13. Unit-test results
+14. Backtest methodology
+15. Known limitations
+16. Example recommendation output
+17. UI changes
+18. Future improvement recommendations
+
+==================================================
+FINAL PRINCIPLE
+==================================================
+
+The system must follow this decision hierarchy:
+
+MARKET DIRECTION
+      +
+TREND CONFIRMATION
+      +
+OPTION QUALITY
+      +
+LIQUIDITY
+      +
+RISK/REWARD
+      +
+EXPECTED MOVE
+      +
+BREAKEVEN FEASIBILITY
+      +
+TARGET FEASIBILITY
+      +
+DATA QUALITY
+      |
+      v
+RISK-ADJUSTED OPTION SELECTION
+
+The engine must prefer a well-supported, feasible and executable setup over
+an option that merely has a cheap premium or attractive theoretical percentage
+return.
+
+The engine must be allowed to say:
+
+NO TRADE / WAIT
+
+when the evidence is insufficient.
+
+The recommendation is an analytical model output, not a guarantee of profit.

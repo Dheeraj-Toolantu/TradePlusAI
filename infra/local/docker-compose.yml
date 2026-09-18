@@ -1,0 +1,17 @@
+services:
+  database:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: tradepulse
+      POSTGRES_USER: tradepulse
+      POSTGRES_PASSWORD: tradepulse_local_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - tradepulse-db:/var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+volumes:
+  tradepulse-db:

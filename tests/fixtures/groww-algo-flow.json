@@ -1,0 +1,8 @@
+{
+  "pass": { "newsImpact": 80, "minimumNewsImpact": 70, "regimeAllowed": true, "technicalConfirmed": true, "optionsConfirmed": true, "liquidityConfirmed": true },
+  "newsBlocked": { "newsImpact": 60, "minimumNewsImpact": 70 },
+  "rrBlocked": { "entry": 100, "stop": 90, "target": 105, "minimumRiskReward": 2 },
+  "riskBlocked": { "dailyLoss": 3000, "maxDailyLoss": 3000 },
+  "staleData": { "marketFreshness": "STALE" },
+  "growwFailure": { "providerStatus": 503, "expectedSafeState": "BLOCK_NEW_ENTRIES" }
+}

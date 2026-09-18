@@ -1,0 +1,4 @@
+import { describe, expect, it } from "vitest";
+import { evaluateEndOfDay } from "../../services/paper-trading/src/square-off-service";
+
+describe("paper square-off", () => { it("requests square-off only after enabled cutoff", () => { const account = { id: "p", capital: 100000, balance: 100000, realizedPnl: 0, orders: [{ id: "1", symbol: "NIFTY", side: "BUY" as const, quantity: 1, price: 100, status: "FILLED" as const }] }; expect(evaluateEndOfDay(account, new Date(2026, 8, 8, 15, 31), { enabled: true, cutoffHour: 15 }).action).toBe("SQUARE_OFF"); expect(evaluateEndOfDay(account, new Date(2026, 8, 8, 14, 59), { enabled: true, cutoffHour: 15 }).action).toBe("HOLD"); }); });

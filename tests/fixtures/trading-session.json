@@ -1,0 +1,25 @@
+{
+  "mode": "PAPER",
+  "indices": [
+    { "symbol": "NIFTY", "price": 24871.3, "change": 0.52, "regime": "BULL_TREND" },
+    { "symbol": "BANKNIFTY", "price": 54238.6, "change": 0.72, "regime": "BULL_TREND" },
+    { "symbol": "SENSEX", "price": 81362.1, "change": 0.52, "regime": "RANGE" }
+  ],
+  "risk": { "status": "READY", "dailyLoss": 0, "maxDailyLoss": 3 },
+  "broker": { "name": "Groww", "status": "DISCONNECTED" },
+  "freshness": "FRESH",
+  "signals": [
+    {
+      "id": "signal-nifty-breakout",
+      "symbol": "NIFTY",
+      "state": "ENTRY_CONFIRMED",
+      "side": "BUY",
+      "entry": 24870,
+      "stop": 24830,
+      "target": 24950,
+      "rr": 2,
+      "score": 84,
+      "reason": "Price above VWAP with positive breadth and confirming OI build-up."
+    }
+  ]
+}

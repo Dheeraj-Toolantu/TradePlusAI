@@ -1,0 +1,3 @@
+export default function StrategyBuilderPage() {
+  return <main style={{ padding: 32, color: "#e6f2f3", background: "#06141c", minHeight: "100vh", fontFamily: "Manrope, sans-serif" }}><p style={{ color: "#30d4ca", letterSpacing: 2 }}>STRATEGY WORKSPACE</p><h1>Strategy Builder</h1><p>Compose IF / AND / OR / NOT rules, then configure risk, targets, trailing, and exits.</p><div style={{ border: "1px solid #173944", padding: 20, marginTop: 24 }}>IF <b>VWAP</b> is above <b>EMA 20</b> AND <b>OI change</b> is positive THEN <b>BUY ATM</b></div><a href="/" style={{ display: "inline-block", marginTop: 24, color: "#30d4ca" }}>Back to dashboard</a></main>;
+}

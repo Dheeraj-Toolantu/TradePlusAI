@@ -1,0 +1,3 @@
+import type { NewsOutcome } from "../../../packages/domain-contracts/src/groww-algo-entities";
+
+export function calibrationReport(outcomes: NewsOutcome[]) { const accuracy = outcomes.filter((outcome) => outcome.accuracy !== undefined).map((outcome) => outcome.accuracy ?? 0); return { samples: accuracy.length, averageAccuracy: accuracy.length ? accuracy.reduce((sum, value) => sum + value, 0) / accuracy.length : 0, bias: accuracy.length && accuracy.reduce((sum, value) => sum + value, 0) / accuracy.length < 0.5 ? "UNDERPERFORMS" : "NO_CONFIRMED_BIAS", originalPredictionsImmutable: true }; }

@@ -1,0 +1,31 @@
+{
+  "name": "tradepulse-ai",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.5",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*",
+    "adapters/*"
+  ],
+  "scripts": {
+    "dev": "corepack pnpm --parallel --filter @tradepulse/web --filter @tradepulse/api dev",
+    "build": "npm run build --workspace=@tradepulse/web",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "db:migrate": "powershell -ExecutionPolicy Bypass -File infra/local/migrate.ps1",
+    "fixtures:load": "node infra/local/load-fixtures.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "firebase": "^12.19.0"
+  }
+}

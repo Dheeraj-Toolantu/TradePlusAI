@@ -1,0 +1,18 @@
+name: Security checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: node -e "const fs=require('fs'); const files=['.env.groww.example','services/execution/src/groww-config.ts']; for (const file of files) { if (!fs.existsSync(file)) throw new Error('Missing security file '+file); }"
+      - run: npm run build

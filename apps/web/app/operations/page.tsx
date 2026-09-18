@@ -1,0 +1,3 @@
+export default function OperationsPage() {
+  return <main style={{ padding: 32, color: "#e6f2f3", background: "#06141c", minHeight: "100vh", fontFamily: "Manrope, sans-serif" }}><p style={{ color: "#30d4ca", letterSpacing: 2 }}>REVIEW &amp; OPERATIONS</p><h1>Trade Journal &amp; Analytics</h1><div style={{ marginTop: 24, border: "1px solid #173944", padding: 18 }}><b>Notifications</b><p>No pending notifications.</p><b>Audit trail</b><p>All decision and execution records are append-only and mode-labelled.</p><b>Analytics</b><p>Paper performance is clearly separated from assisted and live results.</p></div><a href="/" style={{ display: "inline-block", marginTop: 24, color: "#30d4ca" }}>Back to dashboard</a></main>;
+}

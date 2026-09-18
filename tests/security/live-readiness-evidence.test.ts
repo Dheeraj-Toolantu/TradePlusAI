@@ -1,0 +1,4 @@
+import { describe, expect, it } from "vitest";
+import { canActivateLive } from "../../services/execution/src/live-release-policy";
+
+describe("live readiness evidence", () => { it("blocks activation until release evidence is complete", () => { const input = { allGatesPassed: true, brokerHealthy: true, reconciled: true, consent: true, promotionApproved: true }; expect(canActivateLive(input, { LIVE_EXECUTION_ENABLED: "true", LIVE_COMPLIANCE_APPROVED: "true" })).toBe(false); expect(canActivateLive({ ...input, releaseEvidenceComplete: true }, { LIVE_EXECUTION_ENABLED: "true", LIVE_COMPLIANCE_APPROVED: "true" })).toBe(true); }); });

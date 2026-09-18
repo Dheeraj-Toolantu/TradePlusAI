@@ -1,0 +1,5 @@
+import { describe, expect, it } from "vitest";
+import { evaluateAlgoFlow } from "../../services/strategy/src/algo-flow-gate";
+import { PaperBrokerAdapter } from "../../services/paper-trading/src/paper-broker-adapter";
+
+describe("Groww algo paper flow", () => { it("flows through gates and ends in Paper Broker", async () => { const risk = { signalId: "s", mode: "PAPER" as const, capital: 100000, riskPercent: 1, entry: 100, stop: 90, target: 120, candidateQuantity: 50, lotSize: 50, dailyLoss: 0, maxDailyLoss: 3000, openPositions: 0, maxOpenPositions: 2, tradesToday: 0, maxTradesToday: 5, minRiskReward: 2, marketFreshness: "FRESH" as const, killSwitch: false }; expect(evaluateAlgoFlow({ newsImpact: 80, minimumNewsImpact: 70, regimeAllowed: true, technicalConfirmed: true, optionsConfirmed: true, liquidityConfirmed: true, risk }).allowed).toBe(true); const paper = new PaperBrokerAdapter({ id: "p", capital: 100000, balance: 100000, realizedPnl: 0, orders: [] }); expect((await paper.placeOrder({ referenceId: "TP-123456", symbol: "NIFTY", quantity: 50, side: "BUY", orderType: "MARKET" })).value?.status).toBe("FILLED"); }); });

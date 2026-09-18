@@ -1,0 +1,86 @@
+import { createHash } from "node:crypto";
+import type { BrokerAdapter, BrokerOrderRequest, BrokerOrderState, BrokerPosition, BrokerQuote, BrokerResult } from "../../../packages/broker-contracts/src/broker-adapter";
+import { toGrowwOrder, validateReferenceId } from "./groww-request-policy";
+
+export type GrowwTransport = { request(path: string, init: { method: string; body?: unknown }): Promise<unknown> };
+
+type GrowwPayload = { status?: string; payload?: Record<string, unknown> };
+type CachedGrowwToken = { key: string; token: string };
+
+let cachedGrowwToken: CachedGrowwToken | undefined;
+let growwTokenRequest: { key: string; promise: Promise<string> } | undefined;
+let growwTokenCooldownUntil = 0;
+let growwTokenCooldownMessage = "";
+
+export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.env): GrowwTransport {
+  let token = environment.GROWW_ACCESS_TOKEN;
+  const apiKey = environment.GROWW_API_KEY;
+  const apiSecret = environment.GROWW_API_SECRET;
+  const baseUrl = environment.GROWW_API_BASE_URL ?? "https://api.groww.in";
+  const tokenCacheKey = `${baseUrl}:${apiKey ?? ""}`;
+  function tokenExpired(value: string): boolean {
+    try {
+      const encodedPayload = value.split(".")[1];
+      if (!encodedPayload) return false;
+      const payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as { exp?: number };
+      return typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000) + 30;
+    } catch {
+      return false;
+    }
+  }
+  async function accessToken(forceRefresh = false): Promise<string> {
+    if (!forceRefresh && token && !tokenExpired(token)) return token;
+    if (!apiKey || !apiSecret) throw new Error("GROWW_ACCESS_TOKEN is not configured; set it or configure GROWW_API_KEY and GROWW_API_SECRET");
+    if (forceRefresh) cachedGrowwToken = undefined;
+    if (cachedGrowwToken?.key === tokenCacheKey && !tokenExpired(cachedGrowwToken.token)) return cachedGrowwToken.token;
+    if (growwTokenCooldownUntil > Date.now()) throw new Error(growwTokenCooldownMessage);
+    if (growwTokenRequest?.key === tokenCacheKey) return growwTokenRequest.promise;
+    const promise = (async () => {
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const checksum = createHash("sha256").update(`${apiSecret}${timestamp}`, "utf8").digest("hex");
+      const response = await fetch(`${baseUrl}/v1/token/api/access`, { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: JSON.stringify({ key_type: "approval", checksum, timestamp }), cache: "no-store" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = `Groww token API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`;
+        if (response.status === 429) { growwTokenCooldownUntil = Date.now() + 30_000; growwTokenCooldownMessage = message; }
+        throw new Error(message);
+      }
+      const generated = String((body as GrowwPayload)?.payload?.token ?? (body as { token?: string }).token ?? "");
+      if (!generated) throw new Error("Groww token API returned no access token");
+      cachedGrowwToken = { key: tokenCacheKey, token: generated };
+      token = generated;
+      return generated;
+    })();
+    growwTokenRequest = { key: tokenCacheKey, promise };
+    try { return await promise; } finally { if (growwTokenRequest?.promise === promise) growwTokenRequest = undefined; }
+  }
+  return {
+    async request(path, init) {
+      const requestOptions = (bearer: string) => ({ method: init.method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${bearer}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: init.body === undefined ? undefined : JSON.stringify(init.body), cache: "no-store" as const });
+      let bearer = await accessToken();
+      let response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
+      if (response.status === 401 && apiKey && apiSecret) {
+        token = undefined;
+        bearer = await accessToken(true);
+        response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
+      }
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(`Groww API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`);
+      return body;
+    },
+  };
+}
+
+function payloadOf(value: unknown): Record<string, unknown> { return ((value as GrowwPayload)?.payload ?? {}) as Record<string, unknown>; }
+function orderState(value: unknown, fallbackId: string, fallbackQuantity = 0): BrokerOrderState { const payload = payloadOf(value); return { brokerOrderId: String(payload.groww_order_id ?? payload.order_reference_id ?? fallbackId), status: String(payload.order_status ?? "UNKNOWN"), filledQuantity: Number(payload.filled_quantity ?? 0), remainingQuantity: Number(payload.remaining_quantity ?? fallbackQuantity), averageFillPrice: payload.average_fill_price === undefined ? undefined : Number(payload.average_fill_price) }; }
+
+export class GrowwAdapter implements BrokerAdapter {
+  constructor(private readonly transport: GrowwTransport) {}
+  async healthCheck(): Promise<BrokerResult<{ connected: boolean; authenticated: boolean; permissions: string[]; checkedAt: string }>> { try { await this.transport.request("/v1/user/profile", { method: "GET" }); return { ok: true, value: { connected: true, authenticated: true, permissions: ["quotes", "orders", "positions", "trades"], checkedAt: new Date().toISOString() } }; } catch (error) { return { ok: false, error: { code: "GROWW_HEALTH_FAILED", message: error instanceof Error ? error.message : "Groww health check failed", retryable: true, safeStateImpact: "BLOCK_NEW_ENTRIES" } }; } }
+  async getQuotes(symbols: string[]): Promise<BrokerResult<BrokerQuote[]>> { try { const values = await Promise.all(symbols.map(async (symbol) => { const market = symbol === "SENSEX" ? { exchange: "BSE", tradingSymbol: "SENSEX" } : { exchange: "NSE", tradingSymbol: symbol === "INDIA VIX" ? "INDIAVIX" : symbol }; const path = `/v1/live-data/quote?exchange=${market.exchange}&segment=CASH&trading_symbol=${encodeURIComponent(market.tradingSymbol)}`; const body = await this.transport.request(path, { method: "GET" }); const payload = payloadOf(body); const ohlc = (payload.ohlc ?? {}) as Record<string, unknown>; return { symbol, price: Number(payload.ltp ?? payload.last_price ?? 0), change: Number(payload.day_change ?? payload.change ?? 0), percent: Number(payload.day_change_perc ?? payload.change_percent ?? 0), timestamp: payload.last_trade_time ? new Date(Number(payload.last_trade_time)).toISOString() : new Date().toISOString(), open: Number(ohlc.open ?? payload.open ?? payload.last_price ?? 0), high: Number(ohlc.high ?? payload.high ?? payload.last_price ?? 0), low: Number(ohlc.low ?? payload.low ?? payload.last_price ?? 0), volume: Number(payload.volume ?? 0) }; })); return { ok: true, value: values }; } catch (error) { return { ok: false, error: { code: "GROWW_QUOTES_FAILED", message: error instanceof Error ? error.message : "Groww quote request failed", retryable: true, safeStateImpact: "BLOCK_NEW_ENTRIES" } }; } }
+  async getPositions(): Promise<BrokerResult<BrokerPosition[]>> { try { const body = await this.transport.request("/v1/portfolio/positions", { method: "GET" }); const positions = ((payloadOf(body).positions ?? []) as Record<string, unknown>[]).map((position) => ({ symbol: String(position.trading_symbol ?? position.symbol), quantity: Number(position.quantity ?? position.net_quantity ?? 0), averagePrice: Number(position.average_price ?? position.avg_price ?? 0) })); return { ok: true, value: positions }; } catch (error) { return { ok: false, error: { code: "GROWW_POSITIONS_FAILED", message: error instanceof Error ? error.message : "Groww positions request failed", retryable: true, safeStateImpact: "BLOCK_NEW_ENTRIES" } }; } }
+  async placeOrder(request: BrokerOrderRequest): Promise<BrokerResult<BrokerOrderState>> { try { validateReferenceId(request.referenceId); const body = await this.transport.request("/v1/order/create", { method: "POST", body: toGrowwOrder(request) }); return { ok: true, value: orderState(body, request.referenceId, request.quantity) }; } catch (error) { return { ok: false, error: { code: "GROWW_ORDER_FAILED", message: error instanceof Error ? error.message : "Groww order failed", retryable: false, safeStateImpact: "BLOCK_NEW_ENTRIES" } }; } }
+  async getOrderStatus(referenceId: string): Promise<BrokerResult<BrokerOrderState>> { try { validateReferenceId(referenceId); const body = await this.transport.request(`/v1/order/status/reference/${referenceId}?segment=FNO`, { method: "GET" }); return { ok: true, value: orderState(body, referenceId) }; } catch (error) { return { ok: false, error: { code: "GROWW_STATUS_FAILED", message: error instanceof Error ? error.message : "Groww order status failed", retryable: true, safeStateImpact: "BLOCK_NEW_ENTRIES" } }; } }
+  async cancelOrder(orderId: string): Promise<BrokerResult<BrokerOrderState>> { try { const body = await this.transport.request("/v1/order/cancel", { method: "POST", body: { segment: "FNO", groww_order_id: orderId } }); return { ok: true, value: orderState(body, orderId) }; } catch (error) { return { ok: false, error: { code: "GROWW_CANCEL_FAILED", message: error instanceof Error ? error.message : "Groww cancellation failed", retryable: true, safeStateImpact: "BLOCK_NEW_ENTRIES" } }; } }
+  async reconcile(): Promise<BrokerResult<{ unexpectedPositions: BrokerPosition[] }>> { const result = await this.getPositions(); if ("error" in result) return { ok: false, error: result.error }; return { ok: true, value: { unexpectedPositions: result.value.filter((position) => position.quantity !== 0) } }; }
+}

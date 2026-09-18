@@ -1,0 +1,4 @@
+import { describe, expect, it } from "vitest";
+import { PaperBrokerAdapter } from "../../services/paper-trading/src/paper-broker-adapter";
+
+describe("Paper Broker isolation", () => { it("simulates 100 orders without a provider transport", async () => { const paper = new PaperBrokerAdapter({ id: "p", capital: 100000, balance: 100000, realizedPnl: 0, orders: [] }); for (let index = 0; index < 100; index += 1) await paper.placeOrder({ referenceId: `TP-${String(index).padStart(6, "0")}`, symbol: "NIFTY", quantity: 50, side: "BUY", orderType: "MARKET" }); expect((await paper.getPositions()).value).toEqual([]); }); });

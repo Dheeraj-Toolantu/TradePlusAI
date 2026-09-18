@@ -1,0 +1,24 @@
+﻿
+
+symbol         : NIFTY2691523300PE
+contract       : PUT
+expiry         : 2026-09-15
+strike         : 23300
+premium        : 37.65
+bid            : 36.98
+ask            : 38.32
+openInterest   : 462737
+oiChange       : 0
+volume         : 7597736
+iv             : 29.56
+delta          : -0.383
+theta          : -37.7
+lotSize        : 65
+tickSize       : 0.05
+freezeQuantity : 1801
+score          : 91
+riskReward     : 2
+reason         : Real-time chain Greeks, OI and volume
+
+
+

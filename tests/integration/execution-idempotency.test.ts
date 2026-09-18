@@ -1,0 +1,6 @@
+import { describe, expect, it } from "vitest";
+import { ExecutionService } from "../../services/execution/src/execution-service";
+
+describe("execution idempotency", () => {
+  it("does not place a duplicate reference", async () => { let calls = 0; const service = new ExecutionService({ healthCheck: async () => ({ ok: true, value: { connected: true, authenticated: true, permissions: [], checkedAt: "" } }), getQuotes: async () => ({ ok: true, value: [] }), getPositions: async () => ({ ok: true, value: [] }), placeOrder: async (request) => { calls += 1; return { ok: true, value: { brokerOrderId: "broker-1", status: "OPEN", filledQuantity: 0, remainingQuantity: request.quantity } }; }, getOrderStatus: async () => ({ ok: true, value: { brokerOrderId: "broker-1", status: "OPEN", filledQuantity: 0, remainingQuantity: 50 } }), cancelOrder: async () => ({ ok: true, value: { brokerOrderId: "broker-1", status: "CANCELLED", filledQuantity: 0, remainingQuantity: 0 } }), reconcile: async () => ({ ok: true, value: { unexpectedPositions: [] } }) }); const request = { referenceId: "TP-123456", symbol: "NIFTY", quantity: 50, side: "BUY" as const, orderType: "MARKET" as const }; await service.place(request); await service.place(request); expect(calls).toBe(1); });
+});
