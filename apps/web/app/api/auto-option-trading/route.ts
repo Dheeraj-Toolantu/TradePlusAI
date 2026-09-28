@@ -1,8 +1,12 @@
 import { NextResponse } from "next/server";
 import { AutoOptionTrader } from "../../../../../services/paper-trading/src/auto-option-trader";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
+import { readGrowwConfig } from "../../../../../services/execution/src/groww-config";
+import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
 
-const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2 });
+const paperTrader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, executionMode: "PAPER" });
+const liveTrader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, executionMode: "ALGO_LIVE" });
+const liveAdapter = new GrowwAdapter(createGrowwTransport());
 
 type RecordValue = Record<string, unknown>;
 
@@ -12,7 +16,8 @@ function numberOf(value: unknown): number {
 }
 
 export async function GET() {
-  return NextResponse.json({ mode: "PAPER", enabled: true, maxTrades: 3, minimumLoss: 2500, minimumProfit: 0, message: "POST a live market snapshot and auto-risk settings to run one auto-option scan." });
+  const config = readGrowwConfig();
+  return NextResponse.json({ mode: config.executionMode, enabled: true, liveEnabled: config.executionMode === "ALGO_LIVE" && config.liveExecutionEnabled && config.complianceApproved && config.liveTradingConfirmationRequired, maxTrades: 3, minimumLoss: 2500, minimumProfit: 0, message: "POST a live market snapshot and auto-risk settings to run one auto-option scan." });
 }
 
 export async function POST(request: Request) {
@@ -21,6 +26,12 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` }, { status: 403 });
   }
   const body = await request.json().catch(() => ({})) as RecordValue;
+  const config = readGrowwConfig();
+  const requestedMode = String(body.mode ?? "PAPER").toUpperCase();
+  const live = requestedMode === "ALGO_LIVE";
+  if (live && (config.executionMode !== "ALGO_LIVE" || !config.liveExecutionEnabled || !config.complianceApproved || !config.liveTradingConfirmationRequired)) return NextResponse.json({ error: "LIVE_AUTO_DISABLED: all live execution gates must be enabled." }, { status: 403 });
+  if (live && body.confirmLive !== true) return NextResponse.json({ error: "LIVE_AUTO_CONFIRMATION_REQUIRED: confirm autonomous Groww orders explicitly." }, { status: 400 });
+  if (requestedMode !== "PAPER" && !live) return NextResponse.json({ error: "Unsupported auto-trading mode." }, { status: 400 });
   const symbol = String(body.symbol ?? "NIFTY").toUpperCase();
   const spot = numberOf(body.spot);
   const candles = Array.isArray(body.candles) ? body.candles : [];
@@ -29,7 +40,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Auto option scan requires a live spot, at least 3 candles, and option-chain contracts." }, { status: 400 });
   }
   try {
-    const status = await trader.tick({
+    const status = await (live ? liveTrader : paperTrader).tick({
       symbol,
       spot,
       settings: {
@@ -63,6 +74,7 @@ export async function POST(request: Request) {
         tickSize: numberOf(contract.tickSize),
         freezeQuantity: numberOf(contract.freezeQuantity),
       })),
+      liveExecution: live ? { adapter: liveAdapter, exchange: symbol === "SENSEX" ? "BSE" : "NSE" } : undefined,
     });
     return NextResponse.json({ ...status, symbol, spot, source: "Live market candles + Groww option chain" });
   } catch (error) {

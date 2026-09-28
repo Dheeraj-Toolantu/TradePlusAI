@@ -51,6 +51,15 @@ def _normalize_timestamp(value: object) -> str:
     return parsed.astimezone(MARKET_TIMEZONE).isoformat()
 
 
+def _number(value: object, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 _GAP_REASONS = {
     "NORMAL_DAY": "Open inside the previous session range",
     "GAP_UP_UNRESOLVED": "Gap up beyond the ATR threshold; hold or fill not yet confirmed",
@@ -320,7 +329,7 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
 
 
 def analyze_payload(payload: dict) -> dict:
-    candles = [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=float(item["open"]), high=float(item["high"]), low=float(item["low"]), close=float(item["close"]), volume=float(item.get("volume", 0))) for item in payload.get("candles", [])]
+    candles = [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in payload.get("candles", [])]
     symbol = str(payload.get("symbol", "UNKNOWN"))
     strategy = str(payload.get("strategy", "ORB_RETEST"))
     result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy)

@@ -27,6 +27,7 @@ server.listen(port, () => {
 });
 
 const sockets = new WebSocketServer({ server, path: "/ws/quotes" });
+const aiMonitoringUrl = process.env.AI_MONITORING_STATUS_URL ?? `${process.env.WEB_APP_URL ?? "http://localhost:3000"}/api/ai-monitoring`;
 
 async function quote(symbol: string, segment: "CASH" | "FNO") {
   const marketSymbol = segment === "CASH" && symbol === "INDIA VIX" ? "INDIAVIX" : symbol;
@@ -34,8 +35,9 @@ async function quote(symbol: string, segment: "CASH" | "FNO") {
   const body = await createGrowwTransport().request(`/v1/live-data/quote?exchange=${exchange}&segment=${segment}&trading_symbol=${encodeURIComponent(marketSymbol)}`, { method: "GET" });
   const payload = ((body as { payload?: Record<string, unknown> }).payload ?? {});
   const price = Number(payload.ltp ?? payload.last_price ?? payload.lastPrice);
+  const volume = Number(payload.volume ?? payload.total_volume ?? payload.volume_traded);
   if (!Number.isFinite(price) || price <= 0) throw new Error("Quote unavailable");
-  return { symbol, price, timestamp: new Date().toISOString(), source: `Groww real-time ${segment === "CASH" ? "market" : "F&O"} quote` };
+  return { symbol, price, volume: Number.isFinite(volume) ? volume : null, timestamp: new Date().toISOString(), source: `Groww real-time ${segment === "CASH" ? "market" : "F&O"} quote` };
 }
 
 sockets.on("connection", (socket) => {
@@ -43,6 +45,32 @@ sockets.on("connection", (socket) => {
   let marketSymbols: string[] = [underlying];
   let optionSymbols: string[] = [];
   let tradeSymbols: string[] = [];
+  let aiMonitoringSubscribed = false;
+  let aiFetchBusy = false;
+  const publishAiMonitoring = async () => {
+    if (!aiMonitoringSubscribed || socket.readyState !== WebSocket.OPEN || aiFetchBusy) return;
+    aiFetchBusy = true;
+    try {
+      const response = await fetch(aiMonitoringUrl, { headers: { "x-user-id": "local-user" }, cache: "no-store", signal: AbortSignal.timeout(4000) });
+      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const monitoring = (data.monitoring ?? {}) as Record<string, unknown>;
+      const health = (data.health ?? {}) as Record<string, unknown>;
+      const latest = (data.latest ?? {}) as Record<string, unknown>;
+      const log = (data.log ?? {}) as Record<string, unknown>;
+      socket.send(JSON.stringify({
+        type: "ai-monitoring",
+        monitoring: { sessionId: monitoring.sessionId, state: monitoring.state, monitoringEnabled: monitoring.monitoringEnabled, automationEnabled: monitoring.automationEnabled, mode: monitoring.mode },
+        health: { blockers: Array.isArray(health.blockers) ? health.blockers.slice(0, 12) : [] },
+        latest: { direction: latest.direction, status: latest.status, confidence: latest.confidence, invalidation: latest.invalidation },
+        log: { items: Array.isArray(log.items) ? log.items.slice(-20) : [] },
+      }));
+    } catch {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ai-monitoring", error: "AI monitoring status unavailable" }));
+    } finally {
+      aiFetchBusy = false;
+    }
+  };
+  const aiTimer = setInterval(() => { void publishAiMonitoring(); }, 5000);
   const timer = setInterval(async () => {
     if (socket.readyState !== WebSocket.OPEN) return;
     const market = await Promise.all(marketSymbols.map(async (symbol) => { try { return await quote(symbol, "CASH"); } catch { return { symbol, price: null, timestamp: new Date().toISOString(), source: "Groww market quote unavailable" }; } }));
@@ -54,13 +82,15 @@ sockets.on("connection", (socket) => {
   }, 2000);
   socket.on("message", (raw) => {
     try {
-      const message = JSON.parse(raw.toString()) as { underlying?: unknown; marketSymbols?: unknown; optionSymbols?: unknown; tradeSymbols?: unknown; symbols?: unknown };
+      const message = JSON.parse(raw.toString()) as { underlying?: unknown; marketSymbols?: unknown; optionSymbols?: unknown; tradeSymbols?: unknown; symbols?: unknown; channels?: unknown };
+      aiMonitoringSubscribed = Array.isArray(message.channels) && message.channels.some((channel) => channel === "ai-monitoring");
       underlying = typeof message.underlying === "string" ? message.underlying.trim().toUpperCase() : underlying;
       marketSymbols = (Array.isArray(message.marketSymbols) ? message.marketSymbols : [underlying]).filter((value): value is string => typeof value === "string" && value.trim().length > 0).map((value) => value.trim().toUpperCase()).slice(0, 20);
       optionSymbols = (Array.isArray(message.optionSymbols) ? message.optionSymbols : []).filter((value): value is string => typeof value === "string" && value.trim().length > 0).map((value) => value.trim().toUpperCase()).slice(0, 40);
       const requestedTrades: unknown[] = Array.isArray(message.tradeSymbols) ? message.tradeSymbols : Array.isArray(message.symbols) ? message.symbols : [];
       tradeSymbols = requestedTrades.filter((value): value is string => typeof value === "string" && value.trim().length > 0).map((value: string) => value.trim().toUpperCase()).slice(0, 40);
+      if (aiMonitoringSubscribed) void publishAiMonitoring();
     } catch { socket.send(JSON.stringify({ type: "error", message: "Invalid quote subscription." })); }
   });
-  socket.on("close", () => clearInterval(timer));
+  socket.on("close", () => { clearInterval(timer); clearInterval(aiTimer); });
 });

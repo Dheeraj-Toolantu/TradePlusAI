@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "ai-trading-context.v1",
+  "symbol": "NIFTY",
+  "timeframe": "5m",
+  "freshness": "FRESH",
+  "quality": "VALID",
+  "candles": [
+    {
+      "timestamp": "2026-09-20T09:20:00.000Z",
+      "open": 100.0,
+      "high": 105.0,
+      "low": 99.0,
+      "close": 104.0,
+      "volume": 1000.0
+    }
+  ],
+  "deterministicAnalysis": {
+    "status": "CONFIRMED",
+    "trend": "UPTREND"
+  }
+}

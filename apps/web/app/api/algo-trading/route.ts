@@ -6,6 +6,7 @@ import { readGrowwConfig } from "../../../../../services/execution/src/groww-con
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
 import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
+import { exitLivePosition, moveTrailingStop, submitLiveEntry } from "../../../../../services/execution/src/live-order-service";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -63,7 +64,7 @@ async function fnoQuote(symbol: string) {
 async function markedPaperOrders() {
   await hydrateFromFirestore();
   const config = readGrowwConfig();
-  if (!config.accessTokenConfigured && !config.apiKeySecretConfigured) return paperOrders.map((order) => ({ ...order, currentPrice: order.price, pnl: 0, pnlPercent: 0, quoteSource: "Entry price (Groww unavailable)" }));
+  if (!config.accessTokenConfigured && !config.apiKeySecretConfigured) return paperOrders.map((order) => ({ ...order, currentPrice: order.currentPrice ?? order.price, pnl: order.pnl ?? 0, pnlPercent: order.pnlPercent ?? 0, quoteSource: order.currentPrice ? "Last known quote (Groww unavailable)" : "Entry price (Groww unavailable)" }));
   const transport = createGrowwTransport();
   return Promise.all(paperOrders.map(async (order) => {
     try {
@@ -74,9 +75,32 @@ async function markedPaperOrders() {
       const entry = Number(order.price); const quantity = Number(order.quantity);
       const direction = String(order.side).toUpperCase() === "SELL" ? -1 : 1;
       const pnl = (currentPrice - entry) * quantity * direction;
+      if (order.mode === "ALGO_LIVE" && order.brokerStopOrderId && order.trailingDistance && currentPrice > 0) {
+        const favorable = order.side.toUpperCase() === "BUY" ? currentPrice > entry : currentPrice < entry;
+        const activated = order.side.toUpperCase() === "BUY" ? currentPrice >= Number(order.target ?? Infinity) : currentPrice <= Number(order.target ?? -Infinity);
+        const previousHighWater = Number(order.highWaterMark ?? entry);
+        const highWaterMark = order.side.toUpperCase() === "BUY" ? Math.max(previousHighWater, currentPrice) : Math.min(previousHighWater, currentPrice);
+        const candidateStop = order.side.toUpperCase() === "BUY" ? highWaterMark - order.trailingDistance : highWaterMark + order.trailingDistance;
+        const previousStop = Number(order.trailingStop ?? order.stopLoss ?? 0);
+        const improves = order.side.toUpperCase() === "BUY" ? candidateStop > previousStop : candidateStop < previousStop;
+        if (favorable && activated && improves && candidateStop > 0) {
+          try {
+            const moved = await moveTrailingStop(new GrowwAdapter(createGrowwTransport()), { referenceId: `ts-${Date.now()}`, stopOrderId: order.brokerStopOrderId, symbol: order.symbol, quantity: order.quantity, entrySide: order.side.toUpperCase() === "BUY" ? "BUY" : "SELL", stopPrice: candidateStop, exchange: String(order.symbol).startsWith("SENSEX") ? "BSE" : "NSE", product: "NRML" });
+            const trailingUpdates: Partial<OrderRecord> = { highWaterMark, trailingStop: candidateStop, trailingActivatedAt: order.trailingActivatedAt ?? new Date().toISOString(), brokerStopOrderId: moved.brokerOrderId, updatedAt: new Date().toISOString() };
+            Object.assign(order, trailingUpdates);
+            void updateOrderInFirestore(order.id, trailingUpdates);
+          } catch { /* Keep the existing protective stop when a broker modification fails. */ }
+        }
+      }
       return { ...order, currentPrice, pnl, pnlPercent: entry ? (currentPrice - entry) / entry * 100 * direction : 0, quoteSource: "Groww real-time F&O quote" };
     } catch {
-      return { ...order, currentPrice: order.price, pnl: 0, pnlPercent: 0, quoteSource: "Entry price (quote unavailable)" };
+      return {
+        ...order,
+        currentPrice: order.currentPrice ?? order.price,
+        pnl: order.pnl ?? 0,
+        pnlPercent: order.pnlPercent ?? 0,
+        quoteSource: order.currentPrice ? "Last known quote (Groww quote unavailable)" : "Entry price (quote unavailable)",
+      };
     }
   }));
 }
@@ -175,6 +199,10 @@ export async function GET(request: Request) {
   if (!new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK"]).has(strategy)) return NextResponse.json({ error: "Unsupported strategy" }, { status: 400 });
   if (provider !== "groww") return NextResponse.json({ error: "Groww is the only supported market-data and execution provider for the algo trading page." }, { status: 400 });
 
+  if (url.searchParams.get("ordersOnly") === "true") {
+    return NextResponse.json({ orders: await markedPaperOrders(), updatedAt: new Date().toISOString() });
+  }
+
   const safeModeState = readSafeModeState();
 
   try {
@@ -230,13 +258,13 @@ export async function POST(request: Request) {
   const requestedMode = String(body.mode ?? config.executionMode).toUpperCase();
 
   if (requestedMode === "ALGO_LIVE") {
-    if (config.executionMode !== "ALGO_LIVE" || !config.liveExecutionEnabled || !config.complianceApproved) {
-      return NextResponse.json({ error: "LIVE_EXECUTION_DISABLED: set EXECUTION_MODE=ALGO_LIVE, LIVE_EXECUTION_ENABLED=true, and LIVE_COMPLIANCE_APPROVED=true only after all release gates pass." }, { status: 403 });
+    if (config.executionMode !== "ALGO_LIVE" || !config.liveExecutionEnabled || !config.complianceApproved || !config.liveTradingConfirmationRequired) {
+      return NextResponse.json({ error: "LIVE_EXECUTION_DISABLED: all server-side live execution and confirmation gates must be enabled." }, { status: 403 });
     }
-    return NextResponse.json({ error: "ALGO_LIVE_NOT_IMPLEMENTED: broker order submission is not wired in this route; no live order was sent." }, { status: 501 });
+    if (body.confirmLive !== true) return NextResponse.json({ error: "LIVE_CONFIRMATION_REQUIRED: explicitly confirm this order in the UI." }, { status: 400 });
   }
 
-  if (requestedMode !== config.executionMode || requestedMode !== "PAPER") {
+  if (requestedMode !== config.executionMode || !["PAPER", "ALGO_LIVE"].includes(requestedMode)) {
     return NextResponse.json({ error: `Execution mode is configured as ${config.executionMode}. Change EXECUTION_MODE in .env.local before requesting ${requestedMode}.` }, { status: 409 });
   }
 
@@ -253,8 +281,8 @@ export async function POST(request: Request) {
   const expiry = String(body.expiry ?? "");
   const provider = String(body.provider ?? "groww");
 
-  if (!String(body.symbol ?? "").trim() || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0 || !Number.isFinite(target) || target <= 0 || !Number.isFinite(stopLoss) || stopLoss <= 0) {
-    return NextResponse.json({ error: "Paper orders require a symbol, positive quantity, entry price, take profit, and stop loss." }, { status: 400 });
+  if (!String(body.symbol ?? "").trim() || !Number.isFinite(quantity) || quantity <= 0 || (!Number.isFinite(price) && requestedMode === "PAPER") || (Number.isFinite(price) && price <= 0) || !Number.isFinite(target) || target <= 0 || !Number.isFinite(stopLoss) || stopLoss <= 0) {
+    return NextResponse.json({ error: "Orders require a symbol, positive quantity, target, and stop loss." }, { status: 400 });
   }
   if (!paperStrategies.has(strategy)) return NextResponse.json({ error: "This strategy is not enabled for single-leg paper execution." }, { status: 400 });
   const side = String(body.side ?? "BUY").toUpperCase();
@@ -318,6 +346,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "V5 structural risk invalid: target must be beyond entry and stop must be on the invalidation side." }, { status: 400 });
   }
   const liveEntryPrice = await fnoQuote(String(body.symbol));
+  if (requestedMode === "ALGO_LIVE" && !liveEntryPrice && !Number.isFinite(price)) return NextResponse.json({ error: "LIVE_ENTRY_BLOCKED: Groww quote unavailable for live order." }, { status: 503 });
   const entryPrice = liveEntryPrice ?? price;
   const risk = Math.abs(entryPrice - stopLoss);
   const reward = Math.abs(target - entryPrice);
@@ -326,6 +355,21 @@ export async function POST(request: Request) {
   }
 
   const symbol = String(body.symbol);
+
+  if (requestedMode === "ALGO_LIVE") {
+    const referenceId = `live-${Date.now()}`;
+    const stopReferenceId = `sl-${Date.now()}`;
+    try {
+      const live = await submitLiveEntry(adapter, { referenceId, stopReferenceId, symbol, quantity, side: side as "BUY" | "SELL", entryPrice: String(body.orderType ?? "MARKET").toUpperCase() === "LIMIT" && Number.isFinite(price) ? price : undefined, stopLoss, exchange: underlying.toUpperCase() === "SENSEX" ? "BSE" : "NSE", product: "NRML" });
+      const trailingDistance = Number(body.trailingDistance);
+      const entryPrice = live.entry.averageFillPrice ?? liveEntryPrice ?? price;
+      const order: OrderRecord = { id: referenceId, strategy, strategyName: String(body.strategyName ?? strategy), symbol, growwSymbol: String(body.growwSymbol ?? symbol), expiry, side, quantity, lotSize: lotSize || undefined, price: entryPrice, target, stopLoss, status: live.entry.status === "FILLED" ? "FILLED" : "OPEN", mode: "ALGO_LIVE", source: "Groww live F&O order", createdAt: new Date().toISOString(), brokerOrderId: live.entry.brokerOrderId, brokerStopOrderId: live.protectiveStop.brokerOrderId, trailingDistance: Number.isFinite(trailingDistance) && trailingDistance > 0 ? trailingDistance : risk, highWaterMark: entryPrice };
+      await saveOrderToFirestore(order);
+      return NextResponse.json({ order, mode: "ALGO_LIVE", liveOrders: 1, firestoreSynced: true });
+    } catch (error) {
+      return NextResponse.json({ error: error instanceof Error ? error.message : "Groww live order failed" }, { status: 502 });
+    }
+  }
 
   const order: OrderRecord = {
     id: `paper-${Date.now()}`,
@@ -362,6 +406,19 @@ export async function DELETE(request: Request) {
   if (index < 0) return NextResponse.json({ error: "Paper order was not found." }, { status: 404 });
 
   const [order] = paperOrders.splice(index, 1);
+  if (order.mode === "ALGO_LIVE") {
+    const config = readGrowwConfig();
+    if (config.executionMode !== "ALGO_LIVE" || !config.liveExecutionEnabled || !config.complianceApproved || !config.liveTradingConfirmationRequired) return NextResponse.json({ error: "LIVE_EXIT_DISABLED: live execution gates are not enabled." }, { status: 403 });
+    try {
+      const exit = await exitLivePosition(new GrowwAdapter(createGrowwTransport()), { referenceId: `exit-${Date.now()}`, symbol: order.symbol, quantity: order.quantity, entrySide: order.side.toUpperCase() === "BUY" ? "BUY" : "SELL", exchange: String(order.symbol).startsWith("SENSEX") ? "BSE" : "NSE", product: "NRML", protectiveStopOrderId: order.brokerStopOrderId });
+      const updates: Partial<OrderRecord> = { status: "EXITED", exitAt: new Date().toISOString(), exitReason: "MANUAL_EXIT", brokerExitOrderId: exit.brokerOrderId, exitPrice: exit.averageFillPrice };
+      await updateOrderInFirestore(order.id, updates);
+      return NextResponse.json({ order: { ...order, ...updates }, status: "EXITED", mode: "ALGO_LIVE", firestoreUpdated: true });
+    } catch (error) {
+      paperOrders.unshift(order);
+      return NextResponse.json({ error: error instanceof Error ? error.message : "Groww live exit failed" }, { status: 502 });
+    }
+  }
   const currentLtp = (await fnoQuote(order.symbol)) ?? order.currentPrice ?? order.price;
   const direction = String(order.side).toUpperCase() === "SELL" ? -1 : 1;
   const realizedPnl = (currentLtp - order.price) * order.quantity * direction;

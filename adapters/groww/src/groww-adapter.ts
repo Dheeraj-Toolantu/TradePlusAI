@@ -11,6 +11,12 @@ let cachedGrowwToken: CachedGrowwToken | undefined;
 let growwTokenRequest: { key: string; promise: Promise<string> } | undefined;
 let growwTokenCooldownUntil = 0;
 let growwTokenCooldownMessage = "";
+const growwResponseCache = new Map<string, { expiresAt: number; body: unknown }>();
+const growwResponseRequests = new Map<string, Promise<unknown>>();
+let growwApiCooldownUntil = 0;
+let growwApiCooldownMessage = "";
+const GET_CACHE_TTL_MS = 5_000;
+const RATE_LIMIT_COOLDOWN_MS = 30_000;
 
 export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.env): GrowwTransport {
   let token = environment.GROWW_ACCESS_TOKEN;
@@ -29,10 +35,10 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
     }
   }
   async function accessToken(forceRefresh = false): Promise<string> {
-    if (!forceRefresh && token && !tokenExpired(token)) return token;
-    if (!apiKey || !apiSecret) throw new Error("GROWW_ACCESS_TOKEN is not configured; set it or configure GROWW_API_KEY and GROWW_API_SECRET");
     if (forceRefresh) cachedGrowwToken = undefined;
     if (cachedGrowwToken?.key === tokenCacheKey && !tokenExpired(cachedGrowwToken.token)) return cachedGrowwToken.token;
+    if (!forceRefresh && token && !tokenExpired(token)) return token;
+    if (!apiKey || !apiSecret) throw new Error("GROWW_ACCESS_TOKEN is not configured; set it or configure GROWW_API_KEY and GROWW_API_SECRET");
     if (growwTokenCooldownUntil > Date.now()) throw new Error(growwTokenCooldownMessage);
     if (growwTokenRequest?.key === tokenCacheKey) return growwTokenRequest.promise;
     const promise = (async () => {
@@ -42,7 +48,7 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         const message = `Groww token API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`;
-        if (response.status === 429) { growwTokenCooldownUntil = Date.now() + 30_000; growwTokenCooldownMessage = message; }
+        if (response.status === 429) { growwTokenCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; growwTokenCooldownMessage = message; }
         throw new Error(message);
       }
       const generated = String((body as GrowwPayload)?.payload?.token ?? (body as { token?: string }).token ?? "");
@@ -56,17 +62,40 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
   }
   return {
     async request(path, init) {
-      const requestOptions = (bearer: string) => ({ method: init.method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${bearer}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: init.body === undefined ? undefined : JSON.stringify(init.body), cache: "no-store" as const });
-      let bearer = await accessToken();
-      let response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
-      if (response.status === 401 && apiKey && apiSecret) {
-        token = undefined;
-        bearer = await accessToken(true);
-        response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
+      const cacheKey = `${baseUrl}${path}`;
+      const cacheable = init.method.toUpperCase() === "GET";
+      if (cacheable) {
+        const cached = growwResponseCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) return cached.body;
+        const pending = growwResponseRequests.get(cacheKey);
+        if (pending) return pending;
       }
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(`Groww API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`);
-      return body;
+      if (growwApiCooldownUntil > Date.now()) {
+        const cached = cacheable ? growwResponseCache.get(cacheKey) : undefined;
+        if (cached && cached.expiresAt > Date.now()) return cached.body;
+        throw new Error(growwApiCooldownMessage);
+      }
+      const requestOptions = (bearer: string) => ({ method: init.method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${bearer}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: init.body === undefined ? undefined : JSON.stringify(init.body), cache: "no-store" as const });
+      const requestPromise = (async () => {
+        let bearer = await accessToken();
+        let response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
+        if (response.status === 401 && apiKey && apiSecret) {
+          token = undefined;
+          bearer = await accessToken(true);
+          response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
+        }
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const message = `Groww API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`;
+          if (response.status === 429) { growwApiCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; growwApiCooldownMessage = message; }
+          throw new Error(message);
+        }
+        if (cacheable) growwResponseCache.set(cacheKey, { expiresAt: Date.now() + GET_CACHE_TTL_MS, body });
+        return body;
+      })();
+      if (cacheable) growwResponseRequests.set(cacheKey, requestPromise);
+      try { return await requestPromise; }
+      finally { if (cacheable && growwResponseRequests.get(cacheKey) === requestPromise) growwResponseRequests.delete(cacheKey); }
     },
   };
 }

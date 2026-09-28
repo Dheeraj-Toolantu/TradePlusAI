@@ -1,0 +1,9 @@
+model_list:
+  - model_name: openai/gpt-oss-20b
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 60

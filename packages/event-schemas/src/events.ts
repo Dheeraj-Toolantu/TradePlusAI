@@ -26,6 +26,23 @@ export type SetupStateEvent = {
   occurredAt: IsoTimestamp;
 };
 
+export type AITradingEventType =
+  | "ai.monitoring.started"
+  | "ai.monitoring.stopped"
+  | "ai.monitoring.degraded"
+  | "ai.evaluation.requested"
+  | "ai.evaluation.completed"
+  | "ai.evaluation.failed"
+  | "ai.suggestion.created"
+  | "ai.automation.blocked"
+  | "ai.automation.allowed"
+  | "ai.automation.cancelled";
+
+export type AITradingEvent<T = unknown> = EventEnvelope<T> & {
+  eventType: AITradingEventType;
+  subjectType: "MonitoringSession" | "AIEvaluation" | "AISuggestion" | "AutomationDecision";
+};
+
 export function isUnsafeEvent(event: EventEnvelope): boolean {
   return event.freshness === "STALE" || event.freshness === "UNKNOWN" || event.eventType === "safe_state.entered";
 }

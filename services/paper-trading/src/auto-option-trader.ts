@@ -1,4 +1,6 @@
 import { getActiveOrdersFromFirestore, saveOrderToFirestore, type OrderRecord } from "../../../apps/web/lib/firestore-orders";
+import type { BrokerAdapter } from "../../../packages/broker-contracts/src/broker-adapter";
+import { exitLivePosition, moveTrailingStop, submitLiveEntry } from "../../execution/src/live-order-service";
 
 type Candle = { timestamp: string; open: number; high: number; low: number; close: number; volume: number };
 type Contract = {
@@ -26,6 +28,7 @@ type EngineInput = {
   candles: Candle[];
   contracts: Contract[];
   settings?: AutoOptionTraderSettings;
+  liveExecution?: { adapter: BrokerAdapter; exchange: "NSE" | "BSE" };
 };
 
 export type AutoOptionTraderSettings = {
@@ -59,6 +62,7 @@ export type AutoOptionTraderConfig = {
   maxOpenPositions?: number;
   trailingActivationR?: number;
   trailingDistanceR?: number;
+  executionMode?: "PAPER" | "ALGO_LIVE";
 };
 
 export class AutoOptionTrader {
@@ -83,6 +87,7 @@ export class AutoOptionTrader {
       maxOpenPositions: config.maxOpenPositions ?? 3,
       trailingActivationR: config.trailingActivationR ?? 1,
       trailingDistanceR: config.trailingDistanceR ?? 0.75,
+      executionMode: config.executionMode ?? "PAPER",
     };
   }
 
@@ -130,7 +135,7 @@ export class AutoOptionTrader {
 
     if (eligible.length === 0) {
       return {
-        mode: "PAPER",
+        mode: input.liveExecution ? "ALGO_LIVE" : "PAPER",
         limitHit,
         tradesTaken: this.tradedToday,
         orders: [...this.orders],
@@ -153,7 +158,7 @@ export class AutoOptionTrader {
       }
       void saveOrderToFirestore(previousSuggestion ?? suggestionOrder);
       return {
-        mode: "PAPER",
+        mode: input.liveExecution ? "ALGO_LIVE" : "PAPER",
         limitHit: true,
         tradesTaken: this.tradedToday,
         orders: [...this.orders],
@@ -179,6 +184,8 @@ export class AutoOptionTrader {
     }
 
     const initialRisk = Math.max(winner.entry - winner.stopLoss, 0.01);
+    const liveExecution = input.liveExecution;
+    const liveOrder = liveExecution ? await submitLiveEntry(liveExecution.adapter, { referenceId: `al-${Date.now()}`, stopReferenceId: `as-${Date.now()}`, symbol: winner.symbol, quantity, side: "BUY", stopLoss: winner.stopLoss, exchange: liveExecution.exchange, product: "NRML" }) : null;
     const order: OrderRecord = {
       id: `auto-${orderKey}`,
       strategy: "AUTO_OPTION_ENGINE",
@@ -198,9 +205,11 @@ export class AutoOptionTrader {
       trailingStop: winner.stopLoss,
       trailingDistance: Math.round((winner.entry - winner.stopLoss) * this.config.trailingDistanceR * 100) / 100,
       status: "OPEN",
-      mode: "PAPER",
-      source: "Auto option engine",
+      mode: liveExecution ? "ALGO_LIVE" : "PAPER",
+      source: liveExecution ? "Auto option engine · Groww live" : "Auto option engine",
       createdAt: timestamp,
+      brokerOrderId: liveOrder?.entry.brokerOrderId,
+      brokerStopOrderId: liveOrder?.protectiveStop.brokerOrderId,
     };
 
     this.orders.push(order);
@@ -210,7 +219,7 @@ export class AutoOptionTrader {
     void saveOrderToFirestore(order);
 
     return {
-      mode: "PAPER",
+      mode: input.liveExecution ? "ALGO_LIVE" : "PAPER",
       limitHit: this.tradedToday >= settings.maxTrades,
       tradesTaken: this.tradedToday,
       orders: [...this.orders],
@@ -271,6 +280,15 @@ export class AutoOptionTrader {
         order.trailingStop = trailingStop;
         order.stopLoss = trailingStop;
         if (highWaterMark >= activationPrice && !order.trailingActivatedAt) order.trailingActivatedAt = timestamp;
+        if (input.liveExecution && stopMoved && order.brokerStopOrderId) {
+          try {
+            const moved = await moveTrailingStop(input.liveExecution.adapter, { referenceId: `at-${Date.now()}`, stopOrderId: order.brokerStopOrderId, symbol: order.symbol, quantity: order.quantity, entrySide: "BUY", stopPrice: trailingStop, exchange: input.liveExecution.exchange, product: "NRML" });
+            order.brokerStopOrderId = moved.brokerOrderId;
+          } catch {
+            order.stopLoss = currentStop;
+            order.trailingStop = currentStop;
+          }
+        }
       }
       if (Number.isFinite(initialStop) && (!Number.isFinite(Number(order.minimumLossExitPrice)) || Number(order.minimumLossExitPrice) > initialStop)) {
         order.minimumLossExitPrice = initialStop;
@@ -282,6 +300,9 @@ export class AutoOptionTrader {
       const hitStop = contract.premium <= trailingStop;
       const hitLossProtection = pnl <= -settings.minimumLoss;
       if (!hitTarget && !hitStop && !hitLossProtection) continue;
+      if (input.liveExecution && order.brokerOrderId) {
+        await exitLivePosition(input.liveExecution.adapter, { referenceId: `ae-${Date.now()}`, symbol: order.symbol, quantity: order.quantity, entrySide: "BUY", exchange: input.liveExecution.exchange, product: "NRML", protectiveStopOrderId: order.brokerStopOrderId });
+      }
       const updates: Partial<OrderRecord> = {
         status: "EXITED",
         exitPrice: contract.premium,
@@ -344,7 +365,7 @@ export class AutoOptionTrader {
     this.activeOrdersHydrated = true;
     const persisted = await getActiveOrdersFromFirestore();
     for (const order of persisted) {
-      if (order.strategy !== "AUTO_OPTION_ENGINE" || !["OPEN", "FILLED"].includes(order.status)) continue;
+      if (order.strategy !== "AUTO_OPTION_ENGINE" || order.mode !== this.config.executionMode || !["OPEN", "FILLED"].includes(order.status)) continue;
       const symbol = normalizeSymbol(order.symbol);
       if (this.active.has(symbol)) continue;
       const entry = Number(order.price);
