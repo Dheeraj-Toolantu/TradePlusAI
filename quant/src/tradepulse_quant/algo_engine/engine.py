@@ -29,16 +29,6 @@ class Candle:
     volume: float
 
 
-def _ema(values: list[float], period: int) -> float:
-    if not values:
-        return 0.0
-    multiplier = 2 / (period + 1)
-    current = values[0]
-    for value in values[1:]:
-        current += (value - current) * multiplier
-    return current
-
-
 def _normalize_timestamp(value: object) -> str:
     try:
         if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
@@ -175,8 +165,8 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     average_volume = sum(candle.volume for candle in recent) / len(recent) if recent else 0.0
     relative_volume = (candles[-1].volume / average_volume) if candles and average_volume > 0 else None
 
-    orb = evaluate_orb_retest(candles) if strategy == "ORB_RETEST" and data_quality_ok else None
-    max_extension = round(min(max(last_close, 1.0) * 0.0035, max(orb.atr, 0.01)), 4) if orb is not None and last_close else None
+    orb = evaluate_orb_retest(candles, atr_value) if strategy == "ORB_RETEST" and data_quality_ok else None
+    max_extension = round(min(max(last_close, 1.0) * 0.0035, orb.atr) if orb.atr > 0 else max(last_close, 1.0) * 0.0035, 4) if orb is not None and last_close else None
 
     gap = None
     if session and previous_session and atr_value:
@@ -190,45 +180,73 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
             config=config,
         )
 
+    trend_15m = _trend_15m(candles, config)
     regime = classify_regime(
         adx_value,
         last_close,
         vwap_value,
         ema_fast,
         ema_slow,
-        trend_15m=_trend_15m(candles, config),
+        trend_15m=trend_15m,
         gap_state=gap.state if gap else "NORMAL_DAY",
         config=config,
     )
 
-    direction_consistent = (
-        ema_fast is not None and ema_slow is not None and vwap_value is not None and last_close is not None
-        and ((ema_fast > ema_slow and last_close > vwap_value) or (ema_fast < ema_slow and last_close < vwap_value))
-    )
-    trend_cluster = 0
-    if ema_fast is not None and ema_slow is not None and ema_fast != ema_slow:
-        trend_cluster += 1
-    if direction_consistent:
-        trend_cluster += 1
-    if adx_value is not None and adx_value >= config.adx_entry_threshold:
-        trend_cluster += 1
-    structure_cluster = (1 if orb is not None and orb.breakout_index is not None else 0) + (1 if orb is not None and orb.status == "CONFIRMED" else 0)
+    setup = result.get("setup") or {}
+    side = setup.get("side")
+    if side is None and ema_fast is not None and ema_slow is not None and ema_fast != ema_slow:
+        side = "BUY" if ema_fast > ema_slow else "SELL"
+    direction = 1 if side == "BUY" else -1 if side == "SELL" else 0
+
+    # Spec 7 trend cluster: VWAP, EMA20/EMA50 and 15m trend scored as ONE correlated cluster.
+    trend_votes = 0
+    if direction and last_close is not None and vwap_value is not None and (last_close - vwap_value) * direction > 0:
+        trend_votes += 1
+    if direction and ema_fast is not None and ema_slow is not None and (ema_fast - ema_slow) * direction > 0:
+        trend_votes += 1
+    if (direction == 1 and trend_15m == "BULL") or (direction == -1 and trend_15m == "BEAR"):
+        trend_votes += 1
+    trend_cluster = 3 if trend_votes == 3 else 1 if trend_votes == 2 else 0
+
+    # Structure cluster: strategy breakout/reclaim confirmation (2) + PDH/PDL acceptance (1).
+    strategy_confirmed = result.get("decision") == "CONFIRMED"
+    if strategy == "ORB_RETEST":
+        structure_confirmed = orb is not None and orb.status == "CONFIRMED"
+    else:
+        structure_confirmed = strategy_confirmed
+    pdh = max(candle.high for candle in previous_session) if previous_session else None
+    pdl = min(candle.low for candle in previous_session) if previous_session else None
+    pdh_pdl_confirmed = last_close is not None and ((direction == 1 and pdh is not None and last_close > pdh) or (direction == -1 and pdl is not None and last_close < pdl))
+    structure_cluster = (2 if structure_confirmed else 0) + (1 if pdh_pdl_confirmed else 0)
+
+    # Index cash candles from Groww carry zero volume; volume evidence is then unavailable (0 points).
     if relative_volume is None:
         volume_evidence = 0 if candles else None
     elif relative_volume >= config.volume_multiplier:
         volume_evidence = 2
-    elif relative_volume >= 1.2:
-        volume_evidence = 1
     else:
         volume_evidence = 0
-    minimum_score = float(config.score_thresholds["minimum_trade_score"])
-    score_total = float(trend_cluster + structure_cluster + (volume_evidence or 0))
 
     option_evidence = option_evidence or {}
-    ors = option_evidence.get("ors")
-    oi_direction_score = option_evidence.get("oi_direction_score")
-    iv_regime = option_evidence.get("iv_regime")
+    ors_call = option_evidence.get("ors_call")
+    ors_put = option_evidence.get("ors_put")
+    oi_score_raw = option_evidence.get("oi_direction_score")
+    iv_regime = option_evidence.get("vix_regime", option_evidence.get("iv_regime"))
     liquidity_score = option_evidence.get("liquidity_score")
+    ors = ors_call if direction == 1 else ors_put if direction == -1 else None
+    if ors is None and option_evidence.get("ors") is not None and ors_call is None and ors_put is None:
+        ors = option_evidence.get("ors")
+    if "ors_confirmed" in option_evidence and ors_call is None and ors_put is None:
+        ors_confirmed = option_evidence.get("ors_confirmed")
+    else:
+        ors_confirmed = (ors is not None and float(ors) >= config.ors_thresholds["normal"]) if direction else False
+    if "oi_pcr_supportive" in option_evidence and oi_score_raw is None:
+        oi_supportive = option_evidence.get("oi_pcr_supportive")
+    else:
+        oi_supportive = (oi_score_raw is not None and float(oi_score_raw) * direction >= 1) if direction else False
+    minimum_score = float(config.score_thresholds["minimum_trade_score"])
+    score_total = float(trend_cluster + structure_cluster + (volume_evidence or 0) + (1 if ors_confirmed else 0) + (1 if oi_supportive else 0))
+    oi_direction_score = oi_score_raw
     calculations = {
         "underlying": {
             "last_price": _round(last_close),
@@ -249,10 +267,13 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         },
         "score": {
             "trend_cluster": trend_cluster,
+            "trend_votes": trend_votes,
+            "trend_15m": trend_15m,
             "structure_cluster": structure_cluster,
+            "pdh_pdl_confirmed": pdh_pdl_confirmed,
             "volume_evidence": volume_evidence,
-            "option_relative_strength": _round(float(ors)) if ors is not None else None,
-            "oi_direction": _round(float(oi_direction_score)) if oi_direction_score is not None else None,
+            "option_relative_strength": 1 if ors_confirmed else 0,
+            "oi_direction": 1 if oi_supportive else 0,
             "total": score_total,
             "minimum": minimum_score,
         },
@@ -269,20 +290,19 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "regime": regime,
     }
 
-    setup = result.get("setup") or {}
     evidence = {
         "data_quality_ok": data_quality_ok,
         "session_allowed": entry_permitted,
         "strategy_decision": result.get("decision"),
         "regime": regime,
         "gap_state": gap.state if gap else None,
-        "breakout_valid": orb is not None and orb.breakout_index is not None,
-        "retest_confirmed": orb is not None and orb.status == "CONFIRMED",
+        "breakout_valid": (orb is not None and orb.breakout_index is not None) if strategy == "ORB_RETEST" else strategy_confirmed,
+        "retest_confirmed": (orb is not None and orb.status == "CONFIRMED") if strategy == "ORB_RETEST" else strategy_confirmed,
         "score": score_total,
         "minimum_score": minimum_score,
         "risk_reward": setup.get("risk_reward"),
-        "ors_confirmed": option_evidence.get("ors_confirmed"),
-        "oi_pcr_supportive": option_evidence.get("oi_pcr_supportive"),
+        "ors_confirmed": ors_confirmed if option_evidence else None,
+        "oi_pcr_supportive": oi_supportive if option_evidence else None,
         "vix_regime": iv_regime,
         "option_quote_fresh": option_evidence.get("option_quote_fresh"),
         "liquidity_score": liquidity_score,
@@ -290,42 +310,100 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     return evidence, calculations, session_info
 
 
+ORB_MAX_SIGNAL_AGE_CANDLES = 1
+
+
 def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST") -> dict:
     if len(candles) < 21:
         return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "At least 21 candles are required", "confidence": 0, "setup": None}
     if strategy == "ORB_RETEST":
-        orb = evaluate_orb_retest(candles)
-        if orb.status == "CONFIRMED" and orb.side:
-            entry = candles[-1].close
-            risk = max(orb.atr, entry * 0.002)
-            stop = entry - risk if orb.side == "BUY" else entry + risk
-            target = entry + risk * 2 if orb.side == "BUY" else entry - risk * 2
-            quantity = max(1, int(risk_per_trade / max(risk, 0.01)))
-            return {"symbol": symbol, "strategy": strategy, "decision": "CONFIRMED", "reason": orb.reason, "confidence": 100, "calculations": {"orb": {"opening_range_high": orb.opening_range_high, "opening_range_low": orb.opening_range_low, "breakout_index": orb.breakout_index, "retest_index": orb.retest_index, "atr": orb.atr}}, "setup": {"side": orb.side, "entry": entry, "stop_loss": stop, "target": target, "risk_reward": 2.0, "quantity": quantity, "target_method": "PROTOTYPE_2R_ATR_HEURISTIC", "stop_method": "PROTOTYPE_ATR_BUFFER"}}
-    closes = [candle.close for candle in candles]
-    recent = candles[-20:]
-    current = candles[-1]
-    ema9 = _ema(closes[-50:], 9)
-    ema20 = _ema(closes[-50:], 20)
-    vwap_volume = sum(max(candle.volume, 1.0) for candle in recent)
-    vwap = sum(candle.close * max(candle.volume, 1.0) for candle in recent) / vwap_volume
-    support = min(candle.low for candle in recent)
-    resistance = max(candle.high for candle in recent)
-    average_volume = sum(candle.volume for candle in recent) / len(recent)
-    relative_volume = current.volume / max(average_volume, 1.0)
-    bullish = ema9 > ema20 and current.close > vwap
-    bearish = ema9 < ema20 and current.close < vwap
-    side: Side | None = "BUY" if bullish else "SELL" if bearish else None
-    atr = sum(candle.high - candle.low for candle in candles[-14:]) / 14
-    confirmation = relative_volume >= 1.2 and ((bullish and current.close > candles[-2].high) or (bearish and current.close < candles[-2].low))
-    confidence = min(100, 45 + (20 if side else 0) + (15 if confirmation else 0) + (10 if relative_volume >= 1.2 else 0))
-    if not side or not confirmation:
-        return {"symbol": symbol, "strategy": strategy, "decision": "WAIT_FOR_CONFIRMATION", "reason": "Trend, VWAP, breakout and volume must agree", "confidence": confidence, "indicators": {"ema9": ema9, "ema20": ema20, "vwap": vwap, "atr": atr, "relative_volume": relative_volume}, "levels": {"support": support, "resistance": resistance}}
-    risk = max(atr, current.close * 0.002)
-    stop = support - atr * 0.25 if side == "BUY" else resistance + atr * 0.25
-    target = current.close + risk * 2 if side == "BUY" else current.close - risk * 2
-    quantity = max(1, int(risk_per_trade / max(abs(current.close - stop), 0.01)))
-    return {"symbol": symbol, "strategy": strategy, "decision": "CONFIRMED", "reason": "EMA, VWAP, breakout and relative volume confirmed", "confidence": confidence, "indicators": {"ema9": ema9, "ema20": ema20, "vwap": vwap, "atr": atr, "relative_volume": relative_volume}, "levels": {"support": support, "resistance": resistance}, "setup": {"side": side, "entry": current.close, "stop_loss": stop, "target": target, "risk_reward": 2.0, "quantity": quantity, "target_method": "PROTOTYPE_2R_ATR_HEURISTIC", "stop_method": "PROTOTYPE_ATR_BUFFER"}}
+        config = StrategyConfiguration()
+        atr_value = indicators.atr(candles, config.atr_period)
+        orb = evaluate_orb_retest(candles, atr_value)
+        orb_calc = {"orb": {"opening_range_high": orb.opening_range_high, "opening_range_low": orb.opening_range_low, "breakout_index": orb.breakout_index, "retest_index": orb.retest_index, "atr": orb.atr, "bars_since_retest": orb.bars_since_retest}}
+        if orb.status != "CONFIRMED" or not orb.side:
+            # Never fall through to a different (EMA/VWAP) rule set: ORB either confirms or waits.
+            return {"symbol": symbol, "strategy": strategy, "decision": orb.status, "reason": orb.reason, "confidence": 0, "calculations": orb_calc, "setup": None}
+        if orb.bars_since_retest is not None and orb.bars_since_retest > ORB_MAX_SIGNAL_AGE_CANDLES:
+            return {"symbol": symbol, "strategy": strategy, "decision": "SIGNAL_EXPIRED", "reason": f"ORB retest confirmed {orb.bars_since_retest} candles ago; entering now would be chasing", "confidence": 0, "calculations": orb_calc, "setup": None}
+        entry = candles[-1].close
+        buffer = orb.atr * config.stop_buffer_atr_multiplier
+        # Spec 15: structural stop beyond the retest extreme / breakout level, plus an ATR buffer.
+        if orb.side == "BUY":
+            stop = min(orb.retest_low if orb.retest_low is not None else entry, orb.opening_range_high or entry) - buffer
+        else:
+            stop = max(orb.retest_high if orb.retest_high is not None else entry, orb.opening_range_low or entry) + buffer
+        risk = abs(entry - stop)
+        if risk <= 0 or (orb.side == "BUY" and stop >= entry) or (orb.side == "SELL" and stop <= entry):
+            return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Structural stop is not on the invalidation side of entry", "confidence": 0, "calculations": orb_calc, "setup": None}
+        target = entry + risk * config.rr_minimum if orb.side == "BUY" else entry - risk * config.rr_minimum
+        quantity = max(1, int(risk_per_trade / max(risk, 0.01)))
+        return {"symbol": symbol, "strategy": strategy, "decision": "CONFIRMED", "reason": orb.reason, "confidence": 100, "calculations": orb_calc, "setup": {"side": orb.side, "entry": entry, "stop_loss": round(stop, 2), "target": round(target, 2), "risk_reward": round(abs(target - entry) / risk, 2), "quantity": quantity, "target_method": "STRUCTURAL_2R", "stop_method": "RETEST_EXTREME_MINUS_ATR_BUFFER"}}
+    if strategy == "VWAP_REVERSAL":
+        return _vwap_reversal(symbol, candles, risk_per_trade)
+    return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Range Defined Risk is analysis-only until the multi-leg builder is enabled", "confidence": 0, "setup": None}
+
+
+def _vwap_reversal(symbol: str, candles: list[Candle], risk_per_trade: float) -> dict:
+    """Spec 6D: stretch away from VWAP into support/resistance, rejection, then a VWAP reclaim.
+
+    Bullish: price trades below session VWAP, tags support (PDL or the session low) and
+    forms a higher low, then the latest completed candle closes back above VWAP as a
+    bullish candle. Bearish is the mirror image. Touching a level alone never triggers.
+    """
+    config = StrategyConfiguration()
+    session, previous = _split_sessions(candles)
+    base = {"symbol": symbol, "strategy": "VWAP_REVERSAL", "confidence": 0, "setup": None}
+    if len(session) < 6:
+        return {**base, "decision": "WAIT_FOR_CONFIRMATION", "reason": "VWAP reversal needs at least 6 session candles"}
+    atr_value = indicators.atr(candles, config.atr_period) or 0.0
+    vwap_series: list[float] = []
+    cumulative_pv = cumulative_v = 0.0
+    for index, candle in enumerate(session):
+        typical = (candle.high + candle.low + candle.close) / 3.0
+        weight = candle.volume if candle.volume > 0 else 1.0
+        cumulative_pv += typical * weight
+        cumulative_v += weight
+        vwap_series.append(cumulative_pv / cumulative_v)
+    latest, prior = session[-1], session[-2]
+    vwap_now, vwap_prior = vwap_series[-1], vwap_series[-2]
+    window = session[-12:-1]
+    pdl = min(c.low for c in previous) if previous else None
+    pdh = max(c.high for c in previous) if previous else None
+    tolerance = max(atr_value * 0.25, latest.close * 0.0005)
+    indicators_out = {"vwap": vwap_now, "atr": atr_value}
+
+    reclaimed_up = prior.close <= vwap_prior and latest.close > vwap_now and latest.close > latest.open
+    reclaimed_down = prior.close >= vwap_prior and latest.close < vwap_now and latest.close < latest.open
+    if reclaimed_up and window:
+        low_index = min(range(len(window)), key=lambda i: window[i].low)
+        swing_low = window[low_index].low
+        support = min(c.low for c in session[:-1])
+        at_support = abs(swing_low - support) <= tolerance or (pdl is not None and abs(swing_low - pdl) <= tolerance)
+        higher_low = low_index < len(window) - 1 and min(c.low for c in window[low_index + 1:] + [latest]) > swing_low
+        if at_support and higher_low:
+            stop = swing_low - atr_value * config.stop_buffer_atr_multiplier
+            return _reversal_setup(base, "BUY", latest.close, stop, config, risk_per_trade, indicators_out, support, pdh)
+        return {**base, "decision": "WAIT_FOR_CONFIRMATION", "reason": "VWAP reclaimed, but no support test with a higher low preceded it", "indicators": indicators_out}
+    if reclaimed_down and window:
+        high_index = max(range(len(window)), key=lambda i: window[i].high)
+        swing_high = window[high_index].high
+        resistance = max(c.high for c in session[:-1])
+        at_resistance = abs(swing_high - resistance) <= tolerance or (pdh is not None and abs(swing_high - pdh) <= tolerance)
+        lower_high = high_index < len(window) - 1 and max(c.high for c in window[high_index + 1:] + [latest]) < swing_high
+        if at_resistance and lower_high:
+            stop = swing_high + atr_value * config.stop_buffer_atr_multiplier
+            return _reversal_setup(base, "SELL", latest.close, stop, config, risk_per_trade, indicators_out, pdl, resistance)
+        return {**base, "decision": "WAIT_FOR_CONFIRMATION", "reason": "VWAP lost, but no resistance test with a lower high preceded it", "indicators": indicators_out}
+    return {**base, "decision": "WAIT_FOR_CONFIRMATION", "reason": "Waiting for a rejection at support/resistance followed by a VWAP reclaim", "indicators": indicators_out}
+
+
+def _reversal_setup(base: dict, side: Side, entry: float, stop: float, config: StrategyConfiguration, risk_per_trade: float, indicators_out: dict, support: float | None, resistance: float | None) -> dict:
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return {**base, "decision": "NO_TRADE", "reason": "Structural stop is not on the invalidation side of entry", "indicators": indicators_out}
+    target = entry + risk * config.rr_minimum if side == "BUY" else entry - risk * config.rr_minimum
+    return {**base, "decision": "CONFIRMED", "confidence": 100, "reason": f"{'Support' if side == 'BUY' else 'Resistance'} rejection followed by a confirmed VWAP reclaim", "indicators": indicators_out, "levels": {"support": support, "resistance": resistance}, "setup": {"side": side, "entry": entry, "stop_loss": round(stop, 2), "target": round(target, 2), "risk_reward": round(abs(target - entry) / risk, 2), "quantity": max(1, int(risk_per_trade / max(risk, 0.01))), "target_method": "STRUCTURAL_2R", "stop_method": "REJECTION_EXTREME_MINUS_ATR_BUFFER"}}
 
 
 def analyze_payload(payload: dict) -> dict:

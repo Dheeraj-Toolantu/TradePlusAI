@@ -1,12 +1,9 @@
 import { NextResponse } from "next/server";
 import { AutoOptionTrader } from "../../../../../services/paper-trading/src/auto-option-trader";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
-import { readGrowwConfig } from "../../../../../services/execution/src/groww-config";
-import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
+import { getMarketIntel, isIntelSymbol, latestCachedIntel, type MarketIntel } from "../../../lib/market-intel";
 
-const paperTrader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, executionMode: "PAPER" });
-const liveTrader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, executionMode: "ALGO_LIVE" });
-const liveAdapter = new GrowwAdapter(createGrowwTransport());
+const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2 });
 
 type RecordValue = Record<string, unknown>;
 
@@ -16,8 +13,7 @@ function numberOf(value: unknown): number {
 }
 
 export async function GET() {
-  const config = readGrowwConfig();
-  return NextResponse.json({ mode: config.executionMode, enabled: true, liveEnabled: config.executionMode === "ALGO_LIVE" && config.liveExecutionEnabled && config.complianceApproved && config.liveTradingConfirmationRequired, maxTrades: 3, minimumLoss: 2500, minimumProfit: 0, message: "POST a live market snapshot and auto-risk settings to run one auto-option scan." });
+  return NextResponse.json({ mode: "PAPER", enabled: true, maxTrades: 3, minimumLoss: 2500, minimumProfit: 0, message: "POST a live market snapshot and auto-risk settings to run one auto-option scan." });
 }
 
 export async function POST(request: Request) {
@@ -26,12 +22,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` }, { status: 403 });
   }
   const body = await request.json().catch(() => ({})) as RecordValue;
-  const config = readGrowwConfig();
-  const requestedMode = String(body.mode ?? "PAPER").toUpperCase();
-  const live = requestedMode === "ALGO_LIVE";
-  if (live && (config.executionMode !== "ALGO_LIVE" || !config.liveExecutionEnabled || !config.complianceApproved || !config.liveTradingConfirmationRequired)) return NextResponse.json({ error: "LIVE_AUTO_DISABLED: all live execution gates must be enabled." }, { status: 403 });
-  if (live && body.confirmLive !== true) return NextResponse.json({ error: "LIVE_AUTO_CONFIRMATION_REQUIRED: confirm autonomous Groww orders explicitly." }, { status: 400 });
-  if (requestedMode !== "PAPER" && !live) return NextResponse.json({ error: "Unsupported auto-trading mode." }, { status: 400 });
   const symbol = String(body.symbol ?? "NIFTY").toUpperCase();
   const spot = numberOf(body.spot);
   const candles = Array.isArray(body.candles) ? body.candles : [];
@@ -39,10 +29,26 @@ export async function POST(request: Request) {
   if (!symbol || spot <= 0 || candles.length < 3 || contracts.length === 0) {
     return NextResponse.json({ error: "Auto option scan requires a live spot, at least 3 candles, and option-chain contracts." }, { status: 400 });
   }
+  // Auto entries must agree with the market verdict (trend confluence + option writers) and
+  // are blocked in an extreme-VIX regime. Missing intel pauses entries; exits still run.
+  let intel: MarketIntel | null = null;
+  if (isIntelSymbol(symbol)) {
+    intel = latestCachedIntel(symbol) ?? await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
+  }
+  const bias = intel?.available ? intel.verdict?.bias : undefined;
+  const entryBlockedReason = !intel?.available
+    ? "market intelligence (trend, OI flow, VIX) is unavailable"
+    : intel.volatility?.regime === "EXTREME"
+      ? "India VIX is in the EXTREME regime"
+      : bias === "SIDEWAYS"
+        ? "no clear trend (confluence verdict is SIDEWAYS)"
+        : undefined;
   try {
-    const status = await (live ? liveTrader : paperTrader).tick({
+    const status = await trader.tick({
       symbol,
       spot,
+      marketBias: bias,
+      entryBlockedReason,
       settings: {
         maxTrades: numberOf(body.maxTrades) || 3,
         minimumLoss: numberOf(body.minimumLoss) || 2500,
@@ -74,9 +80,8 @@ export async function POST(request: Request) {
         tickSize: numberOf(contract.tickSize),
         freezeQuantity: numberOf(contract.freezeQuantity),
       })),
-      liveExecution: live ? { adapter: liveAdapter, exchange: symbol === "SENSEX" ? "BSE" : "NSE" } : undefined,
     });
-    return NextResponse.json({ ...status, symbol, spot, source: "Live market candles + Groww option chain" });
+    return NextResponse.json({ ...status, symbol, spot, marketBias: bias ?? null, source: "Live market candles + Groww option chain + market-intel verdict" });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Auto option scan failed" }, { status: 503 });
   }

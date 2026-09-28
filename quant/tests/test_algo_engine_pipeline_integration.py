@@ -38,5 +38,27 @@ class AlgoEnginePipelineIntegrationTests(unittest.TestCase):
         self.assertIn("DATA_QUALITY_BLOCKED", result["pipeline"]["reasons"])
 
 
+    def test_option_evidence_only_scores_when_it_agrees_with_the_setup_side(self):
+        from test_orb_retest import fresh_session_candles
+
+        candles = [{"timestamp": c.timestamp, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume} for c in fresh_session_candles()]
+        agreeing = analyze_payload({"symbol": "NIFTY", "strategy": "ORB_RETEST", "candles": candles, "option_evidence": {"oi_direction_score": 2, "ors_call": 1.2, "ors_put": None, "vix_regime": "NORMAL", "liquidity_score": 3, "option_quote_fresh": True}})
+        opposing = analyze_payload({"symbol": "NIFTY", "strategy": "ORB_RETEST", "candles": candles, "option_evidence": {"oi_direction_score": -2, "ors_call": 0.4, "ors_put": None, "vix_regime": "NORMAL", "liquidity_score": 3, "option_quote_fresh": True}})
+        self.assertEqual(agreeing["calculations"]["score"]["option_relative_strength"], 1)
+        self.assertEqual(agreeing["calculations"]["score"]["oi_direction"], 1)
+        self.assertEqual(opposing["calculations"]["score"]["option_relative_strength"], 0)
+        self.assertEqual(opposing["calculations"]["score"]["oi_direction"], 0)
+        self.assertEqual(agreeing["calculations"]["score"]["total"] - opposing["calculations"]["score"]["total"], 2)
+        self.assertIn("OI_PCR_NOT_SUPPORTIVE", opposing["pipeline"]["reasons"])
+        self.assertIn("ORS_NOT_CONFIRMED", opposing["pipeline"]["reasons"])
+
+    def test_extreme_vix_blocks_the_pipeline(self):
+        from test_orb_retest import fresh_session_candles
+
+        candles = [{"timestamp": c.timestamp, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume} for c in fresh_session_candles()]
+        result = analyze_payload({"symbol": "NIFTY", "strategy": "ORB_RETEST", "candles": candles, "option_evidence": {"vix_regime": "EXTREME", "oi_direction_score": 2, "ors_call": 1.5}})
+        self.assertIn("VIX_BLOCKED", result["pipeline"]["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()
