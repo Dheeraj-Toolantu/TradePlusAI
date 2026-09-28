@@ -4,7 +4,7 @@ import {
   setDoc,
   getDoc,
   getDocs,
-  updateDoc,
+  deleteDoc,
   query,
   where,
   orderBy,
@@ -57,6 +57,11 @@ const LIVE_TRADE_COLLECTIONS = ["openTrade", "openTrades", "positionTrade", "pos
 const EXITED_TRADE_COLLECTIONS = ["ExitedTrade", "exitedTrade", "exitedTrades"];
 const localOrderStore = new Map<string, OrderRecord>();
 
+/** Test hook: drop the in-process order cache so each test starts from an empty book. */
+export function clearLocalOrderStore(): void {
+  localOrderStore.clear();
+}
+
 export function tradeCollectionsForStatus(status: string): string[] {
   const normalized = String(status ?? "").trim().toUpperCase();
   if (["OPEN", "FILLED"].includes(normalized)) {
@@ -66,6 +71,23 @@ export function tradeCollectionsForStatus(status: string): string[] {
     return [ORDERS_COLLECTION, ...EXITED_TRADE_COLLECTIONS];
   }
   return [ORDERS_COLLECTION];
+}
+
+const isLiveStatus = (status: unknown) => ["OPEN", "FILLED"].includes(String(status ?? "").trim().toUpperCase());
+
+/**
+ * An order lives in the live-trade collections only while it is OPEN/FILLED. Once it exits
+ * (or is cancelled/simulated) those copies must be removed; otherwise they keep status OPEN
+ * forever and get re-hydrated as phantom open positions.
+ */
+async function removeLiveCopies(orderId: string): Promise<void> {
+  await Promise.all(LIVE_TRADE_COLLECTIONS.map(async (collectionName) => {
+    try {
+      await deleteDoc(doc(db, collectionName, orderId));
+    } catch (err) {
+      console.warn(`Failed to remove stale live copy ${collectionName}/${orderId}:`, err);
+    }
+  }));
 }
 
 function orderFromDocument(data: Record<string, unknown>, documentId: string): OrderRecord {
@@ -99,6 +121,7 @@ async function writeOrderToCollections(order: OrderRecord): Promise<void> {
       }
     }
   }
+  if (!isLiveStatus(order.status)) await removeLiveCopies(order.id);
 }
 
 async function readCollectionOrders(collectionName: string, statuses: string[] = [], maxResults = 100): Promise<OrderRecord[]> {
@@ -132,10 +155,9 @@ export async function updateOrderInFirestore(
   for (const collectionName of collections) {
     try {
       const orderDocRef = doc(db, collectionName, orderId);
-      await updateDoc(orderDocRef, {
-        ...merged,
-        updatedAt: new Date().toISOString(),
-      });
+      // merge-write rather than updateDoc: the exited collections have no document yet
+      // when an order first exits, and updateDoc would fail on a missing document.
+      await setDoc(orderDocRef, { ...merged, updatedAt: new Date().toISOString() }, { merge: true });
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
       if (code === "permission-denied") {
@@ -147,21 +169,37 @@ export async function updateOrderInFirestore(
       }
     }
   }
+  if (!isLiveStatus(merged.status ?? existing?.status)) await removeLiveCopies(orderId);
 }
 
 export async function getActiveOrdersFromFirestore(): Promise<OrderRecord[]> {
   const collections = [ORDERS_COLLECTION, ...LIVE_TRADE_COLLECTIONS];
   const mapped = new Map<string, OrderRecord>();
 
-  const collectionResults = await Promise.all(
-    collections.map((collectionName) => readCollectionOrders(collectionName, ["OPEN", "FILLED"], 100))
-  );
+  const [collectionResults, closedResults] = await Promise.all([
+    Promise.all(collections.map((collectionName) => readCollectionOrders(collectionName, ["OPEN", "FILLED"], 100))),
+    Promise.all([
+      readCollectionOrders(ORDERS_COLLECTION, ["EXITED", "CANCELLED", "SIMULATED"], 500),
+      ...EXITED_TRADE_COLLECTIONS.map((collectionName) => readCollectionOrders(collectionName, [], 500)),
+    ]),
+  ]);
+  // The orders collection and the exited collections are authoritative: an order recorded
+  // there as closed is never active, even if a stale OPEN copy survives in a live collection.
+  const closedIds = new Set(closedResults.flat().map((order) => order.id));
+  const staleIds = new Set<string>();
   for (const docs of collectionResults) {
     for (const order of docs) {
+      if (closedIds.has(order.id)) { staleIds.add(order.id); continue; }
       mapped.set(order.id, { ...order, status: String(order.status ?? "OPEN") as OrderRecord["status"] });
       localOrderStore.set(order.id, order);
     }
   }
+  for (const id of closedIds) {
+    const cached = localOrderStore.get(id);
+    if (cached && isLiveStatus(cached.status)) localOrderStore.delete(id);
+  }
+  // Self-heal: remove stale live copies left behind by earlier versions of this module.
+  if (staleIds.size) await Promise.all(Array.from(staleIds, (id) => removeLiveCopies(id)));
 
   for (const order of localOrderStore.values()) {
     if (["OPEN", "FILLED"].includes(String(order.status ?? "").toUpperCase())) {
