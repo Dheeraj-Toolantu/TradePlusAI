@@ -1,5 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { POST } from "../../apps/web/app/api/algo-trading/route";
+import { firestoreFake } from "../setup/firestore-fake";
+
+// Hermetic contract master: never download Groww's live instrument CSV in tests.
+vi.mock("../../adapters/groww/src/groww-instruments", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../adapters/groww/src/groww-instruments")>();
+  const fixture = {
+    exchange: "NSE", exchangeToken: "71234", tradingSymbol: "NIFTY2691523300PE", growwSymbol: "NIFTY2691523300PE", instrumentType: "PE", segment: "FNO",
+    underlyingSymbol: "NIFTY", expiryDate: "2026-09-15", strikePrice: 23300, lotSize: 65, tickSize: 0.05, freezeQuantity: 1801, isReserved: false, buyAllowed: true, sellAllowed: true,
+  };
+  return { ...actual, loadGrowwInstrumentCatalog: async () => new actual.GrowwInstrumentCatalog([fixture]) };
+});
 
 const requestFor = (body: Record<string, unknown>) => new Request("http://localhost/api/algo-trading", {
   method: "POST",
@@ -65,5 +76,6 @@ describe("algo trading execution boundary", () => {
         status: "OPEN",
       }),
     });
+    expect(firestoreFake.documents("orders")).toEqual([expect.objectContaining({ symbol: "NIFTY2691523300PE", status: "OPEN" })]);
   });
 });

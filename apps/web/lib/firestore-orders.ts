@@ -55,6 +55,11 @@ const LIVE_TRADE_COLLECTIONS = ["openTrade", "openTrades", "positionTrade", "pos
 const EXITED_TRADE_COLLECTIONS = ["ExitedTrade", "exitedTrade", "exitedTrades"];
 const localOrderStore = new Map<string, OrderRecord>();
 
+/** Test hook: drop the in-process order cache so each test starts from an empty book. */
+export function clearLocalOrderStore(): void {
+  localOrderStore.clear();
+}
+
 export function tradeCollectionsForStatus(status: string): string[] {
   const normalized = String(status ?? "").trim().toUpperCase();
   if (["OPEN", "FILLED"].includes(normalized)) {
