@@ -48,6 +48,13 @@ export type OrderRecord = {
   realizedPnl?: number;
   realizedPnlPercent?: number;
   brokerOrderId?: string;
+  referenceId?: string;
+  exchange?: string;
+  underlying?: string;
+  initialStopLoss?: number;
+  charges?: number;
+  exitError?: string;
+  reconcileWarning?: string;
 };
 
 const ORDERS_COLLECTION = "orders";

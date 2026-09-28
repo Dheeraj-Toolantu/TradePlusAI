@@ -101,6 +101,20 @@ def rsi(closes: list[float], period: int = 14) -> float | None:
     return 100.0 - 100.0 / (1.0 + average_gain / average_loss)
 
 
+def trend_15m(bars: list[Bar]) -> str | None:
+    """Resample completed 5m bars to 15m closes; EMA 9 vs 21 with a 0.02% dead-band."""
+    buckets: dict[tuple, float] = {}
+    for bar in bars:
+        buckets[(bar.time.date(), bar.time.hour, bar.time.minute // 15)] = bar.close
+    closes = [buckets[key] for key in sorted(buckets)]
+    fast, slow = indicators.ema(closes, 9), indicators.ema(closes, 21)
+    if fast is None or slow is None:
+        return None
+    if abs(fast - slow) <= slow * 0.0002:
+        return "FLAT"
+    return "BULLISH" if fast > slow else "BEARISH"
+
+
 def technicals(bars: list[Bar]) -> dict:
     session, previous = split_sessions(bars)
     closes = [bar.close for bar in bars]
@@ -114,6 +128,7 @@ def technicals(bars: list[Bar]) -> dict:
         "ema50": indicators.ema(closes, 50),
         "atr14": atr_value,
         "rsi14": rsi(closes, 14),
+        "trend_15m": trend_15m(bars),
         "session_open": session[0].open if session else None,
         "session_high": max((bar.high for bar in session), default=None),
         "session_low": min((bar.low for bar in session), default=None),

@@ -16,6 +16,7 @@ from .options_flow import analyze_options_flow, select_contract
 from .smart_money import analyze_smart_money, find_swings
 from .volatility import analyze_volatility
 
+HIGH_IMPACT_EVENTS = {"RBI policy", "US Fed", "Union Budget", "Elections", "Inflation data", "Geopolitics"}
 BIAS_THRESHOLD = 3.0
 READY_THRESHOLD = 5.0
 DEFAULT_CAPITAL = 100_000.0
@@ -39,7 +40,7 @@ def _fmt(value: float | None) -> str:
     return "--" if value is None else f"{value:,.2f}"
 
 
-def build_verdict(tech: dict, smc: dict, flow: dict) -> dict:
+def build_verdict(tech: dict, smc: dict, flow: dict, sentiment: dict | None = None) -> dict:
     factors: list[dict] = []
     price, vwap, atr = tech.get("last_price"), tech.get("vwap"), tech.get("atr14") or 0.0
     band = atr * 0.1
@@ -49,8 +50,12 @@ def build_verdict(tech: dict, smc: dict, flow: dict) -> dict:
         factors.append(_factor("vwap", "Price vs VWAP", points, 1.5, f"Price {_fmt(price)} is {where} session VWAP {_fmt(vwap)}{'' if tech.get('vwap_is_volume_weighted') else ' (TWAP: index has no volume)'}", "VWAP is the day's average traded price. Institutions buy below it and sell above it; trading on the side of VWAP keeps you with the day's flow."))
     ema20, ema50 = tech.get("ema20"), tech.get("ema50")
     if ema20 is not None and ema50 is not None:
-        points = 1.5 if ema20 > ema50 else -1.5 if ema20 < ema50 else 0.0
-        factors.append(_factor("ema", "EMA 20 vs EMA 50 (5m)", points, 1.5, f"EMA20 {_fmt(ema20)} {'>' if points > 0 else '<' if points < 0 else '='} EMA50 {_fmt(ema50)}", "When the fast average is above the slow one the short-term trend is up. It confirms trend; it does not time entries."))
+        points = 1.0 if ema20 > ema50 else -1.0 if ema20 < ema50 else 0.0
+        factors.append(_factor("ema", "EMA 20 vs EMA 50 (5m)", points, 1.0, f"EMA20 {_fmt(ema20)} {'>' if points > 0 else '<' if points < 0 else '='} EMA50 {_fmt(ema50)}", "When the fast average is above the slow one the short-term trend is up. It confirms trend; it does not time entries."))
+    trend_15m = tech.get("trend_15m")
+    if trend_15m in ("BULLISH", "BEARISH", "FLAT"):
+        points = 1.0 if trend_15m == "BULLISH" else -1.0 if trend_15m == "BEARISH" else 0.0
+        factors.append(_factor("trend_15m", "Higher timeframe (15m EMA 9/21)", points, 1.0, f"15-minute trend is {trend_15m.lower()}", "Professionals trade the 5-minute chart only in the direction of the 15-minute trend. Fighting the higher timeframe is the most common beginner mistake."))
     if smc.get("available"):
         event = smc.get("last_event")
         trend = smc.get("trend")
@@ -74,13 +79,21 @@ def build_verdict(tech: dict, smc: dict, flow: dict) -> dict:
         factors.append(_factor("oi_flow", "Option writers (5-min OI change)", float(score or 0), 2.0, flow.get("oi_direction_label") or "Unavailable", "Option writers (sellers) are usually large, well-funded players. Fresh put writing = they expect support; fresh call writing = they expect a ceiling."))
         pcr = flow.get("pcr_oi")
         if pcr is not None:
-            points = 1.0 if pcr >= 1.2 else 0.5 if pcr >= 1.0 else -1.0 if pcr <= 0.7 else -0.5 if pcr <= 0.9 else 0.0
+            points = 0.5 if pcr >= 1.2 else 0.25 if pcr >= 1.0 else -0.5 if pcr <= 0.7 else -0.25 if pcr <= 0.9 else 0.0
             note = " (very high: market may be overbought)" if pcr > 1.6 else " (very low: market may be oversold)" if pcr < 0.5 else ""
-            factors.append(_factor("pcr", "Put-Call Ratio (OI)", points, 1.0, f"PCR {pcr:.2f}{note}", "PCR = total put OI / total call OI. Above 1 means more puts are written (bullish support); below 0.7 means call writers dominate. Extremes often reverse, so it is a light-weight factor."))
+            factors.append(_factor("pcr", "Put-Call Ratio (OI)", points, 0.5, f"PCR {pcr:.2f}{note}", "PCR = total put OI / total call OI. Above 1 means more puts are written (bullish support); below 0.7 means call writers dominate. Extremes often reverse, so it is a light-weight factor."))
     rsi_value = tech.get("rsi14")
     if rsi_value is not None:
-        points = 1.0 if rsi_value >= 60 else 0.5 if rsi_value >= 55 else -1.0 if rsi_value <= 40 else -0.5 if rsi_value <= 45 else 0.0
-        factors.append(_factor("rsi", "Momentum (RSI 14)", points, 1.0, f"RSI {rsi_value:.1f}", "RSI above 55-60 shows buyers in control, below 40-45 sellers. It measures momentum strength, not direction reversals."))
+        points = 0.5 if rsi_value >= 60 else 0.25 if rsi_value >= 55 else -0.5 if rsi_value <= 40 else -0.25 if rsi_value <= 45 else 0.0
+        factors.append(_factor("rsi", "Momentum (RSI 14)", points, 0.5, f"RSI {rsi_value:.1f}", "RSI above 55-60 shows buyers in control, below 40-45 sellers. It measures momentum strength, not direction reversals."))
+    if sentiment and sentiment.get("india_label") not in (None, "INSUFFICIENT_DATA"):
+        score = float(sentiment.get("india_score") or 0.0)
+        if sentiment.get("contrarian_note"):
+            points, detail = 0.0, f"Crowd extreme ({score:+.0f}): {sentiment['contrarian_note']}"
+        else:
+            points = 0.5 if score >= 25 else 0.25 if score >= 10 else -0.5 if score <= -25 else -0.25 if score <= -10 else 0.0
+            detail = f"India sentiment {score:+.0f}/100 (retail {float(sentiment.get('retail_score') or 0):+.0f}, news {float(sentiment.get('news_score') or 0):+.0f})"
+        factors.append(_factor("sentiment", "Retail & news sentiment", points, 0.5, detail, "What retail traders on public forums and the financial news are saying right now. Useful as a light confirmation; at extremes the crowd is usually wrong, so euphoria or panic scores zero."))
 
     total = sum(factor["points"] for factor in factors)
     bias = "BULLISH" if total >= BIAS_THRESHOLD else "BEARISH" if total <= -BIAS_THRESHOLD else "SIDEWAYS"
@@ -219,6 +232,11 @@ def build_trade_plan(bars: list[Bar], tech: dict, smc: dict, flow: dict, vol: di
     vwap = tech.get("vwap")
     stretch = abs(price - vwap) / atr if vwap is not None and atr else 0.0
     smc_agrees = smc.get("trend") == bias
+    last_bar = bars[-1]
+    bar_range = max(last_bar.high - last_bar.low, 1e-9)
+    body_ratio = abs(last_bar.close - last_bar.open) / bar_range
+    candle_ok = (last_bar.close - last_bar.open) * direction > 0 and body_ratio >= 0.5
+    high_impact = [event for event in (meta.get("sentiment") or {}).get("event_risk") or [] if event in HIGH_IMPACT_EVENTS]
     late_expiry = bool(meta.get("expiry_today")) and meta["now"].time() >= time(13, 30)
     checklist = [
         {"key": "session", "label": "Inside the entry window (09:35-14:45 IST)", "passed": session["entry_permitted"], "detail": f"Now {session['window'].replace('_', ' ').lower()}"},
@@ -231,6 +249,8 @@ def build_trade_plan(bars: list[Bar], tech: dict, smc: dict, flow: dict, vol: di
         {"key": "rr", "label": "Reward at least 2× risk", "passed": rr >= MIN_RR - 1e-6, "detail": f"R:R {rr:.2f} on the option premium"},
         {"key": "room", "label": "Room to target (no big OI wall before Target 1)", "passed": blocking_wall is None, "detail": f"Wall at {_fmt(blocking_wall)} blocks the path" if blocking_wall else "Path to Target 1 is clear of the main OI wall"},
         {"key": "liquidity", "label": "Liquid strike (liquidity score ≥ 2/3)", "passed": bool(contract) and contract["liquidity_score"] >= 2, "detail": f"{contract['trading_symbol'] or contract['strike']} liquidity {contract['liquidity_score']}/3" if contract else "No liquid contract near ATM"},
+        {"key": "candle", "label": "Confirmation candle (last 5m closes in trade direction, body ≥ 50%)", "passed": candle_ok, "detail": f"Last candle {'green' if last_bar.close > last_bar.open else 'red' if last_bar.close < last_bar.open else 'doji'}, body {body_ratio * 100:.0f}% of range"},
+        {"key": "events", "label": "No high-impact event in the news right now", "passed": not high_impact, "detail": ("Active: " + ", ".join(high_impact)) if high_impact else ("No RBI/Fed/Budget/election headlines" if meta.get("sentiment") else "Sentiment scan unavailable; check the economic calendar yourself")},
         {"key": "expiry", "label": "No late expiry-day gamma risk", "passed": not late_expiry, "detail": "Expiry day after 13:30: premiums can vanish in minutes" if late_expiry else ("Expiry today: size halved" if meta.get("expiry_today") else "Not expiry day")},
     ]
     failed = [item for item in checklist if not item["passed"]]
@@ -308,7 +328,9 @@ def analyze_market(payload: dict) -> dict:
         "risk_pct": min(max(float(payload.get("risk_pct") or DEFAULT_RISK_PCT), 0.1), 2.0),
         "expiry_today": expiry == now.date().isoformat(),
     }
-    verdict = build_verdict(tech, smc, flow)
+    sentiment = payload.get("sentiment") if isinstance(payload.get("sentiment"), dict) else None
+    meta["sentiment"] = sentiment
+    verdict = build_verdict(tech, smc, flow, sentiment)
     plan = build_trade_plan(bars, tech, smc, flow, vol, verdict, session, meta)
 
     liquidity_scores = [c["liquidity_score"] for c in (select_contract(flow.get("chain") or {}, spot, s) for s in ("CE", "PE")) if c] if flow.get("available") else []

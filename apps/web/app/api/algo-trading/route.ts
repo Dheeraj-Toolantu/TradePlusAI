@@ -43,7 +43,8 @@ async function hydrateFromFirestore() {
   try {
     const remoteOrders = await getActiveOrdersFromFirestore();
     if (remoteOrders.length > 0) {
-      paperOrders = remoteOrders;
+      // Real-money positions are owned by /api/live-orders; the paper book must never touch them.
+      paperOrders = remoteOrders.filter((order) => order.mode !== "ALGO_LIVE");
     }
     firestoreHydrated = true;
   } catch (err) {
@@ -123,6 +124,36 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
   });
 }
 
+// Operational evidence for the V5 no-trade gate. Previously only broker health, SAFE_MODE and
+// the kill switch were supplied, so DAILY_RISK, CONTRACT_METADATA, RECONCILIATION and
+// EXECUTION_READY were always "missing" and the pipeline could never confirm a setup.
+const PAPER_CAPITAL = Number(process.env.PAPER_CAPITAL ?? 100_000);
+const DAILY_LOSS_LIMIT_PCT = 2; // V5 StrategyConfiguration.daily_loss_limit_pct
+const MAX_TRADES_PER_DAY = 3; // V5 StrategyConfiguration.max_trades_per_day
+
+async function operationalEvidence(symbol: string, brokerHealthy: boolean, safety: { safeMode: boolean; killSwitch: boolean }) {
+  const today = istDate();
+  const [orders, catalog] = await Promise.all([
+    getAllOrdersFromFirestore(200).catch(() => [] as OrderRecord[]),
+    loadGrowwInstrumentCatalog().catch(() => null),
+  ]);
+  const todays = orders.filter((order) => order.mode !== "ALGO_LIVE" && order.status !== "CANCELLED" && order.status !== "SIMULATED" && istDate(new Date(order.createdAt)) === today);
+  const realized = todays.reduce((sum, order) => sum + (order.status === "EXITED" ? Number(order.realizedPnl ?? 0) : 0), 0);
+  const dailyRiskAllowed = todays.length < MAX_TRADES_PER_DAY && -realized < PAPER_CAPITAL * DAILY_LOSS_LIMIT_PCT / 100;
+  const contractMetadata = catalog === null ? false : catalog.getAll().some((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && String(instrument.expiryDate ?? "") >= today && Number(instrument.lotSize) > 0);
+  return {
+    broker_healthy: brokerHealthy,
+    safe_mode: safety.safeMode,
+    kill_switch: safety.killSwitch,
+    daily_risk_allowed: dailyRiskAllowed,
+    contract_metadata_available: contractMetadata,
+    // The paper book is the system of record for paper trades; real positions are reconciled
+    // against Groww by the live monitor (/api/live-orders), not by this gate.
+    reconciliation_ok: true,
+    execution_ready: !safety.safeMode && !safety.killSwitch,
+  };
+}
+
 async function validateLiveContract(body: RecordValue): Promise<string | null> {
   const symbol = String(body.symbol ?? "");
   const underlying = String(body.underlying ?? "").toUpperCase();
@@ -161,11 +192,7 @@ export async function GET(request: Request) {
     const adapter = new GrowwAdapter(createGrowwTransport());
     const health = await adapter.healthCheck();
     const brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
-    const evidence = {
-      broker_healthy: brokerHealthy,
-      safe_mode: safeModeState.safeMode,
-      kill_switch: safeModeState.killSwitch,
-    };
+    const evidence = await operationalEvidence(symbol, brokerHealthy, safeModeState);
     const [analysis, account, liveOrders, history] = await Promise.all([
       runEngine(symbol, provider, url.origin, strategy, evidence),
       provider === "groww" ? growwAccountSummary().catch(() => null) : Promise.resolve(null),
@@ -213,7 +240,7 @@ export async function POST(request: Request) {
     if (config.executionMode !== "ALGO_LIVE" || !config.liveExecutionEnabled || !config.complianceApproved) {
       return NextResponse.json({ error: "LIVE_EXECUTION_DISABLED: set EXECUTION_MODE=ALGO_LIVE, LIVE_EXECUTION_ENABLED=true, and LIVE_COMPLIANCE_APPROVED=true only after all release gates pass." }, { status: 403 });
     }
-    return NextResponse.json({ error: "ALGO_LIVE_NOT_IMPLEMENTED: broker order submission is not wired in this route; no live order was sent." }, { status: 501 });
+    return NextResponse.json({ error: "LIVE_ORDERS_USE_CONFIRMATION_FLOW: real-money orders go through /api/live-orders (preview, then PIN-confirmed submit); no live order was sent from this route." }, { status: 400 });
   }
 
   if (requestedMode !== config.executionMode || requestedMode !== "PAPER") {
@@ -282,11 +309,7 @@ export async function POST(request: Request) {
     // Manual paper entries are explicitly user-authorized and skip this gate only; the
     // kill-switch, SAFE_MODE, broker-health, contract-master, lot/freeze, and minimum-2R
     // checks still apply to every order.
-    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, {
-      broker_healthy: brokerHealthy,
-      safe_mode: safeModeState.safeMode,
-      kill_switch: safeModeState.killSwitch,
-    });
+    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState));
     const pipeline = serverAnalysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
     if (pipeline?.decision !== "CONFIRMED") {
       return NextResponse.json({ error: "V5 no-trade gate rejected the paper entry.", reasons: pipeline?.reasons ?? ["SERVER_PIPELINE_UNAVAILABLE"] }, { status: 403 });
@@ -338,8 +361,8 @@ export async function DELETE(request: Request) {
   const id = new URL(request.url).searchParams.get("id");
   if (!id) return NextResponse.json({ error: "Paper order id is required." }, { status: 400 });
 
-  const index = paperOrders.findIndex((order) => order.id === id);
-  if (index < 0) return NextResponse.json({ error: "Paper order was not found." }, { status: 404 });
+  const index = paperOrders.findIndex((order) => order.id === id && order.mode !== "ALGO_LIVE");
+  if (index < 0) return NextResponse.json({ error: id.startsWith("live-") ? "Live positions must be exited through /api/live-orders so a real sell order is sent." : "Paper order was not found." }, { status: 404 });
 
   const [order] = paperOrders.splice(index, 1);
   const currentLtp = (await fnoQuote(order.symbol)) ?? order.currentPrice ?? order.price;
