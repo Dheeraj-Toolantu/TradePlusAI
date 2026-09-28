@@ -165,20 +165,10 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     average_volume = sum(candle.volume for candle in recent) / len(recent) if recent else 0.0
     relative_volume = (candles[-1].volume / average_volume) if candles and average_volume > 0 else None
 
-    orb = evaluate_orb_retest(candles, atr_value) if strategy == "ORB_RETEST" and data_quality_ok else None
+    orb = _orb_for(candles, config)[0] if strategy == "ORB_RETEST" and data_quality_ok else None
     max_extension = round(min(max(last_close, 1.0) * 0.0035, orb.atr) if orb.atr > 0 else max(last_close, 1.0) * 0.0035, 4) if orb is not None and last_close else None
 
-    gap = None
-    if session and previous_session and atr_value:
-        gap = evaluate_gap_day(
-            opening_price=session[0].open,
-            previous_high=max(candle.high for candle in previous_session),
-            previous_low=min(candle.low for candle in previous_session),
-            atr_value=atr_value,
-            post_opening_lows=[candle.low for candle in session[1:]],
-            post_opening_highs=[candle.high for candle in session[1:]],
-            config=config,
-        )
+    gap = _gap_for(candles, config)
 
     trend_15m = _trend_15m(candles, config)
     regime = classify_regime(
@@ -264,6 +254,11 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
             "retest_index": orb.retest_index if orb else None,
             "max_extension": max_extension,
             "status": orb.status if orb else None,
+            "reason": orb.reason if orb else None,
+            "opening_minutes": orb.opening_minutes if orb else None,
+            "breakout_time": orb.breakout_time if orb else None,
+            "retest_time": orb.retest_time if orb else None,
+            "bars_since_retest": orb.bars_since_retest if orb else None,
         },
         "score": {
             "trend_cluster": trend_cluster,
@@ -295,6 +290,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "session_allowed": entry_permitted,
         "strategy_decision": result.get("decision"),
         "regime": regime,
+        "setup_side": (result.get("setup") or {}).get("side"),
         "gap_state": gap.state if gap else None,
         "breakout_valid": (orb is not None and orb.breakout_index is not None) if strategy == "ORB_RETEST" else strategy_confirmed,
         "retest_confirmed": (orb is not None and orb.status == "CONFIRMED") if strategy == "ORB_RETEST" else strategy_confirmed,
@@ -311,6 +307,49 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
 
 
 ORB_MAX_SIGNAL_AGE_CANDLES = 1
+CANDLE_MINUTES = 5
+
+
+def _gap_for(candles: list[Candle], config: StrategyConfiguration):
+    session, previous = _split_sessions(candles)
+    atr_value = indicators.atr(candles, config.atr_period)
+    if not (session and previous and atr_value):
+        return None
+    return evaluate_gap_day(
+        opening_price=session[0].open,
+        previous_high=max(candle.high for candle in previous),
+        previous_low=min(candle.low for candle in previous),
+        atr_value=atr_value,
+        post_opening_lows=[candle.low for candle in session[1:]],
+        post_opening_highs=[candle.high for candle in session[1:]],
+        config=config,
+    )
+
+
+def _orb_for(candles: list[Candle], config: StrategyConfiguration):
+    """ORB with the spec-4 gap-day window (30 min instead of 15) and multi-session ATR."""
+    gap = _gap_for(candles, config)
+    minutes = gap.required_or_duration_minutes if gap else config.orb_duration_minutes
+    return evaluate_orb_retest(candles, indicators.atr(candles, config.atr_period), minutes), gap
+
+
+def _orb_calculations(orb, gap) -> dict:
+    return {"orb": {
+        "opening_range_high": orb.opening_range_high, "opening_range_low": orb.opening_range_low, "opening_minutes": orb.opening_minutes,
+        "breakout_index": orb.breakout_index, "retest_index": orb.retest_index, "breakout_time": orb.breakout_time, "retest_time": orb.retest_time,
+        "atr": orb.atr, "bars_since_retest": orb.bars_since_retest, "status": orb.status, "reason": orb.reason, "gap_state": gap.state if gap else None,
+    }}
+
+
+def completed_candles(candles: list[Candle], now: datetime, minutes: int = CANDLE_MINUTES) -> list[Candle]:
+    """Drop the candle still forming at ``now``; signals on it would repaint before it closes."""
+    kept = []
+    for candle in candles:
+        started = _parse_timestamp(candle.timestamp)
+        if started is None or started + timedelta(minutes=minutes) <= now:
+            kept.append(candle)
+    return kept
+
 
 
 def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST") -> dict:
@@ -318,9 +357,8 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "At least 21 candles are required", "confidence": 0, "setup": None}
     if strategy == "ORB_RETEST":
         config = StrategyConfiguration()
-        atr_value = indicators.atr(candles, config.atr_period)
-        orb = evaluate_orb_retest(candles, atr_value)
-        orb_calc = {"orb": {"opening_range_high": orb.opening_range_high, "opening_range_low": orb.opening_range_low, "breakout_index": orb.breakout_index, "retest_index": orb.retest_index, "atr": orb.atr, "bars_since_retest": orb.bars_since_retest}}
+        orb, gap = _orb_for(candles, config)
+        orb_calc = _orb_calculations(orb, gap)
         if orb.status != "CONFIRMED" or not orb.side:
             # Never fall through to a different (EMA/VWAP) rule set: ORB either confirms or waits.
             return {"symbol": symbol, "strategy": strategy, "decision": orb.status, "reason": orb.reason, "confidence": 0, "calculations": orb_calc, "setup": None}
@@ -336,9 +374,27 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         risk = abs(entry - stop)
         if risk <= 0 or (orb.side == "BUY" and stop >= entry) or (orb.side == "SELL" and stop <= entry):
             return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Structural stop is not on the invalidation side of entry", "confidence": 0, "calculations": orb_calc, "setup": None}
-        target = entry + risk * config.rr_minimum if orb.side == "BUY" else entry - risk * config.rr_minimum
-        quantity = max(1, int(risk_per_trade / max(risk, 0.01)))
-        return {"symbol": symbol, "strategy": strategy, "decision": "CONFIRMED", "reason": orb.reason, "confidence": 100, "calculations": orb_calc, "setup": {"side": orb.side, "entry": entry, "stop_loss": round(stop, 2), "target": round(target, 2), "risk_reward": round(abs(target - entry) / risk, 2), "quantity": quantity, "target_method": "STRUCTURAL_2R", "stop_method": "RETEST_EXTREME_MINUS_ATR_BUFFER"}}
+        direction = 1 if orb.side == "BUY" else -1
+        target = entry + risk * config.rr_minimum * direction
+        # Spec 15: never force 2R through a major structural level. The previous day's high
+        # (for longs) / low (for shorts) is the obstacle; the reward is measured to it.
+        _, previous = _split_sessions(candles)
+        obstacle = (max(c.high for c in previous) if direction > 0 else min(c.low for c in previous)) if previous else None
+        reward = abs(target - entry)
+        obstacle_label = None
+        if obstacle is not None and 0 < (obstacle - entry) * direction < reward:
+            reward = abs(obstacle - entry)
+            obstacle_label = f"{'PDH' if direction > 0 else 'PDL'} {obstacle:.2f}"
+        rr = round(reward / risk, 2)
+        if rr < config.rr_minimum:
+            return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": f"Only {rr}R of room before {obstacle_label}; the 2R target is not realistic", "confidence": 0, "calculations": orb_calc, "setup": None}
+        size_multiplier = gap.first_trade_risk_multiplier if gap and gap.is_gap_day else 1.0
+        quantity = max(1, int(risk_per_trade * size_multiplier / max(risk, 0.01)))
+        return {"symbol": symbol, "strategy": strategy, "decision": "CONFIRMED", "reason": orb.reason, "confidence": 100, "calculations": orb_calc, "setup": {
+            "side": orb.side, "entry": entry, "stop_loss": round(stop, 2), "target": round(target, 2), "risk_reward": rr, "quantity": quantity,
+            "size_multiplier": size_multiplier, "gap_day": bool(gap and gap.is_gap_day),
+            "target_method": "STRUCTURAL_2R" + (f"_CLEAR_OF_{obstacle_label.split()[0]}" if obstacle_label else ""), "stop_method": "RETEST_EXTREME_MINUS_ATR_BUFFER",
+        }}
     if strategy == "VWAP_REVERSAL":
         return _vwap_reversal(symbol, candles, risk_per_trade)
     return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Range Defined Risk is analysis-only until the multi-leg builder is enabled", "confidence": 0, "setup": None}
@@ -410,18 +466,22 @@ def analyze_payload(payload: dict) -> dict:
     candles = [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in payload.get("candles", [])]
     symbol = str(payload.get("symbol", "UNKNOWN"))
     strategy = str(payload.get("strategy", "ORB_RETEST"))
+    now = datetime.now(MARKET_TIMEZONE)
+    candles = completed_candles(candles, now)
     result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy)
     # Evidence the engine can observe directly from candles and the IST clock is computed
     # first; the caller (Node API boundary) may only *add* independently-verified evidence
     # such as broker health, SAFE_MODE, and kill-switch state. A caller can never overwrite
     # observed data-quality, session, regime, gap, breakout, or retest evidence with this merge.
-    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), datetime.now(MARKET_TIMEZONE), payload.get("option_evidence"))
+    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, payload.get("option_evidence"))
     result["calculations"] = calculations
     result["session"] = session_info
     caller_evidence = payload.get("pipeline") or {}
     pipeline_input = {**caller_evidence, **evidence}
     pipeline = evaluate_payload(pipeline_input)
     result["pipeline"] = pipeline
+    result["strategy_decision"] = result.get("decision")
+    result["strategy_reason"] = result.get("reason")
     if pipeline["decision"] != "CONFIRMED":
         result["decision"] = "NO_TRADE"
         result["reason"] = "; ".join(pipeline["reasons"])
