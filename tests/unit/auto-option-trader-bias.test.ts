@@ -1,12 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-
-// Hermetic: never touch the real Cloud Firestore project from unit tests.
-vi.mock("../../apps/web/lib/firestore-orders", () => ({
-  saveOrderToFirestore: vi.fn(async () => undefined),
-  getActiveOrdersFromFirestore: vi.fn(async () => []),
-}));
-
-const { AutoOptionTrader } = await import("../../services/paper-trading/src/auto-option-trader");
+import { describe, expect, it } from "vitest";
+import { AutoOptionTrader } from "../../services/paper-trading/src/auto-option-trader";
 
 const candles = [
   { timestamp: "2026-09-15T09:40:00+05:30", open: 23120, high: 23135, low: 23110, close: 23125, volume: 1000 },
