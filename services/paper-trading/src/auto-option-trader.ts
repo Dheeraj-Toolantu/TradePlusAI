@@ -26,6 +26,10 @@ type EngineInput = {
   candles: Candle[];
   contracts: Contract[];
   settings?: AutoOptionTraderSettings;
+  /** Confluence verdict from the market-intel engine. CALLs need BULLISH, PUTs need BEARISH. */
+  marketBias?: "BULLISH" | "BEARISH" | "SIDEWAYS";
+  /** When set, no new entries are taken (open positions are still managed and exited). */
+  entryBlockedReason?: string;
 };
 
 export type AutoOptionTraderSettings = {
@@ -119,7 +123,23 @@ export class AutoOptionTrader {
       if (!this.contractIsNearAtm(contract, input.spot)) failures.push(`delta/ATM filter failed (strike ${contract.strike}, delta ${contract.delta})`);
       return `${contract.contract} ${contract.symbol}: ${failures.length ? failures.join("; ") : "eligible"}`;
     });
+    if (input.entryBlockedReason) {
+      return {
+        mode: "PAPER",
+        limitHit,
+        tradesTaken: this.tradedToday,
+        orders: [...this.orders],
+        suggestions: [...this.suggestions],
+        diagnostics: [`Entries paused: ${input.entryBlockedReason}`, ...this.lastDiagnostics],
+        summary: `Auto entries paused for ${input.symbol}: ${input.entryBlockedReason}. Open positions are still managed.`,
+      };
+    }
+    const biasAllows = (contract: Contract) => !input.marketBias || (contract.contract === "CALL" ? input.marketBias === "BULLISH" : input.marketBias === "BEARISH");
+    if (input.marketBias) {
+      this.lastDiagnostics = this.lastDiagnostics.map((line, index) => biasAllows(input.contracts[index]) ? line : `${line}; market verdict ${input.marketBias} does not confirm ${input.contracts[index].contract}`);
+    }
     const eligible = input.contracts
+      .filter(biasAllows)
       .filter((contract) => contract.score >= this.config.minScore)
       .filter((contract) => contract.riskReward >= this.config.minRiskReward)
       .filter((contract) => contract.lotSize > 0)

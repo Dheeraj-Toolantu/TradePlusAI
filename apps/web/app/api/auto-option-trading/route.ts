@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { AutoOptionTrader } from "../../../../../services/paper-trading/src/auto-option-trader";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
+import { getMarketIntel, isIntelSymbol, latestCachedIntel, type MarketIntel } from "../../../lib/market-intel";
 
 const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2 });
 
@@ -28,10 +29,26 @@ export async function POST(request: Request) {
   if (!symbol || spot <= 0 || candles.length < 3 || contracts.length === 0) {
     return NextResponse.json({ error: "Auto option scan requires a live spot, at least 3 candles, and option-chain contracts." }, { status: 400 });
   }
+  // Auto entries must agree with the market verdict (trend confluence + option writers) and
+  // are blocked in an extreme-VIX regime. Missing intel pauses entries; exits still run.
+  let intel: MarketIntel | null = null;
+  if (isIntelSymbol(symbol)) {
+    intel = latestCachedIntel(symbol) ?? await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
+  }
+  const bias = intel?.available ? intel.verdict?.bias : undefined;
+  const entryBlockedReason = !intel?.available
+    ? "market intelligence (trend, OI flow, VIX) is unavailable"
+    : intel.volatility?.regime === "EXTREME"
+      ? "India VIX is in the EXTREME regime"
+      : bias === "SIDEWAYS"
+        ? "no clear trend (confluence verdict is SIDEWAYS)"
+        : undefined;
   try {
     const status = await trader.tick({
       symbol,
       spot,
+      marketBias: bias,
+      entryBlockedReason,
       settings: {
         maxTrades: numberOf(body.maxTrades) || 3,
         minimumLoss: numberOf(body.minimumLoss) || 2500,
@@ -64,7 +81,7 @@ export async function POST(request: Request) {
         freezeQuantity: numberOf(contract.freezeQuantity),
       })),
     });
-    return NextResponse.json({ ...status, symbol, spot, source: "Live market candles + Groww option chain" });
+    return NextResponse.json({ ...status, symbol, spot, marketBias: bias ?? null, source: "Live market candles + Groww option chain + market-intel verdict" });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Auto option scan failed" }, { status: 503 });
   }
