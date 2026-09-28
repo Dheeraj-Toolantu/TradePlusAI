@@ -1,8 +1,7 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import path from "node:path";
 import { GrowwAdapter, createGrowwTransport } from "../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../adapters/groww/src/groww-instruments";
+import { runPythonModule } from "./python";
+import { getSentiment, sentimentForIntel } from "./sentiment";
 import { baselineSnapshot, recordSnapshot, snapshotHistorySeconds, type ChainLeg, type ChainRow } from "./oi-snapshot-store";
 
 export const INTEL_SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
@@ -97,26 +96,6 @@ async function fetchQuotes(symbol: IntelSymbol) {
   };
 }
 
-function runPython(payload: Raw): Promise<MarketIntel> {
-  const root = existsSync(path.resolve(process.cwd(), "quant")) ? process.cwd() : path.resolve(process.cwd(), "../..");
-  const executable = process.env.PYTHON_EXECUTABLE ?? "python";
-  return new Promise((resolve, reject) => {
-    const child = spawn(executable, ["-m", "tradepulse_quant.market_intel.engine"], { cwd: root, env: { ...process.env, PYTHONPATH: path.join(root, "quant", "src") }, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => child.kill(), 15_000);
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    child.on("error", (error) => { clearTimeout(timer); reject(error); });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) { reject(new Error(stderr.trim() || `Market-intel engine exited with code ${code}`)); return; }
-      try { resolve(JSON.parse(stdout) as MarketIntel); } catch { reject(new Error("Market-intel engine returned invalid JSON")); }
-    });
-    child.stdin.end(JSON.stringify(payload));
-  });
-}
-
 export type IntelOptions = { origin: string; capital?: number; riskPct?: number; force?: boolean };
 
 async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<MarketIntel> {
@@ -126,7 +105,8 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
   const now = Date.now();
   const baseline = baselineSnapshot(symbol, expiry, now);
   if (chain.rows.length) recordSnapshot(symbol, { takenAt: now, spot, expiry, rows: chain.rows });
-  const result = await runPython({
+  const sentiment = sentimentForIntel(await getSentiment().catch(() => null));
+  const result = await runPythonModule<MarketIntel>("tradepulse_quant.market_intel.engine", {
     symbol,
     spot,
     expiry,
@@ -139,6 +119,7 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
     vix: quotes.vix,
     capital: options.capital,
     risk_pct: options.riskPct,
+    sentiment,
   });
   return { ...result, baseline_history_seconds: snapshotHistorySeconds(symbol, expiry, now), source: "Groww option chain + 5m candles + India VIX", fetched_at: new Date(now).toISOString() };
 }

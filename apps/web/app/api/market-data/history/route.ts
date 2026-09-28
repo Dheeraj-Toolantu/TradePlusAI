@@ -95,12 +95,31 @@ async function fetchYahooHistory(symbol: string, timeframe: string, period: Hist
   return timestamps.flatMap((time: number, index: number) => { const open = Number(quote.open?.[index]); const high = Number(quote.high?.[index]); const low = Number(quote.low?.[index]); const close = Number(quote.close?.[index]); if (![open, high, low, close].every(Number.isFinite)) return []; return [{ time, open, high, low, close, volume: numericVolume(quote.volume?.[index]) }]; });
 }
 
+// Short response cache: the algo page, market-intel and the V5 engine all request the same
+// 5-minute history within seconds of each other. Only successful responses are cached.
+const HISTORY_TTL_MS = 20_000;
+const historyGlobal = globalThis as typeof globalThis & { __tradepulseHistoryCache?: Map<string, { at: number; body: unknown }> };
+const historyCache = (historyGlobal.__tradepulseHistoryCache ??= new Map());
+
 export async function GET(request: Request) {
+  const key = new URL(request.url).search;
+  const cached = historyCache.get(key);
+  if (cached && Date.now() - cached.at < HISTORY_TTL_MS) return NextResponse.json(cached.body);
+  const response = await computeHistory(request);
+  if (response.status === 200) {
+    const body = await response.clone().json();
+    if (historyCache.size > 200) historyCache.clear();
+    historyCache.set(key, { at: Date.now(), body });
+  }
+  return response;
+}
+
+async function computeHistory(request: Request) {
   const url = new URL(request.url);
   const symbol = (url.searchParams.get("symbol") ?? "NIFTY").toUpperCase();
   const timeframe = url.searchParams.get("timeframe") ?? "5m";
   const period = (url.searchParams.get("period") ?? "day") as HistoryPeriod;
-  const selectedDate = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
+  const selectedDate = url.searchParams.get("date") ?? new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
   const provider = url.searchParams.get("provider") ?? process.env.MARKET_DATA_PROVIDER ?? "groww";
   const validEquitySymbol = /^[A-Z][A-Z0-9.&_-]{0,29}$/.test(symbol);
   if (!validEquitySymbol || !intervals[timeframe] || !periods.includes(period)) return NextResponse.json({ error: "Unsupported symbol, timeframe, or period" }, { status: 400 });

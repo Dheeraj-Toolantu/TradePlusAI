@@ -225,6 +225,31 @@ class MarketIntelEngineTests(unittest.TestCase):
         result = analyze_market({"symbol": "NIFTY", "candles": trending_candles(1)[:5], "spot": 25000})
         self.assertFalse(result["available"])
 
+    def test_higher_timeframe_and_confirmation_candle_are_evaluated(self):
+        result = analyze_market(self.payload(1))
+        factors = {factor["key"]: factor for factor in result["verdict"]["factors"]}
+        self.assertEqual(factors["trend_15m"]["signal"], "BULLISH")
+        self.assertAlmostEqual(sum(factor["max"] for factor in factors.values() if factor["key"] != "sentiment"), 9.5)
+        keys = [item["key"] for item in result["trade_plan"]["checklist"]]
+        self.assertIn("candle", keys)
+        self.assertIn("events", keys)
+
+    def test_sentiment_is_a_light_factor_and_events_block_the_plan(self):
+        payload = self.payload(1)
+        payload["sentiment"] = {"india_score": 38, "india_label": "BULLISH", "retail_score": 45, "news_score": 30, "event_risk": ["RBI policy"], "contrarian_note": None}
+        result = analyze_market(payload)
+        factor = next(f for f in result["verdict"]["factors"] if f["key"] == "sentiment")
+        self.assertEqual((factor["points"], factor["max"]), (0.5, 0.5))
+        events = next(item for item in result["trade_plan"]["checklist"] if item["key"] == "events")
+        self.assertFalse(events["passed"])
+        self.assertNotEqual(result["trade_plan"]["status"], "READY")
+
+    def test_euphoric_crowd_scores_zero(self):
+        payload = self.payload(1)
+        payload["sentiment"] = {"india_score": 70, "india_label": "VERY_BULLISH", "retail_score": 80, "news_score": 40, "event_risk": [], "contrarian_note": "Retail crowd is euphoric."}
+        factor = next(f for f in analyze_market(payload)["verdict"]["factors"] if f["key"] == "sentiment")
+        self.assertEqual(factor["points"], 0.0)
+
     def test_cli_emits_strict_json(self):
         root = Path(__file__).resolve().parents[1]
         completed = subprocess.run([sys.executable, "-m", "tradepulse_quant.market_intel.engine"], input=json.dumps(self.payload(1)), capture_output=True, text=True, cwd=root, env={"PYTHONPATH": str(root / "src")}, check=True)

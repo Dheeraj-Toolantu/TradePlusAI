@@ -48,7 +48,16 @@ export type OrderRecord = {
   realizedPnl?: number;
   realizedPnlPercent?: number;
   brokerOrderId?: string;
+  referenceId?: string;
+  exchange?: string;
+  underlying?: string;
+  initialStopLoss?: number;
+  charges?: number;
+  exitError?: string;
+  reconcileWarning?: string;
   brokerStopOrderId?: string;
+  stopReferenceId?: string;
+  brokerStopTrigger?: number;
   brokerExitOrderId?: string;
 };
 

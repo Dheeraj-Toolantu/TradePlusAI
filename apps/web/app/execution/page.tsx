@@ -1,848 +1,546 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MarketIntelPanel, type TradePlan } from "../../components/market-intel/market-intel-panel";
-import { formatConfidenceText, formatExpectedMoveText, formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
+import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
+import type { TradePlan } from "../../components/market-intel/market-intel-panel";
+import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 
-type Option = { symbol: string; growwSymbol: string; type?: string; expiry?: string; strike?: number; lotSize?: number; tickSize?: number; freezeQuantity?: number; active?: boolean };
+// Heavy, below-the-fold or on-demand panels load in their own chunks so the first paint only
+// needs the header and the trade desk shell.
+const MarketIntelPanel = dynamic(() => import("../../components/market-intel/market-intel-panel").then((module) => module.MarketIntelPanel), { ssr: false, loading: () => <div className="algo-empty">Loading trade desk…</div> });
+const SentimentPanel = dynamic(() => import("../../components/market-intel/sentiment-panel").then((module) => module.SentimentPanel), { ssr: false });
+const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitoring-panel").then((module) => module.AIMonitoringPanel), { ssr: false });
+const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
+
 type PipelineGate = { code: string; passed: boolean; detail: string };
-type Pipeline = { decision: string; reasons: string[]; gates: PipelineGate[] };
-type Analysis = { decision: string; reason?: string; setup?: { side: string; entry: number; stop_loss: number; target: number; target_method?: string; stop_method?: string }; indicators?: { vwap: number }; levels?: { support: number; resistance: number }; calculations?: { underlying?: Record<string, number | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null> }; session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean }; pipeline?: Pipeline };
+type Analysis = {
+  decision: string; reason?: string;
+  setup?: { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string };
+  calculations?: { underlying?: Record<string, number | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string };
+  session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean };
+  pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
+};
 type Order = {
-  id: string;
-  symbol: string;
-  growwSymbol?: string;
-  strategy?: string;
-  strategyName?: string;
-  side: string;
-  quantity: number;
-  lotSize?: number;
-  price: number;
-  status: string;
-  mode?: string;
-  target?: number;
-  stopLoss?: number;
-  highWaterMark?: number;
-  trailingStop?: number;
-  trailingDistance?: number;
-  trailingActivatedAt?: string;
-  currentPrice?: number;
-  pnl?: number;
-  pnlPercent?: number;
-  quoteSource?: string;
-  createdAt: string;
-  updatedAt?: string;
-  exitPrice?: number;
-  exitAt?: string;
-  exitReason?: string;
-  realizedPnl?: number;
-  realizedPnlPercent?: number;
+  id: string; symbol: string; strategy?: string; strategyName?: string; side: string; quantity: number; lotSize?: number; price: number; status: string; mode?: string;
+  target?: number; stopLoss?: number; trailingStop?: number; trailingActivatedAt?: string; currentPrice?: number; pnl?: number; pnlPercent?: number; quoteSource?: string;
+  createdAt: string; exitPrice?: number; exitReason?: string; realizedPnl?: number; realizedPnlPercent?: number; exitError?: string; reconcileWarning?: string;
 };
-type QuoteUpdate = { symbol: string; price: number | null; timestamp: string; source: string };
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
-type OptionCandidate = {
-  symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; score: number; riskReward: number; lotSize?: number; tickSize?: number; freezeQuantity?: number; active?: boolean; reason: string;
-  direction?: string; directional_score?: number; trend_score?: number; delta_score?: number; iv_score?: number; oi_score?: number; liquidity_score?: number; risk_reward_score?: number; final_score?: number; confidence?: number; decision?: string; feasibility?: { expected_move_points?: number; required_move?: number; breakeven?: number; expected_range?: { lower?: number; upper?: number }; breakeven_feasibility?: string; target_feasibility?: string }; pipeline?: { score_breakdown?: Record<string, number>; warnings?: string[] }; warnings?: string[]; target?: number; stop?: number;
-};
+type QuoteUpdate = { symbol: string; price: number | null; timestamp: string; source: string };
+type OptionCandidate = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; score: number; riskReward: number; lotSize?: number; tickSize?: number; freezeQuantity?: number };
+type Contract = { symbol: string; growwSymbol: string; type: "CE" | "PE"; expiry?: string; strike?: number; lotSize: number; tickSize?: number; freezeQuantity?: number; active?: boolean };
+type SearchResult = Contract & { exchange?: string };
 type StrategyId = "ORB_RETEST" | "VWAP_REVERSAL" | "RANGE_DEFINED_RISK";
-type StrategyDefinition = { id: StrategyId; name: string; shortName: string; description: string; minimumScore: number; minimumRiskReward: number; directional: boolean };
-type OrderTab = "OPEN" | "POSITIONS" | "HISTORY" | "LOGS";
-type AlgoLog = { time: string; text: string; type: "entry" | "exit" | "sync" | "info" };
-const money = (value: number) => value.toLocaleString("en-IN", { maximumFractionDigits: 2 });
-const calculationValue = (value: number | string | null | undefined, percent = false) => formatMarketCalculationValue(value, { percent });
-const normalizeSymbolKey = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-const isLiveQuoteSource = (source: string | undefined | null) => {
-  const candidate = String(source ?? "").trim();
-  if (!candidate) return true;
-  const lowered = candidate.toLowerCase();
-  if (lowered.includes("unavailable") || lowered.includes("entry price") || lowered.includes("not available") || lowered.includes("failed")) return false;
-  return lowered.includes("groww") && (lowered.includes("quote") || lowered.includes("live") || lowered.includes("real") || lowered.includes("ltp"));
-};
-const hasLiveQuote = (order: Pick<Order, "currentPrice" | "price" | "pnl" | "pnlPercent" | "quoteSource">) => {
-  const currentPrice = Number(order.currentPrice ?? order.price ?? NaN);
-  const pnl = Number(order.pnl ?? NaN);
-  const pnlPercent = Number(order.pnlPercent ?? NaN);
-  if (!Number.isFinite(currentPrice) || currentPrice <= 0) return false;
-  if (!Number.isFinite(pnl) && !Number.isFinite(pnlPercent)) return false;
-  return isLiveQuoteSource(order.quoteSource);
-};
-// Live ticks only move the last price. VWAP, EMAs, score and option evidence stay exactly as
-// the backend V5 engine computed them: recomputing them client-side from a rolling window
-// (the previous behaviour) silently replaced the session VWAP and the spec score.
-const liveAnalysis = (current: Analysis | null, candles: Candle[]): Analysis | null => {
-  if (!current || !candles.length) return current;
-  return { ...current, calculations: { ...current.calculations, underlying: { ...(current.calculations?.underlying ?? {}), last_price: candles.at(-1)!.close } } };
-};
-// Fallback lot sizes (NSE/BSE revision effective Jan 2026) used only if the live contract
-// master is unavailable; the Groww instrument metadata always wins.
-const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
-const fallbackLot = (underlying: string) => FALLBACK_LOT[underlying] ?? 1;
-const istDate = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
-const strategies: StrategyDefinition[] = [
-  { id: "ORB_RETEST", name: "ORB + Retest", shortName: "Primary", description: "15m opening range breakout, 5m retest hold, VWAP and OI confirmation.", minimumScore: 8, minimumRiskReward: 2, directional: true },
-  { id: "VWAP_REVERSAL", name: "VWAP Reversal", shortName: "Secondary", description: "Support or resistance rejection followed by a confirmed VWAP reclaim.", minimumScore: 8, minimumRiskReward: 2, directional: true },
-  { id: "RANGE_DEFINED_RISK", name: "Range Defined Risk", shortName: "Range", description: "Defined-risk range setup for intact, non-trending sessions. No naked option selling.", minimumScore: 8, minimumRiskReward: 2, directional: false },
+type LiveStatus = { enabled: boolean; disabledReasons: string[]; limits?: { maxDailyLoss: number; maxTradesPerDay: number; maxLotsPerOrder: number; maxOrderValue: number; maxOpenPositions: number; minRewardRisk: number }; today?: { tradesToday: number; realizedPnl: number; openRisk: number; lossBudgetLeft: number }; positions: Order[]; monitor?: { running: boolean; lastTickAt: string | null; lastError: string | null } };
+type Tab = "LIVE" | "PAPER" | "HISTORY" | "LOGS";
+type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
+
+const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
+const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
+const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
+const STRATEGIES: Array<{ id: StrategyId; name: string; description: string }> = [
+  { id: "ORB_RETEST", name: "ORB + Retest", description: "15-minute opening range breakout, retest hold within 3 candles, structural stop, 2R target." },
+  { id: "VWAP_REVERSAL", name: "VWAP Reversal", description: "Rejection at support/resistance with a higher low / lower high, then a confirmed VWAP reclaim." },
+  { id: "RANGE_DEFINED_RISK", name: "Range (analysis only)", description: "Defined-risk range regime detection. Multi-leg execution is not enabled; no naked selling." },
 ];
+const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
+const calc = (value: unknown, percent = false) => formatMarketCalculationValue(value as number | string | null | undefined, { percent });
+const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+const istDate = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
+const nowLabel = () => new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
 
 export default function ExecutionPage() {
-  const [symbol, setSymbol] = useState("NIFTY");
-  const provider = "groww";
+  const [symbol, setSymbol] = useState<string>("NIFTY");
   const [strategyId, setStrategyId] = useState<StrategyId>("ORB_RETEST");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
-  const [orders, setOrders] = useState<Order[]>([]);
-  const [query, setQuery] = useState("NIFTY");
-  const [options, setOptions] = useState<Option[]>([]);
-  const [selected, setSelected] = useState<Option | null>(null);
-  const [quantity, setQuantity] = useState(FALLBACK_LOT.NIFTY);
+  const [paperOrders, setPaperOrders] = useState<Order[]>([]);
+  const [history, setHistory] = useState<Order[]>([]);
+  const [account, setAccount] = useState<{ available: number | null; source: string } | null>(null);
+  const [safety, setSafety] = useState({ safeMode: false, killSwitch: false, reason: "" });
+  const [message, setMessage] = useState("Paper mode is the default. Live orders need server enablement and a PIN-confirmed preview.");
   const [busy, setBusy] = useState(false);
-  const [takeProfit, setTakeProfit] = useState("");
+  const [clock, setClock] = useState("");
+  const [quotes, setQuotes] = useState<Record<string, number>>({});
+  const [streamStatus, setStreamStatus] = useState("connecting");
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [chain, setChain] = useState<OptionCandidate[]>([]);
+  const [chainStatus, setChainStatus] = useState("Loading option chain…");
+  const candlesRef = useRef<Candle[]>([]);
+  const chainRef = useRef<OptionCandidate[]>([]);
+  const mutationVersion = useRef(0);
+
+  const [contract, setContract] = useState<Contract | null>(null);
+  const [lots, setLots] = useState(1);
   const [stopLoss, setStopLoss] = useState("");
-  const [triggerMode, setTriggerMode] = useState<"AUTO" | "MANUAL">("AUTO");
+  const [target, setTarget] = useState("");
+  const [ticketSource, setTicketSource] = useState("MANUAL");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
-  const [searched, setSearched] = useState(false);
-  const [streamStatus, setStreamStatus] = useState("Connecting to live quotes...");
-  const [message, setMessage] = useState("Paper mode is active. No live orders are sent.");
-  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
-  const [marketCandles, setMarketCandles] = useState<Candle[]>([]);
-  const [optionCandidates, setOptionCandidates] = useState<OptionCandidate[]>([]);
-  const [marketQuotes, setMarketQuotes] = useState<Record<string, number>>({});
-  const [account, setAccount] = useState<{ available: number | null; used: number | null; total: number | null; source: string } | null>(null);
-  const [chainStatus, setChainStatus] = useState("Loading market data...");
-  const [executionMode, setExecutionMode] = useState("PAPER");
-  const [liveExecution, setLiveExecution] = useState(false);
-  const [safeMode, setSafeMode] = useState<{ active: boolean; reason: string | null }>({ active: false, reason: null });
-  const [killSwitch, setKillSwitch] = useState<{ active: boolean; reason: string | null }>({ active: false, reason: null });
-  const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
+
+  const [live, setLive] = useState<LiveStatus | null>(null);
+  const [liveDraft, setLiveDraft] = useState<LiveTicketDraft | null>(null);
+  const [livePin, setLivePin] = useState("");
+
+  const [autoEnabled, setAutoEnabled] = useState(false);
   const [autoMaxTrades, setAutoMaxTrades] = useState(3);
-  const [autoMinimumLoss, setAutoMinimumLoss] = useState(2500);
-  const [autoMinimumProfit, setAutoMinimumProfit] = useState(1000);
-  const [autoTradeStatus, setAutoTradeStatus] = useState<{ tradesTaken: number; limitHit: boolean; summary: string; diagnostics?: string[]; suggestions: Array<{ symbol: string; contract: string; entry: number; stopLoss: number; target: number; score: number }> }>({ tradesTaken: 0, limitHit: false, summary: "Auto engine is disabled", suggestions: [] });
-  const autoScanBusy = useRef(false);
-  const autoScanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const marketCandlesRef = useRef<Candle[]>([]);
-  const optionCandidatesRef = useRef<OptionCandidate[]>([]);
-  const [istClock, setIstClock] = useState("");
-  const selectedStrategy = useMemo(
-    () => strategies.find((strategy) => strategy.id === strategyId) ?? strategies[0],
-    [strategyId],
-  );
+  const [autoMinLoss, setAutoMinLoss] = useState(2500);
+  const [autoMinProfit, setAutoMinProfit] = useState(1000);
+  const [autoStatus, setAutoStatus] = useState<{ tradesTaken: number; limitHit: boolean; summary: string; diagnostics?: string[] }>({ tradesTaken: 0, limitHit: false, summary: "Auto engine is off" });
+  const autoBusy = useRef(false);
+  const autoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [orderTab, setOrderTab] = useState<OrderTab>("OPEN");
-  const [orderHistory, setOrderHistory] = useState<Order[]>([]);
-  const [firestoreSynced, setFirestoreSynced] = useState(true);
-  const orderMutationVersion = useRef(0);
-  const [algoLogs, setAlgoLogs] = useState<AlgoLog[]>([
-    { time: new Date().toLocaleTimeString("en-IN"), text: "System initialized. Connected to Cloud Firestore 'orders' collection.", type: "sync" },
-  ]);
+  const [tab, setTab] = useState<Tab>("PAPER");
+  const [logs, setLogs] = useState<Log[]>([]);
+  const log = useCallback((text: string, type: Log["type"] = "info") => setLogs((current) => [{ time: nowLabel(), text, type }, ...current].slice(0, 200)), []);
 
+  const strategy = STRATEGIES.find((item) => item.id === strategyId) ?? STRATEGIES[0];
+  const lotSize = contract?.lotSize ?? FALLBACK_LOT[symbol] ?? 1;
+  const spot = candles.at(-1)?.close ?? quotes[symbol] ?? 0;
+
+  // ---- data loading -------------------------------------------------------------------
   const refresh = useCallback(async () => {
     setBusy(true);
-    const refreshMutationVersion = orderMutationVersion.current;
+    const version = mutationVersion.current;
     try {
-      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=${provider}&strategy=${strategyId}`, { cache: "no-store" }).then((response) => response.json());
+      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategyId}`, { cache: "no-store" }).then((response) => response.json());
       setAnalysis(data.analysis ?? null);
       setAccount(data.account ?? null);
-      if (refreshMutationVersion === orderMutationVersion.current) {
-        setOrders(data.orders ?? []);
-        setOrderHistory(data.history ?? []);
+      setSafety({ safeMode: Boolean(data.safeMode), killSwitch: Boolean(data.killSwitch), reason: data.killSwitchReason ?? data.safeModeReason ?? "" });
+      if (version === mutationVersion.current) {
+        setPaperOrders((data.orders ?? []).filter((order: Order) => order.mode !== "ALGO_LIVE"));
+        setHistory(data.history ?? []);
       }
-      setFirestoreSynced(Boolean(data.firestoreConnected));
-      setExecutionMode(String(data.mode ?? "PAPER"));
-      setLiveExecution(Boolean(data.liveExecution));
-      setSafeMode({ active: Boolean(data.safeMode), reason: data.safeModeReason ?? null });
-      setKillSwitch({ active: Boolean(data.killSwitch), reason: data.killSwitchReason ?? null });
-      if (data.broker?.connected === true) setStreamStatus("Groww REST market data connected");
-      else setStreamStatus("Groww market data unavailable");
-      if (data.orders?.length && !selectedOrderId) setSelectedOrderId(data.orders[0].id);
-      if (data.analysis?.setup) { setTakeProfit(String(data.analysis.setup.target)); setStopLoss(String(data.analysis.setup.stop_loss)); }
-      setMessage(data.error ?? "Deterministic engine updated");
-    } catch { setMessage("Algo engine unavailable"); }
+      if (data.error) setMessage(data.error);
+    } catch { setMessage("Strategy engine unavailable; retrying on the next refresh."); }
     finally { setBusy(false); }
-  }, [provider, selectedOrderId, strategyId, symbol]);
+  }, [strategyId, symbol]);
 
-  const runAutoOptionScan = useCallback(async (candleSnapshot = marketCandlesRef.current, candidateSnapshot = optionCandidatesRef.current) => {
-    if (autoScanBusy.current || !autoTradeEnabled || !candleSnapshot.length || !candidateSnapshot.length) return;
-    if (analysis?.session && (!analysis.session.market_open || !analysis.session.entry_permitted)) {
-      setAutoTradeStatus((current) => ({ ...current, summary: "Auto scan waiting for the permitted market entry window" }));
-      return;
-    }
-    autoScanBusy.current = true;
-    try {
-      const response = await fetch("/api/auto-option-trading", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          symbol,
-          maxTrades: autoMaxTrades,
-          minimumLoss: autoMinimumLoss,
-          minimumProfit: autoMinimumProfit,
-          spot: candleSnapshot.at(-1)?.close ?? 0,
-          candles: candleSnapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })),
-          contracts: candidateSnapshot,
-        }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) { setAutoTradeStatus((current) => ({ ...current, summary: data.error ?? "Auto scan blocked" })); return; }
-      setAutoTradeStatus({ tradesTaken: data.tradesTaken ?? 0, limitHit: Boolean(data.limitHit), summary: data.summary ?? "Auto engine scanned the market", diagnostics: data.diagnostics ?? [], suggestions: data.suggestions ?? [] });
-      if (Array.isArray(data.orders) && data.orders.length) {
-        const activeOrders = data.orders.filter((order: Order) => ["OPEN", "FILLED"].includes(order.status));
-        setOrders((current) => [...activeOrders, ...current.filter((order) => !data.orders.some((next: Order) => next.id === order.id))]);
-        setOrderHistory((current) => [...data.orders, ...current.filter((order) => !data.orders.some((next: Order) => next.id === order.id))]);
-      }
-      setAlgoLogs((current) => [{ time: new Date().toLocaleTimeString("en-IN"), text: `[Auto option engine] ${data.summary ?? "Market scanned"}`, type: data.limitHit ? "info" : "entry" }, ...current]);
-    } catch { setAutoTradeStatus((current) => ({ ...current, summary: "Auto scan unavailable; market data is being retried" })); }
-    finally { autoScanBusy.current = false; }
-  }, [analysis?.session, autoMaxTrades, autoMinimumLoss, autoMinimumProfit, autoTradeEnabled, symbol]);
+  const refreshLive = useCallback(async () => {
+    try { setLive(await fetch("/api/live-orders", { cache: "no-store" }).then((response) => response.json())); } catch { /* status is advisory */ }
+  }, []);
 
-  const scheduleAutoOptionScan = useCallback((candleSnapshot = marketCandlesRef.current, candidateSnapshot = optionCandidatesRef.current) => {
-    if (!autoTradeEnabled) return;
-    if (autoScanTimer.current) clearTimeout(autoScanTimer.current);
-    autoScanTimer.current = setTimeout(() => {
-      autoScanTimer.current = null;
-      void runAutoOptionScan(candleSnapshot, candidateSnapshot);
-    }, 250);
-  }, [autoTradeEnabled, runAutoOptionScan]);
-
-  const searchOptions = useCallback(async () => {
-    const search = query.trim().toUpperCase();
-    setSearched(true);
-    if (search.length < 2) { setOptions([]); return; }
-    setSearching(true);
-    try {
-      const data = await fetch(`/api/groww-instruments?q=${encodeURIComponent(search)}`, { cache: "no-store" }).then((response) => response.json());
-      setOptions(Array.isArray(data.instruments) ? data.instruments : []);
-    } catch { setOptions([]); }
-    finally { setSearching(false); }
-  }, [query]);
-
-  async function placePaperOrder() {
-    let targetContract = selected;
-    if (!targetContract) {
-      const candidateMatch = optionCandidates.find((c) => c.symbol.toUpperCase() === query.trim().toUpperCase());
-      const optionMatch = options.find((o) => o.symbol.toUpperCase() === query.trim().toUpperCase());
-      if (optionMatch) {
-        targetContract = {
-          symbol: optionMatch.symbol,
-          growwSymbol: optionMatch.growwSymbol,
-          type: optionMatch.type,
-          expiry: optionMatch.expiry,
-          strike: optionMatch.strike,
-          lotSize: optionMatch.lotSize,
-        };
-        setSelected(targetContract);
-      } else if (candidateMatch) {
-        targetContract = {
-          symbol: candidateMatch.symbol,
-          growwSymbol: candidateMatch.symbol,
-          type: candidateMatch.contract === "CALL" ? "CE" : "PE",
-          expiry: candidateMatch.expiry,
-          strike: candidateMatch.strike,
-          lotSize: candidateMatch.lotSize,
-        };
-        setSelected(targetContract);
-      } else if (suggestedOption) {
-        targetContract = {
-          symbol: suggestedOption.symbol,
-          growwSymbol: suggestedOption.symbol,
-          type: suggestedOption.contract === "CALL" ? "CE" : "PE",
-          expiry: suggestedOption.expiry,
-          strike: suggestedOption.strike,
-          lotSize: suggestedOption.lotSize,
-        };
-        setSelected(targetContract);
-      } else if (chainRows.length > 0) {
-        const topRow = chainRows[0];
-        targetContract = {
-          symbol: topRow.symbol,
-          growwSymbol: topRow.symbol,
-          type: topRow.contract === "CALL" ? "CE" : "PE",
-          expiry: topRow.expiry,
-          strike: topRow.strike,
-          lotSize: topRow.lotSize,
-        };
-        setSelected(targetContract);
-      }
-    }
-    if (!targetContract) {
-      setMessage("⚠️ Please search and select an option contract or click 'Use suggestion' first.");
-      return;
-    }
-
-    if (!targetContract.tickSize || !targetContract.freezeQuantity || targetContract.active === undefined) {
-      try {
-        const metadata = await fetch(`/api/groww-instruments?q=${encodeURIComponent(targetContract.symbol)}`, { cache: "no-store" }).then((response) => response.json());
-        const exact = (metadata.instruments ?? []).find((instrument: Option) => instrument.symbol === targetContract?.symbol);
-        if (exact) {
-          targetContract = { ...targetContract, ...exact };
-          setSelected(targetContract);
-        }
-      } catch { /* The API below returns a precise metadata error if enrichment fails. */ }
-    }
-    
-    const lot = targetContract.lotSize;
-    if (!lot || lot <= 0) {
-      setMessage("Entry blocked: live contract metadata did not provide a valid lot size.");
-      return;
-    }
-    const orderQty = quantity % lot === 0 && quantity > 0 ? quantity : Math.max(lot, Math.round(quantity / lot) * lot);
-    if (orderQty !== quantity) {
-      setQuantity(orderQty);
-    }
-    if (!selectedStrategy.directional) { setMessage("Range Defined Risk is analysis-only until its multi-leg contract builder is enabled. No naked option selling is permitted."); return; }
-    
-    if (analysis?.decision !== "CONFIRMED") {
-      setAlgoLogs((prev) => [{ time: new Date().toLocaleTimeString("en-IN"), text: "Manual entry: the V5 algo pipeline is not CONFIRMED; placing a user-authorized manual paper order (kill-switch, SAFE MODE, broker, contract-master, and 2R risk checks still apply).", type: "info" }, ...prev]);
-    }
-    
-    const candidateMatch = optionCandidates.find((c) => c.symbol === targetContract.symbol);
-    const optionPrice = candidateMatch?.premium && candidateMatch.premium > 0 ? candidateMatch.premium : targetContract.strike ? 120 : (analysis?.setup?.entry ?? liveSpotPrice);
-    const orderPrice = Number.isFinite(optionPrice) && optionPrice > 0 ? optionPrice : (analysis?.setup?.entry ?? liveSpotPrice);
-    
-    const target = Number(takeProfit || (orderPrice > 0 ? orderPrice * 1.3 : 150));
-    const stop = Number(stopLoss || (orderPrice > 0 ? Math.max(orderPrice * 0.85, 0.05) : 80));
-    
-    if (!Number.isFinite(target) || target <= 0 || !Number.isFinite(stop) || stop <= 0) {
-      setMessage("Enter positive Take Profit and Stop Loss values.");
-      return;
-    }
-
-    setBusy(true);
-    try {
-      const response = await fetch("/api/algo-trading", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "PAPER",
-          orderSource: "MANUAL",
-          strategy: selectedStrategy.id,
-          strategyName: selectedStrategy.name,
-          underlying: symbol,
-          symbol: targetContract.symbol,
-          side: "BUY",
-          quantity: orderQty,
-          price: orderPrice,
-          target,
-          stopLoss: stop,
-          lotSize: lot,
-          expiry: targetContract.expiry,
-          growwSymbol: targetContract.growwSymbol,
-          optionType: targetContract.type,
-          strike: targetContract.strike,
-          tickSize: targetContract.tickSize,
-          freezeQuantity: targetContract.freezeQuantity,
-          contractActive: targetContract.active,
-          analysisDecision: analysis?.decision
-        })
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok || !data.order) { setMessage(data.error ?? "Paper order could not be placed."); return; }
-      orderMutationVersion.current += 1;
-      setOrders((current) => [data.order as Order, ...current]);
-      setOrderHistory((current) => [data.order as Order, ...current.filter((o) => o.id !== data.order.id)]);
-      setSelectedOrderId(data.order.id);
-      setAlgoLogs((prev) => [
-        {
-          time: new Date().toLocaleTimeString("en-IN"),
-          text: `[Firestore Saved] Order placed: ${data.order.symbol} (${selectedStrategy.name}) @ ₹${orderPrice} Qty: ${orderQty}`,
-          type: "entry",
-        },
-        ...prev,
-      ]);
-      setMessage(`Paper order placed & saved to Firestore: ${data.order.symbol} @ ₹${orderPrice} (Qty: ${orderQty})`);
-    } catch { setMessage("Paper order request failed. Check that the API is running."); }
-    finally { setBusy(false); }
-  }
-
-  async function exitPaperOrder(order: Order) {
-    setBusy(true);
-    try {
-      const response = await fetch(`/api/algo-trading?id=${encodeURIComponent(order.id)}`, { method: "DELETE" });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) { setMessage(data.error ?? "Trade could not be exited."); return; }
-      orderMutationVersion.current += 1;
-      setOrders((current) => current.filter((item) => item.id !== order.id));
-      if (data.order) {
-        setOrderHistory((current) => [data.order as Order, ...current.filter((o) => o.id !== order.id)]);
-      }
-      if (selectedOrderId === order.id) setSelectedOrderId(null);
-      setAlgoLogs((prev) => [
-        {
-          time: new Date().toLocaleTimeString("en-IN"),
-          text: `[Firestore Updated] Exited ${order.symbol} (P&L: ₹${data.order?.realizedPnl ?? order.pnl ?? 0})`,
-          type: "exit",
-        },
-        ...prev,
-      ]);
-      setMessage(`Paper trade exited & recorded in Firestore: ${order.symbol}`);
-    } catch { setMessage("Exit request failed. Check that the API is running."); }
-    finally { setBusy(false); }
-  }
-
-  useEffect(() => { refresh(); }, [symbol, strategyId]);
+  useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
-    if (!orders.length) return;
-
-    const pendingExit = orders.find((order) => {
-      if (!order || !["OPEN", "FILLED"].includes(order.status)) return false;
-      if (!order.symbol || !order.price || !order.stopLoss) return false;
-      const matchingContract = optionCandidates.find((candidate) => normalizeSymbolKey(candidate.symbol) === normalizeSymbolKey(order.symbol));
-      const premium = matchingContract?.premium ?? Number(order.currentPrice ?? order.price ?? 0);
-      const exitState = getOrderExitState(order, premium);
-      return exitState.hitStop || exitState.hitTarget;
-    });
-
-    if (!pendingExit) return;
-
-    void exitPaperOrder(pendingExit);
-  }, [optionCandidates, orders]);
+    void refreshLive();
+    const timer = setInterval(() => { if (document.visibilityState === "visible") void refreshLive(); }, 10_000);
+    return () => clearInterval(timer);
+  }, [refreshLive]);
   useEffect(() => {
-    const update = () => setIstClock(new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false }));
+    const update = () => setClock(nowLabel());
     update();
     const timer = setInterval(update, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // One history request (cached server-side) + one chain request. The old page also called
+  // /api/options-engine, which always failed on Groww chains (no bid/ask) before falling back.
   useEffect(() => {
     let cancelled = false;
-    setChainStatus("Loading market data...");
+    setChainStatus("Loading option chain…");
     Promise.all([
-      fetch(`/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=5m&period=day&date=${istDate()}`, { cache: "no-store" }).then((response) => response.json()),
-      ["NIFTY", "BANKNIFTY", "SENSEX"].includes(symbol) ? fetch(`/api/options-engine?provider=${provider}&symbols=${symbol}`, { cache: "no-store" }).then((response) => response.json()) : Promise.resolve({ candidates: [], error: "Options are not available for this underlying." }),
-    ]).then(async ([history, chain]) => {
+      fetch(`/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=5m&period=day&date=${istDate()}`, { cache: "no-store" }).then((response) => response.json()).catch(() => ({})),
+      fetch(`/api/option-chain?symbol=${symbol}`, { cache: "no-store" }).then((response) => response.json()).catch(() => ({})),
+    ]).then(([historyBody, chainBody]) => {
       if (cancelled) return;
-      const historyCandles = Array.isArray(history.candles) ? history.candles : [];
-      marketCandlesRef.current = historyCandles;
-      setMarketCandles(historyCandles);
-      if (history.error) {
-        setChainStatus(`Groww market data unavailable · ${history.error}`);
-        setOptionCandidates([]);
-        return;
-      }
-      let candidates = Array.isArray(chain.candidates) ? chain.candidates : [];
-      const rawChainError = typeof chain.error === "string" ? chain.error : "";
-      let status = rawChainError && /429|rate limit|throttl|timeout|temporary|temporar|failed|unavailable/i.test(rawChainError)
-        ? "No actionable option candidates · market data is temporarily throttled"
-        : candidates.length ? `Live ${symbol} option chain` : "No actionable option candidates";
-      if (!candidates.length && ["NIFTY", "BANKNIFTY", "SENSEX"].includes(symbol)) {
-        const fallback = await fetch(`/api/option-chain?symbol=${symbol}`, { cache: "no-store" }).then((response) => response.json());
-        candidates = (fallback.contracts ?? []).map((contract: OptionCandidate) => ({ ...contract, reason: contract.reason ?? "Real-time option-chain evidence" }));
-        const rawFallbackError = typeof fallback.error === "string" ? fallback.error : "";
-        status = candidates.length ? `Live ${symbol} option chain · ${fallback.expiry}` : rawFallbackError && /429|rate limit|throttl|timeout|temporary|temporar|failed|unavailable/i.test(rawFallbackError)
-          ? "No actionable option candidates · market data is temporarily throttled"
-          : "No actionable option candidates";
-      }
-      optionCandidatesRef.current = candidates;
-      setOptionCandidates(candidates);
-      setChainStatus(status);
-    }).catch(() => { if (!cancelled) setChainStatus("Market data unavailable"); });
+      const nextCandles: Candle[] = Array.isArray(historyBody.candles) ? historyBody.candles : [];
+      candlesRef.current = nextCandles;
+      setCandles(nextCandles);
+      const contracts: OptionCandidate[] = Array.isArray(chainBody.contracts) ? chainBody.contracts : [];
+      chainRef.current = contracts;
+      setChain(contracts);
+      setChainStatus(contracts.length ? `Live ${symbol} chain · ${chainBody.expiry ?? ""}` : `Option chain unavailable${chainBody.error ? `: ${chainBody.error}` : ""}`);
+    });
     return () => { cancelled = true; };
-  }, [symbol, provider]);
-  useEffect(() => () => {
-    if (autoScanTimer.current) clearTimeout(autoScanTimer.current);
-  }, []);
-  const orderSymbols = useMemo(() => Array.from(new Set(orders.map((order) => normalizeSymbolKey(order.symbol)).filter(Boolean))).sort(), [orders]);
-  const chainSymbols = useMemo(() => Array.from(new Set(optionCandidates.map((candidate) => normalizeSymbolKey(candidate.symbol)).filter(Boolean))).sort(), [optionCandidates]);
+  }, [symbol]);
+
+  // ---- auto engine (paper only) -------------------------------------------------------
+  const runAutoScan = useCallback(async () => {
+    const snapshot = candlesRef.current;
+    const contracts = chainRef.current;
+    if (autoBusy.current || !autoEnabled || snapshot.length < 3 || !contracts.length) return;
+    if (analysis?.session && (!analysis.session.market_open || !analysis.session.entry_permitted)) { setAutoStatus((current) => ({ ...current, summary: "Waiting for the entry window (09:35-14:45 IST)" })); return; }
+    autoBusy.current = true;
+    try {
+      const response = await fetch("/api/auto-option-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol, maxTrades: autoMaxTrades, minimumLoss: autoMinLoss, minimumProfit: autoMinProfit, spot: snapshot.at(-1)?.close ?? 0, candles: snapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })), contracts }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) { setAutoStatus((current) => ({ ...current, summary: data.error ?? "Auto scan blocked" })); return; }
+      setAutoStatus({ tradesTaken: data.tradesTaken ?? 0, limitHit: Boolean(data.limitHit), summary: data.summary ?? "Scanned", diagnostics: data.diagnostics ?? [] });
+      if (Array.isArray(data.orders) && data.orders.length) {
+        const incoming = data.orders as Order[];
+        setPaperOrders((current) => [...incoming.filter((order) => ["OPEN", "FILLED"].includes(order.status)), ...current.filter((order) => !incoming.some((next) => next.id === order.id))]);
+        setHistory((current) => [...incoming, ...current.filter((order) => !incoming.some((next) => next.id === order.id))]);
+      }
+      log(`[Auto engine] ${data.summary ?? "Market scanned"}`, data.limitHit ? "info" : "entry");
+    } catch { setAutoStatus((current) => ({ ...current, summary: "Auto scan unavailable; retrying" })); }
+    finally { autoBusy.current = false; }
+  }, [analysis?.session, autoEnabled, autoMaxTrades, autoMinLoss, autoMinProfit, log, symbol]);
+
+  const scheduleAutoScan = useCallback(() => {
+    if (!autoEnabled) return;
+    if (autoTimer.current) clearTimeout(autoTimer.current);
+    autoTimer.current = setTimeout(() => { autoTimer.current = null; void runAutoScan(); }, 500);
+  }, [autoEnabled, runAutoScan]);
+  const scheduleRef = useRef(scheduleAutoScan);
+  scheduleRef.current = scheduleAutoScan;
+  useEffect(() => () => { if (autoTimer.current) clearTimeout(autoTimer.current); }, []);
+
+  // ---- live quotes: one socket per index, subscriptions updated in place ------------
+  const subscription = useMemo(() => ({
+    underlying: symbol,
+    marketSymbols: TICKER,
+    optionSymbols: Array.from(new Set(chain.map((item) => norm(item.symbol)))).sort(),
+    tradeSymbols: Array.from(new Set(paperOrders.map((order) => norm(order.symbol)))).sort(),
+  }), [chain, paperOrders, symbol]);
+  const socketRef = useRef<WebSocket | null>(null);
+  const subscriptionKey = JSON.stringify(subscription);
+  useEffect(() => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(subscriptionKey);
+  }, [subscriptionKey]);
+  const subscriptionRef = useRef(subscriptionKey);
+  subscriptionRef.current = subscriptionKey;
+
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(process.env.NEXT_PUBLIC_API_WS_URL ?? `${protocol}://${window.location.hostname}:4000/ws/quotes`);
-    socket.onopen = () => {
-      setStreamStatus("Live market and option data connected");
-      socket.send(JSON.stringify({
-        underlying: symbol,
-        marketSymbols: ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"],
-        optionSymbols: chainSymbols,
-        tradeSymbols: orderSymbols,
-      }));
-    };
+    socketRef.current = socket;
+    socket.onopen = () => { setStreamStatus("live"); socket.send(subscriptionRef.current); };
+    socket.onerror = () => setStreamStatus("unavailable");
+    socket.onclose = () => setStreamStatus("unavailable");
     socket.onmessage = (event) => {
-      const message = JSON.parse(event.data) as { type?: string; quote?: QuoteUpdate; quotes?: QuoteUpdate[] };
-      if (message.type === "markets" && Array.isArray(message.quotes)) {
-        const map: Record<string, number> = {};
-        for (const item of message.quotes) {
-          if (item.symbol && item.price !== null && item.price !== undefined) {
-            map[item.symbol] = item.price;
-          }
+      const payload = JSON.parse(event.data) as { type?: string; quote?: QuoteUpdate; quotes?: QuoteUpdate[] };
+      if (payload.type === "markets" && Array.isArray(payload.quotes)) {
+        const next: Record<string, number> = {};
+        for (const item of payload.quotes) if (item.symbol && item.price !== null) next[item.symbol] = item.price;
+        setQuotes((current) => ({ ...current, ...next }));
+        return;
+      }
+      if (payload.type === "market" && payload.quote?.price) {
+        const price = payload.quote.price;
+        setQuotes((current) => ({ ...current, [payload.quote!.symbol || symbol]: price }));
+        const bucket = Math.floor(Date.now() / 300_000) * 300;
+        const current = candlesRef.current;
+        const last = current.at(-1);
+        const next = !last ? [{ time: bucket, open: price, high: price, low: price, close: price, volume: 0 }]
+          : last.time >= bucket ? [...current.slice(0, -1), { ...last, high: Math.max(last.high, price), low: Math.min(last.low, price), close: price }]
+            : [...current.slice(-150), { time: bucket, open: last.close, high: Math.max(last.close, price), low: Math.min(last.close, price), close: price, volume: 0 }];
+        candlesRef.current = next;
+        setCandles(next);
+        scheduleRef.current();
+        return;
+      }
+      const updates = payload.quotes;
+      if ((payload.type === "chain" || payload.type === "quotes") && updates) {
+        const priceOf = (value: string) => updates.find((quote) => norm(quote.symbol) === norm(value))?.price;
+        const nextChain = chainRef.current.map((item) => { const price = priceOf(item.symbol); return price && price > 0 ? { ...item, premium: price, bid: price, ask: price } : item; });
+        chainRef.current = nextChain;
+        setChain(nextChain);
+        if (payload.type === "quotes") {
+          setPaperOrders((current) => current.map((order) => {
+            const price = priceOf(order.symbol);
+            if (!price) return order;
+            const pnl = (price - order.price) * order.quantity;
+            return { ...order, currentPrice: price, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
+          }));
         }
-        setMarketQuotes((current) => ({ ...current, ...map }));
+        scheduleRef.current();
       }
-      if (message.type === "market" && message.quote?.price !== null && message.quote?.price !== undefined) {
-        const price = message.quote.price;
-        const quoteSymbol = message.quote.symbol || symbol;
-        setMarketQuotes((current) => ({ ...current, [quoteSymbol]: price }));
-        let nextCandles: Candle[] = [];
-        setMarketCandles((current) => {
-          if (!current.length) return [{ time: Math.floor(Date.now() / 1000), open: price, high: price, low: price, close: price, volume: 0 }];
-          const last = current[current.length - 1];
-          const now = Math.floor(Date.now() / 300000) * 300;
-          if (last.time >= now) nextCandles = [...current.slice(0, -1), { ...last, high: Math.max(last.high, price), low: Math.min(last.low, price), close: price }];
-          else nextCandles = [...current.slice(-71), { time: now, open: last.close, high: Math.max(last.close, price), low: Math.min(last.close, price), close: price, volume: 0 }];
-          marketCandlesRef.current = nextCandles;
-          return nextCandles;
-        });
-        if (!nextCandles.length) nextCandles = [{ time: Math.floor(Date.now() / 1000), open: price, high: price, low: price, close: price, volume: 0 }];
-        marketCandlesRef.current = nextCandles;
-        setAnalysis((current) => liveAnalysis(current, nextCandles));
-        scheduleAutoOptionScan(nextCandles, optionCandidatesRef.current);
-        return;
-      }
-      if (message.type === "chain" && message.quotes) {
-        const nextCandidates = optionCandidatesRef.current.map((candidate) => { const update = message.quotes?.find((quote) => quote.symbol === candidate.symbol); return update?.price ? { ...candidate, premium: update.price, bid: update.price, ask: update.price } : candidate; });
-        optionCandidatesRef.current = nextCandidates;
-        setOptionCandidates(nextCandidates);
-
-        scheduleAutoOptionScan(marketCandlesRef.current, nextCandidates);
-        return;
-      }
-      if (message.type !== "quotes" || !message.quotes) return;
-      const refreshedCandidates = optionCandidatesRef.current.map((candidate) => {
-        const update = message.quotes?.find((quote) => normalizeSymbolKey(quote.symbol) === normalizeSymbolKey(candidate.symbol));
-        return update?.price && update.price > 0 ? { ...candidate, premium: update.price, bid: update.price, ask: update.price } : candidate;
-      });
-      optionCandidatesRef.current = refreshedCandidates;
-      setOptionCandidates(refreshedCandidates);
-
-      scheduleAutoOptionScan(marketCandlesRef.current, refreshedCandidates);
-      setOrders((current) => current.map((order) => {
-        const update = message.quotes?.find((quote) => normalizeSymbolKey(quote.symbol) === normalizeSymbolKey(order.symbol));
-        if (!update || update.price === null) return order;
-        const direction = order.side.toUpperCase() === "SELL" ? -1 : 1;
-        const pnl = (update.price - order.price) * order.quantity * direction;
-        return { ...order, currentPrice: update.price, pnl, pnlPercent: order.price ? (update.price - order.price) / order.price * 100 * direction : 0, quoteSource: update.source };
-      }));
     };
-    socket.onerror = () => setStreamStatus("Live stream unavailable; REST refresh remains active");
-    socket.onclose = () => setStreamStatus("Live stream unavailable; REST refresh remains active");
-    return () => socket.close();
-  }, [symbol, orderSymbols, chainSymbols, autoTradeEnabled]);
-  const liveSpotPrice = marketCandles.at(-1)?.close ?? marketQuotes[symbol] ?? 0;
-  const entry = analysis?.setup?.entry ?? liveSpotPrice;
-  const atr = Number(analysis?.calculations?.underlying?.atr14 ?? 0);
-  const target = analysis?.setup?.target ?? (entry > 0 ? entry + (atr > 0 ? atr * 2 : 20) : 0);
-  const stop = analysis?.setup?.stop_loss ?? (entry > 0 ? Math.max(entry - (atr > 0 ? atr : 10), 0.05) : 0);
-  const targetValue = takeProfit || (target > 0 ? String(target) : "");
-  const stopValue = stopLoss || (stop > 0 ? String(stop) : "");
-  const visibleOpenOrders = useMemo(() => {
-    const autoOrders = orders
-      .filter((order) => order.strategy === "AUTO_OPTION_ENGINE" && ["OPEN", "FILLED"].includes(order.status))
-      .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
-    const autoOrderIds = new Set(autoOrders.slice(0, autoMaxTrades).map((order) => order.id));
-    return orders.filter((order) => order.strategy !== "AUTO_OPTION_ENGINE" || autoOrderIds.has(order.id));
-  }, [autoMaxTrades, orders]);
-  const visibleHistory = useMemo(() => {
-    const visibleIds = new Set(visibleOpenOrders.map((order) => order.id));
-    return orderHistory.filter((order) => order.strategy !== "AUTO_OPTION_ENGINE" || order.status === "EXITED" || order.status === "CANCELLED" || order.status === "SIMULATED" || visibleIds.has(order.id));
-  }, [orderHistory, visibleOpenOrders]);
-  const totalPnl = useMemo(() => visibleOpenOrders.reduce((sum, order) => sum + (order.pnl ?? 0), 0), [visibleOpenOrders]);
-  const previewOrder = useMemo(() => orders.find((order) => order.id === selectedOrderId) ?? orders[0], [orders, selectedOrderId]);
-  const previewEntry = previewOrder?.price ?? entry;
-  const previewTarget = previewOrder?.target ?? target;
-  const previewStop = previewOrder?.stopLoss ?? stop;
-  const previewPrice = previewOrder?.currentPrice ?? (liveSpotPrice || previewEntry);
-  const previewRisk = Math.abs(previewEntry - previewStop);
-  const previewReward = Math.abs(previewTarget - previewEntry);
-  const riskReward = previewRisk > 0 ? previewReward / previewRisk : 0;
-  const previewCandles = useMemo(() => marketCandles.slice(-18), [marketCandles]);
-  const previewCandlePrices = useMemo(() => previewCandles.flatMap((c) => [c.low, c.high]), [previewCandles]);
-  const previewLow = useMemo(() => Math.min(...(previewCandlePrices.length ? previewCandlePrices : [previewEntry, previewTarget, previewStop, previewPrice].filter((v) => v > 0))), [previewCandlePrices, previewEntry, previewPrice, previewStop, previewTarget]);
-  const previewHigh = useMemo(() => Math.max(...(previewCandlePrices.length ? previewCandlePrices : [previewEntry, previewTarget, previewStop, previewPrice].filter((v) => v > 0))), [previewCandlePrices, previewEntry, previewPrice, previewStop, previewTarget]);
-  const previewRange = Math.max(previewHigh - previewLow, 0.01);
-  const chartY = (value: number) => `${((previewHigh - value) / previewRange) * 100}%`;
-  const overviewCandles = useMemo(() => marketCandles.slice(-36), [marketCandles]);
-  const overviewPrices = useMemo(() => overviewCandles.length ? overviewCandles.flatMap((candle) => [candle.low, candle.high]) : (entry > 0 ? [entry * 0.995, entry * 1.005] : [100, 105]), [overviewCandles, entry]);
-  const overviewLow = useMemo(() => Math.min(...overviewPrices), [overviewPrices]);
-  const overviewHigh = useMemo(() => Math.max(...overviewPrices), [overviewPrices]);
-  const overviewRange = Math.max(overviewHigh - overviewLow, 0.01);
-  const underlyingCalculations = analysis?.calculations?.underlying;
-  const marketBias = useMemo(() => analysis?.setup?.side?.toUpperCase().includes("SHORT") || (
-    underlyingCalculations?.ema20 !== null && underlyingCalculations?.ema20 !== undefined &&
-    underlyingCalculations?.ema50 !== null && underlyingCalculations?.ema50 !== undefined &&
-    underlyingCalculations?.vwap !== null && underlyingCalculations?.vwap !== undefined &&
-    underlyingCalculations?.last_price !== null && underlyingCalculations?.last_price !== undefined &&
-    Number(underlyingCalculations.ema20) < Number(underlyingCalculations.ema50) && Number(underlyingCalculations.last_price) < Number(underlyingCalculations.vwap)
-  ) ? "PUT" : analysis?.setup?.side?.toUpperCase().includes("LONG") || (
-    underlyingCalculations?.ema20 !== null && underlyingCalculations?.ema20 !== undefined &&
-    underlyingCalculations?.ema50 !== null && underlyingCalculations?.ema50 !== undefined &&
-    underlyingCalculations?.vwap !== null && underlyingCalculations?.vwap !== undefined &&
-    underlyingCalculations?.last_price !== null && underlyingCalculations?.last_price !== undefined &&
-    Number(underlyingCalculations.ema20) > Number(underlyingCalculations.ema50) && Number(underlyingCalculations.last_price) > Number(underlyingCalculations.vwap)
-  ) ? "CALL" : undefined, [analysis, underlyingCalculations]);
-  const biasCandidates = useMemo(() => marketBias ? optionCandidates.filter((candidate) => candidate.contract === marketBias) : optionCandidates, [marketBias, optionCandidates]);
-  const suggestedOption = useMemo(() => (biasCandidates.length ? biasCandidates : optionCandidates).slice().sort((left, right) => (right.final_score ?? right.score) - (left.final_score ?? left.score))[0], [biasCandidates, optionCandidates]);
-  const alternativeCandidates = useMemo(() => optionCandidates.slice().sort((left, right) => (right.final_score ?? right.score) - (left.final_score ?? left.score)).slice(1, 4), [optionCandidates]);
-  const chainRows = useMemo(() => optionCandidates.slice().sort((left, right) => left.strike - right.strike).slice(0, 12), [optionCandidates]);
-  const dynamicStrategyMetrics = useMemo(() => [
-    { label: "Setup", value: selectedStrategy.name },
-    {
-      label: "Regime",
-      value: analysis?.calculations?.underlying?.adx14 !== null && analysis?.calculations?.underlying?.adx14 !== undefined
-        ? `${Number(analysis.calculations.underlying.adx14) >= 22 ? "Trending" : Number(analysis.calculations.underlying.adx14) < 16 ? "Range" : "Chop"} (ADX ${Number(analysis.calculations.underlying.adx14).toFixed(1)})`
-        : analysis?.decision ?? "Evaluating",
-    },
-    {
-      label: "Confirmation",
-      value: analysis?.calculations?.underlying?.relative_volume !== null && analysis?.calculations?.underlying?.relative_volume !== undefined
-        ? `Vol ${Number(analysis.calculations.underlying.relative_volume).toFixed(1)}x · VWAP ${Number(analysis.calculations.underlying.vwap ?? 0).toFixed(0)}`
-        : "Live Streaming",
-    },
-    {
-      label: "Live Exposure",
-      value: `${visibleOpenOrders.length} pos • ${selected?.lotSize ?? quantity} qty lot`,
-    },
-  ], [analysis, quantity, selectedStrategy.name, selected?.lotSize, visibleOpenOrders.length]);
-  const netPositions = useMemo(() => {
-    const positionsMap = new Map<string, { symbol: string; side: string; quantity: number; avgPrice: number; currentPrice: number; pnl: number; pnlPercent: number; strategy: string }>();
-    visibleOpenOrders.forEach((o) => {
-      const cur = o.currentPrice ?? o.price;
-      const pnl = o.pnl ?? 0;
-      const existing = positionsMap.get(o.symbol);
-      if (!existing) {
-        positionsMap.set(o.symbol, {
-          symbol: o.symbol,
-          side: o.side,
-          quantity: o.quantity,
-          avgPrice: o.price,
-          currentPrice: cur,
-          pnl,
-          pnlPercent: o.pnlPercent ?? 0,
-          strategy: o.strategyName ?? o.strategy ?? "ORB + Retest",
-        });
-      } else {
-        existing.quantity += o.quantity;
-        existing.pnl += pnl;
-      }
+    return () => { socket.close(); socketRef.current = null; };
+  }, [symbol]);
+
+  // ---- paper orders -------------------------------------------------------------------
+  const exitPaper = useCallback(async (order: Order) => {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/algo-trading?id=${encodeURIComponent(order.id)}`, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) { setMessage(data.error ?? "Paper exit failed"); return; }
+      mutationVersion.current += 1;
+      setPaperOrders((current) => current.filter((item) => item.id !== order.id));
+      if (data.order) setHistory((current) => [data.order as Order, ...current.filter((item) => item.id !== order.id)]);
+      log(`Paper exit ${order.symbol} · P&L ₹${money(data.order?.realizedPnl ?? order.pnl ?? 0)}`, "exit");
+    } catch { setMessage("Paper exit request failed"); }
+    finally { setBusy(false); }
+  }, [log]);
+
+  // Paper stop/target automation (never touches live positions; those exit server-side).
+  useEffect(() => {
+    const pending = paperOrders.find((order) => {
+      if (order.mode === "ALGO_LIVE" || !["OPEN", "FILLED"].includes(order.status) || !order.stopLoss) return false;
+      const premium = chain.find((item) => norm(item.symbol) === norm(order.symbol))?.premium ?? Number(order.currentPrice ?? order.price);
+      const state = getOrderExitState(order, premium);
+      return state.hitStop || state.hitTarget;
     });
-    return Array.from(positionsMap.values());
-  }, [visibleOpenOrders]);
-  const sessionGatePassed = analysis?.pipeline?.gates.find((gate) => gate.code === "SESSION_BLOCKED")?.passed;
-  const marketStatus = useMemo(() => analysis?.session
-    ? !analysis.session.market_open
-      ? "MARKET CLOSED"
-      : analysis.session.entry_permitted
-        ? "SESSION OPEN"
-        : "ENTRY WINDOW CLOSED"
-    : sessionGatePassed
-      ? "SESSION OPEN"
-      : "SESSION NOT OPEN", [analysis, sessionGatePassed]);
-  const marketStatusTone = marketStatus === "SESSION OPEN" ? "gain" : "warning";
+    if (pending) void exitPaper(pending);
+  }, [chain, paperOrders, exitPaper]);
 
-  const switchIndex = (next: string) => { setSymbol(next); setQuery(next); setSelected(null); setOptions([]); };
-  const loadIntelPlan = (plan: TradePlan, context: { symbol: string; expiry: string | null; lotSize: number | null }) => {
-    const contract = plan.contract;
-    if (!contract || !plan.premium) return;
-    const lot = context.lotSize && context.lotSize > 0 ? context.lotSize : fallbackLot(context.symbol);
-    const lots = plan.lots && plan.lots > 0 ? plan.lots : 1;
-    setSelected({ symbol: contract.trading_symbol, growwSymbol: contract.trading_symbol, type: contract.side, expiry: context.expiry ?? undefined, strike: contract.strike, lotSize: lot });
-    setQuery(contract.trading_symbol);
-    setQuantity(lot * lots);
-    setTakeProfit(String(plan.premium.target1));
+  const premiumFor = (value: Contract | null) => chain.find((item) => norm(item.symbol) === norm(value?.symbol))?.premium;
+
+  async function withMetadata(value: Contract): Promise<Contract> {
+    if (value.tickSize && value.freezeQuantity && value.active !== undefined) return value;
+    try {
+      const data = await fetch(`/api/groww-instruments?q=${encodeURIComponent(value.symbol)}`, { cache: "no-store" }).then((response) => response.json());
+      const exact = (data.instruments ?? []).find((item: SearchResult) => item.symbol === value.symbol);
+      return exact ? { ...value, ...exact } : value;
+    } catch { return value; }
+  }
+
+  function validTicket(): string | null {
+    if (!contract) return "Select a contract first (search below, or load the trade-desk plan).";
+    const sl = Number(stopLoss);
+    const tp = Number(target);
+    if (!(sl > 0) || !(tp > 0)) return "Enter the stop-loss and target premiums.";
+    if (!(lots >= 1)) return "Lots must be at least 1.";
+    return null;
+  }
+
+  async function placePaper() {
+    const problem = validTicket();
+    if (problem) { setMessage(problem); return; }
+    if (strategyId === "RANGE_DEFINED_RISK") { setMessage("Range strategy is analysis-only; no naked option selling is permitted."); return; }
+    const enriched = await withMetadata(contract!);
+    setContract(enriched);
+    const premium = premiumFor(enriched);
+    if (!premium) { setMessage("No live premium for this contract yet; wait for the chain to load or pick a near-ATM strike."); return; }
+    setBusy(true);
+    try {
+      const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        mode: "PAPER", orderSource: "MANUAL", strategy: strategyId, strategyName: `${strategy.name}${ticketSource !== "MANUAL" ? ` · ${ticketSource}` : ""}`, underlying: symbol,
+        symbol: enriched.symbol, growwSymbol: enriched.growwSymbol, side: "BUY", quantity: lots * enriched.lotSize, lotSize: enriched.lotSize, price: premium,
+        target: Number(target), stopLoss: Number(stopLoss), expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
+        tickSize: enriched.tickSize, freezeQuantity: enriched.freezeQuantity, contractActive: enriched.active, analysisDecision: analysis?.decision,
+      }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.order) { setMessage(data.error ?? "Paper order rejected"); return; }
+      mutationVersion.current += 1;
+      setPaperOrders((current) => [data.order as Order, ...current]);
+      setHistory((current) => [data.order as Order, ...current.filter((item) => item.id !== data.order.id)]);
+      setTab("PAPER");
+      setMessage(`Paper order placed: ${data.order.symbol} × ${data.order.quantity} @ ₹${data.order.price}`);
+      log(`Paper entry ${data.order.symbol} × ${data.order.quantity} @ ₹${data.order.price}`, "entry");
+    } catch { setMessage("Paper order request failed"); }
+    finally { setBusy(false); }
+  }
+
+  function openLive() {
+    const problem = validTicket();
+    if (problem) { setMessage(problem); return; }
+    if (!live?.enabled) { setMessage(`Live trading is disabled: ${(live?.disabledReasons ?? ["status unavailable"]).join("; ")}`); return; }
+    setLiveDraft({ symbol: contract!.symbol, lots, stopLoss: Number(stopLoss), target: Number(target), source: ticketSource });
+  }
+
+  async function liveAction(action: "exit" | "mark_closed", order: Order) {
+    const exitPrice = action === "mark_closed" ? Number(window.prompt(`Exit price you received in the Groww app for ${order.symbol}?`) ?? "") : undefined;
+    if (action === "mark_closed" && !(Number(exitPrice) > 0)) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/live-orders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, orderId: order.id, pin: livePin, exitPrice }) });
+      const data = await response.json().catch(() => ({}));
+      setMessage(response.ok ? `Live ${order.symbol} ${action === "exit" ? "exited" : "marked closed"}${data.order?.realizedPnl !== undefined ? ` · P&L ₹${money(data.order.realizedPnl)}` : ""}` : data.error ?? "Live action failed");
+      if (response.ok) log(`LIVE ${action} ${order.symbol}`, "exit");
+      await refreshLive();
+    } finally { setBusy(false); }
+  }
+
+  async function search() {
+    const value = query.trim().toUpperCase();
+    if (value.length < 2) return;
+    setSearching(true);
+    try {
+      const data = await fetch(`/api/groww-instruments?q=${encodeURIComponent(value)}`, { cache: "no-store" }).then((response) => response.json());
+      setResults(Array.isArray(data.instruments) ? data.instruments.slice(0, 8) : []);
+    } catch { setResults([]); }
+    finally { setSearching(false); }
+  }
+
+  const loadPlan = useCallback((plan: TradePlan, context: { symbol: string; expiry: string | null; lotSize: number | null }) => {
+    if (!plan.contract || !plan.premium) return;
+    const size = context.lotSize && context.lotSize > 0 ? context.lotSize : FALLBACK_LOT[context.symbol] ?? 1;
+    setContract({ symbol: plan.contract.trading_symbol, growwSymbol: plan.contract.trading_symbol, type: plan.contract.side, expiry: context.expiry ?? undefined, strike: plan.contract.strike, lotSize: size });
+    setLots(Math.max(1, plan.lots ?? 1));
     setStopLoss(String(plan.premium.stop));
-    setOptions([]);
-    setSearched(true);
-    setMessage(`Market-intel plan loaded: BUY ${contract.trading_symbol} · SL ₹${plan.premium.stop} · T1 ₹${plan.premium.target1} · ${lots} lot(s). Status ${plan.status}${plan.status === "READY" ? "" : " — practise in paper mode only"}.`);
-  };
-  return <main className="algo-page">
-    <aside className="algo-sidebar"><div className="algo-brand"><b>AlgoTrade</b><small>Trade Smarter. Automate Better.</small></div>{["Dashboard", "Trade", "Strategies", "Option Chain", "Backtest", "Orders", "Positions", "Performance", "Alerts", "Groww Connect", "Settings"].map((item) => <button className={item === "Trade" ? "active" : ""} key={item}>{item}</button>)}</aside>
-    <section className="algo-main">
-      <header className="algo-topbar"><input aria-label="Search symbol" value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} placeholder="Search symbol (e.g. NIFTY, BANKNIFTY, RELIANCE...)" /><div className="algo-ticker">{["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"].map((item) => <span key={item}><b>{item}</b><small>{marketQuotes[item] ? `₹${money(marketQuotes[item])}` : "Live monitored"}</small></span>)}</div><div className="algo-account"><small>Groww available margin</small><b>{account?.available !== null && account?.available !== undefined ? `₹${money(account.available)}` : "Groww API connected"}</b><em>{account?.source ?? "Paper-safe until live gates are approved"}</em></div></header>
-      <div className="algo-content"><div className="algo-toolbar"><div><span className="algo-kicker">ALGO EXECUTION WORKSPACE</span><h1>{symbol} strategy control</h1><p>{message} · {streamStatus}</p></div><div className="algo-controls"><span className="provider-badge">Data &amp; execution provider: Groww (live)</span><label className="auto-trade-toggle"><input type="checkbox" checked={autoTradeEnabled} onChange={(event) => { setAutoTradeEnabled(event.target.checked); setAutoTradeStatus((current) => ({ ...current, summary: event.target.checked ? "Auto engine starting its market scan" : "Auto engine is disabled" })); }} /> <b>Auto trade</b><small>paper only · max {autoMaxTrades}</small></label><button onClick={refresh} disabled={busy}>{busy ? "Updating..." : "Refresh analysis"}</button></div></div>
-        <article className="algo-panel control-bar">
-          <div className="control-bar-item"><small>Instrument</small><b>{symbol}</b></div>
-          <div className="control-bar-item"><small>Market status</small><b className={marketStatusTone}>{marketStatus}</b></div>
-          <div className="control-bar-item"><small>IST time</small><b>{istClock || "--:--:--"}</b></div>
-          <div className="control-bar-item"><small>Strategy</small><b>{selectedStrategy.name} · V5</b></div>
-          <div className="control-bar-item"><small>Execution mode</small><b className={executionMode === "ALGO_LIVE" ? (liveExecution ? "loss" : "warning") : "gain"}>{executionMode === "ALGO_LIVE" ? (liveExecution ? "LIVE" : "LIVE_DISABLED") : "PAPER"}</b></div>
-          <div className={`control-bar-item${autoTradeEnabled ? " control-alert" : ""}`}><small>Auto option engine</small><b className={autoTradeStatus.limitHit ? "warning" : autoTradeEnabled ? "gain" : "warning"}>{autoTradeEnabled ? `${autoTradeStatus.tradesTaken}/${autoMaxTrades} ${autoTradeStatus.limitHit ? "SUGGEST" : "TRACKING"}` : "OFF"}</b></div>
-          <div className="control-bar-item"><small>Data feed / broker</small><b className={streamStatus.includes("connected") || streamStatus.includes("Connected") ? "gain" : "warning"}>{streamStatus.includes("unavailable") ? "GROWW UNAVAILABLE" : "GROWW CONNECTED"}</b></div>
-          <div className="control-bar-item"><small>Reconciliation</small><b className="warning">NOT IMPLEMENTED</b></div>
-          <div className={`control-bar-item${safeMode.active ? " control-alert" : ""}`}><small>SAFE MODE</small><b className={safeMode.active ? "loss" : "gain"}>{safeMode.active ? "ACTIVE" : "CLEAR"}</b></div>
-          <div className={`control-bar-item${killSwitch.active ? " control-alert" : ""}`}><small>KILL SWITCH</small><b className={killSwitch.active ? "loss" : "gain"}>{killSwitch.active ? "ACTIVE" : "CLEAR"}</b></div>
-        </article>
-        <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadIntelPlan} />
-        <article className="algo-panel auto-trade-panel"><div className="algo-panel-head"><div><span className="algo-kicker">AUTONOMOUS OPTION ENGINE</span><h2>Market tracking and trade plan</h2></div><span className={autoTradeStatus.limitHit ? "warning" : autoTradeEnabled ? "gain" : "neutral"}>{autoTradeEnabled ? (autoTradeStatus.limitHit ? "SUGGESTION ONLY" : "TRACKING") : "OFF"}</span></div><div className="auto-trade-settings"><label>Maximum open trades<select value={autoMaxTrades} onChange={(event) => setAutoMaxTrades(Number(event.target.value))}><option value={1}>1 trade</option><option value={2}>2 trades</option><option value={3}>3 trades</option><option value={4}>4 trades</option><option value={5}>5 trades</option></select></label><label>Minimum loss exit<select value={autoMinimumLoss} onChange={(event) => setAutoMinimumLoss(Number(event.target.value))}><option value={250}>₹250</option><option value={500}>₹500</option><option value={1000}>₹1,000</option><option value={1500}>₹1,500</option><option value={2000}>₹2,000</option><option value={2500}>₹2,500</option><option value={5000}>₹5,000</option></select></label><label>Minimum profit to trail<select value={autoMinimumProfit} onChange={(event) => setAutoMinimumProfit(Number(event.target.value))}><option value={0}>Immediate after 1R</option><option value={300}>₹300</option><option value={400}>₹400</option><option value={500}>₹500</option><option value={1000}>₹1,000</option><option value={1500}>₹1,500</option><option value={2500}>₹2,500</option></select></label></div><p className="auto-trade-summary">{autoTradeStatus.summary}. A minimum-loss breach exits immediately for capital protection; trend, 15-candle 5-minute structure, candlestick, volume, delta, and option-chain factors classify the exit. Trailing activates only after the selected profit threshold and never loosens.</p>{autoTradeStatus.diagnostics?.length ? <div className="auto-trade-diagnostics">{autoTradeStatus.diagnostics.slice(0, 4).map((diagnostic) => <small key={diagnostic}>{diagnostic}</small>)}</div> : null}{autoTradeStatus.suggestions.length > 0 && <div className="auto-trade-suggestions">{autoTradeStatus.suggestions.slice(-3).reverse().map((suggestion, index) => <span key={`${suggestion.symbol}-${index}`}><b>{suggestion.contract} · {suggestion.symbol}</b><small>Entry ₹{money(suggestion.entry)} · SL ₹{money(suggestion.stopLoss)} · Target ₹{money(suggestion.target)} · Score {suggestion.score}</small></span>)}</div>}</article>
-        <div className="nifty-strategy-banner">
-          <div>
-            <span className="algo-kicker">NIFTY OPTIONS STRATEGY · V5</span>
-            <label className="strategy-selector">Active strategy<select value={strategyId} onChange={(event) => setStrategyId(event.target.value as StrategyId)}>{strategies.map((strategy) => <option value={strategy.id} key={strategy.id}>{strategy.name}</option>)}</select></label>
-            <h2>{selectedStrategy.name} · {selectedStrategy.shortName}</h2>
-            <p>{selectedStrategy.description}</p>
-          </div>
-          <div className="nifty-strategy-metrics">
-            {dynamicStrategyMetrics.map((item) => (
-              <span key={item.label}><small>{item.label}</small><b>{item.value}</b></span>
-            ))}
-          </div>
+    setTarget(String(plan.premium.target1));
+    setTicketSource(`Desk ${plan.status}`);
+    setMessage(`Plan loaded: BUY ${plan.contract.trading_symbol} · SL ₹${plan.premium.stop} · T1 ₹${plan.premium.target1}. Status ${plan.status}${plan.status === "READY" ? "" : " (practise in paper mode)"}.`);
+    document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
+
+  const [cacheClearing, setCacheClearing] = useState(false);
+  const clearCache = useCallback(async () => {
+    setCacheClearing(true);
+    try {
+      await fetch("/api/cache", { method: "POST", cache: "no-store" });
+      setMessage("Server caches cleared (contract master, history, trade desk, sentiment). Reloading…");
+      await refresh();
+    } catch { setMessage("Cache clear failed; live data was not changed."); }
+    finally { setCacheClearing(false); }
+  }, [refresh]);
+  const aiContext = useCallback(() => ({
+    symbol, timeframe: "5m", executionMode: live?.enabled ? "ALGO_LIVE_ARMED" : "PAPER", marketStatus: sessionLabelRef.current, deterministicAnalysis: analysis,
+    candles: candlesRef.current.slice(-30), optionCandidates: chainRef.current.slice(0, 20), risk: { safeMode: safety.safeMode, killSwitch: safety.killSwitch, autoTradeEnabled: autoEnabled },
+  }), [analysis, autoEnabled, live?.enabled, safety.killSwitch, safety.safeMode, symbol]);
+  const sessionLabelRef = useRef("--");
+
+  const switchIndex = useCallback((next: string) => { setSymbol(next); setContract(null); setResults([]); setQuery(""); }, []);
+
+  // ---- derived ---------------------------------------------------------------------------
+  const openPaper = useMemo(() => paperOrders.filter((order) => ["OPEN", "FILLED"].includes(order.status)), [paperOrders]);
+  const paperPnl = openPaper.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
+  const livePositions = live?.positions ?? [];
+  const livePnl = livePositions.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
+  const sessionLabel: string = !analysis?.session ? "--" : !analysis.session.market_open ? "MARKET CLOSED" : analysis.session.entry_permitted ? "ENTRY WINDOW" : analysis.session.window.replaceAll("_", " ");
+  sessionLabelRef.current = sessionLabel;
+  const score = analysis?.calculations?.score ?? {};
+  const underlying = analysis?.calculations?.underlying ?? {};
+  const ticketPremium = premiumFor(contract);
+  const ticketRisk = ticketPremium && Number(stopLoss) > 0 ? (ticketPremium - Number(stopLoss)) * lots * lotSize : null;
+  const ticketReward = ticketPremium && Number(target) > 0 ? (Number(target) - ticketPremium) * lots * lotSize : null;
+
+  return (
+    <main className="exec-page">
+      <header className="exec-header">
+        <div className="exec-brand"><b>TradePulse</b><small>Index options desk</small></div>
+        <div className="algo-ticker" aria-label="Live index quotes">{TICKER.map((item) => <span key={item}><b>{item}</b><small>{quotes[item] ? money(quotes[item]) : "--"}</small></span>)}</div>
+        <div className="exec-badges">
+          <span className={live?.enabled ? "exec-badge exec-badge-live" : "exec-badge"} title={live?.enabled ? "Live trading armed on the server" : (live?.disabledReasons ?? []).join("\n")}>{live?.enabled ? "LIVE ARMED" : "PAPER ONLY"}</span>
+          {safety.killSwitch && <span className="exec-badge exec-badge-danger" title={safety.reason}>KILL SWITCH</span>}
+          {safety.safeMode && <span className="exec-badge exec-badge-danger" title={safety.reason}>SAFE MODE</span>}
+          <span className="exec-badge">{sessionLabel}</span>
+          <span className="exec-badge">IST {clock || "--:--:--"}</span>
+          <span className={streamStatus === "live" ? "exec-badge gain" : "exec-badge warning"}>Quotes {streamStatus}</span>
+          <button type="button" className="exec-badge exec-badge-button" onClick={() => void clearCache()} disabled={cacheClearing}>{cacheClearing ? "Clearing…" : "Clear cache"}</button>
+          <span className="exec-badge">Margin {account?.available !== null && account?.available !== undefined ? `₹${money(account.available)}` : "--"}</span>
         </div>
-        <article className="algo-panel calculation-panel">
-          <div className="algo-panel-head"><div><span className="algo-kicker">TRANSPARENT SIGNAL LEDGER</span><h2>Market calculations</h2></div><span>{analysis?.decision ?? "WAITING"}</span></div>
-          <div className="calculation-grid">
-            <section><b>Underlying structure</b><span>Last price <strong>{calculationValue(analysis?.calculations?.underlying?.last_price)}</strong></span><span>VWAP <strong>{calculationValue(analysis?.calculations?.underlying?.vwap)}</strong></span><span>EMA 20 / 50 <strong>{calculationValue(analysis?.calculations?.underlying?.ema20)} / {calculationValue(analysis?.calculations?.underlying?.ema50)}</strong></span><span>ADX (14) <strong>{calculationValue(analysis?.calculations?.underlying?.adx14)}</strong></span><span>ATR (14) <strong>{calculationValue(analysis?.calculations?.underlying?.atr14)}</strong></span><span>Relative volume <strong>{calculationValue(analysis?.calculations?.underlying?.relative_volume, true)}</strong></span></section>
-            <section><b>ORB and retest</b><span>Opening range high <strong>{calculationValue(analysis?.calculations?.orb?.opening_range_high)}</strong></span><span>Opening range low <strong>{calculationValue(analysis?.calculations?.orb?.opening_range_low)}</strong></span><span>Breakout <strong>{calculationValue(analysis?.calculations?.orb?.breakout_index)}</strong></span><span>Retest <strong>{calculationValue(analysis?.calculations?.orb?.retest_index)}</strong></span><span>Extension limit <strong>{calculationValue(analysis?.calculations?.orb?.max_extension)}</strong></span><span>Status <strong>{calculationValue(analysis?.calculations?.orb?.status)}</strong></span></section>
-            <section><b>Signal score · max 10</b><span>Trend cluster <strong>{calculationValue(analysis?.calculations?.score?.trend_cluster)} / 3</strong></span><span>Structure cluster <strong>{calculationValue(analysis?.calculations?.score?.structure_cluster)} / 3</strong></span><span>Volume evidence <strong>{calculationValue(analysis?.calculations?.score?.volume_evidence)} / 2</strong></span><span>Option relative strength <strong>{calculationValue(analysis?.calculations?.score?.option_relative_strength)} / 1</strong></span><span>OI direction <strong>{calculationValue(analysis?.calculations?.score?.oi_direction)} / 1</strong></span><span>Total / minimum <strong>{calculationValue(analysis?.calculations?.score?.total)} / {calculationValue(analysis?.calculations?.score?.minimum)}</strong></span></section>
-            <section><b>Options and risk gates</b><span>ORS <strong>{calculationValue(analysis?.calculations?.option?.ors)}</strong></span><span>OI / PCR score <strong>{calculationValue(analysis?.calculations?.option?.oi_direction_score)}</strong></span><span>IV / VIX regime <strong>{calculationValue(analysis?.calculations?.option?.iv_regime)}</strong></span><span>Liquidity score <strong>{calculationValue(analysis?.calculations?.option?.liquidity_score)} / 3</strong></span><span>Minimum R:R <strong>{calculationValue(analysis?.calculations?.risk?.minimum_reward_risk)}R</strong></span><span>Daily limits <strong>{calculationValue(analysis?.calculations?.risk?.max_trades_per_day)} trades · {calculationValue(analysis?.calculations?.risk?.daily_loss_limit_pct)}%</strong></span></section>
-          </div>
-          <div className="calculation-note"><b>Gap-day protocol:</b> {calculationValue(analysis?.calculations?.gap?.status)} · {calculationValue(analysis?.calculations?.gap?.reason)} <span>{analysis?.reason ?? "Waiting for market data"}</span></div>
-        </article>
-        <article className="algo-panel pipeline-panel">
-          <div className="algo-panel-head"><div><span className="algo-kicker">V5 DECISION PIPELINE</span><h2>Every gate the backend authoritative pipeline evaluated</h2></div><span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? "WAITING"}</span></div>
-          <div className="pipeline-stage-list">
-            {(analysis?.pipeline?.gates ?? []).map((gate) => (
-              <div className={`pipeline-stage ${gate.passed ? "stage-pass" : "stage-fail"}`} key={gate.code}>
-                <b>{gate.code.replaceAll("_", " ")}</b>
-                <span className={gate.passed ? "gain" : "loss"}>{gate.passed ? "PASS" : "BLOCKED"}</span>
-                <small>{gate.detail}</small>
+      </header>
+
+      <div className="exec-content">
+        <p className="exec-message" role="status">{message}</p>
+        <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadPlan} />
+        <SentimentPanel />
+        <AIMonitoringPanel symbol={symbol} strategyId={strategyId} buildContext={aiContext} />
+
+        <div className="exec-grid">
+          <article className="mi-card exec-strategy">
+            <div className="algo-panel-head">
+              <div><span className="algo-kicker">V5 RULE ENGINE · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
+              <div className="exec-strategy-controls">
+                <select aria-label="Strategy" value={strategyId} onChange={(event) => setStrategyId(event.target.value as StrategyId)}>{STRATEGIES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+                <button type="button" onClick={() => void refresh()} disabled={busy}>{busy ? "…" : "Refresh"}</button>
               </div>
-            ))}
-            {!analysis?.pipeline?.gates.length && <div className="algo-empty">Waiting for the backend V5 pipeline to return evidence.</div>}
-          </div>
-        </article>
-        <article className="algo-panel no-trade-panel">
-          <div className="algo-panel-head"><div><span className="algo-kicker">NO-TRADE ENGINE</span><h2>All active blocking reasons</h2></div><span>{analysis?.pipeline?.reasons?.length ?? 0} reason(s)</span></div>
-          {analysis?.pipeline?.reasons?.length ? (
-            <ul className="no-trade-reasons">
-              {analysis.pipeline.reasons.map((reason) => <li key={reason}>{reason.replaceAll("_", " ")}</li>)}
-            </ul>
-          ) : (
-            <div className="algo-empty">{analysis?.pipeline?.decision === "CONFIRMED" ? "All gates passed. The plan is confirmed for paper execution." : "Waiting for pipeline evidence."}</div>
-          )}
-        </article>
-        <section className="algo-grid">
-          <article className="algo-panel algo-chart-panel"><div className="algo-panel-head"><div><span className="algo-kicker">{symbol} · 5M · NSE</span><h2>Market overview</h2></div><span className="algo-live">● {provider.toUpperCase()} MARKET</span></div><div className="algo-chart-toolbar"><button>1m</button><button className="selected">5m</button><button>15m</button><button>30m</button><button>1h</button><button>1D</button></div><div className="algo-chart-header"><b>{money(marketCandles.at(-1)?.close ?? entry)}</b><span className={(marketCandles.at(-1)?.close ?? entry) >= (marketCandles.at(-2)?.close ?? entry) ? "gain" : "loss"}>{marketCandles.length > 1 ? `${(marketCandles.at(-1)!.close - marketCandles.at(-2)!.close >= 0 ? "+" : "")}${money(marketCandles.at(-1)!.close - marketCandles.at(-2)!.close)}` : "Waiting for quote"}</span></div><div className="algo-market-chart"><div className="algo-chart-grid" />{overviewCandles.map((candle, index) => { const bullish = candle.close >= candle.open; const width = 88 / Math.max(overviewCandles.length, 1); const scale = (value: number) => `${((overviewHigh - value) / overviewRange) * 100}%`; return <div className={`overview-candle ${bullish ? "overview-up" : "overview-down"}`} key={`${candle.time}-${index}`} style={{ left: `${5 + index * width}%`, top: scale(candle.high), height: `${Math.max((candle.high - candle.low) / overviewRange * 82, 2)}%` }}><i style={{ height: "100%" }} /><b style={{ top: `${(candle.high - Math.max(candle.open, candle.close)) / Math.max(candle.high - candle.low, 0.01) * 100}%`, height: `${Math.max(Math.abs(candle.close - candle.open) / Math.max(candle.high - candle.low, 0.01) * 100, 4)}%` }} /><em style={{ height: `${20 + (index * 17) % 70}%` }} /></div>; })}<span className="algo-chart-last">{money(marketCandles.at(-1)?.close ?? entry)}</span></div><div className="algo-metrics"><span>Setup <b className={analysis?.decision === "CONFIRMED" ? (analysis.setup?.side === "SELL" ? "loss" : "gain") : "warning"}>{analysis?.decision === "CONFIRMED" ? (analysis.setup?.side === "SELL" ? "BEARISH (PE)" : "BULLISH (CE)") : "WAITING"}</b></span><span>VWAP <b>{money(analysis?.indicators?.vwap ?? marketCandles.at(-1)?.close ?? entry)}</b></span><span>Support <b>{money(analysis?.levels?.support ?? overviewLow)}</b></span><span>Resistance <b>{money(analysis?.levels?.resistance ?? overviewHigh)}</b></span></div></article>
-          <article className="algo-panel algo-chain"><div className="algo-panel-head"><h2>Option Chain · {symbol}</h2><span>{chainStatus}</span></div>{suggestedOption ? <div className="premium-suggestion"><div className="suggestion-summary"><div><span>Suggested premium {suggestedOption.contract}</span><b>{suggestedOption.symbol} · {money(suggestedOption.premium)}</b><small>Strike {money(suggestedOption.strike)} · Delta {Number(suggestedOption.delta ?? 0).toFixed(2)} · Score {Math.round(suggestedOption.final_score ?? suggestedOption.score)} · R:R {Number(suggestedOption.riskReward ?? 0).toFixed(2)}</small></div><button type="button" onClick={() => { const defaultLot = fallbackLot(symbol); const lot = suggestedOption.lotSize && suggestedOption.lotSize > 0 ? suggestedOption.lotSize : defaultLot; setSelected({ symbol: suggestedOption.symbol, growwSymbol: suggestedOption.symbol, type: suggestedOption.contract === "CALL" ? "CE" : "PE", expiry: suggestedOption.expiry, strike: suggestedOption.strike, lotSize: lot }); setQuery(suggestedOption.symbol); setQuantity(lot); setOptions([]); setSearched(true); if (suggestedOption.premium > 0) { setTakeProfit(String(Math.round(suggestedOption.premium * 1.3))); setStopLoss(String(Math.round(suggestedOption.premium * 0.85))); } setMessage(`Suggested ${suggestedOption.contract} selected: ${suggestedOption.symbol} (Lot ${lot})`); }}>Use suggestion</button></div><div className="suggestion-grid"><span>Setup score <strong>{Math.round(suggestedOption.final_score ?? suggestedOption.score)}/100</strong></span><span>Confidence <strong>{formatConfidenceText(suggestedOption.confidence)}</strong></span><span>Direction <strong>{suggestedOption.direction ?? (suggestedOption.contract === "CALL" ? "BULLISH" : "BEARISH")}</strong></span><span>Delta <strong>{Number(suggestedOption.delta ?? 0).toFixed(2)}</strong></span><span>IV <strong>{Number(suggestedOption.iv ?? 0).toFixed(1)}%</strong></span><span>Breakeven <strong>{money(suggestedOption.feasibility?.breakeven ?? (suggestedOption.strike + suggestedOption.premium))}</strong></span><span>Expected move <strong>{formatExpectedMoveText(suggestedOption.feasibility?.expected_move_points)}</strong></span><span>Required move <strong>{money(suggestedOption.feasibility?.required_move ?? 0)}</strong></span><span>Target <strong>{money(suggestedOption.target ?? suggestedOption.premium * 1.5)}</strong></span><span>Stop <strong>{money(suggestedOption.stop ?? suggestedOption.premium * 0.75)}</strong></span></div><div className="suggestion-explanations"><h3>Why this option?</h3><p>{suggestedOption.reason}</p><ul>{Object.entries(suggestedOption.pipeline?.score_breakdown ?? {}).map(([key, value]) => <li key={key}>{key.replaceAll("_", " ")} · {Number(value).toFixed(1)}</li>)}</ul>{(suggestedOption.warnings ?? []).length ? <div className="suggestion-warnings"><b>Warnings</b>{suggestedOption.warnings!.map((warning) => <small key={warning}>{warning}</small>)}</div> : null}</div>{alternativeCandidates.length ? <div className="suggestion-alternatives"><h3>Alternative strikes</h3>{alternativeCandidates.map((candidate) => <div key={`${candidate.symbol}-${candidate.contract}-${candidate.strike}`} className="alternative-option"><b>{candidate.symbol}</b><span>{candidate.contract}</span><strong>{Math.round(candidate.final_score ?? candidate.score)}/100</strong><small>Strike {money(candidate.strike)} · Delta {Number(candidate.delta ?? 0).toFixed(2)} · R:R {Number(candidate.riskReward ?? 0).toFixed(2)}</small></div>)}</div> : null}</div> : <div className="algo-empty">No actionable option candidate. Directional trend is weak, feasibility is poor, liquidity is insufficient, or the engine is waiting for fresher market data.</div>}<div className="algo-chain-table"><div><span>Type</span><span>Premium</span><span>Strike</span><span>IV</span><span>Score</span></div>{chainRows.length ? chainRows.map((candidate) => <div key={`${candidate.symbol}-${candidate.contract}`}><span className={candidate.contract === "CALL" ? "gain" : "loss"}>{candidate.contract}</span><span>{money(candidate.premium)}</span><span>{money(candidate.strike)}</span><span>{candidate.iv.toFixed(1)}%</span><span>{candidate.score.toFixed(0)}</span></div>) : <div className="chain-empty">{chainStatus}</div>}</div></article>
-          <article className="algo-panel algo-strategy"><div className="algo-panel-head"><h2>Create Strategy</h2><span>Paper builder</span></div><div className="algo-form-section"><b className="step-number">1</b><strong>Search and select option</strong><label>Call / Put symbol<input value={query} onChange={(event) => { setQuery(event.target.value.toUpperCase()); setSearched(false); }} onKeyDown={(event) => { if (event.key === "Enter") searchOptions(); }} placeholder="NIFTY, BANKNIFTY, CE or PE" /></label><button type="button" className="option-search-button" onClick={searchOptions} disabled={searching}>{searching ? "Searching..." : "Search options"}</button>{options.length > 0 && <div className="option-search-results">{options.slice(0, 8).map((option) => <button type="button" key={option.growwSymbol} onClick={() => { const defaultLot = fallbackLot(symbol); const lot = option.lotSize && option.lotSize > 0 ? option.lotSize : defaultLot; setSelected({ ...option, lotSize: lot }); setQuery(option.symbol); setQuantity(lot); setOptions([]); setSearched(true); setMessage(`Option selected: ${option.symbol}`); }}>{option.symbol}<small>{option.type} · {option.expiry} · Strike {option.strike} · Lot {option.lotSize ?? fallbackLot(symbol)}</small></button>)}</div>}{searched && !searching && options.length === 0 && <div className="option-search-empty">No Groww contracts matched. Try an underlying such as NIFTY, BANKNIFTY, or search CE/PE.</div>}{selected && <div className="selected-option"><b>{selected.symbol}</b><span>{selected.type} · Expiry {selected.expiry} · Strike {selected.strike}</span><small>Lot size {selected.lotSize ?? fallbackLot(symbol)} · {selected.growwSymbol}</small></div>}</div><div className="algo-form-section"><b className="step-number">2</b><strong>Set entry and exit rules</strong><label>Trigger<select value={triggerMode} onChange={(e) => setTriggerMode(e.target.value as "AUTO" | "MANUAL")}><option value="AUTO">On Signal (Auto - Gated by Market Strategy)</option><option value="MANUAL">Manual Test (Paper Simulation)</option></select></label><label>Take Profit (Target)<input type="number" value={targetValue} onChange={(event) => setTakeProfit(event.target.value)} placeholder="Target price (e.g. 165)" /></label><label>Stop Loss<input type="number" value={stopValue} onChange={(event) => setStopLoss(event.target.value)} placeholder="Stop price (e.g. 105)" /></label></div><div className="algo-form-section"><b className="step-number">3</b><strong>Position sizing</strong><label>Quantity<input type="number" min={selected?.lotSize ?? fallbackLot(symbol)} step={selected?.lotSize ?? fallbackLot(symbol)} value={quantity} onChange={(event) => setQuantity(Number(event.target.value) || (selected?.lotSize ?? fallbackLot(symbol)))} /></label></div><div className="algo-strategy-actions"><button type="button" className="algo-paper-submit" onClick={placePaperOrder} disabled={busy}>{busy ? "Processing..." : "Place Paper Order"}</button><small>Live execution requires explicit confirmation and compliance gates.</small></div></article>
-          <article className="algo-panel algo-preview"><div className="algo-panel-head"><div><span className="algo-kicker">STRATEGY PREVIEW · CANDLESTICK</span><h2>{previewOrder?.symbol ?? selected?.symbol ?? symbol} · {previewOrder?.side ?? analysis?.setup?.side ?? "WAITING"}</h2></div><span className={riskReward >= 2 ? "gain" : riskReward >= 1 ? "warning" : "loss"}>R:R {riskReward.toFixed(2)}</span></div><div className="algo-preview-body"><div className="algo-preview-chart"><div className="risk-chart"><div className="risk-chart-grid" /><div className="risk-zone risk-zone-reward" style={{ top: chartY(previewTarget), height: `calc(${chartY(previewEntry)} - ${chartY(previewTarget)})` }} /><div className="risk-zone risk-zone-risk" style={{ top: chartY(previewEntry), height: `calc(${chartY(previewStop)} - ${chartY(previewEntry)})` }} /><div className="risk-candles">{previewCandles.length ? previewCandles.map((candle, index) => { const bullish = candle.close >= candle.open; const width = 82 / Math.max(previewCandles.length, 1); const candleHeight = Math.max(((candle.high - candle.low) / previewRange) * 100, 2); const bodyTop = ((candle.high - Math.max(candle.open, candle.close)) / Math.max(candle.high - candle.low, 0.01)) * 100; const bodyHeight = Math.max((Math.abs(candle.close - candle.open) / Math.max(candle.high - candle.low, 0.01)) * 100, 4); return <div className="risk-candle" key={`${candle.time}-${index}`} style={{ left: `${7 + index * width}%`, top: chartY(candle.high), height: `${candleHeight}%` }}><i className="risk-wick" /><b className={bullish ? "candle-up" : "candle-down"} style={{ top: `${bodyTop}%`, height: `${bodyHeight}%` }} /><em style={{ height: `${Math.min(100, (candle.volume / Math.max(...previewCandles.map((c) => c.volume), 1)) * 100)}%` }} /></div>; }) : <div className="chain-empty">Awaiting live market candles</div>}</div><div className="risk-level risk-level-target" style={{ top: chartY(previewTarget) }}><span>Target {money(previewTarget)}</span></div><div className="risk-level risk-level-entry" style={{ top: chartY(previewEntry) }}><span>Entry {money(previewEntry)}</span></div><div className="risk-level risk-level-stop" style={{ top: chartY(previewStop) }}><span>Stop {money(previewStop)}</span></div><div className="risk-level risk-level-live" style={{ top: chartY(previewPrice) }}><span>LTP {money(previewPrice)}</span></div><div className="risk-chart-axis"><span>{money(previewHigh)}</span><span>{money((previewHigh + previewLow) / 2)}</span><span>{money(previewLow)}</span></div><div className="risk-chart-legend"><span className="legend-entry">Entry</span><span className="legend-target">Target</span><span className="legend-stop">Stop</span><span className="legend-live">Live LTP</span></div></div></div><div className="algo-logic"><h3>Risk / Reward <small>Live trade plan</small></h3><div className="risk-summary"><span className="gain">Potential profit<strong>{money(previewReward)}</strong></span><span className="loss">Defined risk<strong>{money(previewRisk)}</strong></span><span className={riskReward >= 2 ? "gain" : "warning"}>Ratio<strong>{riskReward.toFixed(2)} : 1</strong></span></div><p>Entry: {money(previewEntry)} · Current: {money(previewPrice)}</p><p>Target: {money(previewTarget)} · Stop: {money(previewStop)}</p><p>{previewOrder ? "Selected open paper trade is marked from the live quote stream." : "Select an open order to view its trade plan."}</p></div></div></article>
-          <article className="algo-panel algo-orders">
-            <div className="algo-order-tabs">
-              <button className={orderTab === "OPEN" ? "selected" : ""} onClick={() => setOrderTab("OPEN")}>
-                Open Orders <b>{visibleOpenOrders.length}</b>
-              </button>
-              <button className={orderTab === "POSITIONS" ? "selected" : ""} onClick={() => setOrderTab("POSITIONS")}>
-                Positions <b>{netPositions.length}</b>
-              </button>
-              <button className={orderTab === "HISTORY" ? "selected" : ""} onClick={() => setOrderTab("HISTORY")}>
-                Trade History <b>{visibleHistory.length}</b>
-              </button>
-              <button className={orderTab === "LOGS" ? "selected" : ""} onClick={() => setOrderTab("LOGS")}>
-                Algo Logs <b>{algoLogs.length}</b>
-              </button>
-              {firestoreSynced && <span className="firestore-badge"><i /> Cloud Firestore Synced</span>}
-              <strong className={totalPnl >= 0 ? "gain" : "loss"}>
-                Unrealized P&amp;L {totalPnl >= 0 ? "+" : ""}{money(totalPnl)}
-              </strong>
             </div>
-
-            {orderTab === "OPEN" && (
-              visibleOpenOrders.length ? visibleOpenOrders.map((order) => {
-                const pnl = order.pnl ?? 0;
-                const quoteAvailable = hasLiveQuote(order);
-                return (
-                  <div className={`algo-order ${selectedOrderId === order.id ? "selected-order" : ""}`} key={order.id}>
-                    <label className="order-radio">
-                      <input type="radio" name="preview-order" checked={selectedOrderId === order.id} onChange={() => setSelectedOrderId(order.id)} aria-label={`Show ${order.symbol} in strategy preview`} />
-                      <span />
-                    </label>
-                    <b>{order.symbol} <span className="order-strategy-tag">{order.strategyName ?? order.strategy ?? "ORB"}</span></b>
-                    <span>{order.side}</span>
-                    <span>{order.quantity} qty</span>
-                    <span>Entry ₹{money(order.price)}<small>LTP ₹{money(order.currentPrice ?? order.price)} | SL ₹{money(order.stopLoss ?? 0)} | TP ₹{money(order.target ?? 0)}{order.trailingActivatedAt ? ` | Trail ₹${money(order.trailingStop ?? order.stopLoss ?? 0)}` : ""}</small></span>
-                    <strong className={pnl >= 0 ? "gain" : "loss"}>
-                      {quoteAvailable ? `${pnl >= 0 ? "+" : ""}${money(pnl)} (${pnl >= 0 ? "+" : ""}${money(order.pnlPercent ?? 0)}%)` : "P&L awaiting live quote"}
-                    </strong>
-                    <em>{order.status}<button type="button" className="algo-exit" onClick={() => exitPaperOrder(order)} disabled={busy}>Exit</button></em>
-                  </div>
-                );
-              }) : <div className="algo-empty">No active open orders. Use the Strategy Builder above to place an order into Cloud Firestore.</div>
-            )}
-
-            {orderTab === "POSITIONS" && (
-              netPositions.length ? (
-                <table className="positions-table">
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      <th>Strategy</th>
-                      <th>Side</th>
-                      <th>Net Qty</th>
-                      <th>Avg Price</th>
-                      <th>LTP</th>
-                      <th>Unrealized P&amp;L</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {netPositions.map((pos) => (
-                      <tr key={pos.symbol}>
-                        <td><b>{pos.symbol}</b></td>
-                        <td><span className="order-strategy-tag">{pos.strategy}</span></td>
-                        <td><span className={pos.side === "BUY" ? "gain" : "loss"}>{pos.side}</span></td>
-                        <td>{pos.quantity}</td>
-                        <td>₹{money(pos.avgPrice)}</td>
-                        <td>₹{money(pos.currentPrice)}</td>
-                        <td><b className={pos.pnl >= 0 ? "gain" : "loss"}>{pos.pnl >= 0 ? "+" : ""}₹{money(pos.pnl)} ({pos.pnl >= 0 ? "+" : ""}{pos.pnlPercent.toFixed(2)}%)</b></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : <div className="algo-empty">No open positions. All simulated trades have been squared off.</div>
-            )}
-
-            {orderTab === "HISTORY" && (
-              visibleHistory.length ? (
-                <table className="order-history-table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Order ID</th>
-                      <th>Symbol</th>
-                      <th>Strategy</th>
-                      <th>Side</th>
-                      <th>Qty</th>
-                      <th>Entry</th>
-                      <th>Exit Price</th>
-                      <th>Realized P&amp;L</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleHistory.map((item) => (
-                      <tr key={item.id}>
-                        <td><small>{item.createdAt ? new Date(item.createdAt).toLocaleTimeString("en-IN") : "--"}</small></td>
-                        <td><small>{item.id}</small></td>
-                        <td><b>{item.symbol}</b></td>
-                        <td><span className="order-strategy-tag">{item.strategyName ?? item.strategy ?? "ORB"}</span></td>
-                        <td><span className={item.side === "BUY" ? "gain" : "loss"}>{item.side}</span></td>
-                        <td>{item.quantity}</td>
-                        <td>₹{money(item.price)}</td>
-                        <td>{item.exitPrice ? `₹${money(item.exitPrice)}` : "--"}</td>
-                        <td>
-                          {item.realizedPnl !== undefined ? (
-                            <b className={item.realizedPnl >= 0 ? "gain" : "loss"}>
-                              {item.realizedPnl >= 0 ? "+" : ""}₹{money(item.realizedPnl)} ({item.realizedPnl >= 0 ? "+" : ""}{item.realizedPnlPercent ?? 0}%)
-                            </b>
-                          ) : item.pnl !== undefined ? (
-                            <span className={item.pnl >= 0 ? "gain" : "loss"}>
-                              {item.pnl >= 0 ? "+" : ""}₹{money(item.pnl)} (Live)
-                            </span>
-                          ) : "--"}
-                        </td>
-                        <td><em>{item.status}</em></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : <div className="algo-empty">No trade history recorded in Cloud Firestore yet.</div>
-            )}
-
-            {orderTab === "LOGS" && (
-              <div className="algo-logs-list">
-                {algoLogs.map((log, index) => (
-                  <div className={`algo-log-entry ${log.type}`} key={index}>
-                    <span className="algo-log-time">{log.time}</span>
-                    <span>{log.text}</span>
-                  </div>
-                ))}
+            <p className="mi-note">{strategy.description}</p>
+            {analysis?.setup ? (
+              <div className="exec-setup"><b className={analysis.setup.side === "SELL" ? "loss" : "gain"}>{analysis.setup.side === "SELL" ? "BEARISH → buy PE" : "BULLISH → buy CE"}</b><span>Spot entry {money(analysis.setup.entry)} · SL {money(analysis.setup.stop_loss)} · target {money(analysis.setup.target)} · {analysis.setup.risk_reward ?? 2}R</span></div>
+            ) : <p className="mi-note">{analysis?.pipeline ? `${analysis.pipeline.gates.filter((gate) => gate.passed).length}/${analysis.pipeline.gates.length} gates passing. No setup until every gate is green.` : analysis?.reason ?? "Waiting for the engine…"}</p>}
+            <div className="exec-score">
+              {[["Trend cluster", score.trend_cluster, 3], ["Structure", score.structure_cluster, 3], ["Volume", score.volume_evidence, 2], ["Option strength", score.option_relative_strength, 1], ["OI writers", score.oi_direction, 1]].map(([name, value, max]) => (
+                <span key={String(name)}><small>{name}</small><b>{calc(value)} / {String(max)}</b></span>
+              ))}
+              <span className="exec-score-total"><small>Total</small><b className={Number(score.total) >= Number(score.minimum ?? 8) ? "gain" : "warning"}>{calc(score.total)} / 10</b><em>min {calc(score.minimum ?? 8)}</em></span>
+            </div>
+            <div className="exec-gates">{(analysis?.pipeline?.gates ?? []).map((gate) => <span key={gate.code} className={gate.passed ? "pass" : "fail"} title={gate.detail}>{gate.passed ? "✓" : "✗"} {gate.code.replace(/_(BLOCKED|NOT_CONFIRMED|NOT_SUPPORTIVE|BELOW_MINIMUM|UNRESOLVED|MISSING|REQUIRED|UNHEALTHY|STALE|INVALID|NOT_READY)$/, "").replaceAll("_", " ").toLowerCase()}</span>)}</div>
+            <details className="mi-management">
+              <summary>Show calculations</summary>
+              <div className="exec-calcs">
+                <span>VWAP <b>{calc(underlying.vwap)}</b></span><span>EMA 20/50 <b>{calc(underlying.ema20)} / {calc(underlying.ema50)}</b></span><span>ADX <b>{calc(underlying.adx14)}</b></span><span>ATR <b>{calc(underlying.atr14)}</b></span>
+                <span>OR high/low <b>{calc(analysis?.calculations?.orb?.opening_range_high)} / {calc(analysis?.calculations?.orb?.opening_range_low)}</b></span><span>ORB status <b>{calc(analysis?.calculations?.orb?.status)}</b></span>
+                <span>Regime <b>{analysis?.calculations?.regime ?? "--"}</b></span><span>Gap day <b>{calc(analysis?.calculations?.gap?.status)}</b></span><span>VIX regime <b>{calc(analysis?.calculations?.option?.iv_regime)}</b></span>
               </div>
-            )}
+            </details>
           </article>
-        </section>
+
+          <article className="mi-card exec-ticket" id="order-ticket">
+            <div className="algo-panel-head"><div><span className="algo-kicker">ORDER TICKET · OPTION BUY</span><h2>{contract ? contract.symbol : "No contract selected"}</h2></div><span>{chainStatus}</span></div>
+            <div className="exec-search">
+              <input aria-label="Search option contract" value={query} onChange={(event) => setQuery(event.target.value.toUpperCase())} onKeyDown={(event) => { if (event.key === "Enter") void search(); }} placeholder={`e.g. ${symbol} 25000 CE`} />
+              <button type="button" onClick={() => void search()} disabled={searching}>{searching ? "…" : "Search"}</button>
+            </div>
+            {results.length > 0 && <div className="exec-results">{results.map((item) => <button type="button" key={item.growwSymbol} onClick={() => { setContract({ ...item, lotSize: item.lotSize || FALLBACK_LOT[symbol] || 1 }); setResults([]); setTicketSource("MANUAL"); }}>{item.symbol}<small>{item.type} · {item.expiry} · lot {item.lotSize}</small></button>)}</div>}
+            {contract && <p className="mi-note">{contract.type} · strike {money(contract.strike)} · expiry {contract.expiry ?? "--"} · lot {lotSize} · premium {ticketPremium ? `₹${money(ticketPremium)}` : "awaiting quote"}</p>}
+            <div className="exec-fields">
+              <label>Lots<input type="number" min={1} step={1} value={lots} onChange={(event) => setLots(Math.max(1, Math.floor(Number(event.target.value) || 1)))} /><small>{lots * lotSize} qty</small></label>
+              <label>Stop-loss (premium ₹)<input type="number" min={0} step={0.05} value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} /></label>
+              <label>Target (premium ₹)<input type="number" min={0} step={0.05} value={target} onChange={(event) => setTarget(event.target.value)} /></label>
+            </div>
+            <div className="mi-risk-row"><span>Risk <b className="loss">{ticketRisk !== null ? `₹${money(ticketRisk)}` : "--"}</b></span><span>Reward <b className="gain">{ticketReward !== null ? `₹${money(ticketReward)}` : "--"}</b></span><span>R:R <b>{ticketRisk && ticketReward ? (ticketReward / ticketRisk).toFixed(2) : "--"}</b></span></div>
+            <div className="exec-actions">
+              <button type="button" className="exec-paper" onClick={() => void placePaper()} disabled={busy}>Paper order</button>
+              <button type="button" className="exec-live" onClick={openLive} disabled={busy || !live?.enabled} title={live?.enabled ? "Preview and confirm a real Groww order" : (live?.disabledReasons ?? []).join("\n")}>Live order · real money</button>
+            </div>
+            {!live?.enabled && <small className="mi-note">Live is off: {(live?.disabledReasons ?? ["status unavailable"]).slice(0, 3).join("; ")}.</small>}
+          </article>
+        </div>
+
+        <article className="mi-card exec-auto">
+          <div className="algo-panel-head">
+            <div><span className="algo-kicker">AUTO OPTION ENGINE · PAPER ONLY</span><h2>{autoEnabled ? `${autoStatus.tradesTaken}/${autoMaxTrades} trades · ${autoStatus.limitHit ? "suggest-only" : "tracking"}` : "Off"}</h2></div>
+            <label className="auto-trade-toggle"><input type="checkbox" checked={autoEnabled} onChange={(event) => { setAutoEnabled(event.target.checked); setAutoStatus((current) => ({ ...current, summary: event.target.checked ? "Starting market scan" : "Auto engine is off" })); }} /> Enable</label>
+          </div>
+          <div className="exec-fields">
+            <label>Max trades<select value={autoMaxTrades} onChange={(event) => setAutoMaxTrades(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+            <label>Max loss per trade<select value={autoMinLoss} onChange={(event) => setAutoMinLoss(Number(event.target.value))}>{[500, 1000, 1500, 2000, 2500, 5000].map((value) => <option key={value} value={value}>₹{value.toLocaleString("en-IN")}</option>)}</select></label>
+            <label>Trail after profit<select value={autoMinProfit} onChange={(event) => setAutoMinProfit(Number(event.target.value))}>{[0, 500, 1000, 1500, 2500].map((value) => <option key={value} value={value}>{value ? `₹${value.toLocaleString("en-IN")}` : "at +1R"}</option>)}</select></label>
+          </div>
+          <p className="mi-note">{autoStatus.summary}. Entries require the trade-desk verdict to agree and pause in extreme VIX or sideways markets; the auto engine never sends real orders.</p>
+          {autoStatus.diagnostics?.length ? <details className="mi-management"><summary>Why no trade?</summary><ul>{autoStatus.diagnostics.slice(0, 6).map((item) => <li key={item}><small>{item}</small></li>)}</ul></details> : null}
+        </article>
+
+        <article className="mi-card exec-orders">
+          <div className="exec-tabs" role="tablist">
+            {([["LIVE", `Live positions (${livePositions.length})`], ["PAPER", `Paper positions (${openPaper.length})`], ["HISTORY", `History (${history.length})`], ["LOGS", `Logs (${logs.length})`]] as Array<[Tab, string]>).map(([key, text]) => <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}>{text}</button>)}
+            <strong className={(tab === "LIVE" ? livePnl : paperPnl) >= 0 ? "gain" : "loss"}>Unrealised {tab === "LIVE" ? "live" : "paper"} ₹{money(tab === "LIVE" ? livePnl : paperPnl)}</strong>
+          </div>
+
+          {tab === "LIVE" && (
+            <>
+              {live?.today && <div className="mi-risk-row"><span>Trades today <b>{live.today.tradesToday}/{live.limits?.maxTradesPerDay}</b></span><span>Realised <b className={live.today.realizedPnl >= 0 ? "gain" : "loss"}>₹{money(live.today.realizedPnl)}</b></span><span>Open risk <b>₹{money(live.today.openRisk)}</b></span><span>Loss budget left <b>₹{money(live.today.lossBudgetLeft)}</b></span><span>Monitor <b className={live.monitor?.running ? "gain" : ""}>{live.monitor?.running ? "running" : "idle"}</b></span></div>}
+              {live?.monitor?.lastError && <p className="loss mi-note">Monitor error: {live.monitor.lastError}</p>}
+              {livePositions.length ? (
+                <>
+                  <label className="exec-pin">Trading PIN for manual actions<input type="password" inputMode="numeric" autoComplete="off" value={livePin} onChange={(event) => setLivePin(event.target.value)} /></label>
+                  <table className="exec-table"><thead><tr><th>Contract</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Stop</th><th>Target</th><th>P&amp;L</th><th /></tr></thead><tbody>
+                    {livePositions.map((order) => <tr key={order.id}>
+                      <td><b>{order.symbol}</b>{order.reconcileWarning && <small className="warning"> ⚠ {order.reconcileWarning}</small>}{order.exitError && <small className="loss"> {order.exitError}</small>}</td>
+                      <td>{order.quantity}</td><td>₹{money(order.price)}</td><td>₹{money(order.currentPrice)}</td>
+                      <td>₹{money(order.stopLoss)}{order.trailingActivatedAt ? <small> trailing</small> : null}</td><td>₹{money(order.target)}</td>
+                      <td className={(order.pnl ?? 0) >= 0 ? "gain" : "loss"}>₹{money(order.pnl)}</td>
+                      <td><button type="button" className="algo-exit" disabled={busy || livePin.length < 6} onClick={() => void liveAction("exit", order)}>Exit now</button>{order.reconcileWarning && <button type="button" className="algo-exit" disabled={busy || livePin.length < 6} onClick={() => void liveAction("mark_closed", order)}>Mark closed</button>}</td>
+                    </tr>)}
+                  </tbody></table>
+                </>
+              ) : <div className="algo-empty">No open live positions.</div>}
+            </>
+          )}
+
+          {tab === "PAPER" && (openPaper.length ? (
+            <table className="exec-table"><thead><tr><th>Contract</th><th>Strategy</th><th>Qty</th><th>Entry</th><th>LTP</th><th>SL / Target</th><th>P&amp;L</th><th /></tr></thead><tbody>
+              {openPaper.map((order) => <tr key={order.id}>
+                <td><b>{order.symbol}</b></td><td><small>{order.strategyName ?? order.strategy}</small></td><td>{order.quantity}</td><td>₹{money(order.price)}</td><td>₹{money(order.currentPrice ?? order.price)}</td>
+                <td>₹{money(order.stopLoss)} / ₹{money(order.target)}{order.trailingActivatedAt ? <small> trail ₹{money(order.trailingStop)}</small> : null}</td>
+                <td className={(order.pnl ?? 0) >= 0 ? "gain" : "loss"}>{order.pnl !== undefined ? `₹${money(order.pnl)}` : "awaiting quote"}</td>
+                <td><button type="button" className="algo-exit" onClick={() => void exitPaper(order)} disabled={busy}>Exit</button></td>
+              </tr>)}
+            </tbody></table>
+          ) : <div className="algo-empty">No open paper positions.</div>)}
+
+          {tab === "HISTORY" && (history.length ? (
+            <table className="exec-table"><thead><tr><th>Time</th><th>Mode</th><th>Contract</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Realised</th><th>Status</th></tr></thead><tbody>
+              {history.slice(0, 60).map((item) => <tr key={item.id}>
+                <td><small>{new Date(item.createdAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: false, day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</small></td>
+                <td><span className={item.mode === "ALGO_LIVE" ? "exec-badge exec-badge-live" : "exec-badge"}>{item.mode === "ALGO_LIVE" ? "LIVE" : "PAPER"}</span></td>
+                <td><b>{item.symbol}</b></td><td>{item.quantity}</td><td>₹{money(item.price)}</td><td>{item.exitPrice ? `₹${money(item.exitPrice)}` : "--"}</td><td><small>{item.exitReason ?? "--"}</small></td>
+                <td className={(item.realizedPnl ?? 0) >= 0 ? "gain" : "loss"}>{item.realizedPnl !== undefined ? `₹${money(item.realizedPnl)}` : "--"}</td><td><small>{item.status}</small></td>
+              </tr>)}
+            </tbody></table>
+          ) : <div className="algo-empty">No trades recorded yet.</div>)}
+
+          {tab === "LOGS" && (logs.length ? <div className="algo-logs-list">{logs.map((entry, index) => <div className={`algo-log-entry ${entry.type}`} key={`${entry.time}-${index}`}><span className="algo-log-time">{entry.time}</span><span>{entry.text}</span></div>)}</div> : <div className="algo-empty">No activity yet this session.</div>)}
+        </article>
+        <p className="mi-disclaimer">Options trading involves substantial risk. This software is not investment advice and is not a SEBI-registered adviser. API trading may require static-IP registration and algo approval with your broker under SEBI&apos;s retail algo framework; confirm with Groww before enabling live mode.</p>
       </div>
-    </section>
-  </main>;
+      {liveDraft && <LiveOrderDialog draft={liveDraft} onClose={() => setLiveDraft(null)} onPlaced={(text) => { setMessage(text); log(text, "entry"); setTab("LIVE"); void refreshLive(); }} />}
+    </main>
+  );
 }
