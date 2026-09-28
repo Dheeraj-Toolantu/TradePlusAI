@@ -100,6 +100,7 @@ export function evaluateTicket(ticket: LiveTicket, instrument: GrowwInstrument |
 
 type MonitorState = { timer: ReturnType<typeof setInterval> | null; ticks: number; lastTickAt: string | null; lastError: string | null; exiting: Set<string>; positions: Map<string, OrderRecord>; hydrated: boolean; busy: boolean };
 const monitorGlobal = globalThis as typeof globalThis & { __tradepulseLiveMonitor?: MonitorState };
+const stopBreaches = new Map<string, number>();
 const monitor = (monitorGlobal.__tradepulseLiveMonitor ??= { timer: null, ticks: 0, lastTickAt: null, lastError: null, exiting: new Set(), positions: new Map(), hydrated: false, busy: false });
 
 export class LiveTradingService {
@@ -190,9 +191,15 @@ export class LiveTradingService {
     }
     const entry = fill.averagePrice ?? ticket.limitPrice;
     const order: OrderRecord = { ...base, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
-    await this.deps.store.save(order);
     monitor.positions.set(order.id, order);
     this.ensureMonitor();
+    const stop = await this.placeProtectiveStop(order, ticket.stopLoss);
+    if (!stop.ok) {
+      await this.deps.store.save(order);
+      const closed = await this.exit(order.id, "PROTECTIVE_STOP_FAILED", undefined, false);
+      return { ok: false as const, status: 502, error: `Entry filled but Groww rejected the protective stop (${stop.error}); the position was ${closed.ok ? "closed immediately" : "NOT closed: exit it in the Groww app now"}.`, order };
+    }
+    await this.deps.store.save(order);
     return { ok: true as const, status: 200, order, partial: fill.filled < ticket.quantity };
   }
 
@@ -217,6 +224,63 @@ export class LiveTradingService {
     return { filled: Math.min(filled, quantity), averagePrice, note: note || "Unfilled remainder cancelled" };
   }
 
+  // ---- broker-side protective stop (SL-M at Groww) ---------------------------------------
+  // The stop lives at the broker so the position stays protected if this server stops. The app
+  // still owns targets, trailing (it moves the broker stop), square-off and kill-switch exits.
+
+  private async placeProtectiveStop(order: OrderRecord, trigger: number): Promise<{ ok: boolean; error?: string }> {
+    const instrument = await this.deps.instrument(order.symbol);
+    const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
+    const reference = referenceId();
+    const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: order.symbol, quantity: order.quantity, side: "SELL", orderType: "SL_M", triggerPrice: tickDown(trigger, tick), exchange: order.exchange === "BSE" ? "BSE" : "NSE", segment: "FNO", product: "MIS" });
+    if ("error" in placed) return { ok: false, error: placed.error.message };
+    Object.assign(order, { brokerStopOrderId: placed.value.brokerOrderId, stopReferenceId: reference, brokerStopTrigger: tickDown(trigger, tick) });
+    return { ok: true };
+  }
+
+  /** Status of the broker stop: filled (position closed at the broker), dead (cancelled/rejected) or pending. */
+  private async stopState(order: OrderRecord): Promise<{ filled: number; averagePrice?: number; state: "FILLED" | "DEAD" | "PENDING" | "UNKNOWN" }> {
+    if (!order.stopReferenceId) return { filled: 0, state: "UNKNOWN" };
+    const status = await this.deps.broker.getOrderStatus(order.stopReferenceId);
+    if ("error" in status) return { filled: 0, state: "UNKNOWN" };
+    const value = status.value.status.toUpperCase();
+    const filled = status.value.filledQuantity;
+    if (FILLED.has(value) || filled >= order.quantity) return { filled: Math.min(filled, order.quantity), averagePrice: status.value.averageFillPrice, state: "FILLED" };
+    if (DEAD.has(value)) return { filled, averagePrice: status.value.averageFillPrice, state: "DEAD" };
+    return { filled, averagePrice: status.value.averageFillPrice, state: "PENDING" };
+  }
+
+  /** Cancel the broker stop before an app exit. Never lets the app sell while the stop may still fire. */
+  private async releaseStop(order: OrderRecord): Promise<{ status: "RELEASED" } | { status: "ALREADY_EXITED"; filled: number; averagePrice?: number } | { status: "BLOCKED"; error: string }> {
+    if (!order.brokerStopOrderId) return { status: "RELEASED" };
+    await this.deps.broker.cancelOrder(order.brokerStopOrderId);
+    const state = await this.stopState(order);
+    if (state.state === "FILLED") return { status: "ALREADY_EXITED", filled: state.filled, averagePrice: state.averagePrice };
+    if (state.state === "DEAD") {
+      if (state.filled > 0) return { status: "ALREADY_EXITED", filled: state.filled, averagePrice: state.averagePrice };
+      Object.assign(order, { brokerStopOrderId: undefined, stopReferenceId: undefined });
+      return { status: "RELEASED" };
+    }
+    return { status: "BLOCKED", error: "Could not confirm the Groww stop-loss was cancelled; exit aborted to avoid selling twice. Check the Groww app." };
+  }
+
+  private async closeFromBrokerStop(order: OrderRecord, averagePrice: number | undefined, reason: string) {
+    const exitPrice = round2(averagePrice ?? Number(order.brokerStopTrigger ?? order.stopLoss));
+    const exchange = order.exchange === "BSE" ? "BSE" : "NSE";
+    const charges = estimateCharges(order.price, exitPrice, order.quantity, exchange);
+    Object.assign(order, { status: "EXITED", exitPrice, exitAt: new Date(this.deps.now()).toISOString(), exitReason: reason, charges, realizedPnl: round2((exitPrice - order.price) * order.quantity - charges), realizedPnlPercent: round2((exitPrice - order.price) / order.price * 100) });
+    await this.deps.store.save(order);
+    monitor.positions.delete(order.id);
+  }
+
+  private async moveBrokerStop(order: OrderRecord, trigger: number) {
+    const released = await this.releaseStop(order);
+    if (released.status === "ALREADY_EXITED") { await this.closeFromBrokerStop(order, released.averagePrice, "BROKER_STOP"); return; }
+    if (released.status === "BLOCKED") { order.exitError = released.error; return; }
+    const placed = await this.placeProtectiveStop(order, trigger);
+    order.exitError = placed.ok ? undefined : `Trailing stop could not be re-placed at Groww (${placed.error}); the app will exit on its own stop.`;
+  }
+
   async exit(orderId: string, reason: string, pin?: unknown, requirePin = true) {
     if (requirePin && !pinMatches(pin, this.deps.env)) return { ok: false as const, status: 401, error: "Incorrect trading PIN" };
     await this.hydrate();
@@ -225,6 +289,9 @@ export class LiveTradingService {
     if (monitor.exiting.has(orderId)) return { ok: false as const, status: 409, error: "Exit already in progress" };
     monitor.exiting.add(orderId);
     try {
+      const released = await this.releaseStop(order);
+      if (released.status === "ALREADY_EXITED") { await this.closeFromBrokerStop(order, released.averagePrice, "BROKER_STOP"); return { ok: true as const, status: 200, order }; }
+      if (released.status === "BLOCKED") { order.exitError = released.error; await this.deps.store.save(order); return { ok: false as const, status: 502, error: released.error }; }
       const exchange = order.exchange === "BSE" ? "BSE" : "NSE";
       const instrument = await this.deps.instrument(order.symbol);
       const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
@@ -245,7 +312,9 @@ export class LiveTradingService {
       }
       const exitedQuantity = order.quantity - remaining;
       if (remaining > 0) {
-        Object.assign(order, { exitError: `Exit incomplete: ${remaining} qty still open. ${lastError}`.trim(), updatedAt: new Date(this.deps.now()).toISOString() });
+        order.quantity = remaining;
+        const reprotected = await this.placeProtectiveStop(order, Number(order.stopLoss));
+        Object.assign(order, { exitError: `Exit incomplete: ${remaining} qty still open${reprotected.ok ? " (Groww stop-loss re-placed)" : " and UNPROTECTED"}. ${lastError}`.trim(), updatedAt: new Date(this.deps.now()).toISOString() });
         await this.deps.store.save(order);
         return { ok: false as const, status: 502, error: order.exitError, exitedQuantity };
       }
@@ -309,11 +378,23 @@ export class LiveTradingService {
         const breakeven = entry + estimateCharges(entry, entry, order.quantity, order.exchange === "BSE" ? "BSE" : "NSE") / order.quantity;
         if (highWater >= entry + risk) stop = Math.max(stop, round2(breakeven));
         if (highWater >= entry + 1.5 * risk) stop = Math.max(stop, round2(highWater - risk));
+        if (order.brokerStopOrderId) {
+          const state = await this.stopState(order);
+          if (state.state === "FILLED") { await this.closeFromBrokerStop(order, state.averagePrice, stop > initialStop ? "BROKER_TRAILING_STOP" : "BROKER_STOP"); continue; }
+          if (state.state === "DEAD") { Object.assign(order, { brokerStopOrderId: undefined, stopReferenceId: undefined }); await this.placeProtectiveStop(order, Math.max(stop, Number(order.stopLoss))); }
+        }
         const changed = stop !== Number(order.stopLoss) || highWater !== Number(order.highWaterMark);
         Object.assign(order, { currentPrice: ltp, pnl: round2((ltp - entry) * order.quantity), pnlPercent: round2((ltp - entry) / entry * 100), highWaterMark: highWater, stopLoss: stop, trailingStop: stop, quoteSource: "Groww live quote" });
         if (stop > initialStop && !order.trailingActivatedAt) order.trailingActivatedAt = new Date(this.deps.now()).toISOString();
+        if (order.brokerStopOrderId && stop > Number(order.brokerStopTrigger ?? 0) + 0.049) await this.moveBrokerStop(order, stop);
+        if (!monitor.positions.has(order.id)) continue;
         if (changed) await this.deps.store.save(order);
-        const reason = config.killSwitch ? "KILL_SWITCH" : clock.minute >= config.squareOffMinute ? "SQUARE_OFF_1515" : ltp >= Number(order.target) ? "TARGET" : ltp <= stop ? (stop > initialStop ? "TRAILING_STOP" : "STOP_LOSS") : null;
+        // With a live broker stop, Groww executes the stop itself; the app only steps in if the
+        // price has stayed through the stop for 3 checks (stop order stuck or rejected).
+        const breach = ltp <= stop ? (stopBreaches.get(order.id) ?? 0) + 1 : 0;
+        stopBreaches.set(order.id, breach);
+        const stopHit = order.brokerStopOrderId ? breach >= 3 : breach >= 1;
+        const reason = config.killSwitch ? "KILL_SWITCH" : clock.minute >= config.squareOffMinute ? "SQUARE_OFF_1515" : ltp >= Number(order.target) ? "TARGET" : stopHit ? (stop > initialStop ? "TRAILING_STOP" : "STOP_LOSS") : null;
         if (reason) await this.exit(order.id, reason, undefined, false);
       }
       if (monitor.ticks % RECONCILE_EVERY_TICKS === 0 && monitor.positions.size) await this.reconcile();

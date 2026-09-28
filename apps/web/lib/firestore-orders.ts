@@ -55,6 +55,10 @@ export type OrderRecord = {
   charges?: number;
   exitError?: string;
   reconcileWarning?: string;
+  brokerStopOrderId?: string;
+  stopReferenceId?: string;
+  brokerStopTrigger?: number;
+  brokerExitOrderId?: string;
 };
 
 const ORDERS_COLLECTION = "orders";

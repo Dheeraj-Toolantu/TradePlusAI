@@ -112,7 +112,20 @@ async function fetchRealChain(symbol: SymbolName, spot: number, provider: string
   const rawChain = await transport.request(requestPath, { method: "GET" });
   const historyResponse = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=5m&period=day&date=${new Date().toISOString().slice(0, 10)}`, { cache: "no-store" });
   const history = await historyResponse.json();
-  const contracts = normalizeContracts(rawChain, symbol);
+  let contracts = normalizeContracts(rawChain, symbol);
+  if (!contracts.length) {
+    const normalizedResponse = await fetch(`${origin}/api/option-chain?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    const normalizedBody = await normalizedResponse.json() as RawRecord;
+    const normalizedRows = Array.isArray(normalizedBody.contracts) ? normalizedBody.contracts : [];
+    contracts = normalizeContracts({ contracts: normalizedRows.map((row: RawRecord) => ({
+      ...row,
+      option_type: row.contract,
+      ltp: row.premium,
+      lot_size: row.lotSize,
+      oi_change: row.oiChange ?? 0,
+      timestamp_age_seconds: row.timestampAgeSeconds ?? 0,
+    })) }, symbol);
+  }
   if (!contracts.length) throw new Error(`No actionable option-chain data available for ${symbol}; decision is NO_TRADE / WAIT.`);
   if (!Array.isArray(history.candles)) throw new Error(`No actionable 5-minute history available for ${symbol}; decision is NO_TRADE / WAIT.`);
   return { symbol, spot, contracts, candles: history.candles.map((candle: RawRecord) => ({ open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume })) };
@@ -145,6 +158,7 @@ export async function GET(request: Request) {
   try {
     const quoteResponse = await fetch(`${url.origin}/api/market-data?provider=${encodeURIComponent(provider)}&symbols=${selected.join(",")}`, { cache: "no-store" });
     const quoteData = await quoteResponse.json();
+    if (!quoteResponse.ok) throw new Error(String(quoteData.error ?? "Groww spot price is unavailable."));
     const results = await Promise.all(selected.map(async (symbol) => {
       const quote = (quoteData.quotes ?? []).find((item: RawRecord) => item.symbol === symbol);
       const spot = numberOf(quote?.price);

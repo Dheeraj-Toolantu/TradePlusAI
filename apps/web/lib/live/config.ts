@@ -38,6 +38,7 @@ export function readLiveConfig(environment: NodeJS.ProcessEnv = process.env): Li
   if (environment.EXECUTION_MODE !== "ALGO_LIVE") reasons.push("EXECUTION_MODE is not ALGO_LIVE");
   if (environment.LIVE_EXECUTION_ENABLED !== "true") reasons.push("LIVE_EXECUTION_ENABLED is not true");
   if (environment.LIVE_COMPLIANCE_APPROVED !== "true") reasons.push("LIVE_COMPLIANCE_APPROVED is not true");
+  if (environment.LIVE_TRADING_CONFIRMATION !== "true") reasons.push("LIVE_TRADING_CONFIRMATION is not true");
   if (!environment.GROWW_ACCESS_TOKEN && !(environment.GROWW_API_KEY && environment.GROWW_API_SECRET)) reasons.push("Groww API credentials are not configured");
   const pin = environment.LIVE_TRADING_PIN ?? "";
   if (pin.length < 6) reasons.push("LIVE_TRADING_PIN (6+ characters) is not configured");

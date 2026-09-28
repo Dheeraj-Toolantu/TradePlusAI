@@ -10,6 +10,7 @@ import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 // needs the header and the trade desk shell.
 const MarketIntelPanel = dynamic(() => import("../../components/market-intel/market-intel-panel").then((module) => module.MarketIntelPanel), { ssr: false, loading: () => <div className="algo-empty">Loading trade desk…</div> });
 const SentimentPanel = dynamic(() => import("../../components/market-intel/sentiment-panel").then((module) => module.SentimentPanel), { ssr: false });
+const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitoring-panel").then((module) => module.AIMonitoringPanel), { ssr: false });
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
 
 type PipelineGate = { code: string; passed: boolean; detail: string };
@@ -366,6 +367,22 @@ export default function ExecutionPage() {
     document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
 
+  const [cacheClearing, setCacheClearing] = useState(false);
+  const clearCache = useCallback(async () => {
+    setCacheClearing(true);
+    try {
+      await fetch("/api/cache", { method: "POST", cache: "no-store" });
+      setMessage("Server caches cleared (contract master, history, trade desk, sentiment). Reloading…");
+      await refresh();
+    } catch { setMessage("Cache clear failed; live data was not changed."); }
+    finally { setCacheClearing(false); }
+  }, [refresh]);
+  const aiContext = useCallback(() => ({
+    symbol, timeframe: "5m", executionMode: live?.enabled ? "ALGO_LIVE_ARMED" : "PAPER", marketStatus: sessionLabelRef.current, deterministicAnalysis: analysis,
+    candles: candlesRef.current.slice(-30), optionCandidates: chainRef.current.slice(0, 20), risk: { safeMode: safety.safeMode, killSwitch: safety.killSwitch, autoTradeEnabled: autoEnabled },
+  }), [analysis, autoEnabled, live?.enabled, safety.killSwitch, safety.safeMode, symbol]);
+  const sessionLabelRef = useRef("--");
+
   const switchIndex = useCallback((next: string) => { setSymbol(next); setContract(null); setResults([]); setQuery(""); }, []);
 
   // ---- derived ---------------------------------------------------------------------------
@@ -373,7 +390,8 @@ export default function ExecutionPage() {
   const paperPnl = openPaper.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
   const livePositions = live?.positions ?? [];
   const livePnl = livePositions.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
-  const sessionLabel = !analysis?.session ? "--" : !analysis.session.market_open ? "MARKET CLOSED" : analysis.session.entry_permitted ? "ENTRY WINDOW" : analysis.session.window.replaceAll("_", " ");
+  const sessionLabel: string = !analysis?.session ? "--" : !analysis.session.market_open ? "MARKET CLOSED" : analysis.session.entry_permitted ? "ENTRY WINDOW" : analysis.session.window.replaceAll("_", " ");
+  sessionLabelRef.current = sessionLabel;
   const score = analysis?.calculations?.score ?? {};
   const underlying = analysis?.calculations?.underlying ?? {};
   const ticketPremium = premiumFor(contract);
@@ -392,6 +410,7 @@ export default function ExecutionPage() {
           <span className="exec-badge">{sessionLabel}</span>
           <span className="exec-badge">IST {clock || "--:--:--"}</span>
           <span className={streamStatus === "live" ? "exec-badge gain" : "exec-badge warning"}>Quotes {streamStatus}</span>
+          <button type="button" className="exec-badge exec-badge-button" onClick={() => void clearCache()} disabled={cacheClearing}>{cacheClearing ? "Clearing…" : "Clear cache"}</button>
           <span className="exec-badge">Margin {account?.available !== null && account?.available !== undefined ? `₹${money(account.available)}` : "--"}</span>
         </div>
       </header>
@@ -400,6 +419,7 @@ export default function ExecutionPage() {
         <p className="exec-message" role="status">{message}</p>
         <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadPlan} />
         <SentimentPanel />
+        <AIMonitoringPanel symbol={symbol} strategyId={strategyId} buildContext={aiContext} />
 
         <div className="exec-grid">
           <article className="mi-card exec-strategy">

@@ -536,3 +536,9 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
   .exec-actions { grid-template-columns: minmax(0, 1fr); }
   .snt-sources { grid-template-columns: minmax(0, 1fr); }
 }
+.exec-badge-button { cursor: pointer; }
+.exec-badge-button:disabled { opacity: .6; cursor: wait; }
+.ai-panel .ai-chat-messages { max-height: 280px; }
+.ai-panel .ai-chat-message { font-size: 12px; }
+.ai-panel .ai-chat-message b { font-size: 10px; }
+.ai-panel .ai-chat-form input { font-size: 12px; }

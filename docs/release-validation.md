@@ -2,6 +2,14 @@
 
 ## Current validation
 
+### AI-driven trading feature 007
+
+- AI-specific Vitest suites: 20 files and 45 tests passing, covering monitoring lifecycle, model validation, deterministic replay, immutable log access, mode isolation, failure recovery, and paper/live blocking.
+- AI-context contract: 1 Python test passing; deterministic quant regression: 21 tests passing.
+- Next.js production build: passing with `/api/ai-monitoring`, `/api/ai-monitoring/log/[id]`, and the execution-page monitoring readout.
+- Repository lint: passing. Repository-wide Prettier check remains failing on broad pre-existing formatting drift and is not auto-formatted to avoid unrelated churn.
+- Remaining feature gaps: durable AI-record persistence, direct automation-decision integration with the existing order boundary, expiry/idempotency enforcement at execution time, Firestore authorization rules, and browser-level AI safe-state coverage.
+
 - JavaScript test suite: 52 test files and 77 tests passing across contract, integration, unit, security, and e2e safety files.
 - Next.js production build: passing with routes for dashboard, signals, trade detail, strategy builder,
   validation, execution, intelligence, and operations.

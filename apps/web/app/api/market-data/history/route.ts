@@ -7,7 +7,7 @@ const intervals: Record<string, number> = { "1m": 1, "3m": 3, "5m": 5, "10m": 10
 const periods = ["day", "week", "month", "year"] as const;
 type HistoryPeriod = typeof periods[number];
 
-type HistoricalCandle = { time: number; open: number; high: number; low: number; close: number; volume: number };
+type HistoricalCandle = { time: number; open: number; high: number; low: number; close: number; volume: number | null };
 
 function rangeFor(period: HistoryPeriod, selectedDate: string) {
   const end = new Date(`${selectedDate}T23:59:59`);
@@ -17,14 +17,26 @@ function rangeFor(period: HistoryPeriod, selectedDate: string) {
 }
 
 function toGrowwDate(value: Date) { return value.toISOString().slice(0, 19).replace("T", " "); }
+function numericVolume(value: unknown) { if (value === null || value === undefined || value === "") return null; const volume = Number(value); return Number.isFinite(volume) && volume >= 0 ? volume : null; }
 
 function parseCandles(value: unknown): HistoricalCandle[] {
   const payload = (value as { payload?: Record<string, unknown> })?.payload ?? value as Record<string, unknown>;
   const rows = (payload?.candles ?? payload?.data ?? []) as unknown[];
   return rows.flatMap((row) => {
-    if (!Array.isArray(row) || row.length < 6) return [];
-    const [time, open, high, low, close, volume] = row.map(Number);
-    return Number.isFinite(time) && Number.isFinite(open) && Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(close) ? [{ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 }] : [];
+    if (Array.isArray(row)) {
+      if (row.length < 5) return [];
+      const [time, open, high, low, close, volume] = row.map(Number);
+      return Number.isFinite(time) && Number.isFinite(open) && Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(close) ? [{ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : null }] : [];
+    }
+    if (!row || typeof row !== "object") return [];
+    const item = row as Record<string, unknown>;
+    const time = Number(item.time ?? item.timestamp ?? item.t ?? item.start_time);
+    const open = Number(item.open ?? item.open_price);
+    const high = Number(item.high ?? item.high_price);
+    const low = Number(item.low ?? item.low_price);
+    const close = Number(item.close ?? item.close_price ?? item.ltp);
+    const volume = Number(item.volume ?? item.vol ?? item.total_volume);
+    return Number.isFinite(time) && Number.isFinite(open) && Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(close) ? [{ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : null }] : [];
   });
 }
 
@@ -56,6 +68,14 @@ async function fetchGrowwHistory(symbol: string, timeframe: string, period: Hist
   const exchange = instrument?.exchange ?? (symbol === "SENSEX" ? "BSE" : "NSE");
   const response = await transport.request(`/v1/historical/candle/range?exchange=${exchange}&segment=CASH&trading_symbol=${encodeURIComponent(tradingSymbol)}&start_time=${encodeURIComponent(toGrowwDate(start))}&end_time=${encodeURIComponent(toGrowwDate(end))}&interval_in_minutes=${intervals[responseInterval]}`, { method: "GET" });
   const candles = parseCandles(response);
+  if (candles.length && !candles.some((candle) => candle.volume !== null && candle.volume > 0)) {
+    try {
+      const quoteResponse = await transport.request(`/v1/live-data/quote?exchange=${exchange}&segment=CASH&trading_symbol=${encodeURIComponent(tradingSymbol)}`, { method: "GET" });
+      const quotePayload = ((quoteResponse as { payload?: Record<string, unknown> }).payload ?? {}) as Record<string, unknown>;
+      const liveVolume = numericVolume(quotePayload.volume ?? quotePayload.total_volume ?? quotePayload.volume_traded);
+      if (liveVolume !== null) candles[candles.length - 1] = { ...candles[candles.length - 1], volume: liveVolume };
+    } catch { /* Historical candles remain valid when the live volume quote is unavailable. */ }
+  }
   return timeframe === "1M" ? aggregateMonthly(candles) : candles;
 }
 
@@ -72,7 +92,7 @@ async function fetchYahooHistory(symbol: string, timeframe: string, period: Hist
   const result = (await response.json()).chart?.result?.[0];
   const timestamps = result?.timestamp ?? [];
   const quote = result?.indicators?.quote?.[0] ?? {};
-  return timestamps.flatMap((time: number, index: number) => { const open = Number(quote.open?.[index]); const high = Number(quote.high?.[index]); const low = Number(quote.low?.[index]); const close = Number(quote.close?.[index]); if (![open, high, low, close].every(Number.isFinite)) return []; return [{ time, open, high, low, close, volume: Number(quote.volume?.[index] ?? 0) }]; });
+  return timestamps.flatMap((time: number, index: number) => { const open = Number(quote.open?.[index]); const high = Number(quote.high?.[index]); const low = Number(quote.low?.[index]); const close = Number(quote.close?.[index]); if (![open, high, low, close].every(Number.isFinite)) return []; return [{ time, open, high, low, close, volume: numericVolume(quote.volume?.[index]) }]; });
 }
 
 // Short response cache: the algo page, market-intel and the V5 engine all request the same
@@ -107,10 +127,10 @@ async function computeHistory(request: Request) {
     if (provider === "groww") {
       try {
         const candles = await fetchGrowwHistory(symbol, timeframe, period, selectedDate);
-        return NextResponse.json({ candles, provider: "groww", source: `Groww historical candles (${period}, ${selectedDate})`, delayed: false, symbol, timeframe, period, date: selectedDate });
+        return NextResponse.json({ candles, provider: "groww", source: `Groww historical candles (${period}, ${selectedDate})`, volumeAvailable: candles.some((candle) => candle.volume !== null && candle.volume > 0), delayed: false, symbol, timeframe, period, date: selectedDate });
       } catch (error) {
         const candles = await fetchYahooHistory(symbol, timeframe, period, selectedDate);
-        return NextResponse.json({ candles, provider: "yahoo", requestedProvider: "groww", source: `Yahoo Finance fallback after Groww failure${error instanceof Error ? `: ${error.message}` : ""}`, delayed: true, symbol, timeframe, period, date: selectedDate });
+        return NextResponse.json({ candles, provider: "yahoo", requestedProvider: "groww", source: `Yahoo Finance fallback after Groww failure${error instanceof Error ? `: ${error.message}` : ""}`, volumeAvailable: candles.some((candle) => candle.volume !== null && candle.volume > 0), delayed: true, symbol, timeframe, period, date: selectedDate });
       }
     }
     if (provider === "fallback") return NextResponse.json({ candles: [], provider, source: "Fallback fixture", delayed: true, symbol, timeframe, period, date: selectedDate });

@@ -6,6 +6,7 @@ export type GrowwConfig = {
   apiKeySecretConfigured: boolean;
   liveExecutionEnabled: boolean;
   complianceApproved: boolean;
+  liveTradingConfirmationRequired: boolean;
 };
 
 function executionMode(value: string | undefined): "PAPER" | "ALGO_LIVE" {
@@ -21,6 +22,7 @@ export function readGrowwConfig(environment: NodeJS.ProcessEnv = process.env): G
     apiKeySecretConfigured: Boolean(environment.GROWW_API_KEY && environment.GROWW_API_SECRET),
     liveExecutionEnabled: environment.LIVE_EXECUTION_ENABLED === "true",
     complianceApproved: environment.LIVE_COMPLIANCE_APPROVED === "true",
+    liveTradingConfirmationRequired: environment.LIVE_TRADING_CONFIRMATION === "true",
   };
 }
 
