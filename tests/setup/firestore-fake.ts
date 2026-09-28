@@ -27,6 +27,7 @@ const matches = (data: Data, constraint: Constraint) => {
 
 export const firestoreFake = {
   reset: () => collections.clear(),
+  seed: (path: string, id: string, data: Data) => { bucket(path).set(id, structuredClone(data)); },
   documents: (path: string) => Array.from(bucket(path).entries()).map(([id, data]) => ({ id, ...structuredClone(data) })),
 };
 
@@ -39,7 +40,10 @@ vi.mock("firebase/firestore", () => ({
   limit: (count: number): Constraint => ({ kind: "limit", count }),
   orderBy: (): Constraint => ({ kind: "orderBy" }),
   serverTimestamp: () => ({ serverTimestamp: true }),
-  setDoc: async (ref: DocRef, data: Data) => { bucket(ref.path).set(ref.id, structuredClone(data)); },
+  setDoc: async (ref: DocRef, data: Data, options?: { merge?: boolean }) => {
+    const store = bucket(ref.path);
+    store.set(ref.id, options?.merge ? { ...(store.get(ref.id) ?? {}), ...structuredClone(data) } : structuredClone(data));
+  },
   updateDoc: async (ref: DocRef, data: Data) => {
     const store = bucket(ref.path);
     const existing = store.get(ref.id);
