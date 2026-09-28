@@ -61,7 +61,7 @@ async function fetchGrowwHistory(symbol: string, timeframe: string, period: Hist
 
 async function fetchYahooHistory(symbol: string, timeframe: string, period: HistoryPeriod, selectedDate: string) {
   const ticker = { NIFTY: "^NSEI", BANKNIFTY: "^NSEBANK", SENSEX: "^BSESN" }[symbol as "NIFTY" | "BANKNIFTY" | "SENSEX"] ?? symbol;
-  const interval = timeframe === "1M" ? "1mo" : timeframe === "1W" ? "1wk" : timeframe === "1D" ? "1d" : timeframe === "4h" ? "60m" : timeframe === "1h" ? "60m" : timeframe === "10m" || timeframe === "3m" ? "5m" : timeframe === "1m" ? "1m" : "15m";
+  const interval = timeframe === "1M" ? "1mo" : timeframe === "1W" ? "1wk" : timeframe === "1D" ? "1d" : timeframe === "4h" ? "60m" : timeframe === "1h" ? "60m" : timeframe === "5m" || timeframe === "10m" || timeframe === "3m" ? "5m" : timeframe === "1m" ? "1m" : "15m";
   const intraday = ["1m", "3m", "5m", "10m", "15m", "1h", "4h"].includes(timeframe);
   const range = intraday ? (timeframe === "1m" ? "5d" : "1mo") : period === "day" ? "1d" : period === "week" ? "5d" : period === "month" ? "1mo" : "1y";
   const requestedEnd = new Date(`${selectedDate}T23:59:59`);

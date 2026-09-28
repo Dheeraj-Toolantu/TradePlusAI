@@ -6,6 +6,7 @@ import { readGrowwConfig } from "../../../../../services/execution/src/groww-con
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
 import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
+import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-intel";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -94,43 +95,22 @@ async function growwAccountSummary() {
 }
 
 async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}) {
-  const [historyResponse, chainResponse] = await Promise.all([
-    fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=5m&period=week&date=${new Date().toISOString().slice(0, 10)}`, { cache: "no-store" }),
-    fetch(`${origin}/api/option-chain?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" }),
-  ]);
-  const [history, chain] = await Promise.all([historyResponse.json(), chainResponse.json()]);
+  const historyResponse = await fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=5m&period=week&date=${istDate()}`, { cache: "no-store" });
+  const history = await historyResponse.json();
   if (!historyResponse.ok) throw new Error(String(history.error ?? "Market history unavailable"));
   const root = existsSync(path.resolve(process.cwd(), "quant")) ? process.cwd() : path.resolve(process.cwd(), "../..");
   const executable = process.env.PYTHON_EXECUTABLE ?? "python";
+  // Option evidence comes from the market-intel engine: signed OI-flow direction score from
+  // 5-minute OI change, delta-normalised option relative strength, India VIX regime and
+  // strike liquidity. The V5 engine decides whether it supports the setup's direction.
+  // Unavailable evidence stays absent so the no-trade gate fails closed.
   let optionEvidence: Record<string, unknown> = {};
-  try {
-    const contracts = Array.isArray(chain.contracts) ? chain.contracts as Array<Record<string, unknown>> : [];
-    const calls = contracts.filter((contract) => contract.contract === "CALL");
-    const puts = contracts.filter((contract) => contract.contract === "PUT");
-    const sum = (items: Array<Record<string, unknown>>, key: string) => items.reduce((total, item) => total + Number(item[key] ?? 0), 0);
-    const callOi = sum(calls, "openInterest");
-    const putOi = sum(puts, "openInterest");
-    const callVolume = sum(calls, "volume");
-    const putVolume = sum(puts, "volume");
-    const avg = (items: Array<Record<string, unknown>>, key: string) => items.length ? sum(items, key) / items.length : null;
-    const oiPcr = callOi > 0 ? putOi / callOi : null;
-    const avgIv = avg(contracts, "iv");
-    const avgScore = avg(contracts, "score");
-    const avgTurnover = contracts.length ? contracts.reduce((total, contract) => total + Number(contract.volume ?? 0) / Math.max(Number(contract.openInterest ?? 0), 1), 0) / contracts.length : 0;
-    const liquidityScore = contracts.length && avgScore !== null
-      ? Math.max(0, Math.min(3, Math.round((Number(avgScore) / 100) * 3 + (avgTurnover >= 0.5 ? 1 : 0))))
-      : null;
-    const ivRegime = avgIv === null ? null : avgIv < 20 ? "LOW" : avgIv <= 35 ? "NORMAL" : "HIGH";
-    optionEvidence = {
-      ors: contracts.length ? (callVolume + putVolume) / Math.max(callOi + putOi, 1) : null,
-      oi_direction_score: oiPcr === null ? null : oiPcr >= 0.8 && oiPcr <= 1.3 ? 1 : 0,
-      iv_regime: ivRegime,
-      liquidity_score: liquidityScore,
-      ors_confirmed: contracts.length > 0,
-      oi_pcr_supportive: oiPcr !== null && oiPcr >= 0.5 && oiPcr <= 1.8,
-      option_quote_fresh: contracts.length > 0,
-    };
-  } catch { optionEvidence = {}; }
+  if (isIntelSymbol(symbol)) {
+    try {
+      const intel = await getMarketIntel(symbol, { origin });
+      optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>;
+    } catch { optionEvidence = {}; }
+  }
   const payload = { symbol, strategy, candles: history.candles ?? [], risk_per_trade: 1000, option_evidence: optionEvidence, pipeline: evidence };
   return new Promise<RecordValue>((resolve, reject) => {
     const child = spawn(executable, ["-m", "tradepulse_quant.algo_engine.engine"], { cwd: root, env: { ...process.env, PYTHONPATH: path.join(root, "quant", "src") }, windowsHide: true });
