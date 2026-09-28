@@ -314,6 +314,12 @@ export async function POST(request: Request) {
     if (pipeline?.decision !== "CONFIRMED") {
       return NextResponse.json({ error: "V5 no-trade gate rejected the paper entry.", reasons: pipeline?.reasons ?? ["SERVER_PIPELINE_UNAVAILABLE"] }, { status: 403 });
     }
+    // A long-option strategy buys CE for a BUY (bullish) setup and PE for a SELL (bearish) one.
+    const setupSide = String((serverAnalysis.setup as { side?: string } | undefined)?.side ?? "");
+    const optionType = String(body.optionType ?? "").toUpperCase();
+    if ((setupSide === "BUY" && optionType !== "CE") || (setupSide === "SELL" && optionType !== "PE")) {
+      return NextResponse.json({ error: `V5 setup is ${setupSide === "BUY" ? "bullish: buy a CE" : "bearish: buy a PE"}; ${optionType || "this contract"} does not match the signal direction.` }, { status: 409 });
+    }
   }
 
   const direction = side === "SELL" ? -1 : 1;

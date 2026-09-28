@@ -52,7 +52,8 @@ export function SentimentPanel() {
         const response = await fetch("/api/sentiment", { cache: "no-store" });
         const body = await response.json();
         if (cancelled) return;
-        if (!response.ok || body.error) setError(body.error ?? "Sentiment unavailable");
+        const wellFormed = body && typeof body === "object" && body.summary?.india && Array.isArray(body.event_risk) && Array.isArray(body.sources) && Array.isArray(body.top_bullish) && Array.isArray(body.top_bearish) && Array.isArray(body.global_headlines);
+        if (!response.ok || body.error || !wellFormed) setError(body?.error ?? "Sentiment unavailable");
         else { setData(body as Sentiment); setError(null); }
       } catch { if (!cancelled) setError("Sentiment request failed"); }
     };

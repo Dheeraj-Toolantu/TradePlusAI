@@ -33,6 +33,7 @@ class PipelineEvidence:
     session_allowed: bool | None = None
     strategy_decision: str | None = None
     regime: str | None = None
+    setup_side: str | None = None
     gap_state: str | None = None
     breakout_valid: bool | None = None
     retest_confirmed: bool | None = None
@@ -98,6 +99,12 @@ class NoTradeEngine:
             reasons.append("VIX_BLOCKED")
 
         valid_regime = evidence.regime in {"TRENDING_BULL", "TRENDING_BEAR"}
+        # A BUY setup in a bearish trend (or SELL in a bullish one) is a conflicting regime.
+        if valid_regime and evidence.setup_side in {"BUY", "SELL"}:
+            conflict = (evidence.setup_side == "BUY" and evidence.regime == "TRENDING_BEAR") or (evidence.setup_side == "SELL" and evidence.regime == "TRENDING_BULL")
+            if conflict:
+                gates.append(GateEvidence("REGIME_CONFLICT", False, f"{evidence.setup_side} setup against a {evidence.regime} regime"))
+                reasons.append("REGIME_CONFLICT")
         gates.append(GateEvidence("REGIME_BLOCKED", valid_regime, "CHOP, RANGE, UNKNOWN, and conflicting regimes cannot enter"))
         if evidence.regime is None:
             reasons.append("MISSING_REGIME")

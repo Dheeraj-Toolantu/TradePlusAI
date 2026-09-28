@@ -542,3 +542,6 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .ai-panel .ai-chat-message { font-size: 12px; }
 .ai-panel .ai-chat-message b { font-size: 10px; }
 .ai-panel .ai-chat-form input { font-size: 12px; }
+.exec-orb { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0; padding: 8px; border: 1px solid #173a47; border-radius: 6px; background: #0b2330; color: var(--muted); }
+.exec-orb b { color: var(--text); }
+.exec-orb small { flex-basis: 100%; }

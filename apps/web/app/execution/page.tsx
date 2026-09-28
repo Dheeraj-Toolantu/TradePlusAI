@@ -16,10 +16,12 @@ const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-d
 type PipelineGate = { code: string; passed: boolean; detail: string };
 type Analysis = {
   decision: string; reason?: string;
-  setup?: { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string };
+  setup?: { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean };
   calculations?: { underlying?: Record<string, number | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string };
   session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean };
   pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
+  strategy_decision?: string;
+  strategy_reason?: string;
 };
 type Order = {
   id: string; symbol: string; strategy?: string; strategyName?: string; side: string; quantity: number; lotSize?: number; price: number; status: string; mode?: string;
@@ -75,6 +77,8 @@ export default function ExecutionPage() {
   const [stopLoss, setStopLoss] = useState("");
   const [target, setTarget] = useState("");
   const [ticketSource, setTicketSource] = useState("MANUAL");
+  // ALGO_ORB orders are re-validated by the server's V5 pipeline; MANUAL orders are user-authorised.
+  const [ticketOrigin, setTicketOrigin] = useState<"MANUAL" | "ALGO">("MANUAL");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -307,7 +311,7 @@ export default function ExecutionPage() {
     setBusy(true);
     try {
       const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-        mode: "PAPER", orderSource: "MANUAL", strategy: strategyId, strategyName: `${strategy.name}${ticketSource !== "MANUAL" ? ` · ${ticketSource}` : ""}`, underlying: symbol,
+        mode: "PAPER", orderSource: ticketOrigin, strategy: strategyId, strategyName: `${strategy.name}${ticketSource !== "MANUAL" ? ` · ${ticketSource}` : ""}`, underlying: symbol,
         symbol: enriched.symbol, growwSymbol: enriched.growwSymbol, side: "BUY", quantity: lots * enriched.lotSize, lotSize: enriched.lotSize, price: premium,
         target: Number(target), stopLoss: Number(stopLoss), expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
         tickSize: enriched.tickSize, freezeQuantity: enriched.freezeQuantity, contractActive: enriched.active, analysisDecision: analysis?.decision,
@@ -363,6 +367,7 @@ export default function ExecutionPage() {
     setStopLoss(String(plan.premium.stop));
     setTarget(String(plan.premium.target1));
     setTicketSource(`Desk ${plan.status}`);
+    setTicketOrigin("MANUAL");
     setMessage(`Plan loaded: BUY ${plan.contract.trading_symbol} · SL ₹${plan.premium.stop} · T1 ₹${plan.premium.target1}. Status ${plan.status}${plan.status === "READY" ? "" : " (practise in paper mode)"}.`);
     document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
@@ -383,6 +388,30 @@ export default function ExecutionPage() {
   }), [analysis, autoEnabled, live?.enabled, safety.killSwitch, safety.safeMode, symbol]);
   const sessionLabelRef = useRef("--");
 
+  // Map a confirmed V5 spot setup onto a liquid option: CE for BUY, PE for SELL, delta closest
+  // to 0.55 (ATM / slightly ITM), premium levels by delta, 25% premium circuit breaker (spec 15).
+  const loadStrategySetup = useCallback(() => {
+    const setup = analysis?.setup;
+    if (!setup || analysis?.pipeline?.decision !== "CONFIRMED") return;
+    const wanted = setup.side === "SELL" ? "PUT" : "CALL";
+    const pick = chainRef.current
+      .filter((item) => item.contract === wanted && item.premium > 0)
+      .sort((left, right) => Math.abs(Math.abs(left.delta || 0.5) - 0.55) - Math.abs(Math.abs(right.delta || 0.5) - 0.55) || Math.abs(left.strike - setup.entry) - Math.abs(right.strike - setup.entry))[0];
+    if (!pick) { setMessage(`No live ${wanted === "CALL" ? "CE" : "PE"} premium in the chain yet; wait for the option chain to load.`); return; }
+    const delta = Math.abs(pick.delta) > 0.05 ? Math.abs(pick.delta) : 0.5;
+    const premiumStop = Math.max(pick.premium - delta * Math.abs(setup.entry - setup.stop_loss), pick.premium * 0.75);
+    const premiumTarget = pick.premium + delta * Math.abs(setup.target - setup.entry);
+    const round = (value: number) => Math.round(value * 20) / 20;
+    setContract({ symbol: pick.symbol, growwSymbol: pick.symbol, type: wanted === "CALL" ? "CE" : "PE", expiry: pick.expiry, strike: pick.strike, lotSize: pick.lotSize && pick.lotSize > 0 ? pick.lotSize : FALLBACK_LOT[symbol] ?? 1, tickSize: pick.tickSize, freezeQuantity: pick.freezeQuantity });
+    setLots(1);
+    setStopLoss(String(round(premiumStop)));
+    setTarget(String(round(premiumTarget)));
+    setTicketSource(`${strategy.name} V5`);
+    setTicketOrigin("ALGO");
+    setMessage(`${strategy.name} setup loaded: BUY ${pick.symbol} (delta ${delta.toFixed(2)}) · SL ₹${round(premiumStop)} · target ₹${round(premiumTarget)}${setup.gap_day ? " · gap day: half size, keep 1 lot" : ""}. The server re-checks every V5 gate when you place it.`);
+    document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [analysis, strategy.name, symbol]);
+
   const switchIndex = useCallback((next: string) => { setSymbol(next); setContract(null); setResults([]); setQuery(""); }, []);
 
   // ---- derived ---------------------------------------------------------------------------
@@ -393,6 +422,7 @@ export default function ExecutionPage() {
   const sessionLabel: string = !analysis?.session ? "--" : !analysis.session.market_open ? "MARKET CLOSED" : analysis.session.entry_permitted ? "ENTRY WINDOW" : analysis.session.window.replaceAll("_", " ");
   sessionLabelRef.current = sessionLabel;
   const score = analysis?.calculations?.score ?? {};
+  const orb = analysis?.calculations?.orb;
   const underlying = analysis?.calculations?.underlying ?? {};
   const ticketPremium = premiumFor(contract);
   const ticketRisk = ticketPremium && Number(stopLoss) > 0 ? (ticketPremium - Number(stopLoss)) * lots * lotSize : null;
@@ -433,7 +463,18 @@ export default function ExecutionPage() {
             <p className="mi-note">{strategy.description}</p>
             {analysis?.setup ? (
               <div className="exec-setup"><b className={analysis.setup.side === "SELL" ? "loss" : "gain"}>{analysis.setup.side === "SELL" ? "BEARISH → buy PE" : "BULLISH → buy CE"}</b><span>Spot entry {money(analysis.setup.entry)} · SL {money(analysis.setup.stop_loss)} · target {money(analysis.setup.target)} · {analysis.setup.risk_reward ?? 2}R</span></div>
-            ) : <p className="mi-note">{analysis?.pipeline ? `${analysis.pipeline.gates.filter((gate) => gate.passed).length}/${analysis.pipeline.gates.length} gates passing. No setup until every gate is green.` : analysis?.reason ?? "Waiting for the engine…"}</p>}
+            ) : null}
+            {analysis?.setup && analysis.pipeline?.decision === "CONFIRMED" && <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load {strategy.name} setup into the order ticket</button>}
+            {strategyId === "ORB_RETEST" && orb && (
+              <div className="exec-orb" aria-label="ORB timeline">
+                <span>OR ({String(orb.opening_minutes ?? 15)}m{analysis?.calculations?.gap?.status && analysis.calculations.gap.status !== "NORMAL_DAY" ? ", gap day" : ""}) <b>{calc(orb.opening_range_high)} / {calc(orb.opening_range_low)}</b></span>
+                <span>Breakout <b>{orb.breakout_time ? String(orb.breakout_time).slice(11, 16) : "--"}</b></span>
+                <span>Retest <b>{orb.retest_time ? String(orb.retest_time).slice(11, 16) : "--"}</b></span>
+                <span>Status <b className={orb.status === "CONFIRMED" ? "gain" : "warning"}>{String(orb.status ?? "--").replaceAll("_", " ")}</b></span>
+                <small>{String(analysis?.strategy_reason ?? orb.reason ?? "")}</small>
+              </div>
+            )}
+            {!analysis?.setup && <p className="mi-note">{analysis?.pipeline ? `${analysis.pipeline.gates.filter((gate) => gate.passed).length}/${analysis.pipeline.gates.length} gates passing. No setup until every gate is green.` : analysis?.reason ?? "Waiting for the engine…"}</p>}
             <div className="exec-score">
               {[["Trend cluster", score.trend_cluster, 3], ["Structure", score.structure_cluster, 3], ["Volume", score.volume_evidence, 2], ["Option strength", score.option_relative_strength, 1], ["OI writers", score.oi_direction, 1]].map(([name, value, max]) => (
                 <span key={String(name)}><small>{name}</small><b>{calc(value)} / {String(max)}</b></span>
@@ -457,7 +498,7 @@ export default function ExecutionPage() {
               <input aria-label="Search option contract" value={query} onChange={(event) => setQuery(event.target.value.toUpperCase())} onKeyDown={(event) => { if (event.key === "Enter") void search(); }} placeholder={`e.g. ${symbol} 25000 CE`} />
               <button type="button" onClick={() => void search()} disabled={searching}>{searching ? "…" : "Search"}</button>
             </div>
-            {results.length > 0 && <div className="exec-results">{results.map((item) => <button type="button" key={item.growwSymbol} onClick={() => { setContract({ ...item, lotSize: item.lotSize || FALLBACK_LOT[symbol] || 1 }); setResults([]); setTicketSource("MANUAL"); }}>{item.symbol}<small>{item.type} · {item.expiry} · lot {item.lotSize}</small></button>)}</div>}
+            {results.length > 0 && <div className="exec-results">{results.map((item) => <button type="button" key={item.growwSymbol} onClick={() => { setContract({ ...item, lotSize: item.lotSize || FALLBACK_LOT[symbol] || 1 }); setResults([]); setTicketSource("MANUAL"); setTicketOrigin("MANUAL"); }}>{item.symbol}<small>{item.type} · {item.expiry} · lot {item.lotSize}</small></button>)}</div>}
             {contract && <p className="mi-note">{contract.type} · strike {money(contract.strike)} · expiry {contract.expiry ?? "--"} · lot {lotSize} · premium {ticketPremium ? `₹${money(ticketPremium)}` : "awaiting quote"}</p>}
             <div className="exec-fields">
               <label>Lots<input type="number" min={1} step={1} value={lots} onChange={(event) => setLots(Math.max(1, Math.floor(Number(event.target.value) || 1)))} /><small>{lots * lotSize} qty</small></label>
