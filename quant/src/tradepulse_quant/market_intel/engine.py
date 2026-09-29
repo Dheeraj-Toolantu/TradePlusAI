@@ -92,7 +92,9 @@ def build_verdict(tech: dict, smc: dict, flow: dict, sentiment: dict | None = No
             points, detail = 0.0, f"Crowd extreme ({score:+.0f}): {sentiment['contrarian_note']}"
         else:
             points = 0.5 if score >= 25 else 0.25 if score >= 10 else -0.5 if score <= -25 else -0.25 if score <= -10 else 0.0
-            detail = f"India sentiment {score:+.0f}/100 (retail {float(sentiment.get('retail_score') or 0):+.0f}, news {float(sentiment.get('news_score') or 0):+.0f})"
+            retail = sentiment.get("retail_score")
+            retail_text = "n/a" if retail is None else f"{float(retail):+.0f}"
+            detail = f"India sentiment {score:+.0f}/100 (retail {retail_text}, news {float(sentiment.get('news_score') or 0):+.0f})"
         factors.append(_factor("sentiment", "Retail & news sentiment", points, 0.5, detail, "What retail traders on public forums and the financial news are saying right now. Useful as a light confirmation; at extremes the crowd is usually wrong, so euphoria or panic scores zero."))
 
     total = sum(factor["points"] for factor in factors)

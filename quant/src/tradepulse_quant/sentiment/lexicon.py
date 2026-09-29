@@ -11,6 +11,13 @@ import math
 import re
 
 PHRASES: dict[str, float] = {
+    # Direction-qualified breakouts must be matched before the bare (bullish) "breakout".
+    "downward price breakout": -1.5, "downward breakout": -1.5, "downside breakout": -1.5, "negative breakout": -1.5, "bearish breakout": -1.5,
+    "upward price breakout": 1.5, "upward breakout": 1.5, "upside breakout": 1.5, "positive breakout": 1.5, "bullish breakout": 1.5,
+    "false breakout": -1.0, "failed breakout": -1.0,
+    "cross below": -1.2, "crosses below": -1.2, "crossed below": -1.2, "slips below": -1.2, "falls below": -1.2, "breaches below": -1.2,
+    "cross above": 1.2, "crosses above": 1.2, "crossed above": 1.2, "climbs above": 1.2, "reclaims": 1.0,
+    "selling pressure": -1.5, "selling intensifies": -1.8, "weak start": -1.0, "weak opening": -1.0, "strong start": 1.0, "strong opening": 1.0,
     "all time high": 2.0, "all-time high": 2.0, "record high": 2.0, "fresh high": 1.5, "52 week high": 1.5, "52-week high": 1.5,
     "short covering": 1.2, "rate cut": 1.2, "fii buying": 1.5, "fiis buy": 1.5, "fpi inflows": 1.5, "dii buying": 1.0,
     "gap up": 1.2, "breaks out": 1.5, "break out": 1.2, "calls printing": 2.0, "to the moon": 2.0, "buy the dip": 1.0,
@@ -27,7 +34,7 @@ WORDS: dict[str, float] = {
     "bullish": 2.0, "bull": 1.0, "bulls": 1.0, "rally": 1.8, "rallies": 1.8, "rallied": 1.8, "surge": 1.8, "surges": 1.8, "surged": 1.8,
     "soar": 2.0, "soars": 2.0, "jump": 1.2, "jumps": 1.2, "gain": 1.0, "gains": 1.0, "gained": 1.0, "rise": 0.9, "rises": 0.9, "rose": 0.9,
     "climb": 1.0, "climbs": 1.0, "up": 0.3, "higher": 0.8, "high": 0.4, "rebound": 1.3, "rebounds": 1.3, "recovery": 1.2, "recovers": 1.2,
-    "breakout": 1.5, "buy": 0.8, "buying": 0.8, "long": 0.5, "calls": 0.4, "moon": 1.8, "rocket": 1.8, "green": 0.8, "strong": 0.8,
+    "breakout": 1.5, "breakdown": -1.5, "buy": 0.8, "buying": 0.8, "long": 0.5, "calls": 0.4, "moon": 1.8, "rocket": 1.8, "green": 0.8, "strong": 0.8,
     "optimism": 1.3, "optimistic": 1.3, "upbeat": 1.3, "boost": 1.0, "boosts": 1.0, "outperform": 1.2, "record": 0.8, "profit": 0.8,
     "bearish": -2.0, "bear": -1.0, "bears": -1.0, "crash": -2.5, "crashes": -2.5, "crashed": -2.5, "plunge": -2.2, "plunges": -2.2,
     "plunged": -2.2, "tank": -2.0, "tanks": -2.0, "tanked": -2.0, "slump": -1.8, "slumps": -1.8, "fall": -1.0, "falls": -1.0, "fell": -1.0,
@@ -43,7 +50,11 @@ NEGATORS = {"not", "no", "never", "isn't", "wasn't", "don't", "doesn't", "didn't
 INTENSIFIERS = {"very": 1.3, "extremely": 1.6, "huge": 1.4, "massive": 1.5, "sharp": 1.3, "sharply": 1.3, "big": 1.2, "heavy": 1.3, "strongly": 1.3, "slightly": 0.6, "marginally": 0.5}
 TOKEN = re.compile(r"[a-z0-9']+(?:-[a-z0-9]+)?|[\U0001F300-\U0001FAFF]")
 
-INDEX_TERMS = ("nifty", "sensex", "bank nifty", "banknifty", "finnifty", "midcap", "india vix", "dalal street", "nse", "bse")
+INDEX_TERMS = ("nifty", "sensex", "bank nifty", "banknifty", "finnifty", "midcap", "india vix", "dalal street", "nse", "bse", "gift nifty", "indian equities", "indian stock market", "indian markets")
+# Single-company items (results boilerplate, stock tips, dividend alerts) say little about the
+# index; on a 700-point crash day they were diluting the index reading towards neutral.
+STOCK_TERMS = ("standalone net profit", "consolidated net profit", "net profit rises", "net profit falls", "net loss", "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
+               "share price", "shares of", "stock alert", "stocks to buy", "stocks to watch", "dividend", "record date", "bonus issue", "stock split", "ipo", "target price", "block deal")
 INDIA_MACRO = ("rbi", "rupee", "fii", "fpi", "dii", "sebi", "india", "indian", "gst", "repo rate", "budget")
 GLOBAL_TERMS = ("fed", "fomc", "powell", "s&p", "nasdaq", "dow", "wall street", "treasury", "crude", "brent", "dollar", "china", "ecb", "boj", "bond yields")
 EVENT_TERMS = {
@@ -81,10 +92,17 @@ def score_text(text: str) -> float:
     return total / math.sqrt(total * total + 15.0) if total else 0.0
 
 
+def _mentions(lowered: str, terms: tuple[str, ...]) -> bool:
+    # Word boundaries: "nse" must not match "response" or "licence expense".
+    return any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in terms)
+
+
 def relevance(text: str) -> tuple[str, float]:
     lowered = text.lower()
-    if any(term in lowered for term in INDEX_TERMS):
+    if _mentions(lowered, INDEX_TERMS):
         return "INDEX", 1.0
+    if _mentions(lowered, STOCK_TERMS):
+        return "STOCK", 0.15
     if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in INDIA_MACRO):
         return "INDIA_MACRO", 0.7
     if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in GLOBAL_TERMS):
