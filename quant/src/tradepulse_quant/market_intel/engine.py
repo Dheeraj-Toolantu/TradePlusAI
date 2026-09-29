@@ -341,6 +341,8 @@ def analyze_market(payload: dict) -> dict:
         "vix_regime": vol.get("regime"),
         "liquidity_score": min(liquidity_scores) if liquidity_scores else None,
         "option_quote_fresh": bool(flow.get("available")),
+        "expiry": expiry or None,
+        "expiry_today": meta["expiry_today"],
     }
     flow_public = {key: value for key, value in flow.items() if key != "chain"}
     return {

@@ -46,6 +46,7 @@ class PipelineEvidence:
     liquidity_score: float | None = None
     risk_reward: float | None = None
     daily_risk_allowed: bool | None = None
+    daily_risk_detail: str | None = None
     broker_healthy: bool | None = None
     contract_metadata_available: bool | None = None
     reconciliation_ok: bool | None = None
@@ -73,7 +74,7 @@ class NoTradeEngine:
         require("DATA_QUALITY_BLOCKED", evidence.data_quality_ok, "market and option data must pass quality checks")
         require("SESSION_BLOCKED", evidence.session_allowed, "new entries require an open entry window")
         require("OPTION_QUOTE_STALE", evidence.option_quote_fresh, "option quote must be fresh")
-        require("DAILY_RISK_BLOCKED", evidence.daily_risk_allowed, "daily risk manager must approve the entry")
+        require("DAILY_RISK_BLOCKED", evidence.daily_risk_allowed, evidence.daily_risk_detail or "daily risk manager must approve the entry")
         require("BROKER_UNHEALTHY", evidence.broker_healthy, "broker/API health must be confirmed")
         require("CONTRACT_METADATA_MISSING", evidence.contract_metadata_available, "live contract metadata is required")
         require("RECONCILIATION_REQUIRED", evidence.reconciliation_ok, "broker state must be reconciled")

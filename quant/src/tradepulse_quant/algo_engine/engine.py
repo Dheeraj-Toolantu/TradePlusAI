@@ -105,7 +105,29 @@ def _trend_15m(candles: list[Candle], config: StrategyConfiguration) -> str:
     return "BULL" if fast > slow else "BEAR"
 
 
-def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, config: StrategyConfiguration, now: datetime, option_evidence: dict | None = None) -> tuple[dict, dict, dict]:
+def _relative_volume(candles: list[Candle], index: int, lookback: int = 20) -> float | None:
+    """Spec 7: the candle's volume against the mean of the PRIOR ``lookback`` completed candles.
+
+    The candle itself is excluded from its own baseline. Index candles carry no volume, so
+    callers attach near-month futures volume; with none available this returns None.
+    """
+    if index < 1 or index >= len(candles) or candles[index].volume <= 0:
+        return None
+    prior = [candle.volume for candle in candles[max(0, index - lookback):index] if candle.volume > 0]
+    if len(prior) < lookback // 2:
+        return None
+    return candles[index].volume / (sum(prior) / len(prior))
+
+
+def _expiry_today(option_evidence: dict | None, now: datetime) -> bool:
+    evidence = option_evidence or {}
+    if isinstance(evidence.get("expiry_today"), bool):
+        return evidence["expiry_today"]
+    expiry = evidence.get("expiry")
+    return isinstance(expiry, str) and expiry == now.date().isoformat()
+
+
+def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, config: StrategyConfiguration, now: datetime, option_evidence: dict | None = None, daily_candles: list[Candle] | None = None, volume_source: str | None = None) -> tuple[dict, dict, dict]:
     """Compute V5 evidence, the transparent calculations ledger, and live session state.
 
     Evidence is derived only from facts the engine can verify: candle structure, the
@@ -136,6 +158,12 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     trading_day = now.weekday() < 5
     market_open = trading_day and is_session_active(now, config)
     entry_permitted = trading_day and is_entry_permitted(now, config)
+    # Spec 16 expiry-day gamma protocol: stricter score and an earlier entry cutoff.
+    expiry_day = _expiry_today(option_evidence, now)
+    expiry_rules = config.expiry_day_adjustments
+    if expiry_day and entry_permitted:
+        cutoff_minutes = config.trading_windows["entry_end"] - int(expiry_rules["entry_cutoff_minutes"])
+        entry_permitted = now.hour * 60 + now.minute < cutoff_minutes
     if data_quality_ok and market_open and timestamps:
         candle_age_seconds = (now - timestamps[-1]).total_seconds()
         if candle_age_seconds > 15 * 60:
@@ -147,6 +175,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "window": current_session_window(now, config),
         "market_open": market_open,
         "entry_permitted": entry_permitted,
+        "expiry_day": expiry_day,
     }
 
     session, previous_session = _split_sessions(candles)
@@ -161,14 +190,13 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     if vwap_value is None and vwap_basis:
         # Index candles can carry zero volume; fall back to the mean typical price.
         vwap_value = sum((candle.high + candle.low + candle.close) / 3.0 for candle in vwap_basis) / len(vwap_basis)
-    recent = vwap_basis[-20:]
-    average_volume = sum(candle.volume for candle in recent) / len(recent) if recent else 0.0
-    relative_volume = (candles[-1].volume / average_volume) if candles and average_volume > 0 else None
-
-    orb = _orb_for(candles, config)[0] if strategy == "ORB_RETEST" and data_quality_ok else None
+    orb = _orb_for(candles, config, daily_candles)[0] if strategy == "ORB_RETEST" and data_quality_ok else None
+    # ORB volume expansion is judged on the breakout candle; otherwise on the latest candle.
+    volume_index = orb.breakout_index if orb is not None and orb.breakout_index is not None else len(candles) - 1
+    relative_volume = _relative_volume(candles, volume_index) if candles else None
     max_extension = round(min(max(last_close, 1.0) * 0.0035, orb.atr) if orb.atr > 0 else max(last_close, 1.0) * 0.0035, 4) if orb is not None and last_close else None
 
-    gap = _gap_for(candles, config)
+    gap = _gap_for(candles, config, daily_candles)
 
     trend_15m = _trend_15m(candles, config)
     regime = classify_regime(
@@ -209,7 +237,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     pdh_pdl_confirmed = last_close is not None and ((direction == 1 and pdh is not None and last_close > pdh) or (direction == -1 and pdl is not None and last_close < pdl))
     structure_cluster = (2 if structure_confirmed else 0) + (1 if pdh_pdl_confirmed else 0)
 
-    # Index cash candles from Groww carry zero volume; volume evidence is then unavailable (0 points).
+    # Index cash candles carry no volume; without a futures volume proxy this scores 0 points.
     if relative_volume is None:
         volume_evidence = 0 if candles else None
     elif relative_volume >= config.volume_multiplier:
@@ -234,7 +262,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         oi_supportive = option_evidence.get("oi_pcr_supportive")
     else:
         oi_supportive = (oi_score_raw is not None and float(oi_score_raw) * direction >= 1) if direction else False
-    minimum_score = float(config.score_thresholds["minimum_trade_score"])
+    minimum_score = float(config.score_thresholds["minimum_trade_score"]) + (float(expiry_rules["minimum_score_increase"]) if expiry_day else 0.0)
     score_total = float(trend_cluster + structure_cluster + (volume_evidence or 0) + (1 if ors_confirmed else 0) + (1 if oi_supportive else 0))
     oi_direction_score = oi_score_raw
     calculations = {
@@ -246,6 +274,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
             "adx14": _round(adx_value),
             "atr14": _round(atr_value),
             "relative_volume": _round(relative_volume),
+            "volume_source": volume_source or ("CANDLES" if any(candle.volume > 0 for candle in candles) else "UNAVAILABLE"),
         },
         "orb": {
             "opening_range_high": _round(orb.opening_range_high) if orb else None,
@@ -281,7 +310,9 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "gap": {
             "status": gap.state if gap else None,
             "reason": _GAP_REASONS.get(gap.state) if gap else None,
+            "atr_basis": "DAILY_ATR14_PRIOR_SESSIONS",
         },
+        "expiry_day": expiry_day,
         "regime": regime,
     }
 
@@ -310,10 +341,61 @@ ORB_MAX_SIGNAL_AGE_CANDLES = 1
 CANDLE_MINUTES = 5
 
 
-def _gap_for(candles: list[Candle], config: StrategyConfiguration):
+@dataclass(frozen=True)
+class DailyBar:
+    date: str
+    high: float
+    low: float
+    close: float
+
+
+def _daily_bars(candles: list[Candle], daily_candles: list[Candle] | None, before: object) -> list[DailyBar]:
+    """Completed daily bars strictly before ``before`` (today's IST date).
+
+    Exchange daily candles are preferred; otherwise each prior intraday session is folded into
+    one bar. Today's session is excluded so the gap classification is fixed at the open and can
+    never flip (and change the opening-range window) as the day's ranges develop.
+    """
+    bars: dict[str, DailyBar] = {}
+    grouped: dict[object, list[Candle]] = {}
+    for candle in candles:
+        timestamp = _parse_timestamp(candle.timestamp)
+        if timestamp is not None and timestamp.date() < before:
+            grouped.setdefault(timestamp.date(), []).append(candle)
+    for day, rows in grouped.items():
+        bars[day.isoformat()] = DailyBar(day.isoformat(), max(c.high for c in rows), min(c.low for c in rows), rows[-1].close)
+    for candle in daily_candles or []:
+        timestamp = _parse_timestamp(candle.timestamp)
+        if timestamp is not None and timestamp.date() < before and candle.high > 0 and candle.low > 0:
+            bars[timestamp.date().isoformat()] = DailyBar(timestamp.date().isoformat(), candle.high, candle.low, candle.close)
+    return [bars[key] for key in sorted(bars)]
+
+
+def _daily_atr(bars: list[DailyBar], period: int) -> float | None:
+    """Wilder ATR on daily bars; with fewer than ``period`` true ranges it is their plain mean."""
+    ranges = [bar.high - bar.low if index == 0 else max(bar.high - bar.low, abs(bar.high - bars[index - 1].close), abs(bar.low - bars[index - 1].close)) for index, bar in enumerate(bars)]
+    if not ranges:
+        return None
+    if len(ranges) < period:
+        return sum(ranges) / len(ranges)
+    result = sum(ranges[:period]) / period
+    for value in ranges[period:]:
+        result = (result * (period - 1) + value) / period
+    return result
+
+
+def _gap_for(candles: list[Candle], config: StrategyConfiguration, daily_candles: list[Candle] | None = None):
+    """Spec 4: gap = open beyond the previous day's range by more than 0.5 x ATR14 (daily).
+
+    A 5-minute ATR (~25 NIFTY points) made almost any open outside the prior range a "gap
+    day", and because it included today's candles the verdict could change during the session.
+    """
     session, previous = _split_sessions(candles)
-    atr_value = indicators.atr(candles, config.atr_period)
-    if not (session and previous and atr_value):
+    if not (session and previous):
+        return None
+    today = _parse_timestamp(session[0].timestamp).date()
+    atr_value = _daily_atr(_daily_bars(candles, daily_candles, today), config.atr_period)
+    if not atr_value:
         return None
     return evaluate_gap_day(
         opening_price=session[0].open,
@@ -326,9 +408,9 @@ def _gap_for(candles: list[Candle], config: StrategyConfiguration):
     )
 
 
-def _orb_for(candles: list[Candle], config: StrategyConfiguration):
+def _orb_for(candles: list[Candle], config: StrategyConfiguration, daily_candles: list[Candle] | None = None):
     """ORB with the spec-4 gap-day window (30 min instead of 15) and multi-session ATR."""
-    gap = _gap_for(candles, config)
+    gap = _gap_for(candles, config, daily_candles)
     minutes = gap.required_or_duration_minutes if gap else config.orb_duration_minutes
     return evaluate_orb_retest(candles, indicators.atr(candles, config.atr_period), minutes), gap
 
@@ -352,12 +434,12 @@ def completed_candles(candles: list[Candle], now: datetime, minutes: int = CANDL
 
 
 
-def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST") -> dict:
+def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST", daily_candles: list[Candle] | None = None, expiry_day: bool = False) -> dict:
     if len(candles) < 21:
         return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "At least 21 candles are required", "confidence": 0, "setup": None}
     if strategy == "ORB_RETEST":
         config = StrategyConfiguration()
-        orb, gap = _orb_for(candles, config)
+        orb, gap = _orb_for(candles, config, daily_candles)
         orb_calc = _orb_calculations(orb, gap)
         if orb.status != "CONFIRMED" or not orb.side:
             # Never fall through to a different (EMA/VWAP) rule set: ORB either confirms or waits.
@@ -389,10 +471,12 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         if rr < config.rr_minimum:
             return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": f"Only {rr}R of room before {obstacle_label}; the 2R target is not realistic", "confidence": 0, "calculations": orb_calc, "setup": None}
         size_multiplier = gap.first_trade_risk_multiplier if gap and gap.is_gap_day else 1.0
+        if expiry_day:
+            size_multiplier *= float(config.expiry_day_adjustments["risk_multiplier"])
         quantity = max(1, int(risk_per_trade * size_multiplier / max(risk, 0.01)))
         return {"symbol": symbol, "strategy": strategy, "decision": "CONFIRMED", "reason": orb.reason, "confidence": 100, "calculations": orb_calc, "setup": {
             "side": orb.side, "entry": entry, "stop_loss": round(stop, 2), "target": round(target, 2), "risk_reward": rr, "quantity": quantity,
-            "size_multiplier": size_multiplier, "gap_day": bool(gap and gap.is_gap_day),
+            "size_multiplier": size_multiplier, "gap_day": bool(gap and gap.is_gap_day), "expiry_day": expiry_day,
             "target_method": "STRUCTURAL_2R" + (f"_CLEAR_OF_{obstacle_label.split()[0]}" if obstacle_label else ""), "stop_method": "RETEST_EXTREME_MINUS_ATR_BUFFER",
         }}
     if strategy == "VWAP_REVERSAL":
@@ -462,18 +546,25 @@ def _reversal_setup(base: dict, side: Side, entry: float, stop: float, config: S
     return {**base, "decision": "CONFIRMED", "confidence": 100, "reason": f"{'Support' if side == 'BUY' else 'Resistance'} rejection followed by a confirmed VWAP reclaim", "indicators": indicators_out, "levels": {"support": support, "resistance": resistance}, "setup": {"side": side, "entry": entry, "stop_loss": round(stop, 2), "target": round(target, 2), "risk_reward": round(abs(target - entry) / risk, 2), "quantity": max(1, int(risk_per_trade / max(risk, 0.01))), "target_method": "STRUCTURAL_2R", "stop_method": "REJECTION_EXTREME_MINUS_ATR_BUFFER"}}
 
 
+def _candles_from(items: object) -> list[Candle]:
+    return [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+
+
 def analyze_payload(payload: dict) -> dict:
-    candles = [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in payload.get("candles", [])]
+    candles = _candles_from(payload.get("candles", []))
+    daily_candles = _candles_from(payload.get("daily_candles")) or None
     symbol = str(payload.get("symbol", "UNKNOWN"))
     strategy = str(payload.get("strategy", "ORB_RETEST"))
     now = datetime.now(MARKET_TIMEZONE)
     candles = completed_candles(candles, now)
-    result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy)
+    option_evidence = payload.get("option_evidence")
+    result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy, daily_candles, _expiry_today(option_evidence, now))
     # Evidence the engine can observe directly from candles and the IST clock is computed
     # first; the caller (Node API boundary) may only *add* independently-verified evidence
     # such as broker health, SAFE_MODE, and kill-switch state. A caller can never overwrite
     # observed data-quality, session, regime, gap, breakout, or retest evidence with this merge.
-    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, payload.get("option_evidence"))
+    volume_source = payload.get("volume_source") if isinstance(payload.get("volume_source"), str) else None
+    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, option_evidence, daily_candles, volume_source)
     result["calculations"] = calculations
     result["session"] = session_info
     caller_evidence = payload.get("pipeline") or {}

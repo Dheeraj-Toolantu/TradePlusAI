@@ -7,6 +7,7 @@ import { readSafeModeState } from "../../../../../services/execution/src/safe-mo
 import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
 import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-intel";
+import { evaluateDailyRisk } from "../../../lib/daily-risk";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -96,7 +97,12 @@ async function growwAccountSummary() {
 }
 
 async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}) {
-  const historyResponse = await fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=5m&period=week&date=${istDate()}`, { cache: "no-store" });
+  // 5m index candles carry near-month futures volume (index volume is always zero); daily
+  // candles give the true ATR14 used by the gap-day rule.
+  const [historyResponse, daily] = await Promise.all([
+    fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=5m&period=week&volume=futures&date=${istDate()}`, { cache: "no-store" }),
+    fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=1D&period=month&date=${istDate()}`, { cache: "no-store" }).then((response) => (response.ok ? response.json() : {})).catch(() => ({})) as Promise<{ candles?: unknown[] }>,
+  ]);
   const history = await historyResponse.json();
   if (!historyResponse.ok) throw new Error(String(history.error ?? "Market history unavailable"));
   const root = existsSync(path.resolve(process.cwd(), "quant")) ? process.cwd() : path.resolve(process.cwd(), "../..");
@@ -112,7 +118,7 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
       optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>;
     } catch { optionEvidence = {}; }
   }
-  const payload = { symbol, strategy, candles: history.candles ?? [], risk_per_trade: 1000, option_evidence: optionEvidence, pipeline: evidence };
+  const payload = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: 1000, option_evidence: optionEvidence, pipeline: evidence };
   return new Promise<RecordValue>((resolve, reject) => {
     const child = spawn(executable, ["-m", "tradepulse_quant.algo_engine.engine"], { cwd: root, env: { ...process.env, PYTHONPATH: path.join(root, "quant", "src") }, windowsHide: true });
     let output = ""; let error = "";
@@ -128,24 +134,22 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
 // the kill switch were supplied, so DAILY_RISK, CONTRACT_METADATA, RECONCILIATION and
 // EXECUTION_READY were always "missing" and the pipeline could never confirm a setup.
 const PAPER_CAPITAL = Number(process.env.PAPER_CAPITAL ?? 100_000);
-const DAILY_LOSS_LIMIT_PCT = 2; // V5 StrategyConfiguration.daily_loss_limit_pct
-const MAX_TRADES_PER_DAY = 3; // V5 StrategyConfiguration.max_trades_per_day
 
 async function operationalEvidence(symbol: string, brokerHealthy: boolean, safety: { safeMode: boolean; killSwitch: boolean }) {
   const today = istDate();
   const [orders, catalog] = await Promise.all([
-    getAllOrdersFromFirestore(200).catch(() => [] as OrderRecord[]),
+    getAllOrdersFromFirestore(200).catch(() => null),
     loadGrowwInstrumentCatalog().catch(() => null),
   ]);
-  const todays = orders.filter((order) => order.mode !== "ALGO_LIVE" && order.status !== "CANCELLED" && order.status !== "SIMULATED" && istDate(new Date(order.createdAt)) === today);
-  const realized = todays.reduce((sum, order) => sum + (order.status === "EXITED" ? Number(order.realizedPnl ?? 0) : 0), 0);
-  const dailyRiskAllowed = todays.length < MAX_TRADES_PER_DAY && -realized < PAPER_CAPITAL * DAILY_LOSS_LIMIT_PCT / 100;
+  // Fail closed: an unreadable order book must not look like "no trades today".
+  const dailyRisk = orders === null ? { allowed: false, detail: "Blocked: the order book could not be read, so today's trades and losses are unknown" } : evaluateDailyRisk(orders, symbol, PAPER_CAPITAL);
   const contractMetadata = catalog === null ? false : catalog.getAll().some((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && String(instrument.expiryDate ?? "") >= today && Number(instrument.lotSize) > 0);
   return {
     broker_healthy: brokerHealthy,
     safe_mode: safety.safeMode,
     kill_switch: safety.killSwitch,
-    daily_risk_allowed: dailyRiskAllowed,
+    daily_risk_allowed: dailyRisk.allowed,
+    daily_risk_detail: dailyRisk.detail,
     contract_metadata_available: contractMetadata,
     // The paper book is the system of record for paper trades; real positions are reconciled
     // against Groww by the live monitor (/api/live-orders), not by this gate.
