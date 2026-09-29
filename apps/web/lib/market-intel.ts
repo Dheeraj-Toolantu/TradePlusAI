@@ -1,6 +1,7 @@
 import { GrowwAdapter, createGrowwTransport } from "../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../adapters/groww/src/groww-instruments";
 import { runPythonModule } from "./python";
+import { getMacroQuotes } from "./macro";
 import { getSentiment, sentimentForIntel } from "./sentiment";
 import { baselineSnapshot, recordSnapshot, snapshotHistorySeconds, type ChainLeg, type ChainRow } from "./oi-snapshot-store";
 
@@ -105,7 +106,8 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
   const now = Date.now();
   const baseline = baselineSnapshot(symbol, expiry, now);
   if (chain.rows.length) recordSnapshot(symbol, { takenAt: now, spot, expiry, rows: chain.rows });
-  const sentiment = sentimentForIntel(await getSentiment().catch(() => null));
+  const [rawSentiment, macro] = await Promise.all([getSentiment().catch(() => null), getMacroQuotes().catch(() => null)]);
+  const sentiment = sentimentForIntel(rawSentiment);
   const result = await runPythonModule<MarketIntel>("tradepulse_quant.market_intel.engine", {
     symbol,
     spot,
@@ -120,6 +122,7 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
     capital: options.capital,
     risk_pct: options.riskPct,
     sentiment,
+    macro,
   });
   return { ...result, baseline_history_seconds: snapshotHistorySeconds(symbol, expiry, now), source: "Groww option chain + 5m candles + India VIX", fetched_at: new Date(now).toISOString() };
 }

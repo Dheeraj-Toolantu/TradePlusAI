@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { OperatorFootprintPanel, type OperatorFootprint } from "./operator-footprint-panel";
 
 type Signal = "BULLISH" | "BEARISH" | "NEUTRAL";
 type Factor = { key: string; name: string; signal: Signal; points: number; max: number; detail: string; learn: string };
@@ -49,6 +50,7 @@ type Intel = {
     liquidity: { previous_day_high: number | null; previous_day_low: number | null; session_high: number | null; session_low: number | null; equal_highs: Array<{ level: number }>; equal_lows: Array<{ level: number }> };
     dealing_range: { high: number; low: number; equilibrium: number; position_pct: number; zone: string; basis: string } | null;
   };
+  operator?: OperatorFootprint;
   verdict: { bias: "BULLISH" | "BEARISH" | "SIDEWAYS"; score: number; max_score: number; strength: number; factors: Factor[]; agreeing_factors: number; total_factors: number };
   trade_plan: TradePlan;
 };
@@ -321,6 +323,7 @@ export function MarketIntelPanel({ symbol, onSymbolChange, onUsePlan }: { symbol
               {plan.reasons_against?.length ? <div className="mi-against"><b>Against this trade</b>{plan.reasons_against.slice(0, 5).map((reason) => <small key={reason}>{reason}</small>)}</div> : null}
             </article>
           </div>
+          <OperatorFootprintPanel data={intel.operator} />
           <p className="mi-disclaimer">Educational analytics, not investment advice. The desk is not a SEBI-registered adviser. Most retail option buyers lose money; practise in paper mode and never risk more than you can afford to lose.</p>
         </>
       )}

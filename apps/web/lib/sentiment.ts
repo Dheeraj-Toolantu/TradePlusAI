@@ -46,6 +46,8 @@ export function sentimentForIntel(value: Sentiment | null) {
     india_label: value.summary.india.label,
     retail_score: value.summary.india_retail.label === "INSUFFICIENT_DATA" ? null : value.summary.india_retail.score,
     news_score: value.summary.india_news.score,
+    global_score: value.summary.global.score,
+    global_label: value.summary.global.label,
     event_risk: value.event_risk.map((event) => event.event),
     contrarian_note: value.contrarian_note,
   };

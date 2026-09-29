@@ -12,6 +12,8 @@ from datetime import datetime, time
 
 from ..algo_engine.session_engine import current_session_window, is_entry_permitted, is_session_active
 from .candles import IST, Bar, parse_bars, technicals
+from .macro import score_macro
+from .operator_footprint import analyze_operator
 from .options_flow import analyze_options_flow, select_contract
 from .smart_money import analyze_smart_money, find_swings
 from .volatility import analyze_volatility
@@ -334,6 +336,8 @@ def analyze_market(payload: dict) -> dict:
     meta["sentiment"] = sentiment
     verdict = build_verdict(tech, smc, flow, sentiment)
     plan = build_trade_plan(bars, tech, smc, flow, vol, verdict, session, meta)
+    macro = score_macro(payload.get("macro")) if payload.get("macro") else None
+    operator = analyze_operator(bars, tech, smc, flow, vol, verdict, sentiment, macro, {**meta, "market_open": session["market_open"]})
 
     liquidity_scores = [c["liquidity_score"] for c in (select_contract(flow.get("chain") or {}, spot, s) for s in ("CE", "PE")) if c] if flow.get("available") else []
     v5_option_evidence = {
@@ -360,6 +364,7 @@ def analyze_market(payload: dict) -> dict:
         "volatility": vol,
         "options_flow": flow_public,
         "smart_money": smc,
+        "operator": operator,
         "verdict": verdict,
         "trade_plan": plan,
         "v5_option_evidence": v5_option_evidence,

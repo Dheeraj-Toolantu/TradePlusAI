@@ -404,6 +404,21 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .mi-factor-bar i.neg { right: 50%; background: var(--red); }
 .mi-against { display: grid; gap: 3px; margin-top: 10px; padding: 8px; border: 1px solid rgba(240, 191, 102, .35); border-radius: 6px; }
 .mi-against b { color: var(--amber); }
+.mi-operator { display: grid; gap: 10px; }
+.mi-operator .mi-instruction { margin: 0; }
+.mi-best-gap { display: grid; gap: 2px; padding: 10px; border: 1px solid rgba(240, 191, 102, .35); border-radius: 6px; background: #0b2330; }
+.mi-best-gap b { font-size: 16px; font-variant-numeric: tabular-nums; }
+.mi-best-gap em { color: var(--muted); font-size: 11px; font-style: normal; }
+.mi-op-entry summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px; cursor: pointer; font-size: 11px; font-variant-numeric: tabular-nums; }
+.mi-op-meta { color: var(--muted); }
+.mi-op-meta i { font-style: normal; }
+.mi-op-entry ul { margin: 4px 0 6px; padding-left: 16px; color: var(--muted); font-size: 11px; }
+.mi-fvg-odds { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.mi-fvg-odds th, .mi-fvg-odds td { padding: 6px; border-bottom: 1px solid #10303c; text-align: left; vertical-align: top; }
+.mi-fvg-odds tbody th { font-size: 12px; white-space: nowrap; }
+.mi-fvg-odds td small { display: block; }
+.mi-odds-bar { display: block; width: 90px; height: 5px; margin-bottom: 3px; border-radius: 3px; background: #10303c; }
+.mi-odds-bar i { display: block; height: 100%; border-radius: 3px; background: currentColor; }
 .mi-disclaimer { margin: 0; color: var(--muted); font-size: 10px; }
 @media (max-width: 980px) {
   .mi-grid, .mi-verdict { grid-template-columns: minmax(0, 1fr); }
