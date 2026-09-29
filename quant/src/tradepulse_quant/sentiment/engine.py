@@ -26,6 +26,17 @@ MAX_BYTES = 3_000_000
 HALF_LIFE_HOURS = 6.0
 MAX_AGE_HOURS = 36.0
 TAG = re.compile(r"<[^>]+>")
+POLAR_THRESHOLD = 0.15
+# Pseudo-weight of "no opinion" that a handful of opinionated items must outweigh before the
+# score moves far from zero; with dozens of items it is negligible.
+PRIOR_WEIGHT = 1.0
+
+
+def _strip_publisher(title: str, publisher: str | None) -> str:
+    """Google News titles end in " - Publisher"; names like "NDTV Profit" were being scored."""
+    if publisher and title.endswith(f" - {publisher}"):
+        return title[: -len(publisher) - 3].strip()
+    return title
 
 
 def _fetch(url: str) -> str:
@@ -64,9 +75,13 @@ def parse_rss(raw: str) -> list[dict]:
     for node in list(root.iter("item")) + list(root.iter("entry")):
         link_node = node.find("link")
         link = (link_node.text or link_node.get("href") or "") if link_node is not None else ""
+        publisher = _clean(node.findtext("source")) or None
+        title = _clean(node.findtext("title"))
+        body = _clean(node.findtext("description") or node.findtext("summary") or node.findtext("content"))
         items.append({
-            "title": _clean(node.findtext("title")),
-            "body": _clean(node.findtext("description") or node.findtext("summary") or node.findtext("content"))[:600],
+            "title": _strip_publisher(title, publisher),
+            # Google News descriptions only repeat the headline and publisher; score the title alone.
+            "body": "" if publisher and body.startswith(title[:40]) else body[:600],
             "link": link.strip(),
             "published": _parse_date(node.findtext("pubDate") or node.findtext("published") or node.findtext("updated")),
             "engagement": 0,
@@ -95,6 +110,13 @@ def parse_reddit(raw: str) -> list[dict]:
     return [item for item in items if item["title"]]
 
 
+def reddit_rss_url(url: str) -> str:
+    """https://www.reddit.com/r/X/new.json?limit=50 -> https://www.reddit.com/r/X/new/.rss?limit=50"""
+    base, _, query = url.partition("?")
+    base = base[:-5] if base.endswith(".json") else base
+    return f"{base.rstrip('/')}/.rss" + (f"?{query}" if query else "")
+
+
 def collect(sources: list[dict], fixtures: dict[str, str] | None) -> tuple[list[dict], list[dict]]:
     def load(source: dict) -> tuple[dict, list[dict], str | None]:
         try:
@@ -104,6 +126,14 @@ def collect(sources: list[dict], fixtures: dict[str, str] | None) -> tuple[list[
             parsed = parse_reddit(raw) if source["kind"] == "reddit" else parse_rss(raw)
             return source, parsed, None if parsed else "Feed returned no readable items"
         except Exception as error:  # network, TLS, HTTP errors: reported per source, never fatal
+            if source["kind"] == "reddit" and fixtures is None:
+                # Reddit often refuses unauthenticated .json; its public Atom feed usually still works.
+                try:
+                    parsed = parse_rss(_fetch(reddit_rss_url(source["url"])))
+                    if parsed:
+                        return source, parsed, None
+                except Exception:  # noqa: BLE001 - report the original error below
+                    pass
             return source, [], f"{type(error).__name__}: {str(error)[:120]}"
 
     items: list[dict] = []
@@ -129,21 +159,36 @@ def _label(score: float) -> str:
 
 
 def aggregate(items: list[dict]) -> dict:
-    total_weight = weighted = 0.0
-    bullish = bearish = 0
+    """Net tone of the opinionated items, relevance- and recency-weighted.
+
+    Averaging over every item let the ~60% of purely factual headlines (score 0) drag the
+    reading to "neutral": a 700-point Sensex fall with 31% bearish vs 12% bullish items showed
+    -11. The score now averages only items that express a direction, with a small prior so a
+    few posts cannot swing it to an extreme; the counts show how many items were neutral.
+    """
+    total_weight = polar_weight = weighted = bull_weight = bear_weight = 0.0
+    polar_items = 0
     for item in items:
         total_weight += item["weight"]
+        if abs(item["score"]) < POLAR_THRESHOLD:
+            continue
+        polar_items += 1
+        polar_weight += item["weight"]
         weighted += item["weight"] * item["score"]
-        bullish += item["score"] > 0.15
-        bearish += item["score"] < -0.15
-    score = round(100 * weighted / total_weight, 1) if total_weight else 0.0
+        if item["score"] > 0:
+            bull_weight += item["weight"]
+        else:
+            bear_weight += item["weight"]
+    score = round(100 * weighted / (polar_weight + PRIOR_WEIGHT), 1) if polar_weight else 0.0
     count = len(items)
+    # Shares are relevance/recency weighted like the score, so a pile of single-stock
+    # "profit rises" items cannot show "38% bull" beside a bearish index reading.
     return {
         "score": score,
-        "label": _label(score) if count >= 5 else "INSUFFICIENT_DATA",
+        "label": _label(score) if count >= 5 and polar_items >= 3 else "INSUFFICIENT_DATA",
         "items": count,
-        "bullish_pct": round(100 * bullish / count, 1) if count else 0.0,
-        "bearish_pct": round(100 * bearish / count, 1) if count else 0.0,
+        "bullish_pct": round(100 * bull_weight / total_weight, 1) if total_weight else 0.0,
+        "bearish_pct": round(100 * bear_weight / total_weight, 1) if total_weight else 0.0,
     }
 
 
@@ -169,8 +214,6 @@ def analyze_sentiment(payload: dict | None = None) -> dict:
             continue
         text = f"{item['title']}. {item['body']}"
         topic, topic_weight = relevance(text)
-        if item["region"] == "INDIA" and topic == "GENERAL":
-            topic_weight = 0.5  # India-market sources are on-topic even without index keywords
         score = score_text(item["title"]) * 0.7 + score_text(item["body"]) * 0.3 if item["body"] else score_text(item["title"])
         recency = 0.5 ** (age_hours / HALF_LIFE_HOURS)
         engagement = 1.0 + math.log1p(item["engagement"]) / 3.0 if item["audience"] == "RETAIL" else 1.0
@@ -228,7 +271,7 @@ def analyze_sentiment(payload: dict | None = None) -> dict:
         "sources": health,
         "sources_ok": sum(1 for source in health if source["ok"]),
         "sources_total": len(health),
-        "method": "Finance lexicon scoring (incl. Indian retail slang), 6-hour recency half-life, engagement-weighted forums, index-relevance weighting. Scores range -100 (max bearish) to +100.",
+        "method": "Finance lexicon scoring (incl. Indian retail slang), 6-hour recency half-life, engagement-weighted forums and relevance weighting (index news 1.0, India macro 0.7, global macro 0.6, other 0.35, single-stock items 0.15). The score is the weighted net tone of items that express a direction; neutral headlines are counted but do not dilute it. Scores range -100 (max bearish) to +100.",
     }
 
 

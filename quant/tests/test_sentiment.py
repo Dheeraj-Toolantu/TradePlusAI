@@ -102,5 +102,43 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(result["event_risk"][0]["mentions"], 2)
 
 
+class ReviewRegressionTests(unittest.TestCase):
+    """Defects seen on a live 700-point Sensex fall that the panel reported as neutral (-11)."""
+
+    def test_direction_qualified_breakouts_score_bearish(self):
+        self.assertLess(score_text("Titan Company Faces Downward Price Breakout"), 0)
+        self.assertLess(score_text("Negative Breakout: These 10 stocks cross below their 200 DMAs"), 0)
+        self.assertGreater(score_text("Nifty breakout confirmed"), 0)
+
+    def test_short_tokens_need_word_boundaries(self):
+        self.assertNotEqual(relevance("Company response to licence expense query")[0], "INDEX")
+        self.assertEqual(relevance("NSE extends trading hours")[0], "INDEX")
+
+    def test_single_stock_items_are_down_weighted(self):
+        self.assertEqual(relevance("Prasol Chemicals standalone net profit rises 150.70% in the June 2026 quarter"), ("STOCK", 0.15))
+        self.assertEqual(relevance("Nifty falls; Titan share price slips")[0], "INDEX")
+
+    def test_google_news_publisher_suffix_is_not_scored(self):
+        feed = ("<rss><channel><item><title>Stock Market Today: Five Key Factors For Sensex - NDTV Profit</title><link>https://x/1</link>"
+                "<pubDate>Mon, 28 Sep 2026 05:00:00 GMT</pubDate><description>Stock Market Today: Five Key Factors For Sensex NDTV Profit</description>"
+                "<source url='https://ndtvprofit.com'>NDTV Profit</source></item></channel></rss>")
+        item = parse_rss(feed)[0]
+        self.assertEqual(item["title"], "Stock Market Today: Five Key Factors For Sensex")
+        self.assertEqual(score_text(item["title"]), 0)
+
+    def test_neutral_headlines_do_not_dilute_a_clear_selloff(self):
+        bearish = ["Stock Market Crash: Nifty breaches 22,600, Sensex slumps 700 points", "Nifty slumps below 23,000 as selling intensifies", "Sensex falls over 700 points, Nifty trades below 22,600", "Gift Nifty down 25 points; Sensex, Nifty eye weak start"]
+        bullish = ["Nifty Pharma rises 1%"]
+        neutral = [f"Sensex, Nifty: key factors to watch today #{index}" for index in range(8)]
+        stocks = [f"Company {index} standalone net profit rises 20% in the June quarter" for index in range(6)]
+        result = analyze_sentiment({"now": NOW, "sources": SOURCES[:1], "fixtures": {"news": rss(*(bearish + bullish + neutral + stocks))}})
+        self.assertIn(result["summary"]["india"]["label"], ("BEARISH", "VERY_BEARISH"))
+        self.assertTrue(all("net profit" not in item["title"] for item in result["top_bullish"][:1]))
+
+    def test_reddit_rss_fallback_url(self):
+        from tradepulse_quant.sentiment.engine import reddit_rss_url
+        self.assertEqual(reddit_rss_url("https://www.reddit.com/r/IndianStreetBets/new.json?limit=75"), "https://www.reddit.com/r/IndianStreetBets/new/.rss?limit=75")
+
+
 if __name__ == "__main__":
     unittest.main()

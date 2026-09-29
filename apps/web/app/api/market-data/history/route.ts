@@ -57,7 +57,28 @@ function aggregateMonthly(candles: HistoricalCandle[]): HistoricalCandle[] {
   return [...grouped.values()].sort((left, right) => left.time - right.time);
 }
 
-async function fetchGrowwHistory(symbol: string, timeframe: string, period: HistoryPeriod, selectedDate: string) {
+const FUTURES_UNDERLYINGS = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+const INTRADAY = new Set(["1m", "3m", "5m", "10m", "15m", "1h"]);
+
+/**
+ * Index candles have no traded volume. Volume evidence (VWAP weighting, the V5 1.5x volume
+ * expansion score) uses the near-month futures contract instead, matched candle-by-candle.
+ * On expiry day the next month is used, since volume has already rolled.
+ */
+async function attachFuturesVolume(symbol: string, candles: HistoricalCandle[], interval: number, start: Date, end: Date, selectedDate: string) {
+  const catalog = await loadGrowwInstrumentCatalog();
+  const future = catalog.getAll()
+    .filter((instrument) => instrument.segment === "FNO" && instrument.instrumentType === "FUT" && instrument.underlyingSymbol === symbol && Boolean(instrument.expiryDate) && instrument.expiryDate! > selectedDate)
+    .sort((left, right) => String(left.expiryDate).localeCompare(String(right.expiryDate)))[0];
+  if (!future) return null;
+  const response = await createGrowwTransport().request(`/v1/historical/candle/range?exchange=${future.exchange}&segment=FNO&trading_symbol=${encodeURIComponent(future.tradingSymbol)}&start_time=${encodeURIComponent(toGrowwDate(start))}&end_time=${encodeURIComponent(toGrowwDate(end))}&interval_in_minutes=${interval}`, { method: "GET" });
+  const volumes = new Map(parseCandles(response).map((candle) => [candle.time, candle.volume ?? 0]));
+  if (![...volumes.values()].some((volume) => volume > 0)) return null;
+  for (let index = 0; index < candles.length; index += 1) candles[index] = { ...candles[index], volume: volumes.get(candles[index].time) ?? 0 };
+  return future.tradingSymbol;
+}
+
+async function fetchGrowwHistory(symbol: string, timeframe: string, period: HistoryPeriod, selectedDate: string, withFuturesVolume = false) {
   const growwPeriod: HistoryPeriod = timeframe === "1m" ? "day" : timeframe === "3m" || timeframe === "5m" ? "week" : timeframe === "10m" || timeframe === "15m" ? "month" : period;
   const { start, end } = rangeFor(growwPeriod, selectedDate);
   const transport = createGrowwTransport();
@@ -68,15 +89,17 @@ async function fetchGrowwHistory(symbol: string, timeframe: string, period: Hist
   const exchange = instrument?.exchange ?? (symbol === "SENSEX" ? "BSE" : "NSE");
   const response = await transport.request(`/v1/historical/candle/range?exchange=${exchange}&segment=CASH&trading_symbol=${encodeURIComponent(tradingSymbol)}&start_time=${encodeURIComponent(toGrowwDate(start))}&end_time=${encodeURIComponent(toGrowwDate(end))}&interval_in_minutes=${intervals[responseInterval]}`, { method: "GET" });
   const candles = parseCandles(response);
-  if (candles.length && !candles.some((candle) => candle.volume !== null && candle.volume > 0)) {
+  // The whole-day cumulative quote volume used to be written into the last candle here. That
+  // made one 5-minute bar carry the entire session's volume, which skewed VWAP to that bar and
+  // made every volume-expansion check pass or fail at random. Use futures volume instead.
+  let volumeSource: string | null = candles.some((candle) => candle.volume !== null && candle.volume > 0) ? "INSTRUMENT" : null;
+  if (!volumeSource && withFuturesVolume && FUTURES_UNDERLYINGS.has(symbol) && INTRADAY.has(timeframe) && candles.length) {
     try {
-      const quoteResponse = await transport.request(`/v1/live-data/quote?exchange=${exchange}&segment=CASH&trading_symbol=${encodeURIComponent(tradingSymbol)}`, { method: "GET" });
-      const quotePayload = ((quoteResponse as { payload?: Record<string, unknown> }).payload ?? {}) as Record<string, unknown>;
-      const liveVolume = numericVolume(quotePayload.volume ?? quotePayload.total_volume ?? quotePayload.volume_traded);
-      if (liveVolume !== null) candles[candles.length - 1] = { ...candles[candles.length - 1], volume: liveVolume };
-    } catch { /* Historical candles remain valid when the live volume quote is unavailable. */ }
+      const contract = await attachFuturesVolume(symbol, candles, intervals[responseInterval], start, end, selectedDate);
+      if (contract) volumeSource = `NEAR_MONTH_FUTURES:${contract}`;
+    } catch { /* volume stays unavailable; the V5 volume score then fails closed */ }
   }
-  return timeframe === "1M" ? aggregateMonthly(candles) : candles;
+  return { candles: timeframe === "1M" ? aggregateMonthly(candles) : candles, volumeSource };
 }
 
 async function fetchYahooHistory(symbol: string, timeframe: string, period: HistoryPeriod, selectedDate: string) {
@@ -120,14 +143,15 @@ async function computeHistory(request: Request) {
   const timeframe = url.searchParams.get("timeframe") ?? "5m";
   const period = (url.searchParams.get("period") ?? "day") as HistoryPeriod;
   const selectedDate = url.searchParams.get("date") ?? new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
+  const withFuturesVolume = url.searchParams.get("volume") === "futures";
   const provider = url.searchParams.get("provider") ?? process.env.MARKET_DATA_PROVIDER ?? "groww";
   const validEquitySymbol = /^[A-Z][A-Z0-9.&_-]{0,29}$/.test(symbol);
   if (!validEquitySymbol || !intervals[timeframe] || !periods.includes(period)) return NextResponse.json({ error: "Unsupported symbol, timeframe, or period" }, { status: 400 });
   try {
     if (provider === "groww") {
       try {
-        const candles = await fetchGrowwHistory(symbol, timeframe, period, selectedDate);
-        return NextResponse.json({ candles, provider: "groww", source: `Groww historical candles (${period}, ${selectedDate})`, volumeAvailable: candles.some((candle) => candle.volume !== null && candle.volume > 0), delayed: false, symbol, timeframe, period, date: selectedDate });
+        const { candles, volumeSource } = await fetchGrowwHistory(symbol, timeframe, period, selectedDate, withFuturesVolume);
+        return NextResponse.json({ candles, provider: "groww", source: `Groww historical candles (${period}, ${selectedDate})`, volumeAvailable: volumeSource !== null, volumeSource, delayed: false, symbol, timeframe, period, date: selectedDate });
       } catch (error) {
         const candles = await fetchYahooHistory(symbol, timeframe, period, selectedDate);
         return NextResponse.json({ candles, provider: "yahoo", requestedProvider: "groww", source: `Yahoo Finance fallback after Groww failure${error instanceof Error ? `: ${error.message}` : ""}`, volumeAvailable: candles.some((candle) => candle.volume !== null && candle.volume > 0), delayed: true, symbol, timeframe, period, date: selectedDate });

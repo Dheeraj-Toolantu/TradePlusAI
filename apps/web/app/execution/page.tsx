@@ -17,7 +17,7 @@ type PipelineGate = { code: string; passed: boolean; detail: string };
 type Analysis = {
   decision: string; reason?: string;
   setup?: { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean };
-  calculations?: { underlying?: Record<string, number | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string };
+  calculations?: { underlying?: Record<string, number | string | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string };
   session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean };
   pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
   strategy_decision?: string;
@@ -548,6 +548,7 @@ export default function ExecutionPage() {
                 <span>VWAP <b>{calc(underlying.vwap)}</b></span><span>EMA 20/50 <b>{calc(underlying.ema20)} / {calc(underlying.ema50)}</b></span><span>ADX <b>{calc(underlying.adx14)}</b></span><span>ATR <b>{calc(underlying.atr14)}</b></span>
                 <span>OR high/low <b>{calc(analysis?.calculations?.orb?.opening_range_high)} / {calc(analysis?.calculations?.orb?.opening_range_low)}</b></span><span>ORB status <b>{calc(analysis?.calculations?.orb?.status)}</b></span>
                 <span>Regime <b>{analysis?.calculations?.regime ?? "--"}</b></span><span>Gap day <b>{calc(analysis?.calculations?.gap?.status)}</b></span><span>VIX regime <b>{calc(analysis?.calculations?.option?.iv_regime)}</b></span>
+                <span>Rel. volume <b>{calc(underlying.relative_volume)}×</b></span><span>Volume source <b>{String(underlying.volume_source ?? "--").replace("NEAR_MONTH_FUTURES:", "Futures ")}</b></span>{analysis?.session && "expiry_day" in analysis.session && (analysis.session as { expiry_day?: boolean }).expiry_day ? <span>Expiry day <b className="warning">min score 9, size ½, entries end 14:30</b></span> : null}
               </div>
             </details>
           </article>

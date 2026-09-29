@@ -24,14 +24,14 @@ const REFRESH_MS = 10 * 60_000;
 const tone = (score: number) => (score >= 12 ? "gain" : score <= -12 ? "loss" : "warning");
 const label = (value: string) => value.replaceAll("_", " ").toLowerCase();
 
-function Gauge({ title, data }: { title: string; data: Aggregate }) {
+function Gauge({ title, data, note }: { title: string; data: Aggregate; note?: string }) {
   const insufficient = data.label === "INSUFFICIENT_DATA";
   return (
     <div className="snt-gauge">
-      <small>{title}</small>
+      <small>{title}{note ? <i className="warning"> · {note}</i> : null}</small>
       <b className={insufficient ? "" : tone(data.score)}>{insufficient ? "--" : `${data.score > 0 ? "+" : ""}${data.score.toFixed(0)}`}</b>
       <div className="snt-bar"><i style={{ left: `${(Math.max(-100, Math.min(100, data.score)) + 100) / 2}%` }} /></div>
-      <em>{insufficient ? `only ${data.items} posts` : `${label(data.label)} · ${data.items} posts · ${data.bullish_pct.toFixed(0)}% bull / ${data.bearish_pct.toFixed(0)}% bear`}</em>
+      <em title="Bull/bear shares are weighted by relevance and recency, like the score">{insufficient ? `only ${data.items} posts` : `${label(data.label)} · ${data.items} posts · ${data.bullish_pct.toFixed(0)}% bull / ${data.bearish_pct.toFixed(0)}% bear`}</em>
     </div>
   );
 }
@@ -75,7 +75,7 @@ export function SentimentPanel() {
           {data.contrarian_note && <div className="snt-alert snt-contrarian">{data.contrarian_note}</div>}
           {data.divergence && <div className="snt-note">{data.divergence}</div>}
           <div className="snt-gauges">
-            <Gauge title="India · overall" data={data.summary.india} />
+            <Gauge title="India · overall" data={data.summary.india} note={data.summary.india_retail.items === 0 ? "news only, forums unavailable" : undefined} />
             <Gauge title="India · retail forums" data={data.summary.india_retail} />
             <Gauge title="India · news media" data={data.summary.india_news} />
             <Gauge title="Global · overall" data={data.summary.global} />
