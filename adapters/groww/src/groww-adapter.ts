@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import type { BrokerAdapter, BrokerOrderRequest, BrokerOrderState, BrokerPosition, BrokerQuote, BrokerResult } from "../../../packages/broker-contracts/src/broker-adapter";
 import { toGrowwOrder, validateReferenceId } from "./groww-request-policy";
+import { RateLimitError, growwMarketDataLimiter, isMarketDataPath } from "./groww-rate-limiter";
 
-export type GrowwTransport = { request(path: string, init: { method: string; body?: unknown }): Promise<unknown> };
+/** `cacheTtlMs` overrides how long a GET body is reused (live tick pollers want ~1 s, not 5 s). */
+export type GrowwTransport = { request(path: string, init: { method: string; body?: unknown; cacheTtlMs?: number }): Promise<unknown> };
 
 type GrowwPayload = { status?: string; payload?: Record<string, unknown> };
 type CachedGrowwToken = { key: string; token: string };
@@ -17,6 +19,13 @@ let growwApiCooldownUntil = 0;
 let growwApiCooldownMessage = "";
 const GET_CACHE_TTL_MS = 5_000;
 const RATE_LIMIT_COOLDOWN_MS = 30_000;
+const MAX_RATE_LIMIT_COOLDOWN_MS = 120_000;
+
+/** Honour Groww's Retry-After when present, otherwise back off for the default cooldown. */
+function cooldownFor(response: Response): number {
+  const header = Number(response.headers.get("retry-after"));
+  return Number.isFinite(header) && header > 0 ? Math.min(header * 1000, MAX_RATE_LIMIT_COOLDOWN_MS) : RATE_LIMIT_COOLDOWN_MS;
+}
 
 export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.env): GrowwTransport {
   let token = environment.GROWW_ACCESS_TOKEN;
@@ -60,10 +69,12 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
     growwTokenRequest = { key: tokenCacheKey, promise };
     try { return await promise; } finally { if (growwTokenRequest?.promise === promise) growwTokenRequest = undefined; }
   }
+  const limiter = growwMarketDataLimiter(environment);
   return {
     async request(path, init) {
       const cacheKey = `${baseUrl}${path}`;
       const cacheable = init.method.toUpperCase() === "GET";
+      const ttl = init.cacheTtlMs ?? GET_CACHE_TTL_MS;
       if (cacheable) {
         const cached = growwResponseCache.get(cacheKey);
         if (cached && cached.expiresAt > Date.now()) return cached.body;
@@ -73,10 +84,11 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
       if (growwApiCooldownUntil > Date.now()) {
         const cached = cacheable ? growwResponseCache.get(cacheKey) : undefined;
         if (cached && cached.expiresAt > Date.now()) return cached.body;
-        throw new Error(growwApiCooldownMessage);
+        throw new RateLimitError(growwApiCooldownMessage, growwApiCooldownUntil - Date.now());
       }
       const requestOptions = (bearer: string) => ({ method: init.method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${bearer}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: init.body === undefined ? undefined : JSON.stringify(init.body), cache: "no-store" as const });
       const requestPromise = (async () => {
+        if (cacheable && isMarketDataPath(path)) await limiter.acquire();
         let bearer = await accessToken();
         let response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
         if (response.status === 401 && apiKey && apiSecret) {
@@ -87,10 +99,15 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
           const message = `Groww API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`;
-          if (response.status === 429) { growwApiCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; growwApiCooldownMessage = message; }
+          if (response.status === 429) {
+            const cooldown = cooldownFor(response);
+            growwApiCooldownUntil = Date.now() + cooldown;
+            growwApiCooldownMessage = `Groww rate limit reached; pausing market-data calls for ${Math.round(cooldown / 1000)} s (${message})`;
+            throw new RateLimitError(growwApiCooldownMessage, cooldown);
+          }
           throw new Error(message);
         }
-        if (cacheable) growwResponseCache.set(cacheKey, { expiresAt: Date.now() + GET_CACHE_TTL_MS, body });
+        if (cacheable && ttl > 0) growwResponseCache.set(cacheKey, { expiresAt: Date.now() + ttl, body });
         return body;
       })();
       if (cacheable) growwResponseRequests.set(cacheKey, requestPromise);

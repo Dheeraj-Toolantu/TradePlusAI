@@ -205,53 +205,113 @@ export default function ExecutionPage() {
   const subscriptionRef = useRef(subscriptionKey);
   subscriptionRef.current = subscriptionKey;
 
+  // Server-side the socket shares one batched Groww poller across tabs and only pushes prices that
+  // moved. The client reconnects with backoff and falls back to slow HTTP polling of the index
+  // quotes while the socket server is unreachable, so the header never sits on "--".
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(process.env.NEXT_PUBLIC_API_WS_URL ?? `${protocol}://${window.location.hostname}:4000/ws/quotes`);
-    socketRef.current = socket;
-    socket.onopen = () => { setStreamStatus("live"); socket.send(subscriptionRef.current); };
-    socket.onerror = () => setStreamStatus("unavailable");
-    socket.onclose = () => setStreamStatus("unavailable");
-    socket.onmessage = (event) => {
-      const payload = JSON.parse(event.data) as { type?: string; quote?: QuoteUpdate; quotes?: QuoteUpdate[] };
-      if (payload.type === "markets" && Array.isArray(payload.quotes)) {
-        const next: Record<string, number> = {};
-        for (const item of payload.quotes) if (item.symbol && item.price !== null) next[item.symbol] = item.price;
-        setQuotes((current) => ({ ...current, ...next }));
-        return;
-      }
-      if (payload.type === "market" && payload.quote?.price) {
-        const price = payload.quote.price;
-        setQuotes((current) => ({ ...current, [payload.quote!.symbol || symbol]: price }));
-        const bucket = Math.floor(Date.now() / 300_000) * 300;
-        const current = candlesRef.current;
-        const last = current.at(-1);
-        const next = !last ? [{ time: bucket, open: price, high: price, low: price, close: price, volume: 0 }]
-          : last.time >= bucket ? [...current.slice(0, -1), { ...last, high: Math.max(last.high, price), low: Math.min(last.low, price), close: price }]
-            : [...current.slice(-150), { time: bucket, open: last.close, high: Math.max(last.close, price), low: Math.min(last.close, price), close: price, volume: 0 }];
-        candlesRef.current = next;
-        setCandles(next);
-        scheduleRef.current();
-        return;
-      }
-      const updates = payload.quotes;
-      if ((payload.type === "chain" || payload.type === "quotes") && updates) {
-        const priceOf = (value: string) => updates.find((quote) => norm(quote.symbol) === norm(value))?.price;
-        const nextChain = chainRef.current.map((item) => { const price = priceOf(item.symbol); return price && price > 0 ? { ...item, premium: price, bid: price, ask: price } : item; });
-        chainRef.current = nextChain;
-        setChain(nextChain);
-        if (payload.type === "quotes") {
-          setPaperOrders((current) => current.map((order) => {
-            const price = priceOf(order.symbol);
-            if (!price) return order;
-            const pnl = (price - order.price) * order.quantity;
-            return { ...order, currentPrice: price, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
-          }));
-        }
-        scheduleRef.current();
-      }
+    let socket: WebSocket | null = null;
+    let closed = false;
+    let attempts = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const applyMarkets = (items: Array<{ symbol?: string; price?: number | null }>) => {
+      const next: Record<string, number> = {};
+      for (const item of items) if (item.symbol && typeof item.price === "number" && item.price > 0) next[item.symbol] = item.price;
+      if (Object.keys(next).length) setQuotes((current) => ({ ...current, ...next }));
     };
-    return () => { socket.close(); socketRef.current = null; };
+    const pollHttp = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const data = await fetch(`/api/market-data?provider=groww&symbols=${encodeURIComponent(TICKER.join(","))}`, { cache: "no-store" }).then((response) => response.json());
+        if (Array.isArray(data.quotes) && data.quotes.length) { applyMarkets(data.quotes); setStreamStatus("polling"); }
+        else if (data.error) setStreamStatus(/429|rate/i.test(String(data.error)) ? "rate-limited" : "unavailable");
+      } catch { /* keep the last prices */ }
+    };
+    const startPolling = () => {
+      if (pollTimer) return;
+      void pollHttp();
+      pollTimer = setInterval(() => { void pollHttp(); }, 10_000);
+    };
+    const stopPolling = () => { if (pollTimer) clearInterval(pollTimer); pollTimer = null; };
+
+    const onTick = (price: number) => {
+      const bucket = Math.floor(Date.now() / 300_000) * 300;
+      const current = candlesRef.current;
+      const last = current.at(-1);
+      const next = !last ? [{ time: bucket, open: price, high: price, low: price, close: price, volume: 0 }]
+        : last.time >= bucket ? [...current.slice(0, -1), { ...last, high: Math.max(last.high, price), low: Math.min(last.low, price), close: price }]
+          : [...current.slice(-150), { time: bucket, open: last.close, high: Math.max(last.close, price), low: Math.min(last.close, price), close: price, volume: 0 }];
+      candlesRef.current = next;
+      setCandles(next);
+    };
+
+    const connect = () => {
+      if (closed) return;
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      setStreamStatus(attempts ? "reconnecting" : "connecting");
+      socket = new WebSocket(process.env.NEXT_PUBLIC_API_WS_URL ?? `${protocol}://${window.location.hostname}:4000/ws/quotes`);
+      socketRef.current = socket;
+      socket.onopen = () => { attempts = 0; socket?.send(subscriptionRef.current); };
+      socket.onclose = () => {
+        if (socketRef.current === socket) socketRef.current = null;
+        if (closed) return;
+        setStreamStatus("unavailable");
+        startPolling();
+        attempts += 1;
+        retryTimer = setTimeout(connect, Math.min(30_000, 1000 * 2 ** Math.min(attempts, 5)));
+      };
+      socket.onmessage = (event) => {
+        let payload: { type?: string; state?: string; quote?: QuoteUpdate; quotes?: QuoteUpdate[] };
+        try { payload = JSON.parse(event.data); } catch { return; }
+        if (payload.type === "status" && payload.state) {
+          setStreamStatus(payload.state);
+          if (payload.state === "live") stopPolling();
+          return;
+        }
+        if (payload.type === "markets" && Array.isArray(payload.quotes)) {
+          stopPolling();
+          setStreamStatus("live");
+          applyMarkets(payload.quotes);
+          return;
+        }
+        if (payload.type === "market" && payload.quote?.price) {
+          const price = payload.quote.price;
+          setQuotes((current) => ({ ...current, [payload.quote!.symbol || symbol]: price }));
+          onTick(price);
+          scheduleRef.current();
+          return;
+        }
+        const updates = payload.quotes;
+        if ((payload.type === "chain" || payload.type === "quotes") && updates?.length) {
+          const prices = new Map<string, number>();
+          for (const quote of updates) if (quote.price && quote.price > 0) prices.set(norm(quote.symbol), quote.price);
+          if (!prices.size) return;
+          if (payload.type === "chain") {
+            let touched = false;
+            const nextChain = chainRef.current.map((item) => { const price = prices.get(norm(item.symbol)); if (!price || price === item.premium) return item; touched = true; return { ...item, premium: price, bid: price, ask: price }; });
+            if (touched) { chainRef.current = nextChain; setChain(nextChain); }
+          } else {
+            setPaperOrders((current) => current.map((order) => {
+              const price = prices.get(norm(order.symbol));
+              if (!price || price === order.currentPrice) return order;
+              const pnl = (price - order.price) * order.quantity;
+              return { ...order, currentPrice: price, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
+            }));
+          }
+          scheduleRef.current();
+        }
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      stopPolling();
+      socket?.close();
+      socketRef.current = null;
+    };
   }, [symbol]);
 
   // ---- paper orders -------------------------------------------------------------------
