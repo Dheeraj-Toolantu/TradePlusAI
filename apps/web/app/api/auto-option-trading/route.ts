@@ -36,19 +36,27 @@ export async function POST(request: Request) {
     intel = latestCachedIntel(symbol) ?? await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
   }
   const bias = intel?.available ? intel.verdict?.bias : undefined;
-  const entryBlockedReason = !intel?.available
+  // A fresh V5 strategy signal (ORB break-and-retest / VWAP reclaim) is its own directional
+  // evidence: opening-range breaks start FROM sideways conditions, so a SIDEWAYS verdict or
+  // missing intel must not veto it. Extreme VIX and an opposing verdict still do.
+  const rawSignal = (body.strategySignal ?? null) as RecordValue | null;
+  const strategySignal = rawSignal && (rawSignal.side === "BUY" || rawSignal.side === "SELL") && String(rawSignal.id ?? "")
+    ? { id: String(rawSignal.id), strategy: String(rawSignal.strategy ?? "ORB_RETEST"), side: rawSignal.side as "BUY" | "SELL", entry: numberOf(rawSignal.entry), stopLoss: numberOf(rawSignal.stopLoss), target: numberOf(rawSignal.target), reason: String(rawSignal.reason ?? "") }
+    : undefined;
+  const entryBlockedReason = intel?.available && intel.volatility?.regime === "EXTREME" ? "India VIX is in the EXTREME regime" : undefined;
+  const trendBlockedReason = !intel?.available
     ? "market intelligence (trend, OI flow, VIX) is unavailable"
-    : intel.volatility?.regime === "EXTREME"
-      ? "India VIX is in the EXTREME regime"
-      : bias === "SIDEWAYS"
-        ? "no clear trend (confluence verdict is SIDEWAYS)"
-        : undefined;
+    : bias === "SIDEWAYS"
+      ? "no clear trend (confluence verdict is SIDEWAYS)"
+      : undefined;
   try {
     const status = await trader.tick({
       symbol,
       spot,
       marketBias: bias,
       entryBlockedReason,
+      trendBlockedReason,
+      strategySignal,
       settings: {
         maxTrades: numberOf(body.maxTrades) || 3,
         minimumLoss: numberOf(body.minimumLoss) || 2500,

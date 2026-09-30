@@ -208,10 +208,11 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         trend_15m=trend_15m,
         gap_state=gap.state if gap else "NORMAL_DAY",
         config=config,
+        entry_threshold=config.adx_range_threshold if strategy == "ORB_RETEST" else None,
     )
 
     setup = result.get("setup") or {}
-    side = setup.get("side")
+    side = setup.get("side") or (orb.side if orb is not None else None)
     if side is None and ema_fast is not None and ema_slow is not None and ema_fast != ema_slow:
         side = "BUY" if ema_fast > ema_slow else "SELL"
     direction = 1 if side == "BUY" else -1 if side == "SELL" else 0
@@ -263,6 +264,13 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     else:
         oi_supportive = (oi_score_raw is not None and float(oi_score_raw) * direction >= 1) if direction else False
     minimum_score = float(config.score_thresholds["minimum_trade_score"]) + (float(expiry_rules["minimum_score_increase"]) if expiry_day else 0.0)
+    # Index candles carry no volume. When no futures-volume proxy is attached the 2 volume points
+    # are unobservable, not bearish, so the bar is scaled to the 8 points that can be observed
+    # (8/10 -> 6.4/8) instead of demanding a perfect score on everything else.
+    volume_observable = relative_volume is not None
+    if not volume_observable:
+        maximum = float(config.score_thresholds["maximum_score"])
+        minimum_score = round(minimum_score * (maximum - 2) / maximum, 2)
     score_total = float(trend_cluster + structure_cluster + (volume_evidence or 0) + (1 if ors_confirmed else 0) + (1 if oi_supportive else 0))
     oi_direction_score = oi_score_raw
     calculations = {
@@ -300,6 +308,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
             "oi_direction": 1 if oi_supportive else 0,
             "total": score_total,
             "minimum": minimum_score,
+            "volume_observable": volume_observable,
         },
         "option": {"ors": _round(float(ors)) if ors is not None else None, "oi_direction_score": _round(float(oi_direction_score)) if oi_direction_score is not None else None, "iv_regime": iv_regime, "liquidity_score": _round(float(liquidity_score)) if liquidity_score is not None else None},
         "risk": {
@@ -337,7 +346,11 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
     return evidence, calculations, session_info
 
 
-ORB_MAX_SIGNAL_AGE_CANDLES = 1
+ORB_MAX_SIGNAL_AGE_CANDLES = 2  # the retest candle plus up to two more completed candles
+
+
+def _orb_max_extension(price: float, atr: float) -> float:
+    return min(max(price, 1.0) * 0.0035, atr) if atr > 0 else max(price, 1.0) * 0.0035
 CANDLE_MINUTES = 5
 
 
@@ -444,9 +457,17 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         if orb.status != "CONFIRMED" or not orb.side:
             # Never fall through to a different (EMA/VWAP) rule set: ORB either confirms or waits.
             return {"symbol": symbol, "strategy": strategy, "decision": orb.status, "reason": orb.reason, "confidence": 0, "calculations": orb_calc, "setup": None}
-        if orb.bars_since_retest is not None and orb.bars_since_retest > ORB_MAX_SIGNAL_AGE_CANDLES:
-            return {"symbol": symbol, "strategy": strategy, "decision": "SIGNAL_EXPIRED", "reason": f"ORB retest confirmed {orb.bars_since_retest} candles ago; entering now would be chasing", "confidence": 0, "calculations": orb_calc, "setup": None}
         entry = candles[-1].close
+        level = orb.opening_range_high if orb.side == "BUY" else orb.opening_range_low
+        # A retest signal stays actionable for a couple of candles while price is still within
+        # the max extension of the level (spec 6A); beyond that it is a chase, and the engine
+        # waits for the next pullback to the level rather than ending the day.
+        fresh = orb.bars_since_retest is not None and orb.bars_since_retest <= ORB_MAX_SIGNAL_AGE_CANDLES
+        near_level = level is not None and 0 < (entry - level) * (1 if orb.side == "BUY" else -1) <= _orb_max_extension(entry, orb.atr)
+        if not (fresh and near_level):
+            retest_clock = orb.retest_time[11:16] if orb.retest_time else "--"
+            why = f"{orb.bars_since_retest} candles ago" if not fresh else f"price is now {abs(entry - (level or entry)):.1f} pts from the level"
+            return {"symbol": symbol, "strategy": strategy, "decision": "SIGNAL_EXPIRED", "reason": f"ORB retest at {retest_clock} ({why}); entering now would be chasing. Waiting for the next pullback to {level:.2f}", "confidence": 0, "calculations": orb_calc, "setup": None}
         buffer = orb.atr * config.stop_buffer_atr_multiplier
         # Spec 15: structural stop beyond the retest extreme / breakout level, plus an ATR buffer.
         if orb.side == "BUY":
@@ -573,6 +594,9 @@ def analyze_payload(payload: dict) -> dict:
     result["pipeline"] = pipeline
     result["strategy_decision"] = result.get("decision")
     result["strategy_reason"] = result.get("reason")
+    # The raw strategy setup survives the gate so the paper auto engine (which applies its own
+    # risk checks) can act on a fresh ORB signal; ``setup`` stays null unless every gate passes.
+    result["strategy_setup"] = result.get("setup")
     if pipeline["decision"] != "CONFIRMED":
         result["decision"] = "NO_TRADE"
         result["reason"] = "; ".join(pipeline["reasons"])

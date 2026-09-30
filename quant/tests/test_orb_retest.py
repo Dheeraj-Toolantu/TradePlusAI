@@ -73,7 +73,9 @@ class OrbRetestTest(unittest.TestCase):
         last = candles[-1]
         candles.append(Candle((datetime.fromisoformat(last.timestamp) + timedelta(minutes=5)).isoformat(), 101.1, 101.2, 99.8, 100.2, 1_500))
         result = evaluate_orb_retest(candles)
-        self.assertEqual(result.status, "NO_TRADE")
+        # The break is dead; the scan waits for a fresh break of either side instead of ending the day.
+        self.assertEqual(result.status, "WAIT_FOR_BREAKOUT")
+        self.assertIsNone(result.side)
         self.assertIn("failed", result.reason)
 
 
