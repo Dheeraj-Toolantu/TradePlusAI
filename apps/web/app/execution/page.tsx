@@ -6,6 +6,7 @@ import { formatMarketCalculationValue, getOrderExitState } from "../../lib/optio
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { SmartEntry } from "../../lib/market-intel";
+import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
 // Heavy, below-the-fold or on-demand panels load in their own chunks so the first paint only
 // needs the header and the trade desk shell.
@@ -188,17 +189,9 @@ export default function ExecutionPage() {
     if (autoBusy.current || !autoEnabled) return;
     if (snapshot.length < 3 || !contracts.length) { setAutoStatus((current) => ({ ...current, summary: !contracts.length ? "Waiting for the live option chain" : "Waiting for live candles" })); return; }
     if (!inEntryWindow()) { setAutoStatus((current) => ({ ...current, summary: "Waiting for the entry window (09:35-14:45 IST, Mon-Fri)" })); return; }
-    // A fresh ORB/VWAP setup from the V5 engine drives the auto entry direction.
-    const setup = analysis?.strategy_decision === "CONFIRMED" ? analysis.strategy_setup : null;
-    const orb = analysis?.calculations?.orb;
-    const strategySignal = setup && (setup.side === "BUY" || setup.side === "SELL") ? {
-      id: `${strategyId}:${symbol}:${String(orb?.retest_time ?? orb?.breakout_time ?? setup.entry)}`,
-      strategy: strategyId, side: setup.side, entry: setup.entry, stopLoss: setup.stop_loss, target: setup.target,
-      reason: analysis?.strategy_reason ?? "", pipelineDecision: analysis?.pipeline?.decision ?? null,
-    } : null;
     autoBusy.current = true;
     try {
-      const response = await fetch("/api/auto-option-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol, strategySignal, maxTrades: autoMaxTrades, minimumLoss: autoMinLoss, minimumProfit: autoMinProfit, spot: snapshot.at(-1)?.close ?? 0, candles: snapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })), contracts }) });
+      const response = await fetch("/api/auto-option-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol, maxTrades: autoMaxTrades, minimumLoss: autoMinLoss, minimumProfit: autoMinProfit, spot: snapshot.at(-1)?.close ?? 0, candles: snapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })), contracts }) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) { setAutoStatus((current) => ({ ...current, summary: data.error ?? "Auto scan blocked" })); return; }
       setAutoStatus({ tradesTaken: data.tradesTaken ?? 0, limitHit: Boolean(data.limitHit), summary: data.summary ?? "Scanned", diagnostics: data.diagnostics ?? [], smartEntry: data.smartEntry ?? null });
@@ -210,7 +203,7 @@ export default function ExecutionPage() {
       log(`[Auto engine] ${data.summary ?? "Market scanned"}`, data.limitHit ? "info" : "entry");
     } catch { setAutoStatus((current) => ({ ...current, summary: "Auto scan unavailable; retrying" })); }
     finally { autoBusy.current = false; }
-  }, [analysis, autoEnabled, autoMaxTrades, autoMinLoss, autoMinProfit, log, strategyId, symbol]);
+  }, [autoEnabled, autoMaxTrades, autoMinLoss, autoMinProfit, log, symbol]);
 
   const scheduleAutoScan = useCallback(() => {
     if (!autoEnabled) return;
@@ -481,6 +474,18 @@ export default function ExecutionPage() {
     } catch { setMessage("Cache clear failed; live data was not changed."); }
     finally { setCacheClearing(false); }
   }, [refresh]);
+  const loadAdvice = useCallback((advice: OptionAdvice) => {
+    if (!advice.contract || !advice.premium) return;
+    const size = advice.lotSize && advice.lotSize > 0 ? advice.lotSize : FALLBACK_LOT[advice.symbol] ?? 1;
+    setContract({ symbol: advice.contract.trading_symbol, growwSymbol: advice.contract.trading_symbol, type: advice.contract.side, expiry: advice.expiry ?? undefined, strike: advice.contract.strike, lotSize: size });
+    setLots(1);
+    setStopLoss(String(advice.premium.stop));
+    setTarget(String(advice.premium.target1));
+    setTicketSource(`AI ${advice.source === "AI" ? "advisor" : "rule-based"}`);
+    setTicketOrigin("MANUAL");
+    setMessage(`AI suggestion loaded: BUY ${advice.contract.trading_symbol} · SL ₹${advice.premium.stop} · T1 ₹${advice.premium.target1}. Review before placing.`);
+    document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
   const aiContext = useCallback(() => ({
     symbol, timeframe: "5m", executionMode: live?.enabled ? "ALGO_LIVE_ARMED" : "PAPER", marketStatus: sessionLabelRef.current, deterministicAnalysis: analysis,
     candles: candlesRef.current.slice(-30), optionCandidates: chainRef.current.slice(0, 20), risk: { safeMode: safety.safeMode, killSwitch: safety.killSwitch, autoTradeEnabled: autoEnabled },
@@ -548,7 +553,7 @@ export default function ExecutionPage() {
         <p className="exec-message" role="status">{message}</p>
         <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadPlan} />
         <SentimentPanel />
-        <AIMonitoringPanel symbol={symbol} strategyId={strategyId} buildContext={aiContext} />
+        <AIMonitoringPanel symbol={symbol} strategyId={strategyId} buildContext={aiContext} onLoadAdvice={loadAdvice} />
 
         <div className="exec-grid">
           <article className="mi-card exec-strategy">
@@ -626,7 +631,7 @@ export default function ExecutionPage() {
           </div>
           <p className="mi-note">{autoStatus.summary}</p>
           {autoEnabled && autoStatus.smartEntry?.available ? <SmartEntryCard smart={autoStatus.smartEntry} /> : null}
-          <p className="mi-note">Entries only from confirmed setups: price reaches a 5m demand/supply zone (order block, FVG, support/resistance, option-writer wall) and a 1-minute CHoCH confirms the turn, scored on 15m/5m trend, OI writers, PCR, VIX, India sentiment and global cues (min 6/10); or a fresh {strategy.name} signal. Extreme VIX pauses entries. The auto engine never sends real orders.</p>
+          <p className="mi-note">Entries only from confirmed setups: price reaches a 5m demand/supply zone (order block, FVG, support/resistance, option-writer wall) and a 1-minute CHoCH confirms the turn, scored on 15m/5m trend, OI writers, PCR, VIX, India sentiment and global cues (min 6/10). ORB and other V5 strategy signals are not used here. Extreme VIX pauses entries. The auto engine never sends real orders.</p>
           {autoStatus.diagnostics?.length ? <details className="mi-management"><summary>Why no trade?</summary><ul>{autoStatus.diagnostics.slice(0, 6).map((item) => <li key={item}><small>{item}</small></li>)}</ul></details> : null}
         </article>
 

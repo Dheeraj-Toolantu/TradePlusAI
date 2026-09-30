@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { getAIMonitoring, updateAIMonitoring } from "../../lib/ai-monitoring-client";
+import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 type Monitoring = { sessionId?: string; state: string; monitoringEnabled: boolean; mode: string; blockers: string[]; latest?: { direction?: string; status?: string; confidence?: number; invalidation?: string }; log: Array<Record<string, unknown>> };
 
 const POLL_MS = 5_000;
+const ADVICE_MS = 60_000;
 
 function readMonitoring(data: Record<string, unknown>, current: Monitoring): Monitoring {
   const monitoring = (data.monitoring ?? {}) as Record<string, unknown>;
@@ -34,12 +36,15 @@ function readMonitoring(data: Record<string, unknown>, current: Monitoring): Mon
  * order still goes through the deterministic V5 gates, the trade-desk checklist and, for real
  * money, the PIN-confirmed live flow.
  */
-export function AIMonitoringPanel({ symbol, strategyId, buildContext }: { symbol: string; strategyId: string; buildContext: () => Record<string, unknown> }) {
+export function AIMonitoringPanel({ symbol, strategyId, buildContext, onLoadAdvice }: { symbol: string; strategyId: string; buildContext: () => Record<string, unknown>; onLoadAdvice?: (advice: OptionAdvice) => void }) {
   const [monitoring, setMonitoring] = useState<Monitoring>({ state: "DISABLED", monitoringEnabled: false, mode: "PAPER", blockers: [], log: [] });
   const [chat, setChat] = useState<ChatMessage[]>([{ role: "assistant", content: "Ask about trend, candles, levels, option-chain positioning, risk/reward or a paper-trade plan for NIFTY, BANKNIFTY or SENSEX." }]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [advice, setAdvice] = useState<OptionAdvice | null>(null);
+  const [adviceBusy, setAdviceBusy] = useState(false);
+  const [adviceError, setAdviceError] = useState<string | null>(null);
 
   const refresh = useCallback(async (sessionId?: string) => {
     try {
@@ -57,6 +62,30 @@ export function AIMonitoringPanel({ symbol, strategyId, buildContext }: { symbol
     const timer = setInterval(() => { if (document.visibilityState === "visible") void refresh(monitoring.sessionId); }, POLL_MS);
     return () => clearInterval(timer);
   }, [monitoring.monitoringEnabled, monitoring.sessionId, refresh]);
+
+  // While monitoring is on, the AI re-reads the whole market (zones, 1m trigger, structure, OI,
+  // PCR, VIX, sentiment, global cues) every minute and names the best CE / PE, or WAIT.
+  const suggest = useCallback(async () => {
+    if (!monitoring.sessionId) return;
+    setAdviceBusy(true);
+    try {
+      const response = await fetch("/api/ai-monitoring/suggest", { method: "POST", headers: { "content-type": "application/json", "x-user-id": "local-user" }, body: JSON.stringify({ symbol, sessionId: monitoring.sessionId }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(data.error ?? "AI suggestion unavailable"));
+      setAdvice(data.advice as OptionAdvice);
+      setAdviceError(null);
+    } catch (reason) {
+      setAdviceError(reason instanceof Error ? reason.message : "AI suggestion unavailable");
+    } finally {
+      setAdviceBusy(false);
+    }
+  }, [monitoring.sessionId, symbol]);
+  useEffect(() => {
+    if (!monitoring.monitoringEnabled || !monitoring.sessionId) { setAdvice(null); return; }
+    void suggest();
+    const timer = setInterval(() => { if (document.visibilityState === "visible") void suggest(); }, ADVICE_MS);
+    return () => clearInterval(timer);
+  }, [monitoring.monitoringEnabled, monitoring.sessionId, suggest]);
 
   const toggle = async () => {
     try {
@@ -105,6 +134,8 @@ export function AIMonitoringPanel({ symbol, strategyId, buildContext }: { symbol
         {latest?.invalidation ? ` · invalidation: ${latest.invalidation}` : ""}
       </p>
       {monitoring.blockers.length > 0 && <p className="warning mi-note">Blocked: {monitoring.blockers.join("; ")}</p>}
+      {monitoring.monitoringEnabled && (advice ? <AdviceCard advice={advice} busy={adviceBusy} onRefresh={() => void suggest()} onLoad={onLoadAdvice} /> : <p className="mi-note">{adviceBusy ? "AI is reading zones, 1m structure, OI, PCR, VIX and sentiment…" : adviceError ?? "Waiting for the first AI suggestion…"}</p>)}
+      {advice && adviceError && <p className="warning mi-note">Last refresh failed: {adviceError}</p>}
       {error && <p className="warning mi-note">{error}</p>}
       {monitoring.log.length > 0 && (
         <details className="mi-management"><summary>AI evaluation log ({monitoring.log.length})</summary>
@@ -117,5 +148,40 @@ export function AIMonitoringPanel({ symbol, strategyId, buildContext }: { symbol
         <button type="submit" disabled={busy || !input.trim()}>{busy ? "…" : "Ask AI"}</button>
       </form>
     </section>
+  );
+}
+
+function AdviceCard({ advice, busy, onRefresh, onLoad }: { advice: OptionAdvice; busy: boolean; onRefresh: () => void; onLoad?: (advice: OptionAdvice) => void }) {
+  const fmt = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
+  const tone = advice.action === "BUY_CE" ? "gain" : advice.action === "BUY_PE" ? "loss" : "warning";
+  const label = advice.action === "BUY_CE" ? "BUY CALL" : advice.action === "BUY_PE" ? "BUY PUT" : "WAIT";
+  return (
+    <div className="smart-entry ai-advice">
+      <div className="smart-entry-head">
+        <b className={tone}>{label}{advice.contract ? ` · ${advice.contract.trading_symbol || advice.contract.strike}` : ""}</b>
+        <span>{advice.headline}</span>
+        {advice.action !== "WAIT" ? <b>{advice.confidence}%</b> : null}
+        <button type="button" onClick={onRefresh} disabled={busy}>{busy ? "…" : "Re-analyse"}</button>
+      </div>
+      <p className="mi-note">{advice.strategy} · {advice.source === "AI" ? `AI (${advice.model ?? "model"})` : "rule-based fallback"} · {new Date(advice.generatedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}</p>
+      {advice.premium && advice.spot ? (
+        <div className="mi-risk-row">
+          <span>Premium <b>₹{fmt(advice.premium.entry)}</b> · SL <b className="loss">₹{fmt(advice.premium.stop)}</b> · T1 <b className="gain">₹{fmt(advice.premium.target1)}</b>{advice.premium.target2 ? <> · T2 <b className="gain">₹{fmt(advice.premium.target2)}</b></> : null} · {advice.premium.riskReward}R</span>
+          <span>Spot entry <b>{fmt(advice.spot.entryLow)}{advice.spot.entryHigh !== advice.spot.entryLow ? `–${fmt(advice.spot.entryHigh)}` : ""}</b> · SL <b>{fmt(advice.spot.stop)}</b> · T1 <b>{fmt(advice.spot.target1)}</b></span>
+        </div>
+      ) : null}
+      {advice.marketRead ? <p className="mi-note">{advice.marketRead}</p> : null}
+      {advice.trigger ? <p className="mi-note"><b>{advice.action === "WAIT" ? "Would trade if:" : "Entry trigger:"}</b> {advice.trigger}</p> : null}
+      {advice.invalidation ? <p className="mi-note"><b>Invalidation:</b> {advice.invalidation}</p> : null}
+      {advice.blockedBy.length ? <p className="warning mi-note">Blocked: {advice.blockedBy.join("; ")}</p> : null}
+      {advice.psychology.length ? <details className="mi-management" open><summary>Market psychology</summary><ul>{advice.psychology.map((line) => <li key={line}><small>{line}</small></li>)}</ul></details> : null}
+      {advice.reasons.length || advice.risks.length ? <details className="mi-management"><summary>Evidence for / against</summary><ul>
+        {advice.reasons.map((line) => <li key={`r${line}`}><small className="gain">+ </small><small>{line}</small></li>)}
+        {advice.risks.map((line) => <li key={`k${line}`}><small className="loss">− </small><small>{line}</small></li>)}
+      </ul></details> : null}
+      {advice.notes.length ? <p className="mi-note">{advice.notes.join(" ")}</p> : null}
+      {advice.action !== "WAIT" && advice.contract && advice.premium && onLoad ? <button type="button" className="mi-use-plan" onClick={() => onLoad(advice)}>Load this suggestion into the order ticket</button> : null}
+      <p className="mi-note">Suggestion only. It never places an order; paper and live orders still pass every server-side gate.</p>
+    </div>
   );
 }

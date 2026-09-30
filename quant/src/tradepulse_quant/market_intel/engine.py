@@ -355,6 +355,8 @@ def analyze_market(payload: dict) -> dict:
         "expiry_today": meta["expiry_today"],
     }
     flow_public = {key: value for key, value in flow.items() if key != "chain"}
+    # The best liquid, ATM/slightly-ITM contract per side: the only contracts the AI advisor may pick.
+    contract_candidates = {side: select_contract(flow.get("chain") or {}, spot, side) for side in ("CE", "PE")} if flow.get("available") else {"CE": None, "PE": None}
     return {
         "symbol": symbol,
         "available": True,
@@ -370,6 +372,7 @@ def analyze_market(payload: dict) -> dict:
         "smart_money": smc,
         "operator": operator,
         "smart_entry": smart_entry,
+        "contract_candidates": contract_candidates,
         "verdict": verdict,
         "trade_plan": plan,
         "v5_option_evidence": v5_option_evidence,
