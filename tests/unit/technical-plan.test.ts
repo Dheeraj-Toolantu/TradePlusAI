@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTechnicalPlan, type Candle } from "../../apps/web/app/page";
+import { buildTechnicalPlan, type Candle } from "../../apps/web/lib/technical-plan";
 
 function candlesFromClose(values: number[]): Candle[] {
   return values.map((close, index) => {
