@@ -19,8 +19,16 @@ def classify_regime(
     vwap_crosses: int = 0,
     gap_state: str = "NORMAL_DAY",
     config: StrategyConfiguration | None = None,
+    entry_threshold: float | None = None,
 ) -> Regime:
+    """``entry_threshold`` overrides the ADX needed to START a trend (default 22).
+
+    ORB passes the lower range threshold (18): ADX(14) lags a fresh opening-range breakout by
+    several candles, and the confirmed break-and-retest is itself the trend-initiation evidence.
+    Price/VWAP, EMA20/50 and the 15m trend must still all agree.
+    """
     cfg = config or StrategyConfiguration()
+    adx_entry = cfg.adx_entry_threshold if entry_threshold is None else entry_threshold
     if None in {adx_value, close, vwap_value, ema_fast, ema_slow}:
         return "UNKNOWN"
     if gap_state not in {"NORMAL_DAY", "GAP_HOLD_CONFIRMED", "GAP_FILL_CONFIRMED"}:
@@ -31,7 +39,7 @@ def classify_regime(
         return "TRENDING_BULL"
     if (previous == "TRENDING_BEAR" and bearish and adx_value >= cfg.adx_exit_threshold):
         return "TRENDING_BEAR"
-    if adx_value >= cfg.adx_entry_threshold:
+    if adx_value >= adx_entry:
         if bullish:
             return "TRENDING_BULL"
         if bearish:

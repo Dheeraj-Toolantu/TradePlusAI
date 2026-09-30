@@ -30,6 +30,21 @@ type EngineInput = {
   marketBias?: "BULLISH" | "BEARISH" | "SIDEWAYS";
   /** When set, no new entries are taken (open positions are still managed and exited). */
   entryBlockedReason?: string;
+  /** Blocks only trend-following entries that have no strategy signal behind them. */
+  trendBlockedReason?: string;
+  /** A fresh V5 strategy setup on the underlying (e.g. ORB break-and-retest). One trade per id. */
+  strategySignal?: StrategySignal;
+};
+
+export type StrategySignal = {
+  id: string;
+  strategy: string;
+  side: "BUY" | "SELL";
+  /** Underlying (spot) levels from the V5 engine. */
+  entry: number;
+  stopLoss: number;
+  target: number;
+  reason?: string;
 };
 
 export type AutoOptionTraderSettings = {
@@ -78,6 +93,7 @@ export class AutoOptionTrader {
   private tickQueue: Promise<void> = Promise.resolve();
   private lossExitConfirmations = new Map<string, { count: number; candleTimestamp: string }>();
   private readonly maxLossPerPosition = 2500;
+  private consumedSignals = new Set<string>();
 
   constructor(config: Partial<AutoOptionTraderConfig> = {}) {
     this.config = {
@@ -109,6 +125,7 @@ export class AutoOptionTrader {
     if (currentDate !== this.tradeDate) {
       this.tradeDate = currentDate;
       this.tradedToday = 0;
+      this.consumedSignals.clear();
     }
     const timestamp = new Date().toISOString();
     await this.updateExits(input, timestamp, settings);
@@ -137,6 +154,21 @@ export class AutoOptionTrader {
     const biasAllows = (contract: Contract) => !input.marketBias || (contract.contract === "CALL" ? input.marketBias === "BULLISH" : input.marketBias === "BEARISH");
     if (input.marketBias) {
       this.lastDiagnostics = this.lastDiagnostics.map((line, index) => biasAllows(input.contracts[index]) ? line : `${line}; market verdict ${input.marketBias} does not confirm ${input.contracts[index].contract}`);
+    }
+    if (input.strategySignal && !limitHit) {
+      const signalResult = this.strategySignalEntry(input, timestamp, settings);
+      if (signalResult) return signalResult;
+    }
+    if (input.trendBlockedReason) {
+      return {
+        mode: "PAPER",
+        limitHit,
+        tradesTaken: this.tradedToday,
+        orders: [...this.orders],
+        suggestions: [...this.suggestions],
+        diagnostics: [`Trend entries paused: ${input.trendBlockedReason}`, ...this.lastDiagnostics],
+        summary: `Waiting for a ${input.strategySignal?.strategy ?? "strategy"} signal on ${input.symbol}: ${input.trendBlockedReason}. Open positions are still managed.`,
+      };
     }
     const eligible = input.contracts
       .filter(biasAllows)
@@ -183,10 +215,12 @@ export class AutoOptionTrader {
       };
     }
 
-    const quantity = winner.quantity;
-    const orderKey = `${this.tradeDate}:${normalizeSymbol(winner.symbol)}`;
-    const existingOrder = this.orders.find((candidate) => candidate.id === `auto-${orderKey}`);
-    if (existingOrder && ["OPEN", "FILLED"].includes(existingOrder.status)) {
+    return this.placeOrder(winner, timestamp, settings, "Auto Option Engine", "Auto option engine");
+  }
+
+  private placeOrder(winner: AutoTradeSuggestion, timestamp: string, settings: AutoOptionTraderSettings, strategyName: string, source: string) {
+    const symbolKey = normalizeSymbol(winner.symbol);
+    if (this.active.has(symbolKey)) {
       return {
         mode: "PAPER",
         limitHit: this.tradedToday >= settings.maxTrades,
@@ -198,16 +232,19 @@ export class AutoOptionTrader {
       };
     }
 
+    // A re-entry on the same contract later in the day gets its own id instead of
+    // overwriting the earlier (exited) trade's record.
+    const orderId = `auto-${this.tradeDate}:${symbolKey}-${this.tradedToday + 1}`;
     const initialRisk = Math.max(winner.entry - winner.stopLoss, 0.01);
     const order: OrderRecord = {
-      id: `auto-${orderKey}`,
+      id: orderId,
       strategy: "AUTO_OPTION_ENGINE",
-      strategyName: "Auto Option Engine",
+      strategyName,
       symbol: winner.symbol,
       growwSymbol: winner.symbol,
       expiry: winner.expiry,
       side: "BUY",
-      quantity,
+      quantity: winner.quantity,
       lotSize: winner.quantity,
       price: winner.entry,
       target: winner.target,
@@ -216,15 +253,15 @@ export class AutoOptionTrader {
       maxProfitToTrail: Math.max(winner.entry + initialRisk * this.config.trailingActivationR, winner.entry + Math.max(winner.target - winner.entry, 0) * 0.5),
       highWaterMark: winner.entry,
       trailingStop: winner.stopLoss,
-      trailingDistance: Math.round((winner.entry - winner.stopLoss) * this.config.trailingDistanceR * 100) / 100,
+      trailingDistance: Math.round(initialRisk * this.config.trailingDistanceR * 100) / 100,
       status: "OPEN",
       mode: "PAPER",
-      source: "Auto option engine",
+      source,
       createdAt: timestamp,
     };
 
     this.orders.push(order);
-    this.active.set(normalizeSymbol(winner.symbol), order);
+    this.active.set(symbolKey, order);
     this.tradedToday += 1;
     this.suggestions.push(winner);
     void saveOrderToFirestore(order);
@@ -236,8 +273,68 @@ export class AutoOptionTrader {
       orders: [...this.orders],
       suggestions: [...this.suggestions],
       diagnostics: this.lastDiagnostics,
-      summary: `Auto trade placed: ${winner.symbol} ${winner.contract} at ${winner.entry}.`,
+      summary: `Auto trade placed: ${winner.symbol} ${winner.contract} at ${winner.entry}. ${winner.reason}`,
     };
+  }
+
+  /**
+   * Enter on a fresh V5 strategy setup: CE for a bullish setup, PE for a bearish one. The
+   * option stop/target are mapped from the underlying's structural stop and target through
+   * the contract delta (premium move ~= |delta| x spot move), clamped to 10-35% of premium so
+   * noise cannot stop out an ultra-tight stop and a wide one cannot risk most of the premium.
+   * Returns null when no contract qualifies so the caller can fall back to trend entries.
+   */
+  private strategySignalEntry(input: EngineInput, timestamp: string, settings: AutoOptionTraderSettings) {
+    const signal = input.strategySignal!;
+    const wanted = signal.side === "BUY" ? "CALL" : "PUT";
+    const label = `${signal.strategy} ${signal.side === "BUY" ? "bullish" : "bearish"} signal`;
+    if (this.consumedSignals.has(signal.id)) {
+      this.lastDiagnostics = [`${label} already traded (${signal.id})`, ...this.lastDiagnostics];
+      return null;
+    }
+    if (input.marketBias && input.marketBias !== "SIDEWAYS" && input.marketBias !== (wanted === "CALL" ? "BULLISH" : "BEARISH")) {
+      this.lastDiagnostics = [`${label} skipped: market verdict ${input.marketBias} opposes it`, ...this.lastDiagnostics];
+      return null;
+    }
+    const underlyingRisk = Math.abs(signal.entry - signal.stopLoss);
+    const underlyingReward = Math.abs(signal.target - signal.entry);
+    if (!(underlyingRisk > 0) || !(underlyingReward > 0)) {
+      this.lastDiagnostics = [`${label} skipped: missing structural stop/target`, ...this.lastDiagnostics];
+      return null;
+    }
+    const minScore = Math.max(60, this.config.minScore - 15);
+    const candidates = input.contracts
+      .filter((contract) => contract.contract === wanted && contract.lotSize > 0 && contract.premium > 0)
+      .filter((contract) => contract.score >= minScore && this.contractIsNearAtm(contract, input.spot))
+      .filter((contract) => !this.active.has(normalizeSymbol(contract.symbol)))
+      .sort((a, b) => b.score - a.score || Math.abs(Math.abs(a.delta) - 0.5) - Math.abs(Math.abs(b.delta) - 0.5));
+    const contract = candidates[0];
+    if (!contract) {
+      this.lastDiagnostics = [`${label}: no near-ATM ${wanted} with score >= ${minScore}, delta > 0.35 and a lot size`, ...this.lastDiagnostics];
+      return null;
+    }
+    const delta = Math.abs(contract.delta) || 0.5;
+    const tick = contract.tickSize > 0 ? contract.tickSize : 0.05;
+    const roundTick = (value: number) => Math.round(Math.round(value / tick) * tick * 100) / 100;
+    const premiumRisk = Math.min(Math.max(delta * underlyingRisk, contract.premium * 0.10), contract.premium * 0.35);
+    const premiumReward = Math.max(delta * underlyingReward, premiumRisk * this.config.minRiskReward);
+    const suggestion: AutoTradeSuggestion = {
+      symbol: contract.symbol,
+      side: "BUY",
+      contract: wanted,
+      strike: contract.strike,
+      expiry: contract.expiry,
+      entry: contract.premium,
+      stopLoss: roundTick(Math.max(contract.premium - premiumRisk, tick)),
+      target: roundTick(contract.premium + premiumReward),
+      quantity: Math.max(Math.round(contract.lotSize), 1),
+      score: contract.score,
+      riskReward: Math.round(premiumReward / premiumRisk * 100) / 100,
+      reason: `${label}: spot ${signal.entry} SL ${signal.stopLoss} T ${signal.target}${signal.reason ? ` (${signal.reason})` : ""}`,
+      timestamp,
+    };
+    this.consumedSignals.add(signal.id);
+    return this.placeOrder(suggestion, timestamp, settings, `Auto Option Engine · ${signal.strategy}`, `Auto option engine · ${signal.strategy} signal`);
   }
 
   private orderFromSuggestion(suggestion: AutoTradeSuggestion, timestamp: string, suggestionKey: string): OrderRecord {

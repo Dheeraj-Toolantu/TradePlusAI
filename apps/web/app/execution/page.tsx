@@ -22,6 +22,7 @@ type Analysis = {
   pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
   strategy_decision?: string;
   strategy_reason?: string;
+  strategy_setup?: { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number } | null;
 };
 type Order = {
   id: string; symbol: string; strategy?: string; strategyName?: string; side: string; quantity: number; lotSize?: number; price: number; status: string; mode?: string;
@@ -42,7 +43,7 @@ const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
 const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
 const STRATEGIES: Array<{ id: StrategyId; name: string; description: string }> = [
-  { id: "ORB_RETEST", name: "ORB + Retest", description: "15-minute opening range breakout, retest hold within 3 candles, structural stop, 2R target." },
+  { id: "ORB_RETEST", name: "ORB + Retest", description: "15-minute opening range breakout; retest within 3 candles or a later orderly pullback to the level, failed breaks re-armed, structural stop, 2R target." },
   { id: "VWAP_REVERSAL", name: "VWAP Reversal", description: "Rejection at support/resistance with a higher low / lower high, then a confirmed VWAP reclaim." },
   { id: "RANGE_DEFINED_RISK", name: "Range (analysis only)", description: "Defined-risk range regime detection. Multi-leg execution is not enabled; no naked selling." },
 ];
@@ -50,6 +51,12 @@ const money = (value: number | null | undefined) => (value === null || value ===
 const calc = (value: unknown, percent = false) => formatMarketCalculationValue(value as number | string | null | undefined, { percent });
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
 const istDate = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
+// Entry window from the IST wall clock (09:35-14:45, Mon-Fri); independent of a possibly stale analysis.
+const inEntryWindow = () => {
+  const ist = new Date(Date.now() + 330 * 60_000);
+  const minutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return ist.getUTCDay() >= 1 && ist.getUTCDay() <= 5 && minutes >= 9 * 60 + 35 && minutes < 14 * 60 + 45;
+};
 const nowLabel = () => new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
 
 export default function ExecutionPage() {
@@ -104,8 +111,8 @@ export default function ExecutionPage() {
   const spot = candles.at(-1)?.close ?? quotes[symbol] ?? 0;
 
   // ---- data loading -------------------------------------------------------------------
-  const refresh = useCallback(async () => {
-    setBusy(true);
+  const refresh = useCallback(async (quiet = false) => {
+    if (!quiet) setBusy(true);
     const version = mutationVersion.current;
     try {
       const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategyId}`, { cache: "no-store" }).then((response) => response.json());
@@ -118,7 +125,7 @@ export default function ExecutionPage() {
       }
       if (data.error) setMessage(data.error);
     } catch { setMessage("Strategy engine unavailable; retrying on the next refresh."); }
-    finally { setBusy(false); }
+    finally { if (!quiet) setBusy(false); }
   }, [strategyId, symbol]);
 
   const refreshLive = useCallback(async () => {
@@ -126,6 +133,20 @@ export default function ExecutionPage() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  // The engine only sees COMPLETED 5-minute candles and an ORB signal is actionable for about two
+  // candles, so re-run it shortly after every candle close (and every minute as a backstop).
+  // Previously the analysis loaded once, so the card showed stale/expired signals and the auto
+  // engine kept an out-of-date session window.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      const now = Date.now();
+      const nextClose = Math.ceil(now / 300_000) * 300_000 + 5_000;
+      timer = setTimeout(() => { if (document.visibilityState === "visible") void refresh(true); schedule(); }, Math.min(nextClose - now, 60_000));
+    };
+    schedule();
+    return () => { if (timer) clearTimeout(timer); };
+  }, [refresh]);
   useEffect(() => {
     void refreshLive();
     const timer = setInterval(() => { if (document.visibilityState === "visible") void refreshLive(); }, 10_000);
@@ -163,11 +184,20 @@ export default function ExecutionPage() {
   const runAutoScan = useCallback(async () => {
     const snapshot = candlesRef.current;
     const contracts = chainRef.current;
-    if (autoBusy.current || !autoEnabled || snapshot.length < 3 || !contracts.length) return;
-    if (analysis?.session && (!analysis.session.market_open || !analysis.session.entry_permitted)) { setAutoStatus((current) => ({ ...current, summary: "Waiting for the entry window (09:35-14:45 IST)" })); return; }
+    if (autoBusy.current || !autoEnabled) return;
+    if (snapshot.length < 3 || !contracts.length) { setAutoStatus((current) => ({ ...current, summary: !contracts.length ? "Waiting for the live option chain" : "Waiting for live candles" })); return; }
+    if (!inEntryWindow()) { setAutoStatus((current) => ({ ...current, summary: "Waiting for the entry window (09:35-14:45 IST, Mon-Fri)" })); return; }
+    // A fresh ORB/VWAP setup from the V5 engine drives the auto entry direction.
+    const setup = analysis?.strategy_decision === "CONFIRMED" ? analysis.strategy_setup : null;
+    const orb = analysis?.calculations?.orb;
+    const strategySignal = setup && (setup.side === "BUY" || setup.side === "SELL") ? {
+      id: `${strategyId}:${symbol}:${String(orb?.retest_time ?? orb?.breakout_time ?? setup.entry)}`,
+      strategy: strategyId, side: setup.side, entry: setup.entry, stopLoss: setup.stop_loss, target: setup.target,
+      reason: analysis?.strategy_reason ?? "", pipelineDecision: analysis?.pipeline?.decision ?? null,
+    } : null;
     autoBusy.current = true;
     try {
-      const response = await fetch("/api/auto-option-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol, maxTrades: autoMaxTrades, minimumLoss: autoMinLoss, minimumProfit: autoMinProfit, spot: snapshot.at(-1)?.close ?? 0, candles: snapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })), contracts }) });
+      const response = await fetch("/api/auto-option-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol, strategySignal, maxTrades: autoMaxTrades, minimumLoss: autoMinLoss, minimumProfit: autoMinProfit, spot: snapshot.at(-1)?.close ?? 0, candles: snapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })), contracts }) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) { setAutoStatus((current) => ({ ...current, summary: data.error ?? "Auto scan blocked" })); return; }
       setAutoStatus({ tradesTaken: data.tradesTaken ?? 0, limitHit: Boolean(data.limitHit), summary: data.summary ?? "Scanned", diagnostics: data.diagnostics ?? [] });
@@ -179,7 +209,7 @@ export default function ExecutionPage() {
       log(`[Auto engine] ${data.summary ?? "Market scanned"}`, data.limitHit ? "info" : "entry");
     } catch { setAutoStatus((current) => ({ ...current, summary: "Auto scan unavailable; retrying" })); }
     finally { autoBusy.current = false; }
-  }, [analysis?.session, autoEnabled, autoMaxTrades, autoMinLoss, autoMinProfit, log, symbol]);
+  }, [analysis, autoEnabled, autoMaxTrades, autoMinLoss, autoMinProfit, log, strategyId, symbol]);
 
   const scheduleAutoScan = useCallback(() => {
     if (!autoEnabled) return;
@@ -189,6 +219,14 @@ export default function ExecutionPage() {
   const scheduleRef = useRef(scheduleAutoScan);
   scheduleRef.current = scheduleAutoScan;
   useEffect(() => () => { if (autoTimer.current) clearTimeout(autoTimer.current); }, []);
+  // Scans used to run only on WebSocket ticks, so with the socket down (HTTP polling fallback)
+  // or a quiet tape the auto engine never scanned at all. Scan on enable and every 15 seconds.
+  useEffect(() => {
+    if (!autoEnabled) return;
+    scheduleRef.current();
+    const timer = setInterval(() => { if (document.visibilityState === "visible") scheduleRef.current(); }, 15_000);
+    return () => clearInterval(timer);
+  }, [autoEnabled]);
 
   // ---- live quotes: one socket per index, subscriptions updated in place ------------
   const subscription = useMemo(() => ({
@@ -585,7 +623,7 @@ export default function ExecutionPage() {
             <label>Max loss per trade<select value={autoMinLoss} onChange={(event) => setAutoMinLoss(Number(event.target.value))}>{[500, 1000, 1500, 2000, 2500, 5000].map((value) => <option key={value} value={value}>₹{value.toLocaleString("en-IN")}</option>)}</select></label>
             <label>Trail after profit<select value={autoMinProfit} onChange={(event) => setAutoMinProfit(Number(event.target.value))}>{[0, 500, 1000, 1500, 2500].map((value) => <option key={value} value={value}>{value ? `₹${value.toLocaleString("en-IN")}` : "at +1R"}</option>)}</select></label>
           </div>
-          <p className="mi-note">{autoStatus.summary}. Entries require the trade-desk verdict to agree and pause in extreme VIX or sideways markets; the auto engine never sends real orders.</p>
+          <p className="mi-note">{autoStatus.summary}. A fresh {strategy.name} signal from the V5 engine drives entries (sized from the underlying stop via delta); without one, entries need the trade-desk verdict to agree. Extreme VIX pauses entries. The auto engine never sends real orders.</p>
           {autoStatus.diagnostics?.length ? <details className="mi-management"><summary>Why no trade?</summary><ul>{autoStatus.diagnostics.slice(0, 6).map((item) => <li key={item}><small>{item}</small></li>)}</ul></details> : null}
         </article>
 

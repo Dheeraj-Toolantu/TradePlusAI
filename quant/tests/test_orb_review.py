@@ -23,10 +23,11 @@ OPENING = [(25000, 25040, 24990, 25010), (25010, 25050, 25000, 25030), (25030, 2
 
 class ExtensionBeforeRetest(unittest.TestCase):
     def test_run_away_then_retest_is_rejected(self):
+        # The drop back into the level is a 130-pt counter-candle: a rejection, not a retest.
         today = bars(IST_TODAY, OPENING + [(25050, 25075, 25045, 25070), (25070, 25230, 25065, 25220), (25220, 25225, 25080, 25090), (25090, 25110, 25055, 25105)])
         result = evaluate_orb_retest(previous_day() + today)
-        self.assertEqual(result.status, "NO_TRADE")
-        self.assertIn("chasing", result.reason)
+        self.assertEqual(result.status, "WAIT_FOR_PULLBACK")
+        self.assertIn("counter-candle", result.reason)
 
     def test_orderly_breakout_and_retest_confirms_with_timeline(self):
         today = bars(IST_TODAY, OPENING + [(25050, 25075, 25045, 25070), (25068, 25080, 25058, 25076)])
@@ -40,8 +41,53 @@ class ExtensionBeforeRetest(unittest.TestCase):
         # Breakout, a candle that runs +120 without touching the level, then a clean retest.
         today = bars(IST_TODAY, OPENING + [(25050, 25075, 25045, 25070), (25072, 25180, 25071, 25170), (25170, 25172, 25090, 25095), (25062, 25100, 25058, 25090)])
         result = evaluate_orb_retest(previous_day() + today)
+        self.assertEqual(result.status, "WAIT_FOR_PULLBACK")
+        self.assertIsNone(result.retest_index)
+
+
+class PullbackReentry(unittest.TestCase):
+    def test_orderly_pullback_after_an_extended_breakout_confirms(self):
+        # Breakout runs +60 (beyond the 40-pt max extension), drifts back, then tags ORH and holds.
+        run = [(25050, 25075, 25045, 25070), (25070, 25125, 25068, 25120), (25120, 25122, 25095, 25100), (25100, 25104, 25080, 25085)]
+        today = bars(IST_TODAY, OPENING + run + [(25072, 25090, 25058, 25088)])
+        result = evaluate_orb_retest(previous_day() + today)
+        self.assertEqual(result.status, "CONFIRMED")
+        self.assertEqual(result.side, "BUY")
+        self.assertEqual(result.bars_since_retest, 0)
+        self.assertIn("pullback retest", result.reason)
+
+    def test_stale_retest_is_refreshed_by_a_later_pullback(self):
+        drift = [(25080 + step, 25090 + step, 25075 + step, 25085 + step) for step in range(0, 40, 5)]
+        first = OPENING + [(25050, 25075, 25045, 25070), (25068, 25080, 25058, 25076)] + drift
+        stale = analyze("NIFTY", previous_day() + bars(IST_TODAY, first), strategy="ORB_RETEST")
+        self.assertEqual(stale["decision"], "SIGNAL_EXPIRED")
+        self.assertIn("next pullback", stale["reason"])
+        pullback = first + [(25110, 25112, 25080, 25082), (25070, 25088, 25059, 25084)]
+        fresh = analyze("NIFTY", previous_day() + bars(IST_TODAY, pullback), strategy="ORB_RETEST")
+        self.assertEqual(fresh["decision"], "CONFIRMED")
+        self.assertEqual(fresh["setup"]["side"], "BUY")
+
+    def test_failed_break_then_opposite_breakdown_is_traded(self):
+        # Bull trap above ORH, back inside, then a breakdown below ORL (24990) and a retest.
+        moves = [(25050, 25075, 25045, 25070), (25065, 25068, 25030, 25035), (25030, 25035, 24975, 24980), (24983, 24994, 24972, 24976)]
+        result = evaluate_orb_retest(previous_day(high=25100, low=24800) + bars(IST_TODAY, OPENING + moves))
+        self.assertEqual(result.status, "CONFIRMED")
+        self.assertEqual(result.side, "SELL")
+        self.assertIn("earlier: BUY break", result.reason)
+
+    def test_repeated_failed_breaks_mark_a_whipsaw_day(self):
+        up_fail = [(25050, 25075, 25045, 25070), (25065, 25068, 25030, 25035)]
+        down_fail = [(25030, 25035, 24975, 24980), (24985, 25010, 24984, 25005)]
+        result = evaluate_orb_retest(previous_day() + bars(IST_TODAY, OPENING + up_fail + down_fail + up_fail + down_fail))
         self.assertEqual(result.status, "NO_TRADE")
-        self.assertIn("ran", result.reason)
+        self.assertIn("whipsaw", result.reason)
+
+    def test_level_expires_after_the_pullback_window(self):
+        drift = [(25080 + step, 25090 + step, 25075 + step, 25085 + step) for step in range(0, 125, 5)]
+        today = bars(IST_TODAY, OPENING + [(25050, 25075, 25045, 25070)] + drift)
+        result = evaluate_orb_retest(previous_day() + today)
+        self.assertEqual(result.status, "NO_TRADE")
+        self.assertIn("not retested", result.reason)
 
 
 class RetestZone(unittest.TestCase):
@@ -53,8 +99,9 @@ class RetestZone(unittest.TestCase):
     def test_far_miss_still_times_out(self):
         today = bars(IST_TODAY, OPENING + [(25050, 25075, 25045, 25070), (25070, 25085, 25072, 25080), (25080, 25090, 25074, 25086), (25086, 25096, 25078, 25090)])
         result = evaluate_orb_retest(previous_day() + today)
-        self.assertEqual(result.status, "NO_TRADE")
-        self.assertIn("No retest", result.reason)
+        # No touch inside the retest window: keep the level live for a pullback, never chase.
+        self.assertEqual(result.status, "WAIT_FOR_PULLBACK")
+        self.assertIsNone(result.retest_index)
 
 
 class GapDay(unittest.TestCase):
@@ -96,6 +143,18 @@ class RegimeDirection(unittest.TestCase):
 
     def test_aligned_setup_passes(self):
         self.assertEqual(evaluate_payload({**self.base, "regime": "TRENDING_BULL", "setup_side": "BUY"})["decision"], "CONFIRMED")
+
+
+class VolumeUnobservable(unittest.TestCase):
+    def test_minimum_score_is_scaled_when_no_volume_proxy_exists(self):
+        from tradepulse_quant.algo_engine.engine import analyze_payload
+        today = bars(IST_TODAY, OPENING + [(25050, 25075, 25045, 25070), (25068, 25080, 25058, 25076)])
+        rows = [{"timestamp": c.timestamp, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": 0} for c in previous_day() + today]
+        score = analyze_payload({"symbol": "NIFTY", "strategy": "ORB_RETEST", "candles": rows})["calculations"]["score"]
+        self.assertFalse(score["volume_observable"])
+        self.assertEqual(score["minimum"], 6.4)
+        with_volume = [{**row, "volume": 1000} for row in rows]
+        self.assertEqual(analyze_payload({"symbol": "NIFTY", "strategy": "ORB_RETEST", "candles": with_volume})["calculations"]["score"]["minimum"], 8.0)
 
 
 class FormingCandle(unittest.TestCase):
