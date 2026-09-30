@@ -34,6 +34,8 @@ type EngineInput = {
   trendBlockedReason?: string;
   /** A fresh V5 strategy setup on the underlying (e.g. ORB break-and-retest). One trade per id. */
   strategySignal?: StrategySignal;
+  /** Shown in the summary when trend entries are disabled and no signal traded. */
+  waitingFor?: string;
 };
 
 export type StrategySignal = {
@@ -45,6 +47,10 @@ export type StrategySignal = {
   stopLoss: number;
   target: number;
   reason?: string;
+  /** The contract the signal engine picked (liquidity/delta ranked); used when it is on the chain. */
+  preferredSymbol?: string;
+  /** The signal already weighed the trend verdict, so an opposing verdict does not veto it. */
+  ignoreMarketBias?: boolean;
 };
 
 export type AutoOptionTraderSettings = {
@@ -78,6 +84,8 @@ export type AutoOptionTraderConfig = {
   maxOpenPositions?: number;
   trailingActivationR?: number;
   trailingDistanceR?: number;
+  /** Take generic EMA-trend entries when no strategy signal traded (default true). */
+  trendEntries?: boolean;
 };
 
 export class AutoOptionTrader {
@@ -103,6 +111,7 @@ export class AutoOptionTrader {
       maxOpenPositions: config.maxOpenPositions ?? 3,
       trailingActivationR: config.trailingActivationR ?? 1,
       trailingDistanceR: config.trailingDistanceR ?? 0.75,
+      trendEntries: config.trendEntries ?? true,
     };
   }
 
@@ -131,7 +140,7 @@ export class AutoOptionTrader {
     await this.updateExits(input, timestamp, settings);
     const limitHit = this.tradedToday >= settings.maxTrades;
     const trend = this.detectTrend(input.candles);
-    this.lastDiagnostics = input.contracts.slice(0, 20).map((contract) => {
+    this.lastDiagnostics = !this.config.trendEntries ? [] : input.contracts.slice(0, 20).map((contract) => {
       const failures: string[] = [];
       if (contract.score < this.config.minScore) failures.push(`score ${contract.score}<${this.config.minScore}`);
       if (contract.riskReward < this.config.minRiskReward) failures.push(`RR ${contract.riskReward}<${this.config.minRiskReward}`);
@@ -158,6 +167,17 @@ export class AutoOptionTrader {
     if (input.strategySignal && !limitHit) {
       const signalResult = this.strategySignalEntry(input, timestamp, settings);
       if (signalResult) return signalResult;
+    }
+    if (!this.config.trendEntries) {
+      return {
+        mode: "PAPER",
+        limitHit,
+        tradesTaken: this.tradedToday,
+        orders: [...this.orders],
+        suggestions: [...this.suggestions],
+        diagnostics: this.lastDiagnostics,
+        summary: `No confirmed setup on ${input.symbol} yet: ${input.waitingFor ?? "waiting for a zone reversal or strategy signal"}`,
+      };
     }
     if (input.trendBlockedReason) {
       return {
@@ -292,7 +312,7 @@ export class AutoOptionTrader {
       this.lastDiagnostics = [`${label} already traded (${signal.id})`, ...this.lastDiagnostics];
       return null;
     }
-    if (input.marketBias && input.marketBias !== "SIDEWAYS" && input.marketBias !== (wanted === "CALL" ? "BULLISH" : "BEARISH")) {
+    if (!signal.ignoreMarketBias && input.marketBias && input.marketBias !== "SIDEWAYS" && input.marketBias !== (wanted === "CALL" ? "BULLISH" : "BEARISH")) {
       this.lastDiagnostics = [`${label} skipped: market verdict ${input.marketBias} opposes it`, ...this.lastDiagnostics];
       return null;
     }
@@ -308,7 +328,8 @@ export class AutoOptionTrader {
       .filter((contract) => contract.score >= minScore && this.contractIsNearAtm(contract, input.spot))
       .filter((contract) => !this.active.has(normalizeSymbol(contract.symbol)))
       .sort((a, b) => b.score - a.score || Math.abs(Math.abs(a.delta) - 0.5) - Math.abs(Math.abs(b.delta) - 0.5));
-    const contract = candidates[0];
+    const preferred = signal.preferredSymbol ? input.contracts.find((item) => normalizeSymbol(item.symbol) === normalizeSymbol(signal.preferredSymbol!) && item.contract === wanted && item.lotSize > 0 && item.premium > 0 && !this.active.has(normalizeSymbol(item.symbol))) : undefined;
+    const contract = preferred ?? candidates[0];
     if (!contract) {
       this.lastDiagnostics = [`${label}: no near-ATM ${wanted} with score >= ${minScore}, delta > 0.35 and a lot size`, ...this.lastDiagnostics];
       return null;

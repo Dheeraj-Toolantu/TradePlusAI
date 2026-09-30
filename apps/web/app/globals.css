@@ -481,6 +481,9 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-paper { color: white; background: #1560c4; }
 .exec-live { color: #1b0b00; background: var(--amber); }
 .exec-actions button:disabled { opacity: .45; cursor: not-allowed; }
+.smart-entry { border: 1px solid var(--line); background: var(--surface-2); border-radius: 8px; padding: 8px 10px; margin: 6px 0; }
+.smart-entry-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; }
+.smart-entry-head span { flex: 1 1 200px; color: var(--text); }
 .exec-auto .auto-trade-toggle { display: flex; align-items: center; gap: 6px; color: var(--text); font-weight: 600; }
 .exec-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
 .exec-tabs button { padding: 6px 10px; color: var(--muted); border: 1px solid #25505f; border-radius: 5px; background: #0d2a37; font: 600 11px "Manrope", sans-serif; cursor: pointer; }

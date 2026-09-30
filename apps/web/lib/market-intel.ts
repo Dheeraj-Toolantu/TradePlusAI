@@ -14,6 +14,30 @@ export type MarketIntel = Record<string, unknown> & {
   trade_plan?: { status: string; direction: "CE" | "PE" | null };
   volatility?: { regime: string | null };
   v5_option_evidence?: Record<string, unknown>;
+  smart_entry?: SmartEntry;
+};
+
+/** Zone-reversal entry from `market_intel/smart_entry.py` (5m zones + 1m CHoCH confirmation). */
+export type SmartEntry = {
+  available: boolean;
+  status: "ENTRY" | "BLOCKED" | "ARMED" | "WAIT";
+  headline?: string;
+  reason?: string;
+  id?: string;
+  side?: "CE" | "PE";
+  direction?: "BULLISH" | "BEARISH";
+  zone?: { low: number; high: number; sources: string[]; strength: number };
+  trigger?: { type: string; level: number; time: string; candles_ago: number; swept: boolean; displacement: boolean };
+  score?: number;
+  min_score?: number;
+  factors?: Array<{ key: string; name: string; points: number; max: number; detail: string }>;
+  gates?: Array<{ label: string; passed: boolean }>;
+  counter_trend?: boolean;
+  size_multiplier?: number;
+  spot?: { entry: number; stop: number; target1: number; target2: number; target2_label: string; risk_points: number };
+  contract?: { strike: number; premium: number; delta: number | null; trading_symbol: string; liquidity_score: number } | null;
+  psychology?: string[];
+  zones?: Array<{ side: "DEMAND" | "SUPPLY"; low: number; high: number; strength: number; sources: string[]; distance: number }>;
 };
 
 type Raw = Record<string, unknown>;
@@ -86,6 +110,19 @@ async function fetchCandles(symbol: IntelSymbol, origin: string) {
   return (history.candles as Raw[]).filter((candle) => Number(candle.time) <= cutoff);
 }
 
+async function fetchCandles1m(symbol: IntelSymbol, origin: string) {
+  // 1-minute candles only confirm entries at 5-minute zones; a failure degrades to "no trigger".
+  try {
+    const response = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=1m&period=day&date=${istDate()}`, { cache: "no-store" });
+    const history = await response.json();
+    if (!response.ok || !Array.isArray(history.candles)) return [];
+    const cutoff = Date.now() / 1000 - 60;
+    return (history.candles as Raw[]).filter((candle) => Number(candle.time) <= cutoff);
+  } catch {
+    return [];
+  }
+}
+
 async function fetchQuotes(symbol: IntelSymbol) {
   const result = await new GrowwAdapter(createGrowwTransport()).getQuotes(["INDIA VIX", symbol]);
   if ("error" in result) return { vix: null, spot: null };
@@ -101,7 +138,7 @@ export type IntelOptions = { origin: string; capital?: number; riskPct?: number;
 
 async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<MarketIntel> {
   const { expiry, lotSize } = await contractMeta(symbol);
-  const [chain, candles, quotes] = await Promise.all([fetchChain(symbol, expiry), fetchCandles(symbol, options.origin), fetchQuotes(symbol)]);
+  const [chain, candles, candles1m, quotes] = await Promise.all([fetchChain(symbol, expiry), fetchCandles(symbol, options.origin), fetchCandles1m(symbol, options.origin), fetchQuotes(symbol)]);
   const spot = chain.spot || quotes.spot || Number(candles.at(-1)?.close ?? 0);
   const now = Date.now();
   const baseline = baselineSnapshot(symbol, expiry, now);
@@ -114,6 +151,7 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
     expiry,
     lot_size: lotSize,
     candles,
+    candles_1m: candles1m,
     chain: chain.rows,
     baseline_chain: baseline?.rows ?? null,
     baseline_spot: baseline?.spot ?? null,
@@ -124,7 +162,7 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
     sentiment,
     macro,
   });
-  return { ...result, baseline_history_seconds: snapshotHistorySeconds(symbol, expiry, now), source: "Groww option chain + 5m candles + India VIX", fetched_at: new Date(now).toISOString() };
+  return { ...result, baseline_history_seconds: snapshotHistorySeconds(symbol, expiry, now), source: "Groww option chain + 1m/5m candles + India VIX", fetched_at: new Date(now).toISOString() };
 }
 
 /**

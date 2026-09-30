@@ -15,6 +15,7 @@ from .candles import IST, Bar, parse_bars, technicals
 from .macro import score_macro
 from .operator_footprint import analyze_operator
 from .options_flow import analyze_options_flow, select_contract
+from .smart_entry import analyze_smart_entry
 from .smart_money import analyze_smart_money, find_swings
 from .volatility import analyze_volatility
 
@@ -338,6 +339,9 @@ def analyze_market(payload: dict) -> dict:
     plan = build_trade_plan(bars, tech, smc, flow, vol, verdict, session, meta)
     macro = score_macro(payload.get("macro")) if payload.get("macro") else None
     operator = analyze_operator(bars, tech, smc, flow, vol, verdict, sentiment, macro, {**meta, "market_open": session["market_open"]})
+    # 1-minute candles only confirm entries at the 5-minute zones; completed candles only.
+    bars_1m = parse_bars(payload.get("candles_1m") or [])
+    smart_entry = analyze_smart_entry(bars, bars_1m, tech, smc, flow, vol, verdict, sentiment, macro, session, meta) if bars_1m else {"available": False, "status": "WAIT", "reason": "1-minute candles unavailable"}
 
     liquidity_scores = [c["liquidity_score"] for c in (select_contract(flow.get("chain") or {}, spot, s) for s in ("CE", "PE")) if c] if flow.get("available") else []
     v5_option_evidence = {
@@ -365,6 +369,7 @@ def analyze_market(payload: dict) -> dict:
         "options_flow": flow_public,
         "smart_money": smc,
         "operator": operator,
+        "smart_entry": smart_entry,
         "verdict": verdict,
         "trade_plan": plan,
         "v5_option_evidence": v5_option_evidence,

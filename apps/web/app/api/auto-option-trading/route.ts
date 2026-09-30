@@ -1,9 +1,12 @@
 import { NextResponse } from "next/server";
 import { AutoOptionTrader } from "../../../../../services/paper-trading/src/auto-option-trader";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
-import { getMarketIntel, isIntelSymbol, latestCachedIntel, type MarketIntel } from "../../../lib/market-intel";
+import { getMarketIntel, isIntelSymbol, type MarketIntel } from "../../../lib/market-intel";
 
-const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2 });
+// Entries come only from confirmed setups: a smart zone reversal (5m order block / FVG /
+// support-resistance / writer wall + 1m CHoCH) or a fresh ORB/VWAP signal. The old
+// "3-candle EMA trend" entries chased moves in the middle of nowhere and are disabled.
+const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, trendEntries: false });
 
 type RecordValue = Record<string, unknown>;
 
@@ -29,20 +32,28 @@ export async function POST(request: Request) {
   if (!symbol || spot <= 0 || candles.length < 3 || contracts.length === 0) {
     return NextResponse.json({ error: "Auto option scan requires a live spot, at least 3 candles, and option-chain contracts." }, { status: 400 });
   }
-  // Auto entries must agree with the market verdict (trend confluence + option writers) and
-  // are blocked in an extreme-VIX regime. Missing intel pauses entries; exits still run.
+  // Intel is cached for 20 s and shared with the trade desk, so a 1-minute trigger is seen
+  // within one scan. Missing intel pauses smart entries; exits still run.
   let intel: MarketIntel | null = null;
   if (isIntelSymbol(symbol)) {
-    intel = latestCachedIntel(symbol) ?? await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
+    intel = await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
   }
+  const smart = intel?.available ? intel.smart_entry : undefined;
   const bias = intel?.available ? intel.verdict?.bias : undefined;
   // A fresh V5 strategy signal (ORB break-and-retest / VWAP reclaim) is its own directional
   // evidence: opening-range breaks start FROM sideways conditions, so a SIDEWAYS verdict or
   // missing intel must not veto it. Extreme VIX and an opposing verdict still do.
   const rawSignal = (body.strategySignal ?? null) as RecordValue | null;
-  const strategySignal = rawSignal && (rawSignal.side === "BUY" || rawSignal.side === "SELL") && String(rawSignal.id ?? "")
+  const clientSignal = rawSignal && (rawSignal.side === "BUY" || rawSignal.side === "SELL") && String(rawSignal.id ?? "")
     ? { id: String(rawSignal.id), strategy: String(rawSignal.strategy ?? "ORB_RETEST"), side: rawSignal.side as "BUY" | "SELL", entry: numberOf(rawSignal.entry), stopLoss: numberOf(rawSignal.stopLoss), target: numberOf(rawSignal.target), reason: String(rawSignal.reason ?? "") }
     : undefined;
+  // The smart zone engine has already weighed trend, writers, PCR, VIX and sentiment (and
+  // halves size on counter-trend reversals), so the plain verdict does not veto it.
+  const smartSignal = smart?.status === "ENTRY" && smart.id && smart.spot && smart.side
+    ? { id: `SMART:${smart.id}`, strategy: "SMART_ZONE", side: smart.side === "CE" ? "BUY" as const : "SELL" as const, entry: smart.spot.entry, stopLoss: smart.spot.stop, target: smart.spot.target1, reason: smart.headline ?? "", preferredSymbol: smart.contract?.trading_symbol || undefined, ignoreMarketBias: true }
+    : undefined;
+  const strategySignal = smartSignal ?? clientSignal;
+  const waitingFor = smart ? (smart.status === "BLOCKED" ? smart.headline : smart.reason) : "market intelligence (zones, OI flow, VIX) is unavailable";
   const entryBlockedReason = intel?.available && intel.volatility?.regime === "EXTREME" ? "India VIX is in the EXTREME regime" : undefined;
   const trendBlockedReason = !intel?.available
     ? "market intelligence (trend, OI flow, VIX) is unavailable"
@@ -57,6 +68,7 @@ export async function POST(request: Request) {
       entryBlockedReason,
       trendBlockedReason,
       strategySignal,
+      waitingFor,
       settings: {
         maxTrades: numberOf(body.maxTrades) || 3,
         minimumLoss: numberOf(body.minimumLoss) || 2500,
@@ -89,7 +101,7 @@ export async function POST(request: Request) {
         freezeQuantity: numberOf(contract.freezeQuantity),
       })),
     });
-    return NextResponse.json({ ...status, symbol, spot, marketBias: bias ?? null, source: "Live market candles + Groww option chain + market-intel verdict" });
+    return NextResponse.json({ ...status, symbol, spot, marketBias: bias ?? null, smartEntry: smart ?? null, source: "1m/5m candles + Groww option chain + OI flow + VIX + sentiment (market-intel)" });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Auto option scan failed" }, { status: 503 });
   }

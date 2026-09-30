@@ -46,3 +46,23 @@ describe("AutoOptionTrader strategy-signal entries", () => {
     expect(status.summary).toContain("Waiting for a strategy signal");
   });
 });
+
+describe("AutoOptionTrader smart zone entries", () => {
+  const smart = { id: "SMART:CE:24480-24502:09:59", strategy: "SMART_ZONE", side: "BUY" as const, entry: 23150, stopLoss: 23090, target: 23270, ignoreMarketBias: true };
+  const itmCall = { ...call, symbol: "NIFTY2691523100CE", strike: 23100, premium: 130, delta: 0.6, score: 78 };
+
+  it("prefers the contract the zone engine picked and ignores a stale opposing verdict", async () => {
+    const trader = new AutoOptionTrader({ trendEntries: false });
+    const status = await trader.tick({ symbol: "NIFTY", spot: 23150, candles, contracts: [call, itmCall], marketBias: "BEARISH", strategySignal: { ...smart, preferredSymbol: itmCall.symbol } });
+    expect(status.tradesTaken).toBe(1);
+    expect(status.orders[0].symbol).toBe(itmCall.symbol);
+    expect(status.orders[0].strategyName).toContain("SMART_ZONE");
+  });
+
+  it("takes no trend-chasing entries when trend entries are disabled", async () => {
+    const status = await new AutoOptionTrader({ trendEntries: false }).tick({ symbol: "NIFTY", spot: 23150, candles, contracts: [call], marketBias: "BULLISH", waitingFor: "Price is between zones" });
+    expect(status.tradesTaken).toBe(0);
+    expect(status.summary).toContain("Price is between zones");
+    expect(status.diagnostics.join(" ")).not.toContain("trend UNKNOWN");
+  });
+});
