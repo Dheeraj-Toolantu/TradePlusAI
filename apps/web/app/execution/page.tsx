@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
+import type { SmartEntry } from "../../lib/market-intel";
 
 // Heavy, below-the-fold or on-demand panels load in their own chunks so the first paint only
 // needs the header and the trade desk shell.
@@ -98,7 +99,7 @@ export default function ExecutionPage() {
   const [autoMaxTrades, setAutoMaxTrades] = useState(3);
   const [autoMinLoss, setAutoMinLoss] = useState(2500);
   const [autoMinProfit, setAutoMinProfit] = useState(1000);
-  const [autoStatus, setAutoStatus] = useState<{ tradesTaken: number; limitHit: boolean; summary: string; diagnostics?: string[] }>({ tradesTaken: 0, limitHit: false, summary: "Auto engine is off" });
+  const [autoStatus, setAutoStatus] = useState<{ tradesTaken: number; limitHit: boolean; summary: string; diagnostics?: string[]; smartEntry?: SmartEntry | null }>({ tradesTaken: 0, limitHit: false, summary: "Auto engine is off" });
   const autoBusy = useRef(false);
   const autoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -200,7 +201,7 @@ export default function ExecutionPage() {
       const response = await fetch("/api/auto-option-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol, strategySignal, maxTrades: autoMaxTrades, minimumLoss: autoMinLoss, minimumProfit: autoMinProfit, spot: snapshot.at(-1)?.close ?? 0, candles: snapshot.slice(-72).map((candle) => ({ ...candle, timestamp: new Date(candle.time * 1000).toISOString() })), contracts }) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) { setAutoStatus((current) => ({ ...current, summary: data.error ?? "Auto scan blocked" })); return; }
-      setAutoStatus({ tradesTaken: data.tradesTaken ?? 0, limitHit: Boolean(data.limitHit), summary: data.summary ?? "Scanned", diagnostics: data.diagnostics ?? [] });
+      setAutoStatus({ tradesTaken: data.tradesTaken ?? 0, limitHit: Boolean(data.limitHit), summary: data.summary ?? "Scanned", diagnostics: data.diagnostics ?? [], smartEntry: data.smartEntry ?? null });
       if (Array.isArray(data.orders) && data.orders.length) {
         const incoming = data.orders as Order[];
         setPaperOrders((current) => [...incoming.filter((order) => ["OPEN", "FILLED"].includes(order.status)), ...current.filter((order) => !incoming.some((next) => next.id === order.id))]);
@@ -623,7 +624,9 @@ export default function ExecutionPage() {
             <label>Max loss per trade<select value={autoMinLoss} onChange={(event) => setAutoMinLoss(Number(event.target.value))}>{[500, 1000, 1500, 2000, 2500, 5000].map((value) => <option key={value} value={value}>₹{value.toLocaleString("en-IN")}</option>)}</select></label>
             <label>Trail after profit<select value={autoMinProfit} onChange={(event) => setAutoMinProfit(Number(event.target.value))}>{[0, 500, 1000, 1500, 2500].map((value) => <option key={value} value={value}>{value ? `₹${value.toLocaleString("en-IN")}` : "at +1R"}</option>)}</select></label>
           </div>
-          <p className="mi-note">{autoStatus.summary}. A fresh {strategy.name} signal from the V5 engine drives entries (sized from the underlying stop via delta); without one, entries need the trade-desk verdict to agree. Extreme VIX pauses entries. The auto engine never sends real orders.</p>
+          <p className="mi-note">{autoStatus.summary}</p>
+          {autoEnabled && autoStatus.smartEntry?.available ? <SmartEntryCard smart={autoStatus.smartEntry} /> : null}
+          <p className="mi-note">Entries only from confirmed setups: price reaches a 5m demand/supply zone (order block, FVG, support/resistance, option-writer wall) and a 1-minute CHoCH confirms the turn, scored on 15m/5m trend, OI writers, PCR, VIX, India sentiment and global cues (min 6/10); or a fresh {strategy.name} signal. Extreme VIX pauses entries. The auto engine never sends real orders.</p>
           {autoStatus.diagnostics?.length ? <details className="mi-management"><summary>Why no trade?</summary><ul>{autoStatus.diagnostics.slice(0, 6).map((item) => <li key={item}><small>{item}</small></li>)}</ul></details> : null}
         </article>
 
@@ -682,5 +685,33 @@ export default function ExecutionPage() {
       </div>
       {liveDraft && <LiveOrderDialog draft={liveDraft} onClose={() => setLiveDraft(null)} onPlaced={(text) => { setMessage(text); log(text, "entry"); setTab("LIVE"); void refreshLive(); }} />}
     </main>
+  );
+}
+
+function SmartEntryCard({ smart }: { smart: SmartEntry }) {
+  const tone = smart.status === "ENTRY" ? "gain" : smart.status === "BLOCKED" ? "loss" : smart.status === "ARMED" ? "warning" : "";
+  const fmt = (value: number | undefined) => (value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
+  return (
+    <div className="smart-entry">
+      <div className="smart-entry-head">
+        <b className={tone}>{smart.status === "ENTRY" ? "ENTRY" : smart.status === "BLOCKED" ? "BLOCKED" : smart.status === "ARMED" ? "ARMED · in zone" : "WATCHING"}</b>
+        <span>{smart.headline ?? smart.reason}</span>
+        {smart.score !== undefined ? <b className={smart.score >= (smart.min_score ?? 6) ? "gain" : "loss"}>{smart.score.toFixed(1)}/10</b> : null}
+      </div>
+      {smart.zone && smart.trigger ? (
+        <div className="mi-risk-row">
+          <span>{smart.direction === "BULLISH" ? "Demand" : "Supply"} zone <b>{fmt(smart.zone.low)}–{fmt(smart.zone.high)}</b></span>
+          <span>1m CHoCH <b>{fmt(smart.trigger.level)} @ {smart.trigger.time}</b>{smart.trigger.swept ? " · stop-hunt" : ""}</span>
+          {smart.spot ? <span>Spot SL <b>{fmt(smart.spot.stop)}</b> · T1 <b>{fmt(smart.spot.target1)}</b> · T2 <b>{fmt(smart.spot.target2)}</b></span> : null}
+          {smart.contract ? <span>Pick <b>{smart.contract.trading_symbol || smart.contract.strike}</b>{smart.counter_trend ? " · half size (counter-trend)" : ""}</span> : null}
+        </div>
+      ) : null}
+      {smart.psychology?.length ? <details className="mi-management" open={smart.status === "ENTRY"}><summary>Market psychology</summary><ul>{smart.psychology.map((line) => <li key={line}><small>{line}</small></li>)}</ul></details> : null}
+      {smart.factors?.length ? <details className="mi-management"><summary>Score breakdown & gates</summary><ul>
+        {smart.factors.map((factor) => <li key={factor.key}><small><b>{factor.name}</b> {factor.points}/{factor.max}: {factor.detail}</small></li>)}
+        {(smart.gates ?? []).map((gate) => <li key={gate.label}><small className={gate.passed ? "gain" : "loss"}>{gate.passed ? "✓" : "✗"} {gate.label}</small></li>)}
+      </ul></details> : null}
+      {smart.zones?.length ? <details className="mi-management"><summary>Nearest zones</summary><ul>{smart.zones.map((zone) => <li key={`${zone.side}${zone.low}`}><small><b className={zone.side === "DEMAND" ? "gain" : "loss"}>{zone.side}</b> {fmt(zone.low)}–{fmt(zone.high)} · {zone.strength} source(s): {zone.sources.join(", ")} · {zone.distance <= 0 ? "price inside" : `${fmt(zone.distance)} pts away`}</small></li>)}</ul></details> : null}
+    </div>
   );
 }
