@@ -149,6 +149,20 @@ export class MonitoringService {
     }
   }
 
+  /** Record an option-advisor suggestion as the session's latest advisory result. */
+  recordAdvice(ownerId: string, sessionId: string, advice: { symbol: string; action: "BUY_CE" | "BUY_PE" | "WAIT"; confidence: number; headline: string; reasons: string[]; risks: string[]; invalidation: string; source: string }): AISuggestion {
+    const session = this.requireSession(ownerId, sessionId);
+    const configuration = this.configurations.get(session.configurationId);
+    if (!configuration || session.state !== "ACTIVE" || !configuration.monitoringEnabled) throw new Error("Monitoring session is not active");
+    const now = new Date().toISOString();
+    const direction = advice.action === "BUY_CE" ? "BULLISH" : advice.action === "BUY_PE" ? "BEARISH" : "WAITING";
+    const suggestion: AISuggestion = { id: crypto.randomUUID(), evaluationId: crypto.randomUUID(), analysisId: advice.symbol, direction, status: advice.action === "WAIT" ? "WAITING" : "ADVISORY", confidence: advice.confidence, reasonSummary: [advice.headline, ...advice.reasons].slice(0, 6), risks: advice.risks, invalidation: advice.invalidation || undefined, createdAt: now };
+    this.latestSuggestions.set(session.id, suggestion);
+    this.logs.append({ id: crypto.randomUUID(), eventType: "EVALUATION_COMPLETED", subjectId: suggestion.id, correlationId: session.correlationId, summary: { symbol: advice.symbol, direction: advice.action, status: `${suggestion.status} · ${advice.source}`, confidence: advice.confidence }, detailRefs: { suggestionId: suggestion.id }, actor: ownerId, occurredAt: now });
+    session.lastEvaluationAt = now;
+    return structuredClone(suggestion);
+  }
+
   private appendEvaluationLog(evaluation: AIEvaluation, suggestion: AISuggestion, actor: string) {
     this.latestSuggestions.set(evaluation.sessionId, suggestion);
     this.logs.append({ id: crypto.randomUUID(), eventType: "EVALUATION_COMPLETED", subjectId: suggestion.id, correlationId: evaluation.correlationId, summary: { symbol: suggestion.analysisId ?? "UNKNOWN", direction: suggestion.direction, status: suggestion.status, confidence: suggestion.confidence ?? null }, detailRefs: { evaluationId: evaluation.id, suggestionId: suggestion.id }, actor, occurredAt: evaluation.completedAt ?? evaluation.createdAt });

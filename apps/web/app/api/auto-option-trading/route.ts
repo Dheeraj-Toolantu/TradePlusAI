@@ -3,9 +3,9 @@ import { AutoOptionTrader } from "../../../../../services/paper-trading/src/auto
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
 import { getMarketIntel, isIntelSymbol, type MarketIntel } from "../../../lib/market-intel";
 
-// Entries come only from confirmed setups: a smart zone reversal (5m order block / FVG /
-// support-resistance / writer wall + 1m CHoCH) or a fresh ORB/VWAP signal. The old
-// "3-candle EMA trend" entries chased moves in the middle of nowhere and are disabled.
+// Entries come only from a confirmed smart zone reversal (5m order block / FVG / support-
+// resistance / writer wall + 1m CHoCH). ORB/VWAP signals and the old "3-candle EMA trend"
+// entries are not used by the auto engine.
 const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, trendEntries: false });
 
 type RecordValue = Record<string, unknown>;
@@ -40,19 +40,13 @@ export async function POST(request: Request) {
   }
   const smart = intel?.available ? intel.smart_entry : undefined;
   const bias = intel?.available ? intel.verdict?.bias : undefined;
-  // A fresh V5 strategy signal (ORB break-and-retest / VWAP reclaim) is its own directional
-  // evidence: opening-range breaks start FROM sideways conditions, so a SIDEWAYS verdict or
-  // missing intel must not veto it. Extreme VIX and an opposing verdict still do.
-  const rawSignal = (body.strategySignal ?? null) as RecordValue | null;
-  const clientSignal = rawSignal && (rawSignal.side === "BUY" || rawSignal.side === "SELL") && String(rawSignal.id ?? "")
-    ? { id: String(rawSignal.id), strategy: String(rawSignal.strategy ?? "ORB_RETEST"), side: rawSignal.side as "BUY" | "SELL", entry: numberOf(rawSignal.entry), stopLoss: numberOf(rawSignal.stopLoss), target: numberOf(rawSignal.target), reason: String(rawSignal.reason ?? "") }
-    : undefined;
-  // The smart zone engine has already weighed trend, writers, PCR, VIX and sentiment (and
-  // halves size on counter-trend reversals), so the plain verdict does not veto it.
+  // Auto entries come only from the smart zone engine (5m zone + 1m CHoCH). It has already
+  // weighed trend, writers, PCR, VIX and sentiment, so the plain verdict does not veto it.
+  // ORB/VWAP signals are deliberately not used here.
   const smartSignal = smart?.status === "ENTRY" && smart.id && smart.spot && smart.side
     ? { id: `SMART:${smart.id}`, strategy: "SMART_ZONE", side: smart.side === "CE" ? "BUY" as const : "SELL" as const, entry: smart.spot.entry, stopLoss: smart.spot.stop, target: smart.spot.target1, reason: smart.headline ?? "", preferredSymbol: smart.contract?.trading_symbol || undefined, ignoreMarketBias: true }
     : undefined;
-  const strategySignal = smartSignal ?? clientSignal;
+  const strategySignal = smartSignal;
   const waitingFor = smart ? (smart.status === "BLOCKED" ? smart.headline : smart.reason) : "market intelligence (zones, OI flow, VIX) is unavailable";
   const entryBlockedReason = intel?.available && intel.volatility?.regime === "EXTREME" ? "India VIX is in the EXTREME regime" : undefined;
   const trendBlockedReason = !intel?.available
