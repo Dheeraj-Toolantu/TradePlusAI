@@ -563,3 +563,41 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-orb { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0; padding: 8px; border: 1px solid #173a47; border-radius: 6px; background: #0b2330; color: var(--muted); }
 .exec-orb b { color: var(--text); }
 .exec-orb small { flex-basis: 100%; }
+
+/* Options strategy panel (value, time, expiry, volatility, sentiment) */
+.ost-panel { display: grid; gap: 10px; }
+.ost-tabs { display: flex; gap: 4px; }
+.ost-tabs button { padding: 6px 10px; color: var(--muted); border: 1px solid #2b4d5c; border-radius: 4px; background: #102433; font-size: 11px; cursor: pointer; }
+.ost-tabs button.active { color: var(--green); border-color: var(--green); }
+.ost-verdict { display: flex; align-items: baseline; gap: 10px; padding: 8px 10px; border: 1px solid rgba(240, 191, 102, .5); border-radius: 6px; background: rgba(240, 191, 102, .08); }
+.ost-verdict b { color: var(--amber); font: 12px "DM Mono", monospace; }
+.ost-verdict-trade { border-color: rgba(32, 211, 157, .5); background: rgba(32, 211, 157, .08); }
+.ost-verdict-trade b { color: var(--green); }
+.ost-factors, .ost-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.ost-metrics { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.ost-factors span, .ost-metrics span { display: grid; gap: 2px; padding: 8px; border: 1px solid #173a47; border-radius: 6px; background: #0b2330; }
+.ost-factors small, .ost-factors em, .ost-metrics small, .ost-metrics em, .ost-why small { color: var(--muted); font-size: 10px; font-style: normal; }
+.ost-factors b, .ost-metrics b { font-size: 15px; font-variant-numeric: tabular-nums; }
+.ost-factors b.ost-small { font-size: 11px; }
+.ost-notes, .ost-list, .ost-why ul { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: 12px; }
+.ost-notes { color: var(--amber); }
+.ost-plan { display: grid; gap: 8px; padding: 10px; border: 1px solid #173a47; border-radius: 6px; background: #091f2a; }
+.ost-plan-primary { border-color: rgba(48, 212, 202, .55); }
+.ost-plan-head { display: flex; justify-content: space-between; align-items: start; gap: 8px; }
+.ost-plan-head b { display: block; font-size: 15px; }
+.ost-plan-head small { color: var(--muted); font-size: 11px; }
+.ost-legs { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ost-legs th { color: var(--muted); font-weight: 400; font-size: 10px; text-align: right; }
+.ost-legs th:first-child, .ost-legs td:first-child { text-align: left; }
+.ost-legs td { padding: 4px 6px; border-top: 1px solid #173a47; text-align: right; }
+.ost-decomp th, .ost-decomp td { text-align: center !important; }
+.ost-atm td { background: rgba(48, 212, 202, .08); }
+.ost-why { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.ost-alts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.ost-alts .ost-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 900px) {
+  .ost-factors, .ost-metrics, .ost-alts .ost-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ost-why, .ost-alts { grid-template-columns: minmax(0, 1fr); }
+  .ost-panel .algo-panel-head { flex-wrap: wrap; }
+  .ost-legs { font-size: 11px; }
+}

@@ -31,12 +31,14 @@
   },
   "overrides": {
     "postcss": "^8.5.28",
-    "brace-expansion@1": "^1.1.21"
+    "brace-expansion@1": "^1.1.21",
+    "@grpc/grpc-js": "^1.14.5"
   },
   "pnpm": {
     "overrides": {
       "postcss": "^8.5.28",
-      "brace-expansion@1": "^1.1.21"
+      "brace-expansion@1": "^1.1.21",
+      "@grpc/grpc-js": "^1.14.5"
     }
   }
 }

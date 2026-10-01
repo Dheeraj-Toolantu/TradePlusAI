@@ -12,6 +12,7 @@ import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option
 // needs the header and the trade desk shell.
 const MarketIntelPanel = dynamic(() => import("../../components/market-intel/market-intel-panel").then((module) => module.MarketIntelPanel), { ssr: false, loading: () => <div className="algo-empty">Loading trade desk…</div> });
 const SentimentPanel = dynamic(() => import("../../components/market-intel/sentiment-panel").then((module) => module.SentimentPanel), { ssr: false });
+const OptionStrategyPanel = dynamic(() => import("../../components/market-intel/option-strategy-panel").then((module) => module.OptionStrategyPanel), { ssr: false });
 const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitoring-panel").then((module) => module.AIMonitoringPanel), { ssr: false });
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
 
@@ -528,6 +529,9 @@ export default function ExecutionPage() {
   const score = analysis?.calculations?.score ?? {};
   const orb = analysis?.calculations?.orb;
   const underlying = analysis?.calculations?.underlying ?? {};
+  const regime = analysis?.calculations?.regime;
+  const { vwap, ema20, ema50 } = underlying;
+  const strategyTrend = useMemo(() => ({ regime: regime ?? null, vwap: Number(vwap) || null, ema20: Number(ema20) || null, ema50: Number(ema50) || null }), [regime, vwap, ema20, ema50]);
   const ticketPremium = premiumFor(contract);
   const ticketRisk = ticketPremium && Number(stopLoss) > 0 ? (ticketPremium - Number(stopLoss)) * lots * lotSize : null;
   const ticketReward = ticketPremium && Number(target) > 0 ? (Number(target) - ticketPremium) * lots * lotSize : null;
@@ -553,6 +557,7 @@ export default function ExecutionPage() {
         <p className="exec-message" role="status">{message}</p>
         <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadPlan} />
         <SentimentPanel />
+        <OptionStrategyPanel symbol={symbol} onSymbolChange={switchIndex} vix={quotes["INDIA VIX"] ?? null} trend={strategyTrend} />
         <AIMonitoringPanel symbol={symbol} strategyId={strategyId} buildContext={aiContext} onLoadAdvice={loadAdvice} />
 
         <div className="exec-grid">
