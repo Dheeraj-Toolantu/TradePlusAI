@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatConfidenceText, formatExpectedMoveText, formatMarketCalculationValue, getOptionChainEmptyState, getOrderExitState } from "../../apps/web/lib/option-chain-state";
+import { safeMarketDataError } from "../../apps/web/lib/market-data-errors";
 
 describe("option chain state helpers", () => {
   it("formats missing confidence and expected move as clear safe labels", () => {
@@ -33,5 +34,11 @@ describe("option chain state helpers", () => {
       title: "No actionable option candidates",
       detail: expect.stringMatching(/temporarily unavailable|incomplete/i),
     });
+  });
+
+  it("hides broker payloads from rate-limit and internal errors", () => {
+    expect(safeMarketDataError(new Error('Groww token API 429: {"error":"private payload"}'), "Unavailable"))
+      .toBe("Market data is temporarily rate limited. Please try again shortly.");
+    expect(safeMarketDataError(new Error("internal detail"), "Unavailable")).toBe("Unavailable");
   });
 });

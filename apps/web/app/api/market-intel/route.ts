@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getMarketIntel, isIntelSymbol } from "../../../lib/market-intel";
+import { safeMarketDataError } from "../../../lib/market-data-errors";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -15,6 +16,6 @@ export async function GET(request: Request) {
     });
     return NextResponse.json(intel);
   } catch (error) {
-    return NextResponse.json({ symbol, available: false, error: error instanceof Error ? error.message : "Market intelligence unavailable" }, { status: 503 });
+    return NextResponse.json({ symbol, available: false, error: safeMarketDataError(error, "Market intelligence unavailable") }, { status: 503 });
   }
 }

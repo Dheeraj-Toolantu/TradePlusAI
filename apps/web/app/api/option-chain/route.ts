@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
+import { safeMarketDataError } from "../../../lib/market-data-errors";
 
 function payloadOf(value: unknown) { return ((value as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>; }
 function num(value: unknown): number { const n = Number(value); return Number.isFinite(n) ? n : 0; }
@@ -93,6 +94,6 @@ export async function GET(request: Request) {
     rows.sort((left, right) => Number(right.score) - Number(left.score));
     return NextResponse.json({ symbol, expiry, spot, contracts: rows.slice(0, 16), source: "Groww option chain (Greeks, OI, volume)", updatedAt: new Date().toISOString() });
   } catch (error) {
-    return NextResponse.json({ contracts: [], error: error instanceof Error ? error.message : "Option chain unavailable" }, { status: 503 });
+    return NextResponse.json({ contracts: [], error: safeMarketDataError(error, "Option chain unavailable") }, { status: 503 });
   }
 }
