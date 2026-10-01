@@ -62,7 +62,10 @@ function buildRow(symbol: string, optionType: "CE" | "PE", side: ChainSide | und
 }
 
 export async function GET(request: Request) {
-  const symbol = (new URL(request.url).searchParams.get("symbol") ?? "NIFTY").toUpperCase();
+  const params = new URL(request.url).searchParams;
+  const symbol = (params.get("symbol") ?? "NIFTY").toUpperCase();
+  // full=1 returns every strike within ±3% sorted by strike (strategy builder needs both wings).
+  const full = params.get("full") === "1";
   try {
     const catalog = await loadGrowwInstrumentCatalog();
     const instruments = catalog.getAll().filter((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && Boolean(instrument.expiryDate));
@@ -90,8 +93,9 @@ export async function GET(request: Request) {
         if (row) rows.push({ ...row, expiry });
       }
     }
-    rows.sort((left, right) => Number(right.score) - Number(left.score));
-    return NextResponse.json({ symbol, expiry, spot, contracts: rows.slice(0, 16), source: "Groww option chain (Greeks, OI, volume)", updatedAt: new Date().toISOString() });
+    if (full) rows.sort((left, right) => Number(left.strike) - Number(right.strike));
+    else rows.sort((left, right) => Number(right.score) - Number(left.score));
+    return NextResponse.json({ symbol, expiry, spot, contracts: full ? rows : rows.slice(0, 16), source: "Groww option chain (Greeks, OI, volume)", updatedAt: new Date().toISOString() });
   } catch (error) {
     return NextResponse.json({ contracts: [], error: error instanceof Error ? error.message : "Option chain unavailable" }, { status: 503 });
   }
