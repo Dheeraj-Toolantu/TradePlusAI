@@ -1,9 +1,10 @@
 "use client";
 
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
+import { BacktestCandles, type CandleRow } from "./backtest-candles";
 import type { BacktestResult, BacktestSettings, BacktestTrade, StrategyId } from "../../../../services/backtest/src/strategy-backtest";
 
-type Result = BacktestResult & { strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
+type Result = BacktestResult & { candles: CandleRow[]; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
 type Source = "groww" | "yahoo" | "synthetic";
 type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
@@ -122,6 +123,9 @@ function NumberField({ label, value, onChange, step = 1, min = 0, max, disabled 
 function BacktestResults({ result }: { result: Result }) {
   const m = result.metrics;
   const [openTrade, setOpenTrade] = useState<number | null>(null);
+  const [chartTrade, setChartTrade] = useState<number | null>(null);
+  const chartPanel = useRef<HTMLElement>(null);
+  const showOnChart = (id: number) => { setChartTrade(id); chartPanel.current?.scrollIntoView({ behavior: "smooth", block: "start" }); };
   const synthetic = result.source === "synthetic";
   const exportCsv = () => {
     const header = ["#", "day", "side", "entry_time", "entry", "stop", "target1", "target2", "exit_time", "exit", "exit_reason", "points", "r_multiple", "pnl", "hold_min", "confidence", "reason"];
@@ -145,6 +149,13 @@ function BacktestResults({ result }: { result: Result }) {
         <Kpi label="Max drawdown" value={inr(-m.maxDrawdown)} detail={`${pct(-m.maxDrawdownPct)} · worst streak ${m.maxConsecutiveLosses} losses`} />
         <Kpi label="Days" value={`${m.profitableDays}/${m.tradingDays}`} detail={`profitable · best ${inr(m.bestDay)} · worst ${inr(m.worstDay)}`} />
       </section>
+
+      {result.candles?.length ? (
+        <section className="paper-panel bt-chart-panel bt-candles-panel" ref={chartPanel}>
+          <div className="paper-panel-heading"><div><span className="paper-kicker">PRICE CHART</span><h2>{result.symbol} candles with every simulated entry and exit</h2></div></div>
+          <BacktestCandles symbol={result.symbol} candles={result.candles} trades={result.trades} focusId={chartTrade} onFocus={setChartTrade} />
+        </section>
+      ) : null}
 
       {result.trades.length === 0 ? (
         <section className="paper-panel bt-empty"><strong>No trades in this period</strong><p>The strategy found {result.signalsSeen} signal{result.signalsSeen === 1 ? "" : "s"}{result.skipped.length ? ", all blocked by the risk rules below" : ""}. Try a longer period or relax the settings.</p></section>
@@ -183,7 +194,7 @@ function BacktestResults({ result }: { result: Result }) {
             <div className="bt-table-wrap">
               <table className="bt-table">
                 <thead><tr><th>#</th><th>Day</th><th>Side</th><th>Entry</th><th className="num">Price</th><th className="num">Stop</th><th className="num">T1</th><th>Exit</th><th className="num">Exit price</th><th>Reason</th><th className="num">R</th><th className="num">P&amp;L</th><th className="num">Hold</th></tr></thead>
-                <tbody>{result.trades.map((trade) => <TradeRow key={trade.id} trade={trade} open={openTrade === trade.id} onToggle={() => setOpenTrade(openTrade === trade.id ? null : trade.id)} />)}</tbody>
+                <tbody>{result.trades.map((trade) => <TradeRow key={trade.id} trade={trade} open={openTrade === trade.id} onToggle={() => setOpenTrade(openTrade === trade.id ? null : trade.id)} onChart={result.candles?.length ? () => showOnChart(trade.id) : undefined} />)}</tbody>
               </table>
             </div>
           </section>
@@ -211,7 +222,7 @@ function Kpi({ label, value, detail }: { label: string; value: string; detail: s
   return <div className="paper-metric bt-kpi"><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>;
 }
 
-function TradeRow({ trade, open, onToggle }: { trade: BacktestTrade; open: boolean; onToggle: () => void }) {
+function TradeRow({ trade, open, onToggle, onChart }: { trade: BacktestTrade; open: boolean; onToggle: () => void; onChart?: () => void }) {
   return (
     <Fragment>
       <tr className={`bt-trade${open ? " open" : ""}`} onClick={onToggle} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onToggle(); } }} aria-expanded={open}>
@@ -225,6 +236,7 @@ function TradeRow({ trade, open, onToggle }: { trade: BacktestTrade; open: boole
           <p><b>Why it entered:</b> {trade.reason}{trade.confidence !== null ? ` (confidence ${trade.confidence}%)` : ""}</p>
           <p><b>Plan:</b> stop {trade.stop.toFixed(1)} · T1 {trade.target1.toFixed(1)} · T2 {trade.target2.toFixed(1)} · best excursion {r(trade.mfeR)} · worst {r(-trade.maeR)}</p>
           <p><b>Exits:</b> {trade.legs.map((leg) => `${Math.round(leg.fraction * 100)}% at ${leg.price.toFixed(1)} (${reasonLabel(leg.reason)}, ${clockOf(leg.time)})`).join(" · ")}</p>
+          {onChart ? <button type="button" className="paper-button secondary bt-chart-link" onClick={onChart}>Show on chart</button> : null}
         </td></tr>
       ) : null}
     </Fragment>

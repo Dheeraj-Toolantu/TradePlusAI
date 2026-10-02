@@ -30,5 +30,10 @@ describe("backtest route", () => {
     expect(body.daily).toHaveLength(5);
     expect(body.trades.length).toBeLessThanOrEqual(10);
     expect(body.metrics.trades).toBe(body.trades.length);
+    // Candles for the chart cover only the tested sessions (no warm-up days) as compact rows.
+    expect(body.candles).toHaveLength(5 * 375);
+    expect(body.candles[0]).toHaveLength(6);
+    const firstIst = new Date((body.candles[0][0] + 19_800) * 1000).toISOString();
+    expect(firstIst.slice(0, 16)).toBe("2026-09-21T09:15");
   });
 });

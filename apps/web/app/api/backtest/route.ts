@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { DEFAULT_BACKTEST_SETTINGS, aggregate, listSignalSource, mtfSignalSource, runBacktest, type BacktestSettings, type Signal, type StrategyId } from "../../../../../services/backtest/src/strategy-backtest";
+import { DEFAULT_BACKTEST_SETTINGS, aggregate, istDay, listSignalSource, mtfSignalSource, runBacktest, type BacktestSettings, type Signal, type StrategyId } from "../../../../../services/backtest/src/strategy-backtest";
 import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
 
@@ -75,5 +75,8 @@ export async function POST(request: Request) {
   else notes.push("Replays the V5 ORB strategy rules. Live-only no-trade gates (OI flow, India VIX, broker health) have no history and are not applied.");
   if (data.delayed) notes.push("Some days came from the delayed Yahoo feed; historical candles are still valid for a backtest.");
   if (source === "synthetic") notes.unshift("SYNTHETIC DEMO DATA: a seeded random walk for exploring the tool. These numbers say nothing about real-market performance.");
-  return NextResponse.json({ ...result, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
+  // 1-minute candles of the tested sessions (warm-up days excluded) for the candlestick view, as
+  // compact [time, open, high, low, close, volume] rows; the browser aggregates other timeframes.
+  const candles = data.minute.filter((bar) => { const day = istDay(bar.time); return day >= from && day <= to; }).map((bar) => [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0]);
+  return NextResponse.json({ ...result, candles, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
 }

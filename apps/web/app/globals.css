@@ -701,3 +701,40 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
   .bt-chart svg { min-width: 620px; }
   .bt-tabs { flex-wrap: wrap; }
 }
+
+/* Backtest candlestick chart */
+.bt-candles { display: grid; gap: 0; background: #081c24; }
+.bt-candles:fullscreen { grid-template-rows: auto 1fr auto; padding: 10px; }
+.bt-candles:fullscreen .bt-candles-canvas { height: 100%; }
+.bt-candles-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.bt-seg { display: inline-flex; align-items: center; border: 1px solid #23505a; border-radius: 5px; overflow: hidden; }
+.bt-seg button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; color: #8eadb2; background: transparent; border: 0; border-right: 1px solid #23505a; font: 10px "DM Mono", monospace; cursor: pointer; }
+.bt-seg button:last-child { border-right: 0; }
+.bt-seg button:hover:not(:disabled) { color: #e4f1f1; background: #10303a; }
+.bt-seg button.on { color: #e4ffff; background: #164450; }
+.bt-seg button:disabled { opacity: .4; cursor: default; }
+.bt-seg button i { display: inline-block; width: 12px; height: 2px; }
+.bt-seg button i.dashed { height: 0; border-top: 2px dashed; }
+.bt-seg-nav span { padding: 0 10px; color: #b5cbcd; font: 10px "DM Mono", monospace; white-space: nowrap; }
+.bt-seg-nav button { font-size: 14px; padding: 3px 10px; }
+.bt-candles-day { padding: 6px 8px; color: #b5cbcd; background: #0b2631; border: 1px solid #23505a; border-radius: 5px; font: 10px "DM Mono", monospace; }
+.bt-candles-stage { position: relative; }
+.bt-candles-canvas { height: 460px; }
+.bt-ohlc { position: absolute; z-index: 3; top: 8px; left: 12px; right: 80px; display: flex; flex-wrap: wrap; gap: 4px 12px; pointer-events: none; color: #7f9fa5; font: 11px "DM Mono", monospace; }
+.bt-ohlc strong { color: #e4f1f1; font-weight: 500; }
+.bt-ohlc b { color: #d4e5e6; font-weight: 400; }
+.bt-ohlc .up { color: #22d59b; }
+.bt-ohlc .down { color: #fa6b78; }
+.bt-candles-trade { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 10px 14px; border-top: 1px solid var(--line); color: #8eadb2; font: 11px "DM Mono", monospace; }
+.bt-candles-trade strong { color: #e4f1f1; font-weight: 500; }
+.bt-candles-trade b { color: #d4e5e6; font-weight: 500; }
+.bt-candles-trade p { flex-basis: 100%; margin: 0; color: #86a5aa; font: 11px Manrope, sans-serif; line-height: 1.5; }
+.bt-link { margin-left: auto; padding: 0; color: var(--cyan); background: none; border: 0; font: 10px "DM Mono", monospace; cursor: pointer; text-decoration: underline; }
+.bt-candles-hint { margin: 0; padding: 10px 14px; border-top: 1px solid var(--line); color: #6f9097; font-size: 10px; line-height: 1.5; }
+.bt-chart-link { margin-top: 6px; }
+@media (max-width: 760px) {
+  .bt-candles-toolbar { padding: 8px 10px; gap: 6px; }
+  .bt-candles-canvas { height: 360px; }
+  .bt-ohlc { right: 60px; font-size: 10px; gap: 2px 8px; }
+  .bt-ohlc .opt { display: none; }
+}
