@@ -35,7 +35,19 @@ def atr(candles: Sequence[CandleLike], period: int = 14) -> float | None:
         raise ValueError("period must be positive")
     if len(candles) < period:
         return None
-    ranges = [true_range(candle, candles[index - 1].close if index else None) for index, candle in enumerate(candles)]
+    # The first intraday bar of each session uses its own high-low: an overnight gap is not
+    # intraday volatility and would widen stops and retest zones for the first hour.
+    def session_of(candle: CandleLike) -> str | None:
+        stamp = getattr(candle, "timestamp", None)
+        return str(stamp)[:10] if isinstance(stamp, str) and len(stamp) >= 16 and "T" in stamp else None
+
+    def previous_close(index: int) -> float | None:
+        if not index:
+            return None
+        day, before = session_of(candles[index]), session_of(candles[index - 1])
+        return None if day is not None and before is not None and day != before else candles[index - 1].close
+
+    ranges = [true_range(candle, previous_close(index)) for index, candle in enumerate(candles)]
     result = sum(ranges[:period]) / period
     for value in ranges[period:]:
         result = ((result * (period - 1)) + value) / period

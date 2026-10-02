@@ -132,10 +132,20 @@ export function mtfSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
   };
 }
 
-/** Signal source from a precomputed list (e.g. the Python ORB replay), keyed by decision time. */
+/**
+ * Signal source from a precomputed list (e.g. the Python ORB replay). Each signal is delivered at the
+ * first 1-minute bar that closes at or after its decision time, so a single missing 1m bar (feed
+ * hole) does not silently drop it; the simulator then refuses fills that come too late.
+ */
 export function listSignalSource(signals: Signal[]) {
-  const byTime = new Map(signals.map((signal) => [signal.time, signal]));
-  return (index: number, minute: Bar[]) => byTime.get(minute[index].time + 60) ?? null;
+  const sorted = [...signals].sort((a, b) => a.time - b.time);
+  const firstAfter = (t: number) => { let lo = 0; let hi = sorted.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (sorted[mid].time > t) hi = mid; else lo = mid + 1; } return lo; };
+  return (index: number, minute: Bar[]) => {
+    const close = minute[index].time + 60;
+    const previousClose = index > 0 ? minute[index - 1].time + 60 : -Infinity;
+    const k = firstAfter(previousClose);
+    return k < sorted.length && sorted[k].time <= close ? sorted[k] : null;
+  };
 }
 
 type DayRisk = { trades: number; realized: number; consecutiveLosses: number; lastLossAt: number | null };
@@ -171,11 +181,15 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
     if (blocked) { skip(day, blocked); i += 1; continue; }
     const next = minute[i + 1];
     if (istDay(next.time) !== day) { skip(day, "No bar left to fill the entry"); i += 1; continue; }
+    // A data gap between the decision and the next bar means the fill would be stale.
+    if (next.time - signal.time > 120) { skip(day, "Data gap before the fill"); i += 1; continue; }
     const side = signal.side;
     const entry = next.open + side * settings.slippagePoints;
     const riskPts = (entry - signal.stop) * side;
     if (!(riskPts > 0)) { skip(day, "Price gapped through the stop before the fill"); i += 1; continue; }
     const target1 = signal.target1;
+    // A fill that already sits near (or past) T1 has lost its reward: a trader would pass, not chase.
+    if ((target1 - entry) * side < 0.5 * riskPts) { skip(day, "Fill too close to T1 (reward under 0.5R)"); i += 1; continue; }
     const target2 = signal.target2 && (signal.target2 - target1) * side > 0 ? signal.target2 : entry + side * 3 * riskPts;
 
     // Manage the trade bar by bar from the fill bar onward.

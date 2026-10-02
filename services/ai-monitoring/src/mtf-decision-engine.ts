@@ -137,10 +137,16 @@ export function rsi(values: number[], period = 14): number | null {
   return 100 - 100 / (1 + gain / loss);
 }
 
-/** Wilder ATR. */
+/**
+ * Wilder ATR. On intraday bars the first bar of each IST session uses its own high-low: the overnight
+ * gap is not intraday volatility, and counting it would widen every stop for the first hour.
+ */
 export function atr(bars: Bar[], period = 14): number | null {
   if (bars.length <= period) return null;
-  const trs = bars.slice(1).map((bar, i) => Math.max(bar.high - bar.low, Math.abs(bar.high - bars[i].close), Math.abs(bar.low - bars[i].close)));
+  const intraday = bars.length > 1 && bars[1].time - bars[0].time < 86_400;
+  const trs = bars.slice(1).map((bar, i) => (intraday && istDay(bar.time) !== istDay(bars[i].time)
+    ? bar.high - bar.low
+    : Math.max(bar.high - bar.low, Math.abs(bar.high - bars[i].close), Math.abs(bar.low - bars[i].close))));
   let value = trs.slice(0, period).reduce((sum, tr) => sum + tr, 0) / period;
   for (let i = period; i < trs.length; i += 1) value = (value * (period - 1) + trs[i]) / period;
   return value;
@@ -207,17 +213,24 @@ export function detectPatterns(bars: Bar[], levels: KeyLevel[] = [], atrValue: n
   if (isBear(c) && isBull(b) && c.close <= b.open && c.open >= b.close && body(c) > body(b)) add("Bearish engulfing", "BEARISH", 2, "Late buyers of the last candle are trapped; sellers overwhelmed them and closed below their open.");
   if (lowerWick(c) >= 2 * body(c) && lowerWick(c) >= 0.55 * range(c) && upperWick(c) <= 0.25 * range(c)) {
     if (fell) add("Hammer", "BULLISH", 2, "Sellers pushed price down, but buyers rejected the low hard: stop-losses below were hunted and absorbed.");
+    // The same shape after a rally is a hanging man: buyers could not stop an intrabar sell-off.
+    else if (rose) add("Hanging man", "BEARISH", 1, "After a rally, sellers drove price well below the open intrabar: long holders are nervous and the up-move is tiring.");
     else add("Bullish pin bar", "BULLISH", 1, "Long lower wick: lower prices were rejected by buyers.");
   }
   if (upperWick(c) >= 2 * body(c) && upperWick(c) >= 0.55 * range(c) && lowerWick(c) <= 0.25 * range(c)) {
     if (rose) add("Shooting star", "BEARISH", 2, "Buyers chased higher, but sellers rejected the high: breakout buyers are now trapped above.");
+    // The same shape after a decline is an inverted hammer: buyers are probing for the first time.
+    else if (fell) add("Inverted hammer", "BULLISH", 1, "After a decline, buyers pushed price well above the open intrabar: the first sign that sellers are losing control.");
     else add("Bearish pin bar", "BEARISH", 1, "Long upper wick: higher prices were rejected by sellers.");
   }
   if (body(c) <= 0.1 * range(c)) add("Doji", "NEUTRAL", 1, "Indecision: neither side is in control. Wait for the next candle to show who wins.");
   if (body(c) >= 0.85 * range(c) && range(c) > 0) add(isBull(c) ? "Bullish marubozu" : "Bearish marubozu", isBull(c) ? "BULLISH" : "BEARISH", 2, isBull(c) ? "Buyers in full control from open to close: no meaningful selling." : "Sellers in full control from open to close: no meaningful buying.");
   if (c.high <= b.high && c.low >= b.low) add("Inside bar", "NEUTRAL", 1, "Compression after the previous candle: energy is building. Trade the break of the mother bar, not the inside bar.");
-  if (isBear(a) && body(b) <= 0.35 * body(a) && isBull(c) && c.close > (a.open + a.close) / 2) add("Morning star", "BULLISH", 3, "Selling exhausted (small middle candle), then buyers reclaimed more than half the down candle: a classic bottom.");
-  if (isBull(a) && body(b) <= 0.35 * body(a) && isBear(c) && c.close < (a.open + a.close) / 2) add("Evening star", "BEARISH", 3, "Buying exhausted, then sellers took back more than half the up candle: a classic top.");
+  // Stars need a real first candle (≥ 0.6 ATR body), a meaningful third candle, and the right prior
+  // trend; three tiny bars are noise, not exhaustion.
+  const starSize = (first: Bar, third: Bar) => body(first) >= 0.6 * (atrValue ?? range(first)) && body(third) >= 0.5 * body(first);
+  if (fell && starSize(a, c) && isBear(a) && body(b) <= 0.35 * body(a) && isBull(c) && c.close > (a.open + a.close) / 2) add("Morning star", "BULLISH", 3, "Selling exhausted (small middle candle), then buyers reclaimed more than half the down candle: a classic bottom.");
+  if (rose && starSize(a, c) && isBull(a) && body(b) <= 0.35 * body(a) && isBear(c) && c.close < (a.open + a.close) / 2) add("Evening star", "BEARISH", 3, "Buying exhausted, then sellers took back more than half the up candle: a classic top.");
   if ([a, b, c].every(isBull) && b.close > a.close && c.close > b.close && [a, b, c].every((bar) => body(bar) >= 0.5 * range(bar))) add("Three white soldiers", "BULLISH", 2, "Three strong closes in a row: steady institutional buying, not a one-candle spike.");
   if ([a, b, c].every(isBear) && b.close < a.close && c.close < b.close && [a, b, c].every((bar) => body(bar) >= 0.5 * range(bar))) add("Three black crows", "BEARISH", 2, "Three strong down closes in a row: steady distribution.");
   if (Math.abs(b.low - c.low) <= 0.1 * range(c) && isBear(b) && isBull(c) && fell) add("Tweezer bottom", "BULLISH", 2, "The same low defended twice: buyers are holding that price.");
@@ -403,7 +416,8 @@ export function analyzeMultiTimeframe(input: MtfInput): MtfDecision {
   }
 
   const bias: Bias = side > 0 ? "BULLISH" : "BEARISH";
-  const atr5 = t5.atr14 ?? Math.max(spot * 0.0015, 1);
+  // A flat or stale feed rounds ATR to 0, which is not "known volatility": fall back to 0.15% of spot.
+  const atr5 = t5.atr14 && t5.atr14 > 0 ? t5.atr14 : Math.max(spot * 0.0015, 1);
   const reasons: string[] = [`Top-down alignment: ${context}`];
   const risks: string[] = [];
   const psychology: string[] = [];
@@ -411,8 +425,13 @@ export function analyzeMultiTimeframe(input: MtfInput): MtfDecision {
   // 5m setup: pullback to value or break-and-hold of structure, but never chasing an extended move.
   const supportsNear = levels.filter((level) => level.kind === (side > 0 ? "SUPPORT" : "RESISTANCE") && Math.abs(level.price - spot) <= 0.6 * atr5);
   const valueAreas = [t5.ema20, t5.vwap].filter((value): value is number => value !== null);
-  const atValue = valueAreas.some((value) => Math.abs(spot - value) <= 0.6 * atr5) || supportsNear.length > 0;
-  const brokeStructure = side > 0 ? t5.swingHigh !== null && spot > t5.swingHigh : t5.swingLow !== null && spot < t5.swingLow;
+  // At value means at or just on the right side of it: a long 0.6 ATR BELOW VWAP is not "holding value".
+  const atValue = valueAreas.some((value) => (spot - value) * side >= -0.2 * atr5 && (spot - value) * side <= 0.6 * atr5) || supportsNear.length > 0;
+  // A break of structure counts only while it is fresh: the break happened within the last 3 closed
+  // 5m bars. Price that has sat above an old swing for an hour is no longer a breakout entry.
+  const recent5 = m5.slice(-4);
+  const freshBreak = (level: number | null) => level !== null && recent5.length >= 2 && (spot - level) * side > 0 && recent5.slice(0, -1).some((bar) => (bar.close - level) * side <= 0);
+  const brokeStructure = side > 0 ? freshBreak(t5.swingHigh) : freshBreak(t5.swingLow);
   const extended = t5.ema20 !== null && Math.abs(spot - t5.ema20) > 2 * atr5;
   if (extended) return wait(`${bias === "BULLISH" ? "Bullish" : "Bearish"} trend, but price is ${(Math.abs(spot - t5.ema20!) / atr5).toFixed(1)} ATR from the 5m EMA20: wait for a pullback instead of chasing`, { alignment, blockedBy, reasons, psychology: ["Chasing an extended move means buying from the traders who entered early and are now booking profit."] });
   if (!atValue && !brokeStructure) return wait(`${bias === "BULLISH" ? "Bullish" : "Bearish"} alignment, but price is between levels: wait for a pullback to 5m EMA20/VWAP${supportsNear.length ? "" : " or a key level"} or a break of the 5m swing`, { alignment, blockedBy, reasons });
@@ -421,7 +440,11 @@ export function analyzeMultiTimeframe(input: MtfInput): MtfDecision {
   // 1m trigger: a confirming pattern or a 1m break of structure, on a closed candle.
   const trigger1m = strongest(t1.patterns, bias);
   const lastClosed = m1.at(-1)!;
-  const microBreak = side > 0 ? t1.swingHigh !== null && lastClosed.close > t1.swingHigh : t1.swingLow !== null && lastClosed.close < t1.swingLow;
+  // The 1m break must happen on this candle (fresh cross), or the same break re-triggers every minute.
+  const previousClosed = m1.at(-2);
+  const microBreak = side > 0
+    ? t1.swingHigh !== null && lastClosed.close > t1.swingHigh && previousClosed !== undefined && previousClosed.close <= t1.swingHigh
+    : t1.swingLow !== null && lastClosed.close < t1.swingLow && previousClosed !== undefined && previousClosed.close >= t1.swingLow;
   const trigger5m = strongest(t5.patterns, bias);
   if (!trigger1m && !microBreak) {
     return wait(`Setup is ready on 5m; waiting for a 1-minute ${side > 0 ? "bullish" : "bearish"} confirmation candle or a 1m break of structure`, {
@@ -445,10 +468,15 @@ export function analyzeMultiTimeframe(input: MtfInput): MtfDecision {
     ? Math.min(...recent1m.map((bar) => bar.low), ...(t5.swingLow !== null && t5.swingLow < entry && entry - t5.swingLow <= 1.2 * atr5 ? [t5.swingLow] : []))
     : Math.max(...recent1m.map((bar) => bar.high), ...(t5.swingHigh !== null && t5.swingHigh > entry && t5.swingHigh - entry <= 1.2 * atr5 ? [t5.swingHigh] : []));
   let stop = structural - side * 0.1 * atr5;
-  let riskPoints = Math.abs(entry - stop);
+  // Signed risk: if live price is already through the trigger structure, the setup is void (a long
+  // with its stop above entry would be an instant loss).
+  let riskPoints = (entry - stop) * side;
+  if (!(riskPoints > 0)) return wait(`Live price is already through the 1m ${side > 0 ? "lows" : "highs"} that define the stop: setup invalidated`, { alignment, blockedBy, reasons });
   if (riskPoints < 0.4 * atr5) { stop = entry - side * 0.4 * atr5; riskPoints = 0.4 * atr5; }
   if (riskPoints > 1.5 * atr5) return wait(`Structure stop is ${(riskPoints / atr5).toFixed(1)} ATR away: too wide for an option buy, wait for a tighter entry`, { alignment, blockedBy, reasons });
-  const ahead = levels.filter((level) => (level.price - entry) * side > 0.25 * riskPoints).sort((a, b) => (a.price - b.price) * side);
+  // Every level ahead counts, including one sitting right in front of the entry: buying just under
+  // resistance (or selling just above support) is the classic retail trap.
+  const ahead = levels.filter((level) => (level.price - entry) * side > 0).sort((a, b) => (a.price - b.price) * side);
   const nextLevel = ahead[0];
   const room = nextLevel ? Math.abs(nextLevel.price - entry) : Infinity;
   if (room < MIN_RISK_REWARD * riskPoints) {
@@ -456,10 +484,12 @@ export function analyzeMultiTimeframe(input: MtfInput): MtfDecision {
   }
   const target1 = round2(entry + side * MIN_RISK_REWARD * riskPoints);
   const beyond = ahead.find((level) => Math.abs(level.price - entry) >= 3 * riskPoints);
-  const target2 = round2(beyond ? beyond.price : entry + side * 3 * riskPoints);
+  // Cap T2 at 4R: a level several days away is not an intraday option target.
+  const target2 = round2(beyond && Math.abs(beyond.price - entry) <= 4 * riskPoints ? beyond.price : entry + side * (beyond ? 4 : 3) * riskPoints);
 
   // Confidence: alignment strength + trigger quality + location, minus warning signs.
-  let confidence = 45 + Math.min(25, Math.abs(weighted) * 0.35);
+  // Only bias that points WITH the trade adds confidence.
+  let confidence = 45 + Math.min(25, Math.max(0, weighted * side) * 0.35);
   if (trigger1m) confidence += trigger1m.strength * 4;
   if (microBreak) confidence += 4;
   if (trigger5m) confidence += trigger5m.strength * 3;

@@ -110,12 +110,18 @@ def evaluate_orb_retest(candles: list[CandleLike], atr_value: float | None = Non
             direction, level = active["side"], active["level"]
             held = candle.close > level if direction == "BUY" else candle.close < level
             if not held:
-                # Spec 6B: a close back through the level invalidates the breakout.
+                # Spec 6B: a close back through the level invalidates the breakout. The same candle
+                # may close beyond the OTHER side of the range, so fall through to the breakout check.
                 failures.append(f"{direction} break at {clock(active['index'])} failed at {clock(index)}")
                 active = None
-                continue
+        if active is not None:
+            direction, level = active["side"], active["level"]
             since_breakout = position - active["position"]
             touched = candle.low <= level + zone if direction == "BUY" else candle.high >= level - zone
+            # A "hold" whose wick fell through half the opening range is not a hold: the level was lost
+            # intrabar, and the stop under that wick would be far too wide.
+            midpoint = (opening_high + opening_low) / 2
+            touched = touched and (candle.low >= midpoint if direction == "BUY" else candle.high <= midpoint)
             confirmed_colour = candle.close > candle.open if direction == "BUY" else candle.close < candle.open
             entry_distance = abs(candle.close - level)
             max_extension = _max_extension(candle.close, atr)

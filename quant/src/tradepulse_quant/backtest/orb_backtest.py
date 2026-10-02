@@ -34,6 +34,7 @@ def replay(payload: dict) -> dict:
     days = [datetime.fromtimestamp(t, tz=MARKET_TIMEZONE).date().isoformat() for t in times]
     daily_dates = [datetime.fromtimestamp(float(item["time"]), tz=MARKET_TIMEZONE).date().isoformat() for item in daily]
     signals: list[dict] = []
+    armed: dict[str, int] = {}
     seen: set[str] = set()
     evaluated = 0
     for index, started in enumerate(times):
@@ -53,10 +54,24 @@ def replay(payload: dict) -> dict:
         setup = result.get("setup")
         if result.get("decision") != "CONFIRMED" or not setup:
             continue
-        key = f"{day}:{setup['side']}:{result.get('reason', '')}"
-        if key in seen:
-            continue
-        seen.add(key)
+        # One signal per breakout. The same breakout may signal again only after price has moved at
+        # least 1R away from the level and come back (a genuine second pullback), never on every bar
+        # that keeps touching the level after a stop-out.
+        orb = (result.get("calculations") or {}).get("orb") or {}
+        retest_key = f"{day}:{setup['side']}:{orb.get('retest_time')}"
+        if retest_key in seen:
+            continue  # the same retest candle, reported again on a later bar
+        key = f"{day}:{setup['side']}:{orb.get('breakout_time')}"
+        if key in armed:
+            direction = 1 if setup["side"] == "BUY" else -1
+            level = orb.get("opening_range_high") if direction > 0 else orb.get("opening_range_low")
+            risk = abs(float(setup["entry"]) - float(setup["stop_loss"]))
+            # A new leg: some candle CLOSED at least 1R beyond the level after the previous signal.
+            moved_away = level is not None and any((candle.close - level) * direction >= risk for candle in candles[armed[key] + 1:index])
+            if not moved_away:
+                continue
+        armed[key] = index
+        seen.add(retest_key)
         signals.append({
             "time": started + BAR_SECONDS,
             "side": 1 if setup["side"] == "BUY" else -1,

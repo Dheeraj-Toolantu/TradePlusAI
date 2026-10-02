@@ -116,6 +116,27 @@ describe("SMC liquidity-sweep strategy", () => {
     expect(out[0].signal.reason).toMatch(/previous-day low 24,900/);
   });
 
+  it("takes no new entry after 14:30: no time left to reach T2", () => {
+    const { minute } = scenario();
+    const day2 = at("2026-09-22", "09:15");
+    const shift = 265 * 60; // day 2 moved 4h25m later: the 10:17 shooting star now prints at 14:42
+    const late = minute.map((bar) => (bar.time >= day2 ? { ...bar, time: bar.time + shift } : bar));
+    const { out, funnel } = signalsOf(late.filter((bar) => istDay(bar.time) <= "2026-09-22"));
+    expect(out).toHaveLength(0);
+    expect(funnel.lateSession).toBe(1);
+  });
+
+  it("never places T2 behind an opposing level that T1 has not cleared", () => {
+    const { minute } = scenario();
+    const { out } = signalsOf(minute);
+    const { signal } = out[0];
+    const risk = signal.stop - 25_051;
+    // Day 1 left equal lows at 24,958 (1.4R away) and the PDL at 24,900. T1 front-runs the equal lows
+    // instead of a blind 1.5R, and T2 front-runs the PDL instead of a blind 3R beyond it.
+    expect(signal.target1).toBeCloseTo(24_958 + 0.05 * risk, 0);
+    expect(signal.target2!).toBeCloseTo(24_900 + 0.05 * risk, 0);
+  });
+
   it("does not trade when price never retraces into the zone", () => {
     const { minute } = scenario();
     const start = at("2026-09-22", "10:15");
