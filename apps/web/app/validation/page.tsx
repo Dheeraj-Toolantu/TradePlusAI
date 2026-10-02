@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { BacktestPanel } from "../../components/backtest/backtest-panel";
 
 type PaperStatus = {
   mode: string;
@@ -19,7 +20,7 @@ const money = (value: number) => `Rs ${value.toLocaleString("en-IN", { maximumFr
 const time = (value?: string) => value ? new Date(value).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "--";
 const optionMoney = (value: number) => `Rs ${value.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-export default function ValidationPage() {
+function PaperLab() {
   const [status, setStatus] = useState<PaperStatus | null>(null);
   const [quotes, setQuotes] = useState<IndexQuote[]>([]);
   const [engineCandidates, setEngineCandidates] = useState<OptionCandidate[]>([]);
@@ -81,7 +82,7 @@ export default function ValidationPage() {
   const realizedOptionPnl = optionTrades.filter((trade) => trade.exit !== undefined).reduce((sum, trade) => sum + ((trade.exit ?? trade.entry) - trade.entry) * trade.quantity, 0);
   const unrealizedOptionPnl = openOptionTrades.reduce((sum, trade) => sum + (trade.premium - trade.entry) * trade.quantity, 0);
   const totalPaperPnl = (status?.account.realizedPnl ?? 0) + realizedOptionPnl + unrealizedOptionPnl;
-  return <main className="paper-page">
+  return <>
     <header className="paper-header">
       <div><p className="paper-eyebrow">AUTOMATIC PAPER WORKFLOW</p><h1>Paper trading lab</h1><p className="paper-subtitle">Test the strategy with simulated fills. No live orders can be placed from this workspace.</p></div>
       <div className="paper-actions"><span className="paper-mode"><i /> PAPER ONLY</span><label className="provider-control">Data source<select value={provider} onChange={(event) => setProvider(event.target.value as Provider)} aria-label="Paper market data provider"><option value="groww">Groww live</option><option value="yahoo">Yahoo Finance</option><option value="fallback">Fallback fixture</option></select></label><button className="paper-button secondary" onClick={() => setPaused(!paused)}>{paused ? "Resume updates" : "Pause updates"}</button><button className="paper-button primary" onClick={tick} disabled={busy}>{busy ? "Updating..." : "Update now"}</button></div>
@@ -92,5 +93,25 @@ export default function ValidationPage() {
     <div className="paper-columns"><section className="paper-panel positions-panel"><div className="paper-panel-heading"><div><span className="paper-kicker">PORTFOLIO</span><h2>Open positions</h2></div><span className="count-badge">{status?.positions.length ?? 0}</span></div>{status?.positions.length ? status.positions.map((position) => <article className="position-row" key={position.symbol}><div><strong>{position.symbol}</strong><span className={position.side === "LONG" ? "gain" : "loss"}>{position.side}</span></div><b>{position.quantity} units</b><div className="position-levels"><span>Entry <b>{money(position.entry)}</b></span><span>Stop <b>{money(position.stop)}</b></span><span>Target <b>{money(position.target)}</b></span></div></article>) : <div className="paper-empty"><span className="empty-icon">+</span><strong>No open positions</strong><p>The strategy is collecting market history and waiting for trend and candle confirmation.</p></div>}</section>
       <section className="paper-panel events-panel"><div className="paper-panel-heading"><div><span className="paper-kicker">ACTIVITY</span><h2>Strategy events</h2></div><span className="updated-label">Updated {time(status?.updatedAt)}</span></div>{latestEvents.length ? latestEvents.slice(0, 8).map((event, index) => <article className="event-row" key={`${event.timestamp}-${index}`}><span className={`event-dot ${event.type.toLowerCase()}`} /><div><div><strong>{event.type}</strong><span>{event.symbol}</span></div><p>{event.message}</p></div><small>{time(event.timestamp)}<br />{money(event.price)}</small></article>) : <div className="paper-empty"><strong>Activity will appear here</strong><p>Run an update to evaluate the strategy.</p></div>}</section></div>
     <footer className="paper-footer"><span>Live updates every 5 seconds {paused ? "(paused)" : ""}</span><button className="reset-button" onClick={resetSession} disabled={busy}>Reset paper session</button><a href="/">Back to dashboard</a></footer>
+  </>;
+}
+
+type Tab = "backtest" | "paper";
+
+/** Strategy validation: historical backtests and the live paper-trading lab. */
+export default function ValidationPage() {
+  const [tab, setTab] = useState<Tab>("backtest");
+  useEffect(() => { if (window.location.hash === "#paper") setTab("paper"); }, []);
+  const choose = (next: Tab) => { setTab(next); window.history.replaceState(null, "", next === "paper" ? "#paper" : "#backtest"); };
+  return <main className="paper-page">
+    <nav className="bt-tabs" role="tablist" aria-label="Validation tools">
+      <button type="button" role="tab" aria-selected={tab === "backtest"} className={tab === "backtest" ? "active" : ""} onClick={() => choose("backtest")}>Strategy backtest</button>
+      <button type="button" role="tab" aria-selected={tab === "paper"} className={tab === "paper" ? "active" : ""} onClick={() => choose("paper")}>Paper trading lab</button>
+      <a href="/">Back to dashboard</a>
+    </nav>
+    {tab === "backtest" ? <>
+      <header className="paper-header"><div><p className="paper-eyebrow">STRATEGY VALIDATION</p><h1>Backtest lab</h1><p className="paper-subtitle">Replay the AI multi-timeframe and V5 ORB strategies on past sessions, minute by minute, with the same stops, targets and daily risk limits the auto-traders use.</p></div><div className="paper-actions"><span className="paper-mode"><i /> NO ORDERS PLACED</span></div></header>
+      <BacktestPanel />
+    </> : <PaperLab />}
   </main>;
 }

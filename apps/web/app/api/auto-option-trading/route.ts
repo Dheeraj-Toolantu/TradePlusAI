@@ -6,7 +6,21 @@ import { getMarketIntel, isIntelSymbol, type MarketIntel } from "../../../lib/ma
 // Entries come only from a confirmed smart zone reversal (5m order block / FVG / support-
 // resistance / writer wall + 1m CHoCH). ORB/VWAP signals and the old "3-candle EMA trend"
 // entries are not used by the auto engine.
-const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, trendEntries: false });
+// Paper fills include slippage, open positions are squared off at 15:15 IST, and the day's
+// realised losses stop new entries (see dailyStop below).
+const trader = new AutoOptionTrader({ maxTrades: 3, minScore: 75, minRiskReward: 2, trendEntries: false, slippagePct: Number(process.env.AUTO_OPTION_SLIPPAGE_PCT ?? 0.5) / 100, squareOffIst: "15:15" });
+const MAX_DAILY_LOSS = Number(process.env.AUTO_OPTION_MAX_DAILY_LOSS ?? 3000);
+const MAX_CONSECUTIVE_LOSSES = 2;
+const COOLDOWN_MINUTES = 15;
+
+/** Daily stop for new entries: loss limit, consecutive losses, and a cooldown after a loss. */
+function dailyStop(): string | undefined {
+  const risk = trader.riskSnapshot();
+  if (risk.realizedPnlToday <= -MAX_DAILY_LOSS) return `daily loss limit reached (₹${Math.abs(risk.realizedPnlToday)} of ₹${MAX_DAILY_LOSS})`;
+  if (risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) return `${risk.consecutiveLosses} consecutive losses: entries stopped for the day`;
+  if (risk.lastLossExitAt && Date.now() - Date.parse(risk.lastLossExitAt) < COOLDOWN_MINUTES * 60_000) return `cooling down for ${COOLDOWN_MINUTES} minutes after a loss`;
+  return undefined;
+}
 
 type RecordValue = Record<string, unknown>;
 
@@ -20,10 +34,10 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  // The kill switch / safe mode stop NEW entries; open positions must still be managed to an
+  // exit (stop, target, trailing, square-off), so the scan keeps running for exits only.
   const safety = readSafeModeState();
-  if (safety.killSwitch || safety.safeMode) {
-    return NextResponse.json({ error: safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` }, { status: 403 });
-  }
+  const safetyBlock = safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : safety.safeMode ? `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` : undefined;
   const body = await request.json().catch(() => ({})) as RecordValue;
   const symbol = String(body.symbol ?? "NIFTY").toUpperCase();
   const spot = numberOf(body.spot);
@@ -48,7 +62,7 @@ export async function POST(request: Request) {
     : undefined;
   const strategySignal = smartSignal;
   const waitingFor = smart ? (smart.status === "BLOCKED" ? smart.headline : smart.reason) : "market intelligence (zones, OI flow, VIX) is unavailable";
-  const entryBlockedReason = intel?.available && intel.volatility?.regime === "EXTREME" ? "India VIX is in the EXTREME regime" : undefined;
+  const entryBlockedReason = safetyBlock ?? dailyStop() ?? (intel?.available && intel.volatility?.regime === "EXTREME" ? "India VIX is in the EXTREME regime" : undefined);
   const trendBlockedReason = !intel?.available
     ? "market intelligence (trend, OI flow, VIX) is unavailable"
     : bias === "SIDEWAYS"
@@ -95,7 +109,7 @@ export async function POST(request: Request) {
         freezeQuantity: numberOf(contract.freezeQuantity),
       })),
     });
-    return NextResponse.json({ ...status, symbol, spot, marketBias: bias ?? null, smartEntry: smart ?? null, source: "1m/5m candles + Groww option chain + OI flow + VIX + sentiment (market-intel)" });
+    return NextResponse.json({ ...status, risk: trader.riskSnapshot(), symbol, spot, marketBias: bias ?? null, smartEntry: smart ?? null, source: "1m/5m candles + Groww option chain + OI flow + VIX + sentiment (market-intel)" });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Auto option scan failed" }, { status: 503 });
   }

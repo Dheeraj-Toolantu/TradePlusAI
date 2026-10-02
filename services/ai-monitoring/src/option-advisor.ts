@@ -11,8 +11,14 @@
  * - spot stop/targets must sit on the correct side within 0.2-3 ATR, else fall back to the
  *   engine's structural levels;
  * - option premiums are computed from spot levels via delta, never taken from the model.
- * Suggestions are advisory: nothing here places an order.
+ * - the multi-timeframe engine (1D/15m/5m/1m + candle psychology + option fair value) must agree:
+ *   a suggestion against the aligned 15m/1D trend is forced to WAIT, and mixed timeframes cost
+ *   confidence;
+ * - premium reward/risk is reported honestly from the delta-mapped spot move (never padded to 2R)
+ *   and a setup below MIN_PREMIUM_RR is not traded.
+ * Suggestions are advisory here; automation (paper) lives in the auto-trade route.
  */
+import { mtfBrief, type MtfDecision } from "./mtf-decision-engine";
 
 export type AdvisorAction = "BUY_CE" | "BUY_PE" | "WAIT";
 export type AdvisorCandidate = { side: "CE" | "PE"; trading_symbol: string; strike: number; premium: number; delta: number | null; liquidity_score: number; moneyness?: string };
@@ -38,6 +44,19 @@ export type OptionAdvice = {
   blockedBy: string[];
   notes: string[];
   generatedAt: string;
+  /** How to manage the trade once in: partial booking, breakeven, trailing, time stop. */
+  exitPlan?: string[];
+  /** Multi-timeframe read shown in the AI monitoring panel. */
+  mtf?: MtfSummary | null;
+};
+export type MtfSummary = {
+  action: MtfDecision["action"];
+  confidence: number;
+  alignment: MtfDecision["alignment"];
+  headline: string;
+  timeframes: Array<{ timeframe: string; trend: string; score: number; rsi14: number | null; patterns: string[] }>;
+  valuation: Array<{ side: "CE" | "PE"; tradingSymbol: string; intrinsic: number; extrinsic: number; extrinsicPct: number; fairValue: number | null; verdict: string; note: string }>;
+  keyLevels: string[];
 };
 export type ChatMessage = { role: "system" | "user"; content: string };
 
@@ -46,6 +65,51 @@ const MIN_CONFIDENCE = 50;
 const MAX_BRIEF_CHARS = 9_000;
 const PREMIUM_STOP_FLOOR = 0.1;
 const PREMIUM_STOP_CAP = 0.35;
+/** Minimum honest premium reward/risk (delta-mapped) for an actionable suggestion. */
+const MIN_PREMIUM_RR = 1.5;
+/** Confidence lost when the 1D/15m/5m/1m timeframes are not aligned. */
+const MIXED_TIMEFRAME_PENALTY = 15;
+
+const mtfOf = (intel: Raw): MtfDecision | null => { const value = obj(intel.mtf_decision); return value.timeframes ? value as unknown as MtfDecision : null; };
+
+export function summarizeMtf(decision: MtfDecision | null): MtfSummary | null {
+  if (!decision) return null;
+  return {
+    action: decision.action, confidence: decision.confidence, alignment: decision.alignment, headline: decision.headline,
+    timeframes: (["1D", "15m", "5m", "1m"] as const).map((key) => { const read = decision.timeframes[key]; return { timeframe: key, trend: read?.trend ?? "N/A", score: read?.score ?? 0, rsi14: read?.rsi14 ?? null, patterns: (read?.patterns ?? []).map((pattern) => `${pattern.name}${pattern.atLevel ? ` @ ${pattern.atLevel}` : ""}`) }; }),
+    valuation: Object.values(decision.valuation).filter(Boolean).map((value) => ({ side: value!.side, tradingSymbol: value!.tradingSymbol, intrinsic: value!.intrinsic, extrinsic: value!.extrinsic, extrinsicPct: value!.extrinsicPct, fairValue: value!.fairValue, verdict: value!.verdict, note: value!.note })),
+    keyLevels: decision.levels.map((level) => `${level.label} ${level.price}`),
+  };
+}
+
+/**
+ * Applies the multi-timeframe verdict to a proposed action. Returns the (possibly downgraded)
+ * action and confidence plus notes explaining any change.
+ */
+function reconcileWithMtf(intel: Raw, action: AdvisorAction, confidence: number): { action: AdvisorAction; confidence: number; notes: string[] } {
+  const mtf = mtfOf(intel);
+  if (!mtf || action === "WAIT") return { action, confidence, notes: [] };
+  const notes: string[] = [];
+  const opposes = (action === "BUY_CE" && mtf.alignment === "BEARISH_ALIGNED") || (action === "BUY_PE" && mtf.alignment === "BULLISH_ALIGNED");
+  if (opposes) return { action: "WAIT", confidence, notes: [`${action.replace("_", " ")} would trade against the aligned ${mtf.alignment === "BULLISH_ALIGNED" ? "bullish" : "bearish"} 1D/15m/5m trend; treated as WAIT.`] };
+  if (mtf.alignment === "MIXED") {
+    confidence = Math.max(0, confidence - MIXED_TIMEFRAME_PENALTY);
+    notes.push(`Timeframes are mixed (${mtf.headline}); confidence reduced by ${MIXED_TIMEFRAME_PENALTY}.`);
+    if (confidence < MIN_CONFIDENCE) { notes.push(`Confidence ${confidence}% after the timeframe check is below ${MIN_CONFIDENCE}%; treated as WAIT.`); return { action: "WAIT", confidence, notes }; }
+  } else if (mtf.action === action) {
+    confidence = Math.min(95, confidence + 5);
+    notes.push(`Multi-timeframe engine independently confirms ${action.replace("_", " ")} (${mtf.confidence}%).`);
+  }
+  return { action, confidence, notes };
+}
+
+/** Rejects plans whose delta-mapped premium reward does not cover the premium risk. */
+function premiumPlanAcceptable(premium: OptionAdvice["premium"], notes: string[]): boolean {
+  if (!premium) return false;
+  if (premium.riskReward >= MIN_PREMIUM_RR) return true;
+  notes.push(`Premium reward/risk is only ${premium.riskReward}R after mapping the spot move through delta (minimum ${MIN_PREMIUM_RR}R); treated as WAIT.`);
+  return false;
+}
 
 const obj = (value: unknown): Raw => (value && typeof value === "object" && !Array.isArray(value) ? value as Raw : {});
 const arr = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
@@ -124,6 +188,7 @@ export function buildAdvisorBrief(intel: Raw): Raw {
     global_macro: macro.label ? { label: macro.label, score: macro.score, notes: texts(macro.notes, 3) } : null,
     desk_plan: { status: plan.status, headline: plan.headline, direction: plan.direction, failed_checks: arr(plan.checklist).filter((c) => obj(c).passed === false).map((c) => obj(c).label) },
     candidates: candidatesOf(intel),
+    multi_timeframe: mtfOf(intel) ? mtfBrief(mtfOf(intel)!) : null,
     hard_gates: hardGates(intel),
   };
   let json = JSON.stringify(brief);
@@ -133,6 +198,9 @@ export function buildAdvisorBrief(intel: Raw): Raw {
     delete (brief.option_flow as Raw).fresh_put_writing;
     json = JSON.stringify(brief);
     if (json.length > MAX_BRIEF_CHARS) (brief.confluence_verdict as Raw).factors = arr((brief.confluence_verdict as Raw).factors).slice(0, 6);
+    json = JSON.stringify(brief);
+    const mtf = obj(brief.multi_timeframe);
+    if (json.length > MAX_BRIEF_CHARS && mtf.key_levels) mtf.key_levels = arr(mtf.key_levels).slice(0, 10);
   }
   return brief;
 }
@@ -145,8 +213,11 @@ Rules:
 - An option buyer loses to time decay: prefer WAIT in chop, low-conviction or conflicting evidence, or when price is mid-range between zones.
 - The best entries are at a demand zone (for CE) or supply zone (for PE) after a stop hunt and a 1-minute change of character. A confirmed smart_zone_entry_1m (status ENTRY) is strong evidence; status ARMED means "wait for the trigger"; tell the trader the exact trigger.
 - With-trend pullbacks beat counter-trend reversals. Do not buy against both the 15m trend and the option writers.
+- Read multi_timeframe TOP-DOWN: 1D gives context (trend, previous-day high/low/close, pivots), 15m gives the direction you may trade, 5m gives the setup (pullback into EMA20/VWAP/a key level, or a break-and-hold of the last swing), 1m gives the trigger (a closed confirming candle or a 1m break of structure). Never BUY_CE when multi_timeframe.alignment is BEARISH_ALIGNED or BUY_PE when it is BULLISH_ALIGNED; when it is MIXED prefer WAIT.
+- Read candlestick patterns for their psychology, and only trust them AT a key level (engulfing / hammer / pin bar / morning star at support for CE, the bearish mirror at resistance for PE). A pattern in the middle of nowhere is noise. Do not chase price that is extended more than 2 ATR from the 5m EMA20.
+- Respect option value: intrinsic vs time value and fair value are in multi_timeframe.option_value. Prefer contracts that are not OVERPRICED; when most of the premium is time value the trade must work fast.
 - If hard_gates is non-empty, the action must be WAIT.
-- Stop goes beyond the structure that invalidates the idea (zone edge / sweep extreme), target at the next liquidity (opposing zone, OI wall, PDH/PDL). Reward must be at least 2x risk.
+- Stop goes beyond the structure that invalidates the idea (zone edge / sweep extreme / 1m trigger low or high), target at the next liquidity (opposing zone, OI wall, PDH/PDL, pivot). Reward must be at least 2x risk AND there must be room to the next opposing level.
 - Never promise profit or certainty.
 
 Reply with ONE JSON object only, no markdown:
@@ -172,7 +243,9 @@ function premiumPlan(contract: AdvisorCandidate, spot: number, stop: number, tar
   const delta = Math.abs(contract.delta ?? 0.5) || 0.5;
   const premium = contract.premium;
   const risk = Math.min(Math.max(delta * Math.abs(spot - stop), premium * PREMIUM_STOP_FLOOR), premium * PREMIUM_STOP_CAP);
-  const reward1 = Math.max(delta * Math.abs(target1 - spot), risk * 2);
+  // Honest mapping: the premium target is what the spot target is worth through delta. It is
+  // never padded to 2R, so riskReward shows what the trade can really pay.
+  const reward1 = delta * Math.abs(target1 - spot);
   const reward2 = target2 !== null ? Math.max(delta * Math.abs(target2 - spot), reward1) : null;
   const r2 = (value: number) => Math.round(value * 20) / 20;
   return { entry: r2(premium), stop: r2(Math.max(premium - risk, 0.05)), target1: r2(premium + reward1), target2: reward2 !== null ? r2(premium + reward2) : null, riskReward: Math.round((reward1 / risk) * 100) / 100 };
@@ -217,8 +290,10 @@ export function adviceFromModel(intel: Raw, content: string, model?: string): Op
   const candidates = candidatesOf(intel);
   if (action !== "WAIT" && blockedBy.length) { notes.push(`Model suggested ${action}; forced to WAIT by: ${blockedBy.join("; ")}.`); action = "WAIT"; }
   if (action !== "WAIT" && confidence < MIN_CONFIDENCE) { notes.push(`Model confidence ${confidence}% is below ${MIN_CONFIDENCE}%; treated as WAIT.`); action = "WAIT"; }
+  const reconciled = reconcileWithMtf(intel, action, confidence);
+  action = reconciled.action; confidence = reconciled.confidence; notes.push(...reconciled.notes);
   const side = action === "BUY_CE" ? "CE" : action === "BUY_PE" ? "PE" : null;
-  const contract = side ? candidates[side] : null;
+  let contract = side ? candidates[side] : null;
   if (side && !contract) { notes.push(`No liquid ${side} near ATM on the chain; treated as WAIT.`); action = "WAIT"; }
   let spot: OptionAdvice["spot"] = null;
   let premium: OptionAdvice["premium"] = null;
@@ -228,7 +303,9 @@ export function adviceFromModel(intel: Raw, content: string, model?: string): Op
     if (levels.note) notes.push(levels.note);
     spot = levels.levels;
     premium = spot ? premiumPlan(contract, num(intel.spot) ?? 0, spot.stop, spot.target1, spot.target2) : null;
+    if (!premiumPlanAcceptable(premium, notes)) { action = "WAIT"; spot = null; premium = null; contract = null; }
   }
+  const mtf = mtfOf(intel);
   return {
     source: "AI",
     model,
@@ -251,7 +328,19 @@ export function adviceFromModel(intel: Raw, content: string, model?: string): Op
     blockedBy,
     notes,
     generatedAt: new Date().toISOString(),
+    exitPlan: action === "WAIT" ? [] : exitPlanFor(mtf),
+    mtf: summarizeMtf(mtf),
   };
+}
+
+function exitPlanFor(mtf: MtfDecision | null): string[] {
+  if (mtf?.exitPlan.length) return mtf.exitPlan;
+  return [
+    "Exit on a spot candle close beyond the stop; never average down a losing option.",
+    "Book half at target 1 and move the stop on the rest to entry.",
+    "Time stop: exit if the trade is not working within 15 minutes.",
+    "Square off everything by 15:15 IST.",
+  ];
 }
 
 /** Rule-based suggestion from the smart zone engine / desk plan when no model is reachable. */
@@ -262,13 +351,19 @@ export function deterministicAdvice(intel: Raw, reason?: string): OptionAdvice {
   const blockedBy = hardGates(intel);
   const candidates = candidatesOf(intel);
   const notes = reason ? [reason] : [];
-  const base = { source: "DETERMINISTIC" as const, symbol: String(intel.symbol ?? ""), expiry: typeof intel.expiry === "string" ? intel.expiry : null, lotSize: num(intel.lot_size), blockedBy, notes, generatedAt: new Date().toISOString(), risks: [] as string[] };
+  const mtf = mtfOf(intel);
+  const base = { source: "DETERMINISTIC" as const, symbol: String(intel.symbol ?? ""), expiry: typeof intel.expiry === "string" ? intel.expiry : null, lotSize: num(intel.lot_size), blockedBy, notes, generatedAt: new Date().toISOString(), risks: [] as string[], mtf: summarizeMtf(mtf) };
   const fromSetup = (side: "CE" | "PE", levels: Raw, strategy: string, headline: string, confidence: number, psychology: string[], reasons: string[]): OptionAdvice | null => {
     const contract = candidates[side];
     const stop = num(levels.stop); const target1 = num(levels.target1); const entry = num(levels.entry) ?? num(intel.spot);
     if (!contract || stop === null || target1 === null || entry === null || blockedBy.length) return null;
+    const reconciled = reconcileWithMtf(intel, side === "CE" ? "BUY_CE" : "BUY_PE", confidence);
+    if (reconciled.action === "WAIT") { notes.push(...reconciled.notes); return null; }
     const spot = { entryLow: round(entry)!, entryHigh: round(entry)!, stop: round(stop)!, target1: round(target1)!, target2: round(levels.target2) };
-    return { ...base, action: side === "CE" ? "BUY_CE" : "BUY_PE", confidence, headline, strategy, marketRead: text(verdict.bias ? `Confluence verdict ${verdict.bias} (${verdict.score}/10).` : "", 200), psychology, reasons, contract, spot, premium: premiumPlan(contract, num(intel.spot) ?? entry, spot.stop, spot.target1, spot.target2), trigger: "Setup already confirmed; enter near the entry price, not after a large move.", invalidation: `Spot closes beyond ${spot.stop}` };
+    const premium = premiumPlan(contract, num(intel.spot) ?? entry, spot.stop, spot.target1, spot.target2);
+    const localNotes: string[] = [];
+    if (!premiumPlanAcceptable(premium, localNotes)) { notes.push(...localNotes); return null; }
+    return { ...base, notes: [...notes, ...reconciled.notes], action: side === "CE" ? "BUY_CE" : "BUY_PE", confidence: reconciled.confidence, headline, strategy, marketRead: text(verdict.bias ? `Confluence verdict ${verdict.bias} (${verdict.score}/10).` : "", 200), psychology, reasons, contract, spot, premium, trigger: "Setup already confirmed; enter near the entry price, not after a large move.", invalidation: `Spot closes beyond ${spot.stop}`, exitPlan: exitPlanFor(mtf) };
   };
   if (smart.status === "ENTRY" && (smart.side === "CE" || smart.side === "PE")) {
     const trigger = obj(smart.trigger);
@@ -279,6 +374,11 @@ export function deterministicAdvice(intel: Raw, reason?: string): OptionAdvice {
     const advice = fromSetup(plan.direction, obj(plan.spot), "Trend confluence (desk plan READY)", text(plan.headline, 200), Math.min(90, Math.round(Math.abs(num(verdict.score) ?? 5) * 10)), [], texts(plan.reasons_for, 5));
     if (advice) return advice;
   }
+  if (mtf && mtf.spot && (mtf.action === "BUY_CE" || mtf.action === "BUY_PE")) {
+    const side = mtf.action === "BUY_CE" ? "CE" : "PE";
+    const advice = fromSetup(side, { entry: mtf.spot.entry, stop: mtf.spot.stop, target1: mtf.spot.target1, target2: mtf.spot.target2 }, "Multi-timeframe pullback (1D/15m/5m aligned + 1m trigger)", mtf.headline, mtf.confidence, mtf.psychology, mtf.reasons);
+    if (advice) return { ...advice, risks: mtf.risks, trigger: mtf.trigger, invalidation: mtf.invalidation };
+  }
   const smartRead = text(smart.headline ?? smart.reason, 300);
   return {
     ...base,
@@ -286,13 +386,14 @@ export function deterministicAdvice(intel: Raw, reason?: string): OptionAdvice {
     confidence: 0,
     headline: blockedBy.length ? `Wait: ${blockedBy[0]}` : "Wait: no confirmed zone reversal or READY plan",
     strategy: "Stand aside",
-    marketRead: [verdict.bias ? `Confluence verdict ${verdict.bias} (${verdict.score}/10).` : "", smartRead].filter(Boolean).join(" "),
+    marketRead: [verdict.bias ? `Confluence verdict ${verdict.bias} (${verdict.score}/10).` : "", smartRead, mtf ? `Multi-timeframe: ${mtf.headline}.` : ""].filter(Boolean).join(" "),
     psychology: texts(smart.psychology, 3),
     reasons: [],
     contract: null,
     spot: null,
     premium: null,
-    trigger: smart.status === "ARMED" ? smartRead : "Price reaching a demand/supply zone and a 1-minute change of character",
+    trigger: smart.status === "ARMED" ? smartRead : mtf?.trigger || "Price reaching a demand/supply zone and a 1-minute change of character",
     invalidation: "",
+    exitPlan: [],
   };
 }

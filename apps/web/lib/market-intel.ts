@@ -102,9 +102,11 @@ async function fetchChain(symbol: IntelSymbol, expiry: string) {
 }
 
 async function fetchCandles(symbol: IntelSymbol, origin: string) {
-  const response = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=5m&period=week&date=${istDate()}`, { cache: "no-store" });
+  // Index candles carry near-month futures volume so VWAP is volume-weighted, not a time average.
+  const response = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=5m&period=week&volume=futures&date=${istDate()}`, { cache: "no-store" });
   const history = await response.json();
   if (!response.ok || !Array.isArray(history.candles)) throw new Error(String(history.error ?? "5-minute history unavailable"));
+  if (history.delayed) throw new Error("Live 5-minute candles are unavailable (only delayed data)");
   // Smart-money structure must only use completed candles; drop the one still forming.
   const cutoff = Date.now() / 1000 - 300;
   return (history.candles as Raw[]).filter((candle) => Number(candle.time) <= cutoff);
@@ -113,9 +115,9 @@ async function fetchCandles(symbol: IntelSymbol, origin: string) {
 async function fetchCandles1m(symbol: IntelSymbol, origin: string) {
   // 1-minute candles only confirm entries at 5-minute zones; a failure degrades to "no trigger".
   try {
-    const response = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=1m&period=day&date=${istDate()}`, { cache: "no-store" });
+    const response = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=1m&period=day&volume=futures&date=${istDate()}`, { cache: "no-store" });
     const history = await response.json();
-    if (!response.ok || !Array.isArray(history.candles)) return [];
+    if (!response.ok || !Array.isArray(history.candles) || history.delayed) return [];
     const cutoff = Date.now() / 1000 - 60;
     return (history.candles as Raw[]).filter((candle) => Number(candle.time) <= cutoff);
   } catch {

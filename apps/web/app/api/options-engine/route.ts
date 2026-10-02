@@ -37,12 +37,15 @@ type EngineCandidate = {
   reason: string;
 };
 
+/** IST calendar date: `toISOString()` is UTC and would be the previous day before 05:30 IST. */
+const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
+
 let instrumentCatalogPromise: ReturnType<typeof loadGrowwInstrumentCatalog> | undefined;
 
 async function nearestExpiry(symbol: SymbolName): Promise<string> {
   instrumentCatalogPromise ??= loadGrowwInstrumentCatalog();
   const catalog = await instrumentCatalogPromise;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = istToday();
   const expiry = catalog.getAll()
     .filter((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && Boolean(instrument.expiryDate) && instrument.expiryDate! >= today)
     .map((instrument) => instrument.expiryDate as string)
@@ -110,7 +113,7 @@ async function fetchRealChain(symbol: SymbolName, spot: number, provider: string
     .replaceAll("{expiry_date}", encodeURIComponent(expiry));
   const requestPath = chainPath && !chainPath.includes("{") ? `${chainUrl}${chainUrl.includes("?") ? "&" : "?"}symbol=${encodeURIComponent(symbol)}` : chainUrl;
   const rawChain = await transport.request(requestPath, { method: "GET" });
-  const historyResponse = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=5m&period=day&date=${new Date().toISOString().slice(0, 10)}`, { cache: "no-store" });
+  const historyResponse = await fetch(`${origin}/api/market-data/history?provider=groww&symbol=${symbol}&timeframe=5m&period=day&volume=futures&date=${istToday()}`, { cache: "no-store" });
   const history = await historyResponse.json();
   let contracts = normalizeContracts(rawChain, symbol);
   if (!contracts.length) {
@@ -128,7 +131,11 @@ async function fetchRealChain(symbol: SymbolName, spot: number, provider: string
   }
   if (!contracts.length) throw new Error(`No actionable option-chain data available for ${symbol}; decision is NO_TRADE / WAIT.`);
   if (!Array.isArray(history.candles)) throw new Error(`No actionable 5-minute history available for ${symbol}; decision is NO_TRADE / WAIT.`);
-  return { symbol, spot, contracts, candles: history.candles.map((candle: RawRecord) => ({ open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume })) };
+  if (history.delayed) throw new Error(`Only delayed 5-minute history is available for ${symbol}; decision is NO_TRADE / WAIT.`);
+  // Only completed 5-minute candles: the bar still printing must not confirm a breakout.
+  const cutoff = Date.now() / 1000 - 300;
+  const completed = (history.candles as RawRecord[]).filter((candle) => Number(candle.time) <= cutoff);
+  return { symbol, spot, contracts, candles: completed.map((candle: RawRecord) => ({ open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume })) };
 }
 
 async function runPython(payload: RawRecord): Promise<{ symbol: string; spot: number; candidates: EngineCandidate[] }> {

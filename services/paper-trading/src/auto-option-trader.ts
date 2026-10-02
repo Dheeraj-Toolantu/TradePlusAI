@@ -51,6 +51,13 @@ export type StrategySignal = {
   preferredSymbol?: string;
   /** The signal already weighed the trend verdict, so an opposing verdict does not veto it. */
   ignoreMarketBias?: boolean;
+  /**
+   * Premium stop/target already planned by the caller (e.g. the AI advisor from structure and
+   * delta). When present they are used as-is instead of being re-derived and padded to minRR.
+   */
+  premium?: { stop: number; target: number };
+  /** Lots to buy (default 1). */
+  lots?: number;
 };
 
 export type AutoOptionTraderSettings = {
@@ -86,6 +93,25 @@ export type AutoOptionTraderConfig = {
   trailingDistanceR?: number;
   /** Take generic EMA-trend entries when no strategy signal traded (default true). */
   trendEntries?: boolean;
+  /** Order `strategy` tag; separate traders must not manage each other's orders. */
+  strategyId?: string;
+  /** Order id prefix (default "auto"). */
+  idPrefix?: string;
+  /** Paper fill slippage as a fraction of premium (buys fill higher, sells lower). Default 0. */
+  slippagePct?: number;
+  /** IST "HH:MM" after which open positions are squared off (intraday options). */
+  squareOffIst?: string;
+  /** Clock override for tests. */
+  now?: () => Date;
+};
+
+export type AutoTraderRiskSnapshot = {
+  tradeDate: string;
+  tradesToday: number;
+  openPositions: number;
+  realizedPnlToday: number;
+  consecutiveLosses: number;
+  lastLossExitAt: string | null;
 };
 
 export class AutoOptionTrader {
@@ -93,7 +119,11 @@ export class AutoOptionTrader {
   private readonly active = new Map<string, OrderRecord>();
   private readonly suggestionOrders = new Map<string, OrderRecord>();
   private readonly suggestions: AutoTradeSuggestion[] = [];
-  private readonly config: Required<AutoOptionTraderConfig>;
+  private readonly config: Required<Omit<AutoOptionTraderConfig, "squareOffIst" | "now">> & Pick<AutoOptionTraderConfig, "squareOffIst">;
+  private readonly clock: () => Date;
+  private realizedPnlToday = 0;
+  private consecutiveLosses = 0;
+  private lastLossExitAt: string | null = null;
   private tradedToday = 0;
   private tradeDate = new Date().toISOString().slice(0, 10);
   private lastDiagnostics: string[] = [];
@@ -112,7 +142,38 @@ export class AutoOptionTrader {
       trailingActivationR: config.trailingActivationR ?? 1,
       trailingDistanceR: config.trailingDistanceR ?? 0.75,
       trendEntries: config.trendEntries ?? true,
+      strategyId: config.strategyId ?? "AUTO_OPTION_ENGINE",
+      idPrefix: config.idPrefix ?? "auto",
+      slippagePct: Math.max(0, config.slippagePct ?? 0),
+      squareOffIst: config.squareOffIst,
     };
+    this.clock = config.now ?? (() => new Date());
+    this.tradeDate = this.clock().toISOString().slice(0, 10);
+  }
+
+  /** Daily risk counters for callers that enforce loss limits and cooldowns. */
+  riskSnapshot(): AutoTraderRiskSnapshot {
+    return { tradeDate: this.tradeDate, tradesToday: this.tradedToday, openPositions: this.active.size, realizedPnlToday: Math.round(this.realizedPnlToday * 100) / 100, consecutiveLosses: this.consecutiveLosses, lastLossExitAt: this.lastLossExitAt };
+  }
+
+  /** Orders placed by this trader (newest last). */
+  listOrders(): OrderRecord[] {
+    return this.orders.map((order) => ({ ...order }));
+  }
+
+  private istMinutes(date: Date) {
+    const ist = new Date(date.getTime() + 330 * 60_000);
+    return ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  }
+
+  private pastSquareOff(date: Date) {
+    const match = /^(\d{1,2}):(\d{2})$/.exec(this.config.squareOffIst ?? "");
+    return Boolean(match) && this.istMinutes(date) >= Number(match![1]) * 60 + Number(match![2]);
+  }
+
+  private roundTo(value: number, tick: number) {
+    const step = tick > 0 ? tick : 0.05;
+    return Math.round(Math.round(value / step) * step * 100) / 100;
   }
 
   async tick(input: EngineInput) {
@@ -130,13 +191,17 @@ export class AutoOptionTrader {
   private async tickInternal(input: EngineInput) {
     const settings = this.settingsFor(input.settings);
     await this.hydrateActiveOrders();
-    const currentDate = new Date().toISOString().slice(0, 10);
+    const now = this.clock();
+    const currentDate = now.toISOString().slice(0, 10);
     if (currentDate !== this.tradeDate) {
       this.tradeDate = currentDate;
       this.tradedToday = 0;
+      this.realizedPnlToday = 0;
+      this.consecutiveLosses = 0;
+      this.lastLossExitAt = null;
       this.consumedSignals.clear();
     }
-    const timestamp = new Date().toISOString();
+    const timestamp = now.toISOString();
     await this.updateExits(input, timestamp, settings);
     const limitHit = this.tradedToday >= settings.maxTrades;
     const trend = this.detectTrend(input.candles);
@@ -149,6 +214,7 @@ export class AutoOptionTrader {
       if (!this.contractIsNearAtm(contract, input.spot)) failures.push(`delta/ATM filter failed (strike ${contract.strike}, delta ${contract.delta})`);
       return `${contract.contract} ${contract.symbol}: ${failures.length ? failures.join("; ") : "eligible"}`;
     });
+    if (this.pastSquareOff(now)) input = { ...input, entryBlockedReason: input.entryBlockedReason ?? `after the ${this.config.squareOffIst} IST square-off` };
     if (input.entryBlockedReason) {
       return {
         mode: "PAPER",
@@ -254,11 +320,11 @@ export class AutoOptionTrader {
 
     // A re-entry on the same contract later in the day gets its own id instead of
     // overwriting the earlier (exited) trade's record.
-    const orderId = `auto-${this.tradeDate}:${symbolKey}-${this.tradedToday + 1}`;
+    const orderId = `${this.config.idPrefix}-${this.tradeDate}:${symbolKey}-${this.tradedToday + 1}`;
     const initialRisk = Math.max(winner.entry - winner.stopLoss, 0.01);
     const order: OrderRecord = {
       id: orderId,
-      strategy: "AUTO_OPTION_ENGINE",
+      strategy: this.config.strategyId,
       strategyName,
       symbol: winner.symbol,
       growwSymbol: winner.symbol,
@@ -330,6 +396,7 @@ export class AutoOptionTrader {
       .sort((a, b) => b.score - a.score || Math.abs(Math.abs(a.delta) - 0.5) - Math.abs(Math.abs(b.delta) - 0.5));
     const preferred = signal.preferredSymbol ? input.contracts.find((item) => normalizeSymbol(item.symbol) === normalizeSymbol(signal.preferredSymbol!) && item.contract === wanted && item.lotSize > 0 && item.premium > 0 && !this.active.has(normalizeSymbol(item.symbol))) : undefined;
     const contract = preferred ?? candidates[0];
+    if (contract && signal.premium) return this.plannedPremiumEntry(input, signal, contract, label, timestamp, settings);
     if (!contract) {
       this.lastDiagnostics = [`${label}: no near-ATM ${wanted} with score >= ${minScore}, delta > 0.35 and a lot size`, ...this.lastDiagnostics];
       return null;
@@ -358,10 +425,37 @@ export class AutoOptionTrader {
     return this.placeOrder(suggestion, timestamp, settings, `Auto Option Engine · ${signal.strategy}`, `Auto option engine · ${signal.strategy} signal`);
   }
 
+  /**
+   * Entry with premium levels planned upstream. The fill includes slippage; the stop and target
+   * keep their planned distance from the quoted premium, so slippage costs reward, not safety.
+   */
+  private plannedPremiumEntry(input: EngineInput, signal: StrategySignal, contract: Contract, label: string, timestamp: string, settings: AutoOptionTraderSettings) {
+    const tick = contract.tickSize > 0 ? contract.tickSize : 0.05;
+    const fill = this.roundTo(contract.premium * (1 + this.config.slippagePct), tick);
+    const stopLoss = this.roundTo(Math.min(signal.premium!.stop, fill - tick), tick);
+    const target = this.roundTo(signal.premium!.target, tick);
+    const risk = fill - stopLoss;
+    const reward = target - fill;
+    if (!(risk > 0) || !(reward > 0)) {
+      this.lastDiagnostics = [`${label} skipped: planned premium levels no longer fit the live premium ${contract.premium}`, ...this.lastDiagnostics];
+      return null;
+    }
+    const lots = Math.max(1, Math.floor(signal.lots ?? 1));
+    const suggestion: AutoTradeSuggestion = {
+      symbol: contract.symbol, side: "BUY", contract: contract.contract, strike: contract.strike, expiry: contract.expiry,
+      entry: fill, stopLoss, target, quantity: Math.max(Math.round(contract.lotSize), 1) * lots, score: contract.score,
+      riskReward: Math.round((reward / risk) * 100) / 100,
+      reason: `${label}: spot ${signal.entry} SL ${signal.stopLoss} T ${signal.target}${signal.reason ? ` (${signal.reason})` : ""}`,
+      timestamp,
+    };
+    this.consumedSignals.add(signal.id);
+    return this.placeOrder(suggestion, timestamp, settings, `${signal.strategy}`, `${signal.strategy} signal`);
+  }
+
   private orderFromSuggestion(suggestion: AutoTradeSuggestion, timestamp: string, suggestionKey: string): OrderRecord {
     return {
       id: `suggestion-${suggestionKey.replaceAll(/[^a-zA-Z0-9:-]/g, "-")}`,
-      strategy: "AUTO_OPTION_ENGINE",
+      strategy: this.config.strategyId,
       strategyName: "Auto Option Engine",
       symbol: suggestion.symbol,
       growwSymbol: suggestion.symbol,
@@ -414,19 +508,23 @@ export class AutoOptionTrader {
         order.minimumLossExitPrice = initialStop;
       }
       void saveOrderToFirestore(order);
-      const pnl = (contract.premium - entry) * order.quantity;
+      const exitFill = this.config.slippagePct > 0 ? this.roundTo(contract.premium * (1 - this.config.slippagePct), contract.tickSize) : contract.premium;
+      const pnl = (exitFill - entry) * order.quantity;
       const lossExitConfirmed = this.confirmLossExit(order, contract, input.candles);
       const hitTarget = contract.premium >= Number(order.target);
       const hitStop = contract.premium <= trailingStop;
       const hitLossProtection = pnl <= -settings.minimumLoss;
-      if (!hitTarget && !hitStop && !hitLossProtection) continue;
+      const squareOff = this.pastSquareOff(new Date(timestamp));
+      if (!hitTarget && !hitStop && !hitLossProtection && !squareOff) continue;
       const updates: Partial<OrderRecord> = {
         status: "EXITED",
-        exitPrice: contract.premium,
+        exitPrice: exitFill,
         exitAt: timestamp,
-        exitReason: hitTarget ? "AUTO_TARGET" : hitLossProtection ? (lossExitConfirmed ? "AUTO_MAX_LOSS_CONFIRMED_REVERSAL" : "AUTO_MAX_LOSS") : stopMoved || order.trailingActivatedAt ? "AUTO_TRAILING_STOP" : "AUTO_STOP_LOSS",
+        exitReason: hitTarget ? "AUTO_TARGET" : hitLossProtection ? (lossExitConfirmed ? "AUTO_MAX_LOSS_CONFIRMED_REVERSAL" : "AUTO_MAX_LOSS") : hitStop ? (stopMoved || order.trailingActivatedAt ? "AUTO_TRAILING_STOP" : "AUTO_STOP_LOSS") : "AUTO_SQUARE_OFF",
         realizedPnl: Math.round(pnl * 100) / 100,
       };
+      this.realizedPnlToday += pnl;
+      if (pnl < 0) { this.consecutiveLosses += 1; this.lastLossExitAt = timestamp; } else this.consecutiveLosses = 0;
       Object.assign(order, updates);
       this.active.delete(symbol);
       this.lossExitConfirmations.delete(symbol);
@@ -482,7 +580,7 @@ export class AutoOptionTrader {
     this.activeOrdersHydrated = true;
     const persisted = await getActiveOrdersFromFirestore();
     for (const order of persisted) {
-      if (order.strategy !== "AUTO_OPTION_ENGINE" || !["OPEN", "FILLED"].includes(order.status)) continue;
+      if (order.strategy !== this.config.strategyId || !["OPEN", "FILLED"].includes(order.status)) continue;
       const symbol = normalizeSymbol(order.symbol);
       if (this.active.has(symbol)) continue;
       const entry = Number(order.price);

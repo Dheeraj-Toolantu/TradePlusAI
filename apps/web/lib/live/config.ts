@@ -57,7 +57,9 @@ export function readLiveConfig(environment: NodeJS.ProcessEnv = process.env): Li
       minRewardRisk: numberFrom(environment.LIVE_MIN_REWARD_RISK, 2, 1, 10),
     },
     limitBufferPct: numberFrom(environment.LIVE_LIMIT_BUFFER_PCT, 0.5, 0.05, 3),
-    entryWindow: { start: minuteOf(environment.LIVE_ENTRY_START, "09:20"), end: minuteOf(environment.LIVE_ENTRY_END, "14:45") },
+    // 09:35 matches the strategy engine, AI advisor and paper traders: the first 20 minutes are
+    // opening-auction noise with wide option spreads.
+    entryWindow: { start: minuteOf(environment.LIVE_ENTRY_START, "09:35"), end: minuteOf(environment.LIVE_ENTRY_END, "14:45") },
     squareOffMinute: minuteOf(environment.LIVE_SQUARE_OFF, "15:15"),
     confirmTtlSeconds: numberFrom(environment.LIVE_CONFIRM_TTL_SECONDS, 30, 10, 120),
     killSwitch: safety.killSwitch,

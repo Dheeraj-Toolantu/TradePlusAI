@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type Aggregate = { score: number; label: string; items: number; bullish_pct: number; bearish_pct: number };
 type Headline = { title: string; link: string; source: string; audience: string; age_hours: number; score: number };
@@ -44,31 +44,40 @@ function Headlines({ items }: { items: Headline[] }) {
 export function SentimentPanel() {
   const [data, setData] = useState<Sentiment | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const mounted = useRef(true);
+
+  const load = useCallback(async (force = false) => {
+    if (force) setRefreshing(true);
+    try {
+      const response = await fetch(force ? "/api/sentiment?refresh=1" : "/api/sentiment", { cache: "no-store" });
+      const body = await response.json();
+      if (!mounted.current) return;
+      const wellFormed = body && typeof body === "object" && body.summary?.india && Array.isArray(body.event_risk) && Array.isArray(body.sources) && Array.isArray(body.top_bullish) && Array.isArray(body.top_bearish) && Array.isArray(body.global_headlines);
+      if (!response.ok || body.error || !wellFormed) setError(body?.error ?? "Sentiment unavailable");
+      else { setData(body as Sentiment); setError(null); }
+    } catch { if (mounted.current) setError("Sentiment request failed"); }
+    finally { if (mounted.current && force) setRefreshing(false); }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const response = await fetch("/api/sentiment", { cache: "no-store" });
-        const body = await response.json();
-        if (cancelled) return;
-        const wellFormed = body && typeof body === "object" && body.summary?.india && Array.isArray(body.event_risk) && Array.isArray(body.sources) && Array.isArray(body.top_bullish) && Array.isArray(body.top_bearish) && Array.isArray(body.global_headlines);
-        if (!response.ok || body.error || !wellFormed) setError(body?.error ?? "Sentiment unavailable");
-        else { setData(body as Sentiment); setError(null); }
-      } catch { if (!cancelled) setError("Sentiment request failed"); }
-    };
+    mounted.current = true;
     void load();
     const timer = setInterval(() => { if (document.visibilityState === "visible") void load(); }, REFRESH_MS);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, []);
+    return () => { mounted.current = false; clearInterval(timer); };
+  }, [load]);
 
   return (
     <section className="mi-card snt-panel" aria-label="Retail and news sentiment">
       <div className="algo-panel-head">
         <div><span className="algo-kicker">PUBLIC SENTIMENT · FORUMS + NEWS · INDIA & GLOBAL</span><h2>What retail traders and the media are saying</h2></div>
-        <span>{data ? `${data.sources_ok}/${data.sources_total} sources · ${new Date(data.generated_at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}` : ""}</span>
+        <div className="snt-head-actions">
+          <span>{data ? `${data.sources_ok}/${data.sources_total} sources · ${new Date(data.generated_at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}` : ""}</span>
+          <button type="button" className="snt-refresh" onClick={() => void load(true)} disabled={refreshing} aria-busy={refreshing} title="Re-scan news feeds and forums now (at most once a minute)">{refreshing ? "Refreshing…" : "↻ Refresh"}</button>
+        </div>
       </div>
       {!data && <div className="algo-empty">{error ?? "Scanning public news feeds and forums (first scan takes up to ~40 s)…"}</div>}
+      {data && error && <div className="snt-note loss">Refresh failed: {error}. Showing the previous scan.</div>}
       {data && (
         <>
           {data.event_risk.length > 0 && <div className="snt-alert"><b>Event risk:</b> {data.event_risk.map((event) => <a key={event.event} href={event.link} target="_blank" rel="noreferrer noopener">{event.event} ({event.mentions} mentions)</a>)}</div>}
