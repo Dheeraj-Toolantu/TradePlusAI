@@ -601,3 +601,13 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
   .ost-panel .algo-panel-head { flex-wrap: wrap; }
   .ost-legs { font-size: 11px; }
 }
+
+.snt-head-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+.snt-refresh { border: 1px solid currentColor; background: transparent; color: inherit; border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; opacity: .85; }
+.snt-refresh:hover:not(:disabled) { opacity: 1; }
+.snt-refresh:disabled { cursor: progress; opacity: .5; }
+.ai-toggles { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
+.ai-mtf-table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 10px; }
+.ai-mtf-table th, .ai-mtf-table td { padding: 4px 6px; border-bottom: 1px solid #183743; text-align: left; vertical-align: top; }
+.ai-mtf-table th { color: #7896a0; font-weight: 600; }
+.ai-autotrade { border-color: #2a5f4f; }

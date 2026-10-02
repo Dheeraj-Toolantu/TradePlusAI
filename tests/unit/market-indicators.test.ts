@@ -26,3 +26,26 @@ describe("market indicators", () => {
     expect(markers.some((marker) => marker.type === "BREAKDOWN")).toBe(true);
   });
 });
+
+describe("indicator correctness", () => {
+  it("RSI reflects the latest data, not the oldest 14 changes", () => {
+    const upThenDown = [...Array.from({ length: 20 }, (_, i) => 100 + i), ...Array.from({ length: 20 }, (_, i) => 119 - i * 2)];
+    const value = rsi(upThenDown, 14);
+    expect(value.status === "READY" && value.value).toBeLessThan(30);
+  });
+  it("MACD signal is an EMA of the MACD line (near the line in a steady trend)", () => {
+    const steady = Array.from({ length: 80 }, (_, i) => 100 + i * 0.5);
+    const value = macd(steady, 12, 26, 9);
+    expect(value.status).toBe("READY");
+    if (value.status === "READY") expect(Math.abs(value.value.histogram)).toBeLessThan(0.05);
+  });
+  it("Supertrend flips DOWN after a sustained decline", () => {
+    const closes = [...Array.from({ length: 30 }, (_, i) => 100 + i), ...Array.from({ length: 30 }, (_, i) => 129 - i * 2)];
+    const value = supertrend(closes.map((close) => close + 1), closes.map((close) => close - 1), closes, 10, 3);
+    expect(value.status === "READY" && value.value.direction).toBe("DOWN");
+    const rising = Array.from({ length: 40 }, (_, i) => 100 + i);
+    const up = supertrend(rising.map((close) => close + 1), rising.map((close) => close - 1), rising, 10, 3);
+    expect(up.status === "READY" && up.value.direction).toBe("UP");
+    if (up.status === "READY") expect(up.value.value).toBeLessThan(rising.at(-1)!);
+  });
+});

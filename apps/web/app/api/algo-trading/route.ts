@@ -7,7 +7,7 @@ import { readSafeModeState } from "../../../../../services/execution/src/safe-mo
 import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
 import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-intel";
-import { evaluateDailyRisk } from "../../../lib/daily-risk";
+import { DAILY_RISK_RULES, evaluateDailyRisk } from "../../../lib/daily-risk";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -105,6 +105,8 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
   ]);
   const history = await historyResponse.json();
   if (!historyResponse.ok) throw new Error(String(history.error ?? "Market history unavailable"));
+  // A delayed (Yahoo fallback) chart is minutes behind the market: never let it confirm a setup.
+  if (history.delayed) throw new Error("Live 5-minute candles are unavailable (only delayed data); the strategy engine will not evaluate on stale prices.");
   const root = existsSync(path.resolve(process.cwd(), "quant")) ? process.cwd() : path.resolve(process.cwd(), "../..");
   const executable = process.env.PYTHON_EXECUTABLE ?? "python";
   // Option evidence comes from the market-intel engine: signed OI-flow direction score from
@@ -118,7 +120,7 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
       optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>;
     } catch { optionEvidence = {}; }
   }
-  const payload = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: 1000, option_evidence: optionEvidence, pipeline: evidence };
+  const payload = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence };
   return new Promise<RecordValue>((resolve, reject) => {
     const child = spawn(executable, ["-m", "tradepulse_quant.algo_engine.engine"], { cwd: root, env: { ...process.env, PYTHONPATH: path.join(root, "quant", "src") }, windowsHide: true });
     let output = ""; let error = "";

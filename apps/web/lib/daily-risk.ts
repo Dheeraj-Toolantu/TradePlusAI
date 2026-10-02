@@ -3,6 +3,8 @@ import type { OrderRecord } from "./firestore-orders";
 /** V5 spec section 18 daily risk controls (mirrors quant StrategyConfiguration defaults). */
 export const DAILY_RISK_RULES = {
   dailyLossLimitPct: 2,
+  /** Risk budget per trade (quant StrategyConfiguration.risk_per_trade_pct). */
+  riskPerTradePct: 0.5,
   maxTradesPerDay: 3,
   maxConsecutiveLosses: 2,
   cooldownMinutesAfterLoss: 15,
@@ -14,6 +16,8 @@ export type DailyRiskState = {
   detail: string;
   tradesToday: number;
   realizedPnl: number;
+  /** Mark-to-market loss of today's open paper positions (0 when they are in profit). */
+  openLoss: number;
   consecutiveLosses: number;
   cooldownUntil: string | null;
   openPositions: number;
@@ -48,10 +52,16 @@ export function evaluateDailyRisk(orders: OrderRecord[], underlying: string, cap
   const cooldownEnd = lastLoss ? exitTime(lastLoss) + DAILY_RISK_RULES.cooldownMinutesAfterLoss * 60_000 : 0;
   const openPositions = orders.filter((order) => order.mode !== "ALGO_LIVE" && (order.status === "OPEN" || order.status === "FILLED") && belongsTo(order, underlying.toUpperCase())).length;
   const lossLimit = capital * DAILY_RISK_RULES.dailyLossLimitPct / 100;
+  // Open positions count toward the daily loss limit too: a position deep in loss must stop new
+  // entries before it is closed, not after.
+  const openLoss = Math.min(0, todays.filter((order) => order.status === "OPEN" || order.status === "FILLED").reduce((sum, order) => {
+    const marked = Number.isFinite(Number(order.pnl)) ? Number(order.pnl) : Number.isFinite(Number(order.currentPrice)) ? (Number(order.currentPrice) - Number(order.price)) * Number(order.quantity) * (order.side === "SELL" ? -1 : 1) : 0;
+    return sum + marked;
+  }, 0));
 
   const blocks: string[] = [];
   if (todays.length >= DAILY_RISK_RULES.maxTradesPerDay) blocks.push(`${todays.length}/${DAILY_RISK_RULES.maxTradesPerDay} trades already taken today`);
-  if (-realizedPnl >= lossLimit) blocks.push(`daily loss ${inr(realizedPnl)} reached the ${inr(-lossLimit)} limit`);
+  if (-(realizedPnl + openLoss) >= lossLimit) blocks.push(`daily loss ${inr(realizedPnl + openLoss)}${openLoss < 0 ? ` (incl. ${inr(openLoss)} open)` : ""} reached the ${inr(-lossLimit)} limit`);
   if (consecutiveLosses >= DAILY_RISK_RULES.maxConsecutiveLosses) blocks.push(`${consecutiveLosses} consecutive losses: entries stopped for the day`);
   else if (cooldownEnd > now.getTime()) blocks.push(`cooling down after a loss until ${istClock(new Date(cooldownEnd))} IST`);
   if (openPositions >= DAILY_RISK_RULES.maxOpenPositionsPerUnderlying) blocks.push(`a ${underlying} position is already open`);
@@ -62,6 +72,7 @@ export function evaluateDailyRisk(orders: OrderRecord[], underlying: string, cap
     detail: blocks.length ? `Blocked: ${blocks.join("; ")}. ${summary}` : `OK: ${summary}`,
     tradesToday: todays.length,
     realizedPnl,
+    openLoss,
     consecutiveLosses,
     cooldownUntil: cooldownEnd > now.getTime() ? new Date(cooldownEnd).toISOString() : null,
     openPositions,

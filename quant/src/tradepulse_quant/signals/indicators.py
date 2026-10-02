@@ -16,15 +16,28 @@ def _ema(values: list[float], period: int) -> float | None:
 
 
 def _rsi(values: list[float], period: int = 14) -> float | None:
+    """Wilder RSI: seeded on the first ``period`` changes, smoothed through the latest close."""
     if len(values) <= period:
         return None
-    gains = [max(values[index] - values[index - 1], 0) for index in range(1, len(values))]
-    losses = [max(values[index - 1] - values[index], 0) for index in range(1, len(values))]
-    average_gain = sum(gains[-period:]) / period
-    average_loss = sum(losses[-period:]) / period
+    changes = [values[index] - values[index - 1] for index in range(1, len(values))]
+    average_gain = sum(max(change, 0) for change in changes[:period]) / period
+    average_loss = sum(max(-change, 0) for change in changes[:period]) / period
+    for change in changes[period:]:
+        average_gain = (average_gain * (period - 1) + max(change, 0)) / period
+        average_loss = (average_loss * (period - 1) + max(-change, 0)) / period
     if average_loss == 0:
-        return 100.0
+        return 100.0 if average_gain > 0 else 50.0
     return 100 - 100 / (1 + average_gain / average_loss)
+
+
+def _ema_series(values: list[float], period: int) -> list[float]:
+    if len(values) < period:
+        return []
+    result = [sum(values[:period]) / period]
+    multiplier = 2 / (period + 1)
+    for value in values[period:]:
+        result.append((value - result[-1]) * multiplier + result[-1])
+    return result
 
 
 def _atr(series: OHLCVSeries, period: int) -> float | None:
@@ -47,10 +60,12 @@ def calculate_indicators(series: OHLCVSeries, config: StrategyConfiguration) -> 
     volume_sma = sum(volume_values[-config.volume_period:]) / config.volume_period if len(volume_values) >= config.volume_period else None
     vwap_volume = sum(candle.volume for candle in series.candles)
     vwap = sum(candle.close * candle.volume for candle in series.candles) / vwap_volume if vwap_volume else None
-    fast = _ema(closes, 12)
-    slow = _ema(closes, 26)
-    macd_line = fast - slow if fast is not None and slow is not None else None
-    signal = _ema([value for value in closes], 9) if macd_line is not None else None
+    # MACD line series aligned on the slow EMA; the signal is an EMA of that series, not of price.
+    fast_series = _ema_series(closes, 12)
+    slow_series = _ema_series(closes, 26)
+    macd_series = [fast - slow for fast, slow in zip(fast_series[len(fast_series) - len(slow_series):], slow_series)]
+    macd_line = macd_series[-1] if macd_series else None
+    signal = _ema(macd_series, 9) if macd_line is not None else None
     macd = (macd_line, signal, macd_line - signal) if macd_line is not None and signal is not None else None
     values = (ema9, ema20, ema50, ema200, _rsi(closes), atr, volume_sma, vwap)
     status = "VALID" if all(value is None or isfinite(value) for value in values) else "INVALID"

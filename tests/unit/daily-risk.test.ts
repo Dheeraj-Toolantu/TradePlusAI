@@ -53,3 +53,19 @@ describe("V5 daily risk manager", () => {
     expect(state.allowed).toBe(true);
   });
 });
+
+describe("daily risk with open positions", () => {
+  it("counts the open position's mark-to-market loss toward the daily loss limit", () => {
+    const state = evaluateDailyRisk([
+      order({ realizedPnl: -1_200, exitAt: "2026-09-29T04:10:00Z", underlying: "BANKNIFTY", symbol: "BANKNIFTY26OCT52000CE" }),
+      order({ status: "OPEN", underlying: "SENSEX", symbol: "SENSEX26OCT82000CE", pnl: -900 }),
+    ], "NIFTY", 100_000, new Date("2026-09-29T05:30:00Z"));
+    expect(state.openLoss).toBe(-900);
+    expect(state.allowed).toBe(false);
+    expect(state.detail).toContain("incl. ₹-900 open");
+  });
+  it("ignores open profits", () => {
+    const state = evaluateDailyRisk([order({ status: "OPEN", underlying: "SENSEX", symbol: "SENSEX26OCT82000CE", pnl: 4_000 })], "NIFTY", 100_000, NOW);
+    expect(state.openLoss).toBe(0);
+  });
+});

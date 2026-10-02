@@ -20,6 +20,8 @@ type Headline = { title: string; link: string; source: string; audience: string;
 // Public feeds move slowly and must not be hammered: one scan per 10 minutes per server,
 // stale-while-revalidate so page loads never wait on 15 feeds.
 const TTL_MS = 10 * 60_000;
+// A manual refresh skips the TTL, but never re-scans the feeds more than once a minute.
+export const MANUAL_REFRESH_MIN_MS = 60_000;
 const store = globalThis as typeof globalThis & { __tradepulseSentiment?: { at: number; value: Sentiment } | null; __tradepulseSentimentJob?: Promise<Sentiment> | null };
 
 function refresh(): Promise<Sentiment> {
@@ -29,8 +31,9 @@ function refresh(): Promise<Sentiment> {
   return store.__tradepulseSentimentJob;
 }
 
-export async function getSentiment(options: { wait?: boolean } = {}): Promise<Sentiment | null> {
+export async function getSentiment(options: { wait?: boolean; force?: boolean } = {}): Promise<Sentiment | null> {
   const cached = store.__tradepulseSentiment;
+  if (options.force && !(cached && Date.now() - cached.at < MANUAL_REFRESH_MIN_MS)) return refresh();
   if (cached && Date.now() - cached.at < TTL_MS) return cached.value;
   const job = refresh();
   if (cached && !options.wait) { job.catch(() => undefined); return cached.value; }

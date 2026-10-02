@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { getSentiment } from "../../../lib/sentiment";
 
-export async function GET() {
+// `?refresh=1` forces a fresh scan (rate-limited in getSentiment) for the panel's Refresh button.
+export async function GET(request?: Request) {
+  const force = request ? new URL(request.url).searchParams.get("refresh") === "1" : false;
   try {
-    const sentiment = await getSentiment({ wait: true });
+    const sentiment = await getSentiment({ wait: true, force });
     return NextResponse.json(sentiment ?? { error: "Sentiment scan unavailable" }, { status: sentiment ? 200 : 503 });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Sentiment scan failed" }, { status: 503 });
