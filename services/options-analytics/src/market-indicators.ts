@@ -30,24 +30,32 @@ export type PivotValue = { pivot: number; r1: number; r2: number; s1: number; s2
 
 function insufficient<T>(condition: boolean): IndicatorResult<T> | undefined { return condition ? { status: "INSUFFICIENT_DATA", value: null } : undefined; }
 
+/** Wilder RSI: seeded on the first `period` changes, then smoothed through the latest close. */
 export function rsi(values: number[], period = 14): IndicatorResult<number> {
   const early = insufficient<number>(period < 1 || values.length <= period);
   if (early) return early;
-  let gains = 0;
-  let losses = 0;
-  for (let index = 1; index <= period; index += 1) { const change = values[index] - values[index - 1]; gains += Math.max(change, 0); losses += Math.max(-change, 0); }
-  const averageGain = gains / period;
-  const averageLoss = losses / period;
-  return { status: "READY", value: averageLoss === 0 ? 100 : 100 - 100 / (1 + averageGain / averageLoss) };
+  let averageGain = 0;
+  let averageLoss = 0;
+  for (let index = 1; index <= period; index += 1) { const change = values[index] - values[index - 1]; averageGain += Math.max(change, 0); averageLoss += Math.max(-change, 0); }
+  averageGain /= period;
+  averageLoss /= period;
+  for (let index = period + 1; index < values.length; index += 1) {
+    const change = values[index] - values[index - 1];
+    averageGain = (averageGain * (period - 1) + Math.max(change, 0)) / period;
+    averageLoss = (averageLoss * (period - 1) + Math.max(-change, 0)) / period;
+  }
+  if (averageLoss === 0) return { status: "READY", value: averageGain === 0 ? 50 : 100 };
+  return { status: "READY", value: 100 - 100 / (1 + averageGain / averageLoss) };
 }
 
+/** MACD with the signal line as an EMA of the whole MACD series (from the first valid slow EMA). */
 export function macd(values: number[], fastPeriod = 12, slowPeriod = 26, signalPeriod = 9): IndicatorResult<MacdValue> {
   const early = insufficient<MacdValue>(values.length < slowPeriod + signalPeriod || fastPeriod < 1 || slowPeriod < fastPeriod);
   if (early) return early;
   const fast = ema(values, fastPeriod);
   const slow = ema(values, slowPeriod);
-  const macdValues = values.map((_, index) => fast[index] - slow[index]);
-  const signal = ema(macdValues.slice(-signalPeriod), signalPeriod).at(-1)!;
+  const macdValues = values.map((_, index) => fast[index] - slow[index]).slice(slowPeriod - 1);
+  const signal = ema(macdValues, signalPeriod).at(-1)!;
   const current = macdValues.at(-1)!;
   return { status: "READY", value: { macd: current, signal, histogram: current - signal } };
 }
@@ -61,14 +69,28 @@ export function bollingerBands(values: number[], period = 20, deviationMultiplie
   return { status: "READY", value: { middle, upper: middle + deviation * deviationMultiplier, lower: middle - deviation * deviationMultiplier } };
 }
 
+/** Supertrend: Wilder ATR on true range, final bands carried forward, direction flips on a close through the band. */
 export function supertrend(highs: number[], lows: number[], closes: number[], period = 10, multiplier = 3): IndicatorResult<SupertrendValue> {
-  const early = insufficient<SupertrendValue>(period < 1 || highs.length < period || lows.length !== highs.length || closes.length !== highs.length);
+  const early = insufficient<SupertrendValue>(period < 1 || highs.length <= period || lows.length !== highs.length || closes.length !== highs.length);
   if (early) return early;
-  const ranges = highs.slice(-period).map((high, index) => high - lows.slice(-period)[index]);
-  const atr = ranges.reduce((sum, value) => sum + value, 0) / period;
-  const middle = (highs.at(-1)! + lows.at(-1)!) / 2;
-  const value = middle - multiplier * atr;
-  return { status: "READY", value: { value, direction: closes.at(-1)! >= value ? "UP" : "DOWN" } };
+  const trueRange = (index: number) => index === 0 ? highs[0] - lows[0] : Math.max(highs[index] - lows[index], Math.abs(highs[index] - closes[index - 1]), Math.abs(lows[index] - closes[index - 1]));
+  let atr = 0;
+  for (let index = 1; index <= period; index += 1) atr += trueRange(index);
+  atr /= period;
+  let upper = (highs[period] + lows[period]) / 2 + multiplier * atr;
+  let lower = (highs[period] + lows[period]) / 2 - multiplier * atr;
+  let direction: "UP" | "DOWN" = closes[period] >= lower ? "UP" : "DOWN";
+  for (let index = period + 1; index < closes.length; index += 1) {
+    atr = (atr * (period - 1) + trueRange(index)) / period;
+    const middle = (highs[index] + lows[index]) / 2;
+    const basicUpper = middle + multiplier * atr;
+    const basicLower = middle - multiplier * atr;
+    upper = basicUpper < upper || closes[index - 1] > upper ? basicUpper : upper;
+    lower = basicLower > lower || closes[index - 1] < lower ? basicLower : lower;
+    if (direction === "UP" && closes[index] < lower) direction = "DOWN";
+    else if (direction === "DOWN" && closes[index] > upper) direction = "UP";
+  }
+  return { status: "READY", value: { value: direction === "UP" ? lower : upper, direction } };
 }
 
 export function cpr(high: number, low: number, close: number): IndicatorResult<CprValue> {
