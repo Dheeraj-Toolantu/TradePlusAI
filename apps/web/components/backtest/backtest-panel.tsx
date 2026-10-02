@@ -3,25 +3,29 @@
 import { Fragment, useMemo, useRef, useState } from "react";
 import { BacktestCandles, type CandleRow } from "./backtest-candles";
 import type { BacktestResult, BacktestSettings, BacktestTrade, StrategyId } from "../../../../services/backtest/src/strategy-backtest";
+import type { OptimizerResult, OptimizerRow } from "../../../../services/backtest/src/optimizer";
 
-type Result = BacktestResult & { candles: CandleRow[]; candleMinutes?: number; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
+type Result = BacktestResult & { candles: CandleRow[]; candleMinutes?: number; optimization?: OptimizerResult | null; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
 type Source = "groww" | "yahoo" | "synthetic";
 type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
 const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
   { id: "MTF_AI", title: "AI multi-timeframe", detail: "1D context · 15m direction · 5m pullback · 1m candle trigger, with the AI monitor's entry/stop/target rules." },
   { id: "ORB_RETEST", title: "V5 ORB retest", detail: "Opening-range break, retest and hold with a structural stop and 2R target capped at PDH/PDL." },
+  { id: "TREND_PULLBACK", title: "Trend-day VWAP pullback", detail: "Trades only confirmed trend days: 30 min on one side of a sloping VWAP, OR break, 15m agreeing → pullback into VWAP/EMA20 → 5m resumption candle. Trailing runner." },
   { id: "SMC_SWEEP", title: "SMC liquidity sweep", detail: "S/R + liquidity sweep → CHoCH with displacement → retrace into the FVG / order block → 1m candle confirmation. Stop beyond the sweep, targets at opposing liquidity." },
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };
-const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60, partialAtT1: true, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15, minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15" };
+const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60, partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15, minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15" };
 
 const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
 const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getUTCDay(); return dow !== 0 && dow !== 6; };
 /** Per-strategy time stop: retest/zone entries (ORB, SMC) often need 20–40 minutes to work. */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, SMC_SWEEP: 30 };
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, SMC_SWEEP: 30, TREND_PULLBACK: 45 };
+/** Trend entries are built for a trailing runner; the others default to fixed T1/T2. */
+const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, SMC_SWEEP: 0, TREND_PULLBACK: 1.5 };
 type Preset = { key: string; label: string; sessions?: number; months?: number };
 const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
 function lastMonths(months: number) {
@@ -64,14 +68,16 @@ export function BacktestPanel() {
   const update = <K extends keyof BacktestSettings>(key: K, value: BacktestSettings[K]) => setSettings((current) => ({ ...current, [key]: value }));
   const chooseSymbol = (next: Symbol) => { setSymbol(next); setSettings((current) => ({ ...current, lotSize: LOT_SIZE[next], thetaPerDay: THETA[next] })); };
   const choosePreset = (item: Preset) => { setPreset(item.key); setRange(rangeFor(item)); };
-  const chooseStrategy = (next: StrategyId) => { setStrategy(next); setSettings((current) => ({ ...current, timeStopMinutes: TIME_STOP[next] })); };
+  const chooseStrategy = (next: StrategyId) => { setStrategy(next); setSettings((current) => ({ ...current, timeStopMinutes: TIME_STOP[next], trailR: TRAIL_R[next] })); };
+  const [optimize, setOptimize] = useState(true);
+  const applySettings = (overrides: Partial<BacktestSettings>) => { setSettings((current) => ({ ...current, ...overrides })); window.scrollTo({ top: 0, behavior: "smooth" }); };
   const spanDays = Math.round((Date.parse(range.to) - Date.parse(range.from)) / 86_400_000) + 1;
 
   async function run() {
     // Clear the previous run so an error is never shown above stale results from another period.
     setRunning(true); setError(null); setResult(null);
     try {
-      const response = await fetch("/api/backtest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ strategy, symbol, from: range.from, to: range.to, source, settings }) });
+      const response = await fetch("/api/backtest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ strategy, symbol, from: range.from, to: range.to, source, settings, optimize }) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) { setError({ message: body.error ?? `Backtest failed (HTTP ${response.status})`, issues: Array.isArray(body.issues) ? body.issues : [] }); return; }
       setResult(body as Result);
@@ -118,12 +124,14 @@ export function BacktestPanel() {
             <label>Entry from<input type="time" value={settings.entryStart} onChange={(event) => update("entryStart", event.target.value)} /></label>
             <label>Entry until<input type="time" value={settings.entryEnd} onChange={(event) => update("entryEnd", event.target.value)} /></label>
             <label>Square-off<input type="time" value={settings.squareOff} onChange={(event) => update("squareOff", event.target.value)} /></label>
+            <NumberField label="Trail runner (R, 0 = fixed T2)" value={settings.trailR} step={0.5} min={0} max={5} onChange={(value) => update("trailR", value)} />
             <label className="bt-check"><input type="checkbox" checked={settings.partialAtT1} onChange={(event) => update("partialAtT1", event.target.checked)} /> Book 50% at T1, stop to breakeven</label>
           </div>
           <button type="button" className="paper-button secondary bt-reset" onClick={() => setSettings({ ...DEFAULTS, lotSize: LOT_SIZE[symbol], thetaPerDay: THETA[symbol] })}>Reset to defaults</button>
         </details>
         <div className="bt-actions">
           <button type="button" className="paper-button primary" onClick={() => void run()} disabled={running}>{running ? "Running backtest…" : "Run backtest"}</button>
+          <label className="bt-check bt-optimize"><input type="checkbox" checked={optimize} onChange={(event) => setOptimize(event.target.checked)} /> Optimize settings (walk-forward)</label>
           <span className="bt-hint">{running ? `Fetching 1-minute history for ${range.from} → ${range.to} and replaying every minute. ${spanDays > 45 ? "Several months of data can take 1–2 minutes." : "This can take 10–40 seconds."}` : `${spanDays} calendar days selected (max 190). Signals only see candles that were complete at that moment; entries fill on the next 1-minute bar.`}</span>
         </div>
         {error ? (
@@ -134,7 +142,7 @@ export function BacktestPanel() {
         ) : null}
       </section>
 
-      {result ? <BacktestResults result={result} /> : !running ? <section className="paper-panel bt-empty"><strong>No backtest yet</strong><p>Pick a strategy and period, then run. Use “Synthetic demo data” to explore the tool without a market-data connection.</p></section> : null}
+      {result ? <BacktestResults result={result} onApply={applySettings} /> : !running ? <section className="paper-panel bt-empty"><strong>No backtest yet</strong><p>Pick a strategy and period, then run. Use “Synthetic demo data” to explore the tool without a market-data connection.</p></section> : null}
     </div>
   );
 }
@@ -143,7 +151,7 @@ function NumberField({ label, value, onChange, step = 1, min = 0, max, disabled 
   return <label>{label}<input type="number" value={value} step={step} min={min} max={max} disabled={disabled} onChange={(event) => { const parsed = Number(event.target.value); if (Number.isFinite(parsed)) onChange(parsed); }} /></label>;
 }
 
-function BacktestResults({ result }: { result: Result }) {
+function BacktestResults({ result, onApply }: { result: Result; onApply: (overrides: Partial<BacktestSettings>) => void }) {
   const m = result.metrics;
   const [openTrade, setOpenTrade] = useState<number | null>(null);
   const [chartTrade, setChartTrade] = useState<number | null>(null);
@@ -163,6 +171,8 @@ function BacktestResults({ result }: { result: Result }) {
         <div><strong>{result.strategyLabel} · {result.symbol} · {dayLabel(result.from)} → {dayLabel(result.to)}</strong><span>{result.sessions} sessions · {result.source} data · {result.signalsSeen} signals · {(result.elapsedMs / 1000).toFixed(1)}s</span></div>
         <ul>{result.notes.map((note) => <li key={note}>{note}</li>)}</ul>
       </section>
+
+      {result.optimization ? <OptimizerPanel optimization={result.optimization} onApply={onApply} /> : null}
 
       <section className="bt-kpis" aria-label="Backtest summary">
         <Kpi label="Net P&L" value={inr(m.netPnl)} detail={`${pct(m.returnPct)} on ₹${result.settings.capital.toLocaleString("en-IN")} · charges ₹${m.totalCharges.toLocaleString("en-IN")}`} />
@@ -392,5 +402,56 @@ function RHistogram({ buckets }: { buckets: BacktestResult["rDistribution"] }) {
       </svg>
       <Tooltip tip={tip} width={W} />
     </div>
+  );
+}
+
+const describeSettings = (settings: Partial<BacktestSettings>) => {
+  const parts: string[] = [];
+  if (settings.entryStart) parts.push(`${settings.entryStart}–${settings.entryEnd}`);
+  if (settings.maxTradesPerDay !== undefined) parts.push(`${settings.maxTradesPerDay}/day`);
+  if (settings.minConfidence !== undefined) parts.push(`conf ≥ ${settings.minConfidence}`);
+  if (settings.partialAtT1 !== undefined) parts.push(settings.partialAtT1 ? "½ at T1" : "full at T1");
+  if (settings.trailR !== undefined) parts.push(settings.trailR ? `trail ${settings.trailR}R` : "fixed T2");
+  if (settings.timeStopMinutes !== undefined) parts.push(settings.timeStopMinutes ? `time stop ${settings.timeStopMinutes}m` : "no time stop");
+  return parts.length ? parts.join(" · ") : "Your current settings";
+};
+
+function OptimizerCells({ side }: { side: OptimizerRow["inSample"] }) {
+  return (
+    <>
+      <td className="num">{side.trades}</td>
+      <td className="num">{side.winRate.toFixed(0)}%</td>
+      <td className="num">{side.profitFactor === null ? "∞" : side.profitFactor.toFixed(2)}</td>
+      <td className="num"><b>{inr(side.netPnl)}</b></td>
+    </>
+  );
+}
+
+function OptimizerPanel({ optimization, onApply }: { optimization: OptimizerResult; onApply: (overrides: Partial<BacktestSettings>) => void }) {
+  const rows: Array<{ label: string; row: OptimizerRow; apply: boolean }> = [{ label: "Current", row: optimization.baseline, apply: false }, ...optimization.top.map((row, index) => ({ label: `#${index + 1}`, row, apply: true }))];
+  return (
+    <section className="paper-panel bt-optimizer">
+      <div className="paper-panel-heading"><div><span className="paper-kicker">WALK-FORWARD OPTIMIZER · {optimization.tested} SETTING COMBINATIONS</span><h2>Chosen on {dayLabel(optimization.inSample.from)} → {dayLabel(optimization.inSample.to)}, tested on unseen {dayLabel(optimization.outOfSample.from)} → {dayLabel(optimization.outOfSample.to)}</h2></div></div>
+      <p className="bt-optimizer-note">{optimization.note}</p>
+      <div className="bt-table-wrap">
+        <table className="bt-table">
+          <thead>
+            <tr><th rowSpan={2}>Rank</th><th rowSpan={2}>Settings</th><th colSpan={4} className="bt-group">In-sample ({optimization.inSample.sessions} sessions)</th><th colSpan={4} className="bt-group">Out-of-sample ({optimization.outOfSample.sessions} sessions)</th><th rowSpan={2}></th></tr>
+            <tr><th className="num">Trades</th><th className="num">Win</th><th className="num">PF</th><th className="num">P&amp;L</th><th className="num">Trades</th><th className="num">Win</th><th className="num">PF</th><th className="num">P&amp;L</th></tr>
+          </thead>
+          <tbody>
+            {rows.map(({ label, row, apply }) => (
+              <tr key={label} className={row.robust ? "bt-robust" : ""}>
+                <td>{label}{row.robust ? <span className="bt-badge">holds out-of-sample</span> : null}</td>
+                <td>{describeSettings(row.settings)}</td>
+                <OptimizerCells side={row.inSample} />
+                <OptimizerCells side={row.outOfSample} />
+                <td>{apply ? <button type="button" className="paper-button secondary" onClick={() => onApply(row.settings)}>Apply</button> : null}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }

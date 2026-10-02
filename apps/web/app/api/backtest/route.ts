@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { DEFAULT_BACKTEST_SETTINGS, aggregate, istDay, listSignalSource, mtfSignalSource, runBacktest, type BacktestSettings, type Signal, type StrategyId } from "../../../../../services/backtest/src/strategy-backtest";
 import { smcSignalSource } from "../../../../../services/backtest/src/smc-strategy";
+import { trendPullbackSignalSource } from "../../../../../services/backtest/src/trend-pullback-strategy";
+import { optimizeSettings, precomputeSignals } from "../../../../../services/backtest/src/optimizer";
 import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, validateSourceRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
 
@@ -8,6 +10,7 @@ const STRATEGIES: Record<StrategyId, string> = {
   MTF_AI: "AI multi-timeframe (1D/15m/5m/1m + candle psychology)",
   ORB_RETEST: "V5 ORB break-and-retest (strategy rules)",
   SMC_SWEEP: "SMC liquidity sweep (S/R, CHoCH, FVG/OB, candle psychology)",
+  TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
 };
 /** Above this many sessions the chart gets 5-minute candles to keep the response small. */
 const MINUTE_CANDLE_SESSIONS = 45;
@@ -27,6 +30,7 @@ function settingsFrom(raw: Record<string, unknown>): BacktestSettings {
     slippagePoints: clampNumber(raw.slippagePoints, d.slippagePoints, 0, 100),
     chargesPerTrade: clampNumber(raw.chargesPerTrade, d.chargesPerTrade, 0, 10_000),
     partialAtT1: raw.partialAtT1 === undefined ? d.partialAtT1 : Boolean(raw.partialAtT1),
+    trailR: clampNumber(raw.trailR, d.trailR, 0, 5),
     timeStopMinutes: clampNumber(raw.timeStopMinutes, d.timeStopMinutes, 0, 240),
     maxTradesPerDay: clampNumber(raw.maxTradesPerDay, d.maxTradesPerDay, 1, 20),
     maxDailyLoss: clampNumber(raw.maxDailyLoss, d.maxDailyLoss, 100, 1e9),
@@ -70,8 +74,10 @@ export async function POST(request: Request) {
 
   let signalAt: Parameters<typeof runBacktest>[0]["signalAt"];
   let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
+  let trendFunnel: ReturnType<typeof trendPullbackSignalSource>["funnel"] | null = null;
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
   else if (strategy === "SMC_SWEEP") { const smc = smcSignalSource(symbol, data.minute, data.daily); funnel = smc.funnel; signalAt = smc; }
+  else if (strategy === "TREND_PULLBACK") { const trend = trendPullbackSignalSource(symbol, data.minute, data.daily); trendFunnel = trend.funnel; signalAt = trend; }
   else {
     try {
       const replay = await runPythonModule<{ signals: Array<{ time: number; side: 1 | -1; stop: number; target1: number; reason: string }> }>("tradepulse_quant.backtest.orb_backtest", { symbol, from, candles_5m: aggregate(data.minute, 5), daily_candles: data.daily }, 120_000);
@@ -80,12 +86,19 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: `ORB strategy replay failed: ${error instanceof Error ? error.message : "python error"}` }, { status: 503 });
     }
   }
+  // Signals do not depend on the simulator's settings: compute them once, then replay cheaply.
+  signalAt = precomputeSignals(data.minute, signalAt, from, to);
   const result = runBacktest({ strategy, symbol, from, to, minute: data.minute, signalAt, settings });
+  const optimization = body.optimize ? optimizeSettings({ strategy, symbol, from, to, minute: data.minute, signalAt, settings, usesConfidence: strategy !== "ORB_RETEST" }) : null;
   const notes = [...result.notes];
   if (strategy === "MTF_AI") notes.push("Replays the deterministic multi-timeframe engine the AI monitor relies on. The LLM's discretionary layer, live OI/PCR flow and sentiment cannot be replayed historically.");
   else if (strategy === "SMC_SWEEP") {
     if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.counterTrend} counter-trend, ${funnel.lateSession} after 14:30. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
     notes.push("SMC rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m rejection or engulfing. Stop beyond the sweep; T1 1.5R or opposing liquidity; T2 next opposing liquidity. Counter-trend (vs 15m structure) only off a daily level.");
+  }
+  else if (strategy === "TREND_PULLBACK") {
+    if (trendFunnel) notes.push(`Setup funnel: ${trendFunnel.evaluated} 5m closes checked → ${trendFunnel.trendBars} on a confirmed trend day → ${trendFunnel.pullbacks} pullbacks into value → ${trendFunnel.triggers} resumption candles (${trendFunnel.extended} too far from VWAP, ${trendFunnel.tooWide} stop > 1.6 ATR).`);
+    notes.push("Trend-day rules: 30 min on one side of a sloping VWAP + opening-range break or ≥ 0.5 ADR from the open + 15m EMA20 agreeing → pullback to VWAP/EMA20 that holds → 5m resumption candle. Stop beyond the pullback (0.6–1.6 ATR). Best with a trailing runner (Trail = 1.5R, 45-min time stop).");
   }
   else notes.push("Replays the V5 ORB strategy rules (opening range, break, retest/hold, structural stop, 2R capped at PDH/PDL). Not applied: live-only gates (OI flow, India VIX, broker health) and the live engine's regime/score gates, so live trading is stricter than this replay.");
   if (data.delayed) notes.push("Some days came from the delayed Yahoo feed; historical candles are still valid for a backtest.");
@@ -96,5 +109,5 @@ export async function POST(request: Request) {
   const tested = data.minute.filter((bar) => { const day = istDay(bar.time); return day >= from && day <= to; });
   const candleMinutes = data.sessions > MINUTE_CANDLE_SESSIONS ? 5 : 1;
   const candles = (candleMinutes === 1 ? tested : aggregate(tested, candleMinutes)).map((bar) => [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0]);
-  return NextResponse.json({ ...result, candles, candleMinutes, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
+  return NextResponse.json({ ...result, optimization, candles, candleMinutes, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
 }

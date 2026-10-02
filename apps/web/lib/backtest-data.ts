@@ -74,7 +74,7 @@ export async function loadBacktestData(args: { symbol: string; from: string; to:
   const { symbol, from, to, source, origin } = args;
   const start = warmupStart(from);
   if (source === "synthetic") {
-    const { minute, daily } = syntheticSessions(addDays(from, -90), to, { seed: symbol.length * 97 + Date.parse(from) / DAY_MS });
+    const { minute, daily } = syntheticSessions(addDays(from, -90), to, { seed: symbol.length * 97 + Date.parse(from) / DAY_MS, regimes: true });
     return { minute: minute.filter((bar) => istDay(bar.time) >= start), daily, issues: [] as string[], provider: "synthetic", delayed: false, sessions: [...new Set(minute.filter((bar) => istDay(bar.time) >= from).map((bar) => istDay(bar.time)))].length };
   }
   const fetcher = args.fetcher ?? fetch;
