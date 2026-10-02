@@ -785,3 +785,8 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
   .bt-smc-layers legend { display: none; }
   .bt-smc-layers label { border-left: 0; border-right: 1px solid #23505a; }
 }
+
+/* Support / resistance timeframes */
+.bt-sr-frames label { padding: 6px 7px; }
+.bt-sr-frames label.off { color: #557377; cursor: not-allowed; }
+.bt-sr-frames input { accent-color: #5fd3a3; }

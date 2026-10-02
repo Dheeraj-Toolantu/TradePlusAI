@@ -139,5 +139,7 @@ export async function POST(request: Request) {
   // day replay prints minute by minute (a 5-minute trade would otherwise open and close in one candle).
   const tradeDays = new Set(result.trades.map((trade) => trade.day));
   const replayMinutes = candleMinutes === 1 ? null : Object.fromEntries([...tradeDays].map((day) => [day, tested.filter((bar) => istDay(bar.time) === day).map(row)]));
-  return NextResponse.json({ ...result, optimization, candles, candleMinutes, replayMinutes, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
+  // Daily candles (up to ~1 year before `to`) for the 1D / 1M support-resistance levels on the chart.
+  const dailyCandles = [...data.daily].sort((a, b) => a.time - b.time).filter((bar) => istDay(bar.time) <= to).slice(-260).map(row);
+  return NextResponse.json({ ...result, optimization, candles, candleMinutes, replayMinutes, dailyCandles, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
 }

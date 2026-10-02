@@ -6,6 +6,27 @@ import type { BacktestTrade, TradeLeg } from "../../../../services/backtest/src/
 import { RiskRewardPrimitive, type RiskRewardBox } from "./risk-reward-primitive";
 import { SmcOverlayPrimitive, type SmcLayers } from "./smc-overlay-primitive";
 import { computeSmcOverlays } from "./smc-overlays";
+import { regroup, supportResistance, type SrBar, type SrLevel } from "./sr-levels";
+
+/** Support/resistance timeframes, highest first. `minutes` 0 = built from daily candles. */
+const SR_FRAMES = [
+  { key: "1M", minutes: 0, pivot: 1, width: 2, style: LineStyle.Solid },
+  { key: "1D", minutes: 0, pivot: 2, width: 2, style: LineStyle.Solid },
+  { key: "4H", minutes: 240, pivot: 2, width: 1, style: LineStyle.Solid },
+  { key: "1H", minutes: 60, pivot: 3, width: 1, style: LineStyle.Dashed },
+  { key: "15m", minutes: 15, pivot: 3, width: 1, style: LineStyle.Dashed },
+  { key: "5m", minutes: 5, pivot: 3, width: 1, style: LineStyle.Dotted },
+  { key: "3m", minutes: 3, pivot: 4, width: 1, style: LineStyle.Dotted },
+  { key: "1m", minutes: 1, pivot: 5, width: 1, style: LineStyle.Dotted },
+] as const;
+type SrFrame = (typeof SR_FRAMES)[number]["key"];
+const SR_KEY = "tradepulse.backtest.srFrames";
+const SR_DEFAULT: Record<SrFrame, boolean> = { "1M": false, "1D": true, "4H": false, "1H": true, "15m": false, "5m": false, "3m": false, "1m": false };
+function loadSrFrames(): Record<SrFrame, boolean> {
+  try { const raw = window.localStorage.getItem(SR_KEY); return raw ? { ...SR_DEFAULT, ...JSON.parse(raw) } : SR_DEFAULT; } catch { return SR_DEFAULT; }
+}
+const SUPPORT = "rgba(95, 211, 163, 0.9)";
+const RESISTANCE = "rgba(240, 138, 138, 0.9)";
 
 const SMC_LAYERS_KEY = "tradepulse.backtest.smcLayers";
 const SMC_LAYER_LABELS: Array<[keyof SmcLayers, string, string]> = [
@@ -39,14 +60,14 @@ const ENTRY_COLOR = "#e4f1f1";
 
 const istDay = (epochS: number) => new Date((epochS + IST_S) * 1000).toISOString().slice(0, 10);
 /** Buckets align to the 09:15 IST session open, so 15m and 1H bars match what brokers show. */
-function bucketOf(epochS: number, tf: Timeframe) {
+function bucketOf(epochS: number, tf: number) {
   const open = Math.floor((epochS + IST_S) / 86_400) * 86_400 - IST_S + SESSION_OPEN_S;
   return open + Math.floor((epochS - open) / (tf * 60)) * tf * 60;
 }
 /** lightweight-charts renders timestamps as UTC; shift by +05:30 so the axis reads IST. */
 const chartTime = (epochS: number) => (epochS + IST_S) as UTCTimestamp;
 
-function aggregate(rows: CandleRow[], tf: Timeframe): Bar[] {
+function aggregate(rows: CandleRow[], tf: number): Bar[] {
   const bars: Bar[] = [];
   for (const [time, open, high, low, close, volume] of rows) {
     const bucket = bucketOf(time, tf);
@@ -92,7 +113,7 @@ const SPEEDS = [1, 3, 10, 30, 60];
 /** A trade as far as it has happened by `cutoff` (replay): only the legs already filled. */
 type VisibleTrade = BacktestTrade & { visibleLegs: TradeLeg[]; open: boolean };
 
-export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinutes = null, trades, focusId, onFocus }: { symbol: string; candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; trades: BacktestTrade[]; focusId: number | null; onFocus: (id: number | null) => void }) {
+export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinutes = null, dailyCandles = null, trades, focusId, onFocus }: { symbol: string; candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; dailyCandles?: CandleRow[] | null; trades: BacktestTrade[]; focusId: number | null; onFocus: (id: number | null) => void }) {
   const [tf, setTf] = useState<Timeframe>(5);
   const [showEma, setShowEma] = useState(true);
   const [showVwap, setShowVwap] = useState(true);
@@ -101,6 +122,15 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const [replay, setReplay] = useState<Replay | null>(null);
   const [replayPick, setReplayPick] = useState("");
   const [layers, setLayers] = useState<SmcLayers>({ fvg: true, ob: true, liquidity: true, structure: true });
+  const [srFrames, setSrFrames] = useState<Record<SrFrame, boolean>>(SR_DEFAULT);
+  useEffect(() => { setSrFrames(loadSrFrames()); }, []);
+  const toggleSr = (key: SrFrame) => setSrFrames((current) => {
+    const next = { ...current, [key]: !current[key] };
+    try { window.localStorage.setItem(SR_KEY, JSON.stringify(next)); } catch { /* storage unavailable: keep in memory */ }
+    return next;
+  });
+  /** Set once the user zooms with the buttons during a replay, so the replay stops re-framing the day. */
+  const [manualView, setManualView] = useState(false);
   useEffect(() => { setLayers(loadLayers()); }, []);
   const toggleLayer = (key: keyof SmcLayers) => setLayers((current) => {
     const next = { ...current, [key]: !current[key] };
@@ -117,6 +147,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const markers = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const boxes = useRef<RiskRewardPrimitive | null>(null);
   const smcLayer = useRef<SmcOverlayPrimitive | null>(null);
+  const srLines = useRef<IPriceLine[]>([]);
   const priceLines = useRef<IPriceLine[]>([]);
 
   // Replay: the previous session for context plus the replayed day, printed up to the cursor.
@@ -165,7 +196,8 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
       grid: { vertLines: { color: "rgba(65,116,125,.10)" }, horzLines: { color: "rgba(65,116,125,.14)" } },
       crosshair: { mode: CrosshairMode.Normal, vertLine: { color: "#4f7d86", labelBackgroundColor: "#173944" }, horzLine: { color: "#4f7d86", labelBackgroundColor: "#173944" } },
       rightPriceScale: { borderColor: "#173944", scaleMargins: { top: 0.12, bottom: 0.06 } },
-      timeScale: { borderColor: "#173944", timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 7 },
+      // minBarSpacing stops zoom-out from squashing months of candles into hairlines.
+      timeScale: { borderColor: "#173944", timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 7, minBarSpacing: 1.5 },
       localization: { locale: "en-IN" },
     });
     candleSeries.current = instance.addSeries(CandlestickSeries, { upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN, priceLineColor: "#4f7d86", priceFormat: { type: "price", precision: 2, minMove: 0.01 } });
@@ -186,7 +218,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     };
     instance.subscribeCrosshairMove(onMove);
     chart.current = instance;
-    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; };
+    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; srLines.current = []; };
   }, [hasVolume]);
 
   // Price, volume and indicator data.
@@ -203,6 +235,44 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const anyLayer = layers.fvg || layers.ob || layers.liquidity || layers.structure;
   const overlays = useMemo(() => (anyLayer ? computeSmcOverlays(bars) : { fvgs: [], orderBlocks: [], liquidity: [], structure: [] }), [bars, anyLayer]);
   useEffect(() => { smcLayer.current?.set(overlays, layers); }, [overlays, layers, hasVolume]);
+
+  // Support / resistance per timeframe, from COMPLETED candles only (live-like on a replay).
+  const srAvailable = (frame: (typeof SR_FRAMES)[number]) => (frame.minutes === 0 ? Boolean(dailyCandles?.length) : frame.minutes >= baseMinutes);
+  const srLevels = useMemo(() => {
+    const out: Array<SrLevel & { frame: (typeof SR_FRAMES)[number] }> = [];
+    const lastRow = visibleRows.at(-1);
+    if (!lastRow) return out;
+    const end = lastRow[0] + baseMinutes * 60;
+    const today = istDay(lastRow[0]);
+    const price = lastRow[4];
+    const toBar = (row: CandleRow): SrBar => ({ time: row[0], open: row[1], high: row[2], low: row[3], close: row[4] });
+    const priorDays = (dailyCandles ?? []).filter((row) => istDay(row[0]) < today).map(toBar);
+    for (const frame of SR_FRAMES) {
+      if (!srFrames[frame.key] || !srAvailable(frame)) continue;
+      let frameBars: SrBar[];
+      if (frame.key === "1D") frameBars = priorDays.slice(-120);
+      else if (frame.key === "1M") {
+        const month = (time: number) => { const d = new Date((time + IST_S) * 1000); return d.getUTCFullYear() * 12 + d.getUTCMonth(); };
+        const current = month(lastRow[0]);
+        frameBars = regroup(priorDays, month).filter((bar) => bar.time < current);
+      } else frameBars = aggregate(visibleRows, frame.minutes).filter((bar) => bar.time + frame.minutes * 60 <= end).slice(-300);
+      for (const level of supportResistance(frameBars, { pivot: frame.pivot, perSide: 2, price })) out.push({ ...level, frame });
+    }
+    return out;
+  }, [visibleRows, baseMinutes, dailyCandles, srFrames]);
+  useEffect(() => {
+    const series = candleSeries.current;
+    if (!series) return;
+    for (const line of srLines.current) series.removePriceLine(line);
+    srLines.current = srLevels.map((level) => series.createPriceLine({
+      price: level.price,
+      title: `${level.frame.key} ${level.role === "R" ? "Res" : "Sup"}${level.touches > 1 ? ` ×${level.touches}` : ""}`,
+      color: level.role === "R" ? RESISTANCE : SUPPORT,
+      lineWidth: level.frame.width,
+      lineStyle: level.frame.style,
+      axisLabelVisible: true,
+    }));
+  }, [srLevels, hasVolume]);
 
   useEffect(() => { emaSeries.current?.applyOptions({ visible: showEma }); }, [showEma, hasVolume]);
   useEffect(() => { vwapSeries.current?.applyOptions({ visible: showVwap }); }, [showVwap, hasVolume]);
@@ -275,12 +345,12 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   // Replay viewport: the whole session width is reserved up front, so candles print left to right
   // across an empty day exactly as they would live.
   useEffect(() => {
-    if (!replayDay || !chart.current) return;
+    if (!replayDay || !chart.current || manualView) return;
     const first = bars.findIndex((bar) => istDay(bar.time) === replayDay);
     if (first < 0) return;
     chart.current.timeScale().setVisibleLogicalRange({ from: first - 12, to: first + Math.ceil(375 / tf) + 4 });
     // Re-pinned on every printed candle: the chart would otherwise shift the view as bars are added.
-  }, [replayDay, tf, hasVolume, bars]);
+  }, [replayDay, tf, hasVolume, bars, manualView]);
 
   // Replay clock.
   const playing = replay?.playing ?? false;
@@ -295,7 +365,25 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     return () => clearInterval(id);
   }, [playing, speed, replayLength]);
 
-  const startReplay = (day: string) => { if (!day) return; setReplay({ day, cursor: 1, playing: true, speed: replay?.speed ?? 10 }); };
+  const startReplay = (day: string) => { if (!day) return; setManualView(false); setReplay({ day, cursor: 1, playing: true, speed: replay?.speed ?? 10 }); };
+
+  // Zoom around the centre of the view; Fit frames the current session and resets the price axis
+  // (fitting months of candles into one screen is what made the old "Fit all" look stretched).
+  const zoom = (factor: number) => {
+    const scale = chart.current?.timeScale();
+    const range = scale?.getVisibleLogicalRange();
+    if (!scale || !range) return;
+    const centre = (range.from + range.to) / 2;
+    const half = Math.max(8, ((range.to - range.from) / 2) * factor);
+    scale.setVisibleLogicalRange({ from: centre - half, to: centre + half });
+    if (replayDay) setManualView(true);
+  };
+  const fit = () => {
+    chart.current?.priceScale("right").applyOptions({ autoScale: true });
+    setManualView(false);
+    if (replayDay) return; // the replay effect re-frames the day
+    showDay(focused?.day ?? days.at(-1));
+  };
   const stopReplay = () => { setReplay(null); if (tf < candleMinutes) setTf(5); };
 
   function showDay(day: string | undefined) {
@@ -351,6 +439,17 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
             <label key={key} title={help} className={`bt-smc-${key}`}><input type="checkbox" checked={layers[key]} onChange={() => toggleLayer(key)} />{label}</label>
           ))}
         </fieldset>
+        <fieldset className="bt-smc-layers bt-sr-frames" aria-label="Support and resistance by timeframe">
+          <legend>S/R</legend>
+          {SR_FRAMES.map((frame) => {
+            const available = srAvailable(frame);
+            return (
+              <label key={frame.key} title={available ? `Support/resistance from ${frame.key} swing pivots (clustered; ×n = touches)` : frame.minutes === 0 ? "Daily history not available for this run" : `Needs 1-minute candles: run ≤ 3 months, or use a replay day`} className={available ? "" : "off"}>
+                <input type="checkbox" checked={srFrames[frame.key] && available} disabled={!available} onChange={() => toggleSr(frame.key)} />{frame.key}
+              </label>
+            );
+          })}
+        </fieldset>
         <select className="bt-candles-day" aria-label="Jump to session" value="" onChange={(event) => { onFocus(null); showDay(event.target.value); }}>
           <option value="" disabled>Jump to session…</option>
           {days.map((day) => <option key={day} value={day}>{dayName(day)}</option>)}
@@ -367,7 +466,9 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
           <button type="button" className="bt-replay-go" onClick={() => startReplay(replayPick || focused?.day || allDays.at(-1) || "")}>▶ Replay day</button>
         </div>
         <div className="bt-seg">
-          <button type="button" onClick={() => { onFocus(null); stopReplay(); chart.current?.timeScale().fitContent(); }}>Fit all</button>
+          <button type="button" onClick={() => zoom(0.7)} aria-label="Zoom in" title="Zoom in">＋</button>
+          <button type="button" onClick={() => zoom(1 / 0.7)} aria-label="Zoom out" title="Zoom out">－</button>
+          <button type="button" onClick={fit} aria-label="Fit session" title="Fit the current session and reset the price scale">Fit</button>
           <button type="button" onClick={toggleFullscreen} aria-label="Full screen">⛶</button>
         </div>
       </div>

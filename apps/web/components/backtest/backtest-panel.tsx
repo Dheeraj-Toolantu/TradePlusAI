@@ -5,7 +5,7 @@ import { BacktestCandles, type CandleRow } from "./backtest-candles";
 import type { BacktestResult, BacktestSettings, BacktestTrade, StrategyId } from "../../../../services/backtest/src/strategy-backtest";
 import type { OptimizerResult, OptimizerRow } from "../../../../services/backtest/src/optimizer";
 
-type Result = BacktestResult & { candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; optimization?: OptimizerResult | null; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
+type Result = BacktestResult & { candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; dailyCandles?: CandleRow[] | null; optimization?: OptimizerResult | null; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
 type Source = "groww" | "yahoo" | "synthetic";
 type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
@@ -187,7 +187,7 @@ function BacktestResults({ result, onApply }: { result: Result; onApply: (overri
       {result.candles?.length ? (
         <section className="paper-panel bt-chart-panel bt-candles-panel" ref={chartPanel}>
           <div className="paper-panel-heading"><div><span className="paper-kicker">PRICE CHART</span><h2>{result.symbol} candles with every simulated entry and exit</h2></div></div>
-          <BacktestCandles symbol={result.symbol} candles={result.candles} candleMinutes={result.candleMinutes} replayMinutes={result.replayMinutes ?? null} trades={result.trades} focusId={chartTrade} onFocus={setChartTrade} />
+          <BacktestCandles symbol={result.symbol} candles={result.candles} candleMinutes={result.candleMinutes} replayMinutes={result.replayMinutes ?? null} dailyCandles={result.dailyCandles ?? null} trades={result.trades} focusId={chartTrade} onFocus={setChartTrade} />
         </section>
       ) : null}
 
