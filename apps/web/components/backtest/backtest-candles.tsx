@@ -4,6 +4,20 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, createSeriesMarkers, type IChartApi, type IPriceLine, type ISeriesApi, type ISeriesMarkersPluginApi, type MouseEventParams, type SeriesMarker, type Time, type UTCTimestamp } from "lightweight-charts";
 import type { BacktestTrade, TradeLeg } from "../../../../services/backtest/src/strategy-backtest";
 import { RiskRewardPrimitive, type RiskRewardBox } from "./risk-reward-primitive";
+import { SmcOverlayPrimitive, type SmcLayers } from "./smc-overlay-primitive";
+import { computeSmcOverlays } from "./smc-overlays";
+
+const SMC_LAYERS_KEY = "tradepulse.backtest.smcLayers";
+const SMC_LAYER_LABELS: Array<[keyof SmcLayers, string, string]> = [
+  ["fvg", "FVG", "Fair value gaps: 3-candle imbalances, open until price fills them"],
+  ["ob", "Order blocks", "Last opposite candle before a break of structure, active until closed through"],
+  ["liquidity", "Liquidity", "Unswept swing highs (BSL) / lows (SSL), equal highs/lows (EQH/EQL); ✕ = swept"],
+  ["structure", "BOS / CHoCH", "Break of structure (trend continues) / change of character (trend flips) on a close"],
+];
+function loadLayers(): SmcLayers {
+  const fallback: SmcLayers = { fvg: true, ob: true, liquidity: true, structure: true };
+  try { const raw = window.localStorage.getItem(SMC_LAYERS_KEY); return raw ? { ...fallback, ...JSON.parse(raw) } : fallback; } catch { return fallback; }
+}
 
 /** [epoch seconds, open, high, low, close, volume] — 1-minute bars as returned by /api/backtest. */
 export type CandleRow = [number, number, number, number, number, number];
@@ -86,6 +100,13 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const [legend, setLegend] = useState<Legend | null>(null);
   const [replay, setReplay] = useState<Replay | null>(null);
   const [replayPick, setReplayPick] = useState("");
+  const [layers, setLayers] = useState<SmcLayers>({ fvg: true, ob: true, liquidity: true, structure: true });
+  useEffect(() => { setLayers(loadLayers()); }, []);
+  const toggleLayer = (key: keyof SmcLayers) => setLayers((current) => {
+    const next = { ...current, [key]: !current[key] };
+    try { window.localStorage.setItem(SMC_LAYERS_KEY, JSON.stringify(next)); } catch { /* storage unavailable: keep in memory */ }
+    return next;
+  });
   const wrap = useRef<HTMLDivElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
@@ -95,6 +116,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const vwapSeries = useRef<ISeriesApi<"Line"> | null>(null);
   const markers = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const boxes = useRef<RiskRewardPrimitive | null>(null);
+  const smcLayer = useRef<SmcOverlayPrimitive | null>(null);
   const priceLines = useRef<IPriceLine[]>([]);
 
   // Replay: the previous session for context plus the replayed day, printed up to the cursor.
@@ -152,6 +174,8 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     volumeSeries.current = hasVolume ? instance.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceLineVisible: false, lastValueVisible: false }, 1) : null;
     if (hasVolume) instance.panes()[1]?.setHeight(84);
     markers.current = createSeriesMarkers(candleSeries.current, [], { zOrder: "top" });
+    smcLayer.current = new SmcOverlayPrimitive();
+    candleSeries.current.attachPrimitive(smcLayer.current);
     boxes.current = new RiskRewardPrimitive();
     candleSeries.current.attachPrimitive(boxes.current);
     const onMove = (param: MouseEventParams<Time>) => {
@@ -162,7 +186,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     };
     instance.subscribeCrosshairMove(onMove);
     chart.current = instance;
-    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; priceLines.current = []; };
+    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; };
   }, [hasVolume]);
 
   // Price, volume and indicator data.
@@ -174,6 +198,11 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     vwapSeries.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: vwapValues[index] })));
     if (bars.length) setLegend({ bar: bars.at(-1)!, ema: emaValues.at(-1), vwap: vwapValues.at(-1) });
   }, [bars, emaValues, vwapValues, hasVolume]);
+
+  // Smart-money overlays, computed from the candles on screen (so a replay only sees the past).
+  const anyLayer = layers.fvg || layers.ob || layers.liquidity || layers.structure;
+  const overlays = useMemo(() => (anyLayer ? computeSmcOverlays(bars) : { fvgs: [], orderBlocks: [], liquidity: [], structure: [] }), [bars, anyLayer]);
+  useEffect(() => { smcLayer.current?.set(overlays, layers); }, [overlays, layers, hasVolume]);
 
   useEffect(() => { emaSeries.current?.applyOptions({ visible: showEma }); }, [showEma, hasVolume]);
   useEffect(() => { vwapSeries.current?.applyOptions({ visible: showVwap }); }, [showVwap, hasVolume]);
@@ -316,6 +345,12 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
           <button type="button" className={showVwap ? "on" : ""} aria-pressed={showVwap} onClick={() => setShowVwap(!showVwap)}><i className="dashed" style={{ borderColor: VWAP_COLOR }} />VWAP</button>
           <button type="button" className={showTrades ? "on" : ""} aria-pressed={showTrades} onClick={() => setShowTrades(!showTrades)}>Trades</button>
         </div>
+        <fieldset className="bt-smc-layers" aria-label="Smart-money overlays">
+          <legend>SMC</legend>
+          {SMC_LAYER_LABELS.map(([key, label, help]) => (
+            <label key={key} title={help} className={`bt-smc-${key}`}><input type="checkbox" checked={layers[key]} onChange={() => toggleLayer(key)} />{label}</label>
+          ))}
+        </fieldset>
         <select className="bt-candles-day" aria-label="Jump to session" value="" onChange={(event) => { onFocus(null); showDay(event.target.value); }}>
           <option value="" disabled>Jump to session…</option>
           {days.map((day) => <option key={day} value={day}>{dayName(day)}</option>)}
@@ -390,7 +425,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
           <p>{focused.reason}</p>
         </div>
       ) : (
-        <p className="bt-candles-hint">Boxes show each trade's risk (orange, entry → stop) and reward (blue, entry → T2, dashed T1) with its R:R. Arrows mark entries; dots mark exits at the fill price. Pick a session and press ▶ Replay day to watch it print candle by candle. Use ‹ › to step through trades, or click a trade in the log. Times are IST.</p>
+        <p className="bt-candles-hint">SMC overlays (tick to show): <b className="bt-key-bull">cyan = bullish</b>, <b className="bt-key-bear">magenta = bearish</b>; dashed boxes are FVGs, solid boxes order blocks, dotted lines liquidity (BSL/SSL, EQH/EQL, ✕ swept), labelled lines BOS / CHoCH. Trade boxes show risk (orange, entry → stop) and reward (blue, entry → T2, dashed T1) with the R:R. Arrows mark entries; dots mark exits at the fill price. Pick a session and press ▶ Replay day to watch it print candle by candle. Use ‹ › to step through trades, or click a trade in the log. Times are IST.</p>
       )}
     </div>
   );

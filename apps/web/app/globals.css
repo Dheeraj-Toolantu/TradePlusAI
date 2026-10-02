@@ -771,3 +771,17 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .bt-replay-status b.short, .bt-replay-status b.down { color: #f0a57a; }
 .bt-candles-trade .bt-link { margin-left: 0; }
 .bt-candles-trade .bt-link:first-of-type { margin-left: auto; }
+
+/* SMC overlay toggles */
+.bt-smc-layers { display: inline-flex; align-items: center; gap: 0; margin: 0; padding: 0 0 0 8px; border: 1px solid #23505a; border-radius: 5px; }
+.bt-smc-layers legend { float: left; margin-right: 6px; padding: 0; color: #6f9097; font: 9px "DM Mono", monospace; letter-spacing: .1em; }
+.bt-smc-layers label { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border-left: 1px solid #23505a; color: #b5cbcd; font: 10px "DM Mono", monospace; cursor: pointer; white-space: nowrap; }
+.bt-smc-layers label:hover { background: #10303a; }
+.bt-smc-layers input { margin: 0; accent-color: #30d4ca; }
+.bt-key-bull { color: #7fe8e0; font-weight: 600; }
+.bt-key-bear { color: #f2a3d0; font-weight: 600; }
+@media (max-width: 760px) {
+  .bt-smc-layers { flex-wrap: wrap; padding: 0; }
+  .bt-smc-layers legend { display: none; }
+  .bt-smc-layers label { border-left: 0; border-right: 1px solid #23505a; }
+}
