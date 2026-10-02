@@ -4,13 +4,14 @@ import { Fragment, useMemo, useRef, useState } from "react";
 import { BacktestCandles, type CandleRow } from "./backtest-candles";
 import type { BacktestResult, BacktestSettings, BacktestTrade, StrategyId } from "../../../../services/backtest/src/strategy-backtest";
 
-type Result = BacktestResult & { candles: CandleRow[]; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
+type Result = BacktestResult & { candles: CandleRow[]; candleMinutes?: number; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
 type Source = "groww" | "yahoo" | "synthetic";
 type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
 const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
   { id: "MTF_AI", title: "AI multi-timeframe", detail: "1D context · 15m direction · 5m pullback · 1m candle trigger, with the AI monitor's entry/stop/target rules." },
   { id: "ORB_RETEST", title: "V5 ORB retest", detail: "Opening-range break, retest and hold with a structural stop and 2R target capped at PDH/PDL." },
+  { id: "SMC_SWEEP", title: "SMC liquidity sweep", detail: "S/R + liquidity sweep → CHoCH with displacement → retrace into the FVG / order block → 1m candle confirmation. Stop beyond the sweep, targets at opposing liquidity." },
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };
@@ -19,6 +20,20 @@ const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnl
 const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
 const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getUTCDay(); return dow !== 0 && dow !== 6; };
+/** Per-strategy time stop: the SMC entry needs room to retrace from the zone before it runs. */
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 15, SMC_SWEEP: 30 };
+type Preset = { key: string; label: string; sessions?: number; months?: number };
+const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
+function lastMonths(months: number) {
+  const { to } = lastSessions(1);
+  const date = new Date(`${to}T00:00:00Z`);
+  date.setUTCMonth(date.getUTCMonth() - months);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return { from: date.toISOString().slice(0, 10), to };
+}
+const rangeFor = (preset: Preset) => (preset.months ? lastMonths(preset.months) : lastSessions(preset.sessions ?? 10));
+type RunError = { message: string; issues: string[] };
+
 /** The last `sessions` weekdays ending today (or the last weekday). */
 function lastSessions(sessions: number) {
   let to = istToday();
@@ -38,27 +53,30 @@ const reasonLabel = (reason: string) => reason.replaceAll("_", " ").toLowerCase(
 export function BacktestPanel() {
   const [strategy, setStrategy] = useState<StrategyId>("MTF_AI");
   const [symbol, setSymbol] = useState<Symbol>("NIFTY");
-  const [range, setRange] = useState(() => lastSessions(10));
-  const [preset, setPreset] = useState<number | null>(10);
+  const [range, setRange] = useState(() => lastSessions(20));
+  const [preset, setPreset] = useState<string | null>("20");
   const [source, setSource] = useState<Source>("groww");
   const [settings, setSettings] = useState<BacktestSettings>(DEFAULTS);
   const [running, setRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<RunError | null>(null);
   const [result, setResult] = useState<Result | null>(null);
 
   const update = <K extends keyof BacktestSettings>(key: K, value: BacktestSettings[K]) => setSettings((current) => ({ ...current, [key]: value }));
   const chooseSymbol = (next: Symbol) => { setSymbol(next); setSettings((current) => ({ ...current, lotSize: LOT_SIZE[next], thetaPerDay: THETA[next] })); };
-  const choosePreset = (sessions: number) => { setPreset(sessions); setRange(lastSessions(sessions)); };
+  const choosePreset = (item: Preset) => { setPreset(item.key); setRange(rangeFor(item)); };
+  const chooseStrategy = (next: StrategyId) => { setStrategy(next); setSettings((current) => ({ ...current, timeStopMinutes: TIME_STOP[next] })); };
+  const spanDays = Math.round((Date.parse(range.to) - Date.parse(range.from)) / 86_400_000) + 1;
 
   async function run() {
-    setRunning(true); setError(null);
+    // Clear the previous run so an error is never shown above stale results from another period.
+    setRunning(true); setError(null); setResult(null);
     try {
       const response = await fetch("/api/backtest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ strategy, symbol, from: range.from, to: range.to, source, settings }) });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Backtest failed");
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) { setError({ message: body.error ?? `Backtest failed (HTTP ${response.status})`, issues: Array.isArray(body.issues) ? body.issues : [] }); return; }
       setResult(body as Result);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Backtest failed");
+      setError({ message: reason instanceof Error ? reason.message : "Backtest failed", issues: [] });
     } finally { setRunning(false); }
   }
 
@@ -68,17 +86,17 @@ export function BacktestPanel() {
         <div className="paper-panel-heading"><div><span className="paper-kicker">STRATEGY BACKTEST · WALK-FORWARD ON 1-MINUTE BARS</span><h2>Test a strategy on past sessions</h2></div><span className="paper-lab-badge">SIMULATION ONLY</span></div>
         <div className="bt-strategies" role="radiogroup" aria-label="Strategy">
           {STRATEGIES.map((item) => (
-            <button key={item.id} type="button" role="radio" aria-checked={strategy === item.id} className={`bt-strategy${strategy === item.id ? " selected" : ""}`} onClick={() => setStrategy(item.id)}>
+            <button key={item.id} type="button" role="radio" aria-checked={strategy === item.id} className={`bt-strategy${strategy === item.id ? " selected" : ""}`} onClick={() => chooseStrategy(item.id)}>
               <b>{item.title}</b><span>{item.detail}</span>
             </button>
           ))}
         </div>
         <div className="bt-row">
           <label>Index<select value={symbol} onChange={(event) => chooseSymbol(event.target.value as Symbol)}><option>NIFTY</option><option>BANKNIFTY</option><option>SENSEX</option></select></label>
-          <div className="bt-field"><span>Period</span><div className="bt-presets">{[5, 10, 20].map((sessions) => <button key={sessions} type="button" className={preset === sessions ? "active" : ""} onClick={() => choosePreset(sessions)}>Last {sessions} sessions</button>)}</div></div>
+          <div className="bt-field"><span>Period</span><div className="bt-presets">{PRESETS.map((item) => <button key={item.key} type="button" className={preset === item.key ? "active" : ""} onClick={() => choosePreset(item)}>{item.label}</button>)}</div></div>
           <label>From<input type="date" value={range.from} max={range.to} onChange={(event) => { setPreset(null); setRange((current) => ({ ...current, from: event.target.value })); }} /></label>
           <label>To<input type="date" value={range.to} max={istToday()} onChange={(event) => { setPreset(null); setRange((current) => ({ ...current, to: event.target.value })); }} /></label>
-          <label>Data<select value={source} onChange={(event) => setSource(event.target.value as Source)}><option value="groww">Groww history</option><option value="yahoo">Yahoo (last ~7 days of 1m)</option><option value="synthetic">Synthetic demo data</option></select></label>
+          <label>Data<select value={source} onChange={(event) => setSource(event.target.value as Source)}><option value="groww">Groww history</option><option value="yahoo">Yahoo (last ~30 days only)</option><option value="synthetic">Synthetic demo data</option></select></label>
         </div>
         <details className="bt-settings">
           <summary>Risk &amp; execution settings <small>{settings.lots} lot × {settings.lotSize} · {settings.pnlMode === "OPTION" ? `option est. Δ ${settings.delta}` : "index points"} · max {settings.maxTradesPerDay} trades/day · daily loss ₹{settings.maxDailyLoss.toLocaleString("en-IN")}</small></summary>
@@ -96,7 +114,7 @@ export function BacktestPanel() {
             <NumberField label="Daily loss limit (₹)" value={settings.maxDailyLoss} step={500} onChange={(value) => update("maxDailyLoss", value)} />
             <NumberField label="Stop after N losses" value={settings.maxConsecutiveLosses} min={1} onChange={(value) => update("maxConsecutiveLosses", value)} />
             <NumberField label="Cooldown after loss (min)" value={settings.cooldownMinutes} onChange={(value) => update("cooldownMinutes", value)} />
-            <NumberField label="Min confidence (%)" value={settings.minConfidence} min={0} max={100} disabled={strategy !== "MTF_AI"} onChange={(value) => update("minConfidence", value)} />
+            <NumberField label="Min confidence (%)" value={settings.minConfidence} min={0} max={100} disabled={strategy === "ORB_RETEST"} onChange={(value) => update("minConfidence", value)} />
             <label>Entry from<input type="time" value={settings.entryStart} onChange={(event) => update("entryStart", event.target.value)} /></label>
             <label>Entry until<input type="time" value={settings.entryEnd} onChange={(event) => update("entryEnd", event.target.value)} /></label>
             <label>Square-off<input type="time" value={settings.squareOff} onChange={(event) => update("squareOff", event.target.value)} /></label>
@@ -106,9 +124,14 @@ export function BacktestPanel() {
         </details>
         <div className="bt-actions">
           <button type="button" className="paper-button primary" onClick={() => void run()} disabled={running}>{running ? "Running backtest…" : "Run backtest"}</button>
-          <span className="bt-hint">{running ? `Fetching 1-minute history for ${range.from} → ${range.to} and replaying every minute. This can take 10–40 seconds.` : "Signals only see candles that were complete at that moment; entries fill on the next 1-minute bar."}</span>
+          <span className="bt-hint">{running ? `Fetching 1-minute history for ${range.from} → ${range.to} and replaying every minute. ${spanDays > 45 ? "Several months of data can take 1–2 minutes." : "This can take 10–40 seconds."}` : `${spanDays} calendar days selected (max 190). Signals only see candles that were complete at that moment; entries fill on the next 1-minute bar.`}</span>
         </div>
-        {error ? <p className="bt-error" role="alert">{error}</p> : null}
+        {error ? (
+          <div className="bt-error" role="alert">
+            <strong>{error.message}</strong>
+            {error.issues.length ? <details><summary>Details ({error.issues.length})</summary><ul>{error.issues.map((issue) => <li key={issue}>{issue}</li>)}</ul></details> : null}
+          </div>
+        ) : null}
       </section>
 
       {result ? <BacktestResults result={result} /> : !running ? <section className="paper-panel bt-empty"><strong>No backtest yet</strong><p>Pick a strategy and period, then run. Use “Synthetic demo data” to explore the tool without a market-data connection.</p></section> : null}
@@ -153,7 +176,7 @@ function BacktestResults({ result }: { result: Result }) {
       {result.candles?.length ? (
         <section className="paper-panel bt-chart-panel bt-candles-panel" ref={chartPanel}>
           <div className="paper-panel-heading"><div><span className="paper-kicker">PRICE CHART</span><h2>{result.symbol} candles with every simulated entry and exit</h2></div></div>
-          <BacktestCandles symbol={result.symbol} candles={result.candles} trades={result.trades} focusId={chartTrade} onFocus={setChartTrade} />
+          <BacktestCandles symbol={result.symbol} candles={result.candles} candleMinutes={result.candleMinutes} trades={result.trades} focusId={chartTrade} onFocus={setChartTrade} />
         </section>
       ) : null}
 
