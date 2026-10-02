@@ -1,12 +1,16 @@
 import { NextResponse } from "next/server";
 import { DEFAULT_BACKTEST_SETTINGS, aggregate, istDay, listSignalSource, mtfSignalSource, runBacktest, type BacktestSettings, type Signal, type StrategyId } from "../../../../../services/backtest/src/strategy-backtest";
-import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, type BacktestSource } from "../../../lib/backtest-data";
+import { smcSignalSource } from "../../../../../services/backtest/src/smc-strategy";
+import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, validateSourceRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
 
 const STRATEGIES: Record<StrategyId, string> = {
   MTF_AI: "AI multi-timeframe (1D/15m/5m/1m + candle psychology)",
   ORB_RETEST: "V5 ORB break-and-retest (strategy rules)",
+  SMC_SWEEP: "SMC liquidity sweep (S/R, CHoCH, FVG/OB, candle psychology)",
 };
+/** Above this many sessions the chart gets 5-minute candles to keep the response small. */
+const MINUTE_CANDLE_SESSIONS = 45;
 
 const clampNumber = (value: unknown, fallback: number, min: number, max: number) => { const parsed = Number(value); return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback; };
 const hhmm = (value: unknown, fallback: string) => (typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value) ? value : fallback);
@@ -52,15 +56,20 @@ export async function POST(request: Request) {
   const source: BacktestSource = body.source === "yahoo" ? "yahoo" : body.source === "synthetic" ? "synthetic" : "groww";
   if (!(strategy in STRATEGIES)) return NextResponse.json({ error: "Unknown strategy" }, { status: 400 });
   if (!(BACKTEST_SYMBOLS as readonly string[]).includes(symbol)) return NextResponse.json({ error: "Backtests support NIFTY, BANKNIFTY and SENSEX" }, { status: 400 });
-  const rangeError = validateRange(from, to);
+  const rangeError = validateRange(from, to) ?? validateSourceRange(source, from);
   if (rangeError) return NextResponse.json({ error: rangeError }, { status: 400 });
   const settings = settingsFrom((body.settings ?? {}) as Record<string, unknown>);
   const started = Date.now();
   const data = await loadBacktestData({ symbol, from, to, source, origin: new URL(request.url).origin });
-  if (!data.sessions) return NextResponse.json({ error: `No 1-minute data for ${symbol} between ${from} and ${to}. ${data.issues.slice(0, 3).join("; ")}`, issues: data.issues }, { status: 422 });
+  if (!data.sessions) {
+    const hint = source === "groww" ? "Check that the Groww API is connected (GROWW_API_KEY / secret) and that the dates are trading days." : "Yahoo only serves the last ~30 days of 1-minute candles; use Groww history for older periods.";
+    return NextResponse.json({ error: `No 1-minute candles for ${symbol} between ${from} and ${to}. ${hint}`, issues: data.issues }, { status: 422 });
+  }
 
   let signalAt: Parameters<typeof runBacktest>[0]["signalAt"];
+  let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
+  else if (strategy === "SMC_SWEEP") { const smc = smcSignalSource(symbol, data.minute, data.daily); funnel = smc.funnel; signalAt = smc; }
   else {
     try {
       const replay = await runPythonModule<{ signals: Array<{ time: number; side: 1 | -1; stop: number; target1: number; reason: string }> }>("tradepulse_quant.backtest.orb_backtest", { symbol, from, candles_5m: aggregate(data.minute, 5), daily_candles: data.daily }, 120_000);
@@ -72,11 +81,18 @@ export async function POST(request: Request) {
   const result = runBacktest({ strategy, symbol, from, to, minute: data.minute, signalAt, settings });
   const notes = [...result.notes];
   if (strategy === "MTF_AI") notes.push("Replays the deterministic multi-timeframe engine the AI monitor relies on. The LLM's discretionary layer, live OI/PCR flow and sentiment cannot be replayed historically.");
+  else if (strategy === "SMC_SWEEP") {
+    if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.counterTrend} counter-trend. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
+    notes.push("SMC rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m rejection or engulfing. Stop beyond the sweep; T1 1.5R or opposing liquidity; T2 next opposing liquidity. Counter-trend (vs 15m structure) only off a daily level.");
+  }
   else notes.push("Replays the V5 ORB strategy rules. Live-only no-trade gates (OI flow, India VIX, broker health) have no history and are not applied.");
   if (data.delayed) notes.push("Some days came from the delayed Yahoo feed; historical candles are still valid for a backtest.");
   if (source === "synthetic") notes.unshift("SYNTHETIC DEMO DATA: a seeded random walk for exploring the tool. These numbers say nothing about real-market performance.");
-  // 1-minute candles of the tested sessions (warm-up days excluded) for the candlestick view, as
-  // compact [time, open, high, low, close, volume] rows; the browser aggregates other timeframes.
-  const candles = data.minute.filter((bar) => { const day = istDay(bar.time); return day >= from && day <= to; }).map((bar) => [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0]);
-  return NextResponse.json({ ...result, candles, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
+  // Candles of the tested sessions (warm-up days excluded) for the candlestick view: 1-minute, or
+  // 5-minute for long ranges, as compact [time, open, high, low, close, volume] rows; the browser
+  // aggregates other timeframes.
+  const tested = data.minute.filter((bar) => { const day = istDay(bar.time); return day >= from && day <= to; });
+  const candleMinutes = data.sessions > MINUTE_CANDLE_SESSIONS ? 5 : 1;
+  const candles = (candleMinutes === 1 ? tested : aggregate(tested, candleMinutes)).map((bar) => [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0]);
+  return NextResponse.json({ ...result, candles, candleMinutes, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
 }

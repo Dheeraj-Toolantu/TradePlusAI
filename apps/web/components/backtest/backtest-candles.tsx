@@ -34,7 +34,7 @@ const chartTime = (epochS: number) => (epochS + IST_S) as UTCTimestamp;
 function aggregate(rows: CandleRow[], tf: Timeframe): Bar[] {
   const bars: Bar[] = [];
   for (const [time, open, high, low, close, volume] of rows) {
-    const bucket = tf === 1 ? time : bucketOf(time, tf);
+    const bucket = bucketOf(time, tf);
     const last = bars.at(-1);
     if (last && last.time === bucket) { last.high = Math.max(last.high, high); last.low = Math.min(last.low, low); last.close = close; last.volume += volume; }
     else bars.push({ time: bucket, open, high, low, close, volume });
@@ -72,7 +72,8 @@ const fillBar = (exitEpochS: number) => exitEpochS - 60;
 
 type Legend = { bar: Bar; ema?: number; vwap?: number };
 
-export function BacktestCandles({ symbol, candles, trades, focusId, onFocus }: { symbol: string; candles: CandleRow[]; trades: BacktestTrade[]; focusId: number | null; onFocus: (id: number | null) => void }) {
+export function BacktestCandles({ symbol, candles, candleMinutes = 1, trades, focusId, onFocus }: { symbol: string; candles: CandleRow[]; candleMinutes?: number; trades: BacktestTrade[]; focusId: number | null; onFocus: (id: number | null) => void }) {
+  const timeframes = TIMEFRAMES.filter((value) => value >= candleMinutes);
   const [tf, setTf] = useState<Timeframe>(5);
   const [showEma, setShowEma] = useState(true);
   const [showVwap, setShowVwap] = useState(true);
@@ -210,7 +211,7 @@ export function BacktestCandles({ symbol, candles, trades, focusId, onFocus }: {
     <div className="bt-candles" ref={wrap}>
       <div className="bt-candles-toolbar" role="toolbar" aria-label="Chart controls">
         <div className="bt-seg" role="group" aria-label="Timeframe">
-          {TIMEFRAMES.map((value) => <button key={value} type="button" className={tf === value ? "on" : ""} aria-pressed={tf === value} onClick={() => setTf(value)}>{tfLabel(value)}</button>)}
+          {timeframes.map((value) => <button key={value} type="button" className={tf === value ? "on" : ""} aria-pressed={tf === value} onClick={() => setTf(value)}>{tfLabel(value)}</button>)}
         </div>
         <div className="bt-seg" role="group" aria-label="Overlays">
           <button type="button" className={showEma ? "on" : ""} aria-pressed={showEma} onClick={() => setShowEma(!showEma)}><i style={{ background: EMA_COLOR }} />EMA 20</button>
