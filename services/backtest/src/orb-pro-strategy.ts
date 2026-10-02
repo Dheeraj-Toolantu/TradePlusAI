@@ -6,8 +6,9 @@ import { aggregate, istDay, istMinute, type Signal } from "./strategy-backtest";
  *
  * SENTIMENT FIRST (before the open is even done)
  *  - Gap: an open beyond yesterday's high/low, or more than 0.4× the average daily range (ADR) from
- *    yesterday's close, is a gap day. Gap days use a 30-minute opening range — the first 15 minutes
- *    after a gap are overnight orders being filled, not price discovery.
+ *    yesterday's close, is a gap day. By default gap days are NOT traded: on real NIFTY 1-minute data
+ *    (2024–2026) ORB retests after a gap lost in both directions — the first hour is overnight orders
+ *    being filled and gaps tend to fill. (With gapDays BONUS/PENALTY they use a 30-minute range.)
  *  - Yesterday's close location (top/bottom 30% of its range) tells who finished in control.
  *  - An opening range wider than 0.6 ADR has already spent most of the day's move: no trade.
  *
@@ -62,7 +63,15 @@ const emptyFunnel = (): OrbProFunnel => ({ days: 0, gapDays: 0, orTooWide: 0, br
 
 type Breakout = { dir: 1 | -1; level: number; k: number; time: number; extreme: number; touched: boolean; lastTouch: number; afterFailure: boolean; quality: number; closesBeyond: number };
 
-export function orbProSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
+/** Tunable rules (defaults are the validated ones; the alternatives exist for walk-forward checks). */
+export type OrbProOptions = { t1: "MEASURED" | "ONE_R"; gapDays: "BONUS" | "PENALTY" | "SKIP" };
+// Validated on real NIFTY 1-minute data (Jan 2024 – Oct 2026): chosen on 2024–25, confirmed on 2026.
+// Gap days are skipped: ORB retests on gap days lost money in both directions (overnight orders make
+// the first hour a two-sided auction, and gaps tend to fill).
+export const ORB_PRO_DEFAULTS: OrbProOptions = { t1: "MEASURED", gapDays: "SKIP" };
+
+export function orbProSignalSource(symbol: string, minute: Bar[], daily: Bar[], overrides: Partial<OrbProOptions> = {}) {
+  const options: OrbProOptions = { ...ORB_PRO_DEFAULTS, ...overrides };
   const m5 = aggregate(minute, 5);
   const roundStep = symbol === "NIFTY" ? 50 : 100;
   const funnel = emptyFunnel();
@@ -236,7 +245,7 @@ export function orbProSignalSource(symbol: string, minute: Bar[], daily: Bar[]) 
     // ---- Targets and room -------------------------------------------------------------------------
     const width = s.orHigh - s.orLow;
     const measured = (b.level + d * width - entry) * d;
-    const t1Distance = Math.min(1.5 * risk, Math.max(risk, measured));
+    const t1Distance = options.t1 === "ONE_R" ? risk : Math.min(1.5 * risk, Math.max(risk, measured));
     const obstacle = d > 0 ? s.prevHigh : s.prevLow;
     const room = Number.isFinite(obstacle) && (obstacle - entry) * d > 0 ? (obstacle - entry) * d : Infinity;
     if (room < risk) { funnel.noRoom += 1; s.breakout = null; return; }
@@ -247,7 +256,9 @@ export function orbProSignalSource(symbol: string, minute: Bar[], daily: Bar[]) 
     // ---- Conviction score -------------------------------------------------------------------------
     const reasons: string[] = [];
     let confidence = 55;
-    if (s.gapDay && s.gapDir === d) { confidence += 10; reasons.push("gap-and-go in the gap's direction"); }
+    if (s.gapDay && options.gapDays === "SKIP") { s.breakout = null; return; }
+    if (s.gapDay && options.gapDays === "PENALTY") { confidence -= 8; reasons.push("gap day: overnight orders, two-sided early auction (−)"); }
+    else if (s.gapDay && s.gapDir === d) { confidence += 10; reasons.push("gap-and-go in the gap's direction"); }
     else if (s.gapDay && s.gapDir === -d) { confidence -= 8; reasons.push("against the gap (gap-fill) (−)"); }
     if (b.afterFailure) { confidence += 8; reasons.push("opposite breakout failed first: those traders are trapped"); }
     if (d > 0 ? s.prevCloseLocation >= 0.7 : s.prevCloseLocation <= 0.3) { confidence += 6; reasons.push(`yesterday closed near its ${d > 0 ? "high" : "low"}`); }

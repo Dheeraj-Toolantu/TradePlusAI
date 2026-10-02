@@ -405,10 +405,28 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     const next = focusIndex < 0 ? (direction > 0 ? 0 : sorted.length - 1) : Math.min(sorted.length - 1, Math.max(0, focusIndex + direction));
     onFocus(sorted[next].id);
   };
+  // Full screen: track the real state (Esc / browser UI can exit too) and keep the same candles in
+  // view across the resize, so the chart does not jump or re-stretch when the size changes.
+  const [isFull, setIsFull] = useState(false);
+  const keepRange = useRef<{ from: number; to: number } | null>(null);
+  useEffect(() => {
+    const onChange = () => {
+      const full = document.fullscreenElement === wrap.current && wrap.current !== null;
+      setIsFull(full);
+      const range = keepRange.current ?? chart.current?.timeScale().getVisibleLogicalRange() ?? null;
+      keepRange.current = null;
+      // Wait for the new layout (autoSize follows it), then restore the range once.
+      requestAnimationFrame(() => requestAnimationFrame(() => { if (range && chart.current) chart.current.timeScale().setVisibleLogicalRange(range); }));
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
   const toggleFullscreen = () => {
     if (!wrap.current) return;
+    const range = chart.current?.timeScale().getVisibleLogicalRange();
+    keepRange.current = range ? { from: range.from, to: range.to } : null;
     if (document.fullscreenElement) void document.exitFullscreen();
-    else void wrap.current.requestFullscreen?.();
+    else void wrap.current.requestFullscreen?.().catch(() => { keepRange.current = null; });
   };
 
   // Live replay status: the open position and the day's closed trades so far.
@@ -428,7 +446,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const changePct = legend && legend.bar.open ? (change / legend.bar.open) * 100 : 0;
 
   return (
-    <div className="bt-candles" ref={wrap}>
+    <div className={`bt-candles${isFull ? " is-full" : ""}`} ref={wrap}>
       <div className="bt-candles-toolbar" role="toolbar" aria-label="Chart controls">
         <div className="bt-seg" role="group" aria-label="Timeframe">
           {timeframes.map((value) => <button key={value} type="button" className={tf === value ? "on" : ""} aria-pressed={tf === value} onClick={() => setTf(value)}>{tfLabel(value)}</button>)}
@@ -474,7 +492,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
           <button type="button" onClick={() => zoom(0.7)} aria-label="Zoom in" title="Zoom in">＋</button>
           <button type="button" onClick={() => zoom(1 / 0.7)} aria-label="Zoom out" title="Zoom out">－</button>
           <button type="button" onClick={fit} aria-label="Fit session" title="Fit the current session and reset the price scale">Fit</button>
-          <button type="button" onClick={toggleFullscreen} aria-label="Full screen">⛶</button>
+          <button type="button" onClick={toggleFullscreen} aria-label={isFull ? "Exit full screen" : "Full screen"} aria-pressed={isFull} title={isFull ? "Exit full screen (Esc)" : "Full screen"}>{isFull ? "✕" : "⛶"}</button>
         </div>
       </div>
 

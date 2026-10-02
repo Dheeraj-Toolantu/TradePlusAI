@@ -29,9 +29,12 @@ const dayOne = () => Array.from({ length: 75 }, (_, i) => (i % 2 ? [25_002, 25_0
  * Day 2: 15-min OR 24,995–25,020 → 09:35 conviction breakout (close 25,034) → 09:40 accepted above →
  * 09:46 1m retest to 25,021 → 09:47 1m bullish engulfing closes 25,030.
  */
-function scenario(options: { shift?: number; weakBreakout?: boolean } = {}) {
+function scenario(options: { shift?: number; weakBreakout?: boolean; gapDay?: boolean } = {}) {
   const shift = options.shift ?? 0;
-  const retestStart = at("2026-09-22", "09:45");
+  // A gap day uses a 30-minute range: three more inside candles, and everything after moves 15 minutes.
+  const extra = options.gapDay ? 3 : 0;
+  const retestClock = extra ? "10:00" : "09:45";
+  const retestStart = at("2026-09-22", retestClock);
   const retest: Bar[] = [
     { time: retestStart, open: 25_038, high: 25_038, low: 25_030, close: 25_031, volume: 0 },
     { time: retestStart + 60, open: 25_028, high: 25_029, low: 25_021, close: 25_023, volume: 0 },
@@ -42,10 +45,11 @@ function scenario(options: { shift?: number; weakBreakout?: boolean } = {}) {
   const breakout = options.weakBreakout ? [25_016, 25_034, 25_014, 25_021] : [25_016, 25_036, 25_015, 25_034];
   const bars5 = [
     [25_000, 25_012, 24_995, 25_010], [25_010, 25_020, 25_004, 25_015], [25_015, 25_018, 25_006, 25_012], // OR 09:15–09:30
-    [25_012, 25_019, 25_008, 25_016], breakout, [25_034, 25_040, 25_030, 25_038], [25_038, 25_038, 25_021, 25_035],
-    ...Array.from({ length: 68 }, (_, i) => { const p = 25_035 + i * 2; return [p, p + 6, p - 3, p + 2]; }),
+    [25_012, 25_019, 25_008, 25_016], ...Array.from({ length: extra }, () => [25_012, 25_019, 25_008, 25_016]), breakout, [25_034, 25_040, 25_030, 25_038], [25_038, 25_038, 25_021, 25_035],
+    ...Array.from({ length: 68 - extra }, (_, i) => { const p = 25_035 + i * 2; return [p, p + 6, p - 3, p + 2]; }),
   ];
-  return [...day("2026-09-21", dayOne(), {}, shift), ...day("2026-09-22", bars5, { "09:45": retest }, shift)];
+  // Gap day: yesterday traded 60 points lower, so today opens above the previous-day high.
+  return [...day("2026-09-21", dayOne(), {}, shift - (options.gapDay ? 60 : 0)), ...day("2026-09-22", bars5, { [retestClock]: retest }, shift)];
 }
 
 function signals(minute: Bar[]) {
@@ -81,6 +85,17 @@ describe("ORB retest Pro", () => {
     expect(signal.stop).toBeLessThan(25_000);
     expect(signal.stop).toBeGreaterThan(24_995);
     expect(signal.reason).toMatch(/moved past the 25000 round number/);
+  });
+
+  it("does not trade gap days by default (validated on real data), but can with gapDays BONUS", () => {
+    const minute = scenario({ gapDay: true });
+    const skipped = signals(minute);
+    expect(skipped.funnel.gapDays).toBe(1);
+    expect(skipped.out).toHaveLength(0);
+    const source = orbProSignalSource("NIFTY", minute, [], { gapDays: "BONUS" });
+    const taken = minute.map((_, i) => source(i)).filter(Boolean);
+    expect(taken).toHaveLength(1);
+    expect(taken[0]!.reason).toMatch(/\(gap day\)/);
   });
 
   it("ignores a wick poke through the range (no body / no outer close)", () => {
