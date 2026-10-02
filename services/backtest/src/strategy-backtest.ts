@@ -14,7 +14,7 @@ import { analyzeMultiTimeframe, type Bar } from "../../ai-monitoring/src/mtf-dec
  * estimate; the index-points view is exact for the given candles.
  */
 
-export type StrategyId = "MTF_AI" | "ORB_RETEST" | "SMC_SWEEP";
+export type StrategyId = "MTF_AI" | "ORB_RETEST" | "SMC_SWEEP" | "TREND_PULLBACK";
 export type PnlMode = "OPTION" | "POINTS";
 
 export type BacktestSettings = {
@@ -32,6 +32,12 @@ export type BacktestSettings = {
   /** Brokerage + taxes per round trip, in rupees. */
   chargesPerTrade: number;
   partialAtT1: boolean;
+  /**
+   * Trailing runner: after T1, trail the stop this many R behind the best price reached (0 = off,
+   * fixed T2 instead). With a trail the runner has no T2 and rides the move until the trail or
+   * square-off: the few big trend-day wins are what pay an option buyer.
+   */
+  trailR: number;
   /** Exit if the trade is not +0.5R within this many minutes (0 = off). */
   timeStopMinutes: number;
   maxTradesPerDay: number;
@@ -47,7 +53,7 @@ export type BacktestSettings = {
 
 export const DEFAULT_BACKTEST_SETTINGS: BacktestSettings = {
   capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60,
-  partialAtT1: true, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15,
+  partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15,
   minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15",
 };
 
@@ -82,8 +88,16 @@ export type BacktestResult = {
 };
 
 const IST_S = 330 * 60;
-export const istDay = (epochS: number) => new Date((epochS + IST_S) * 1000).toISOString().slice(0, 10);
-export const istMinute = (epochS: number) => { const d = new Date((epochS + IST_S) * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+// Hot paths (the optimizer replays hundreds of thousands of bars): integer maths plus a per-day cache
+// instead of a Date allocation per call.
+const dayNames = new Map<number, string>();
+export const istDay = (epochS: number) => {
+  const dayNumber = Math.floor((epochS + IST_S) / 86_400);
+  let name = dayNames.get(dayNumber);
+  if (name === undefined) { name = new Date(dayNumber * 86_400_000).toISOString().slice(0, 10); dayNames.set(dayNumber, name); }
+  return name;
+};
+export const istMinute = (epochS: number) => Math.floor((((epochS + IST_S) % 86_400) + 86_400) % 86_400 / 60);
 const clock = (value: string) => { const [h, m] = value.split(":").map(Number); return h * 60 + m; };
 const round2 = (value: number) => Math.round(value * 100) / 100;
 
@@ -152,7 +166,8 @@ type DayRisk = { trades: number; realized: number; consecutiveLosses: number; la
 
 export function runBacktest(input: { strategy: StrategyId; symbol: string; from: string; to: string; minute: Bar[]; signalAt: (index: number, minute: Bar[]) => Signal | null; settings?: Partial<BacktestSettings> }): BacktestResult {
   const settings: BacktestSettings = { ...DEFAULT_BACKTEST_SETTINGS, ...input.settings };
-  const minute = [...input.minute].sort((a, b) => a.time - b.time);
+  const sorted = input.minute.every((bar, index) => index === 0 || input.minute[index - 1].time <= bar.time);
+  const minute = sorted ? input.minute : [...input.minute].sort((a, b) => a.time - b.time);
   const qty = Math.max(1, Math.round(settings.lots)) * Math.max(1, Math.round(settings.lotSize));
   const trades: BacktestTrade[] = [];
   const skipped = new Map<string, { day: string; reason: string; count: number }>();
@@ -196,6 +211,8 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
     let stop = signal.stop;
     let remaining = 1;
     let t1Hit = false;
+    const trailing = settings.trailR > 0;
+    let best = entry; // best price reached up to the previous bar (no same-bar look-ahead)
     const legs: TradeLeg[] = [];
     let mfe = 0; let mae = 0;
     let j = i + 1;
@@ -206,17 +223,24 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
       const favourable = side > 0 ? b.high - entry : entry - b.low;
       const adverse = side > 0 ? entry - b.low : b.high - entry;
       mfe = Math.max(mfe, favourable / riskPts); mae = Math.max(mae, adverse / riskPts);
+      if (trailing && t1Hit) {
+        const trail = best - side * settings.trailR * riskPts;
+        if ((trail - stop) * side > 0) stop = trail;
+      }
       const stopTouched = side > 0 ? b.low <= stop : b.high >= stop;
       if (stopTouched) {
         // Stops are market orders: a gap through the stop fills at the open, not the stop.
         const fill = (side > 0 ? Math.min(stop, b.open) : Math.max(stop, b.open)) - side * settings.slippagePoints;
-        legs.push({ time: end, price: fill, fraction: remaining, reason: t1Hit ? "BREAKEVEN_STOP" : "STOP_LOSS" }); remaining = 0; break;
+        const reason = !t1Hit ? "STOP_LOSS" : (stop - entry) * side > 0 ? "TRAIL_STOP" : "BREAKEVEN_STOP";
+        legs.push({ time: end, price: fill, fraction: remaining, reason }); remaining = 0; break;
       }
       if (!t1Hit && (side > 0 ? b.high >= target1 : b.low <= target1)) {
         if (settings.partialAtT1) { legs.push({ time: end, price: target1, fraction: 0.5, reason: "TARGET_1" }); remaining = 0.5; t1Hit = true; stop = entry; }
+        else if (trailing) { t1Hit = true; stop = entry; }
         else { legs.push({ time: end, price: target1, fraction: remaining, reason: "TARGET_1" }); remaining = 0; break; }
       }
-      if (t1Hit && (side > 0 ? b.high >= target2 : b.low <= target2)) { legs.push({ time: end, price: target2, fraction: remaining, reason: "TARGET_2" }); remaining = 0; break; }
+      if (t1Hit && !trailing && (side > 0 ? b.high >= target2 : b.low <= target2)) { legs.push({ time: end, price: target2, fraction: remaining, reason: "TARGET_2" }); remaining = 0; break; }
+      best = side > 0 ? Math.max(best, b.high) : Math.min(best, b.low);
       if (settings.timeStopMinutes > 0 && !t1Hit && end - (next.time) >= settings.timeStopMinutes * 60 && (b.close - entry) * side < 0.5 * riskPts) {
         legs.push({ time: end, price: b.close - side * settings.slippagePoints, fraction: remaining, reason: "TIME_STOP" }); remaining = 0; break;
       }

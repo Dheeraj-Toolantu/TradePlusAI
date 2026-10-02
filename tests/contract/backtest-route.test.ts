@@ -6,7 +6,7 @@ const post = (body: Record<string, unknown>) => POST(new Request("http://localho
 describe("backtest route", () => {
   it("lists strategies and defaults", async () => {
     const body = await (await GET()).json();
-    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "SMC_SWEEP"]);
+    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "SMC_SWEEP", "TREND_PULLBACK"]);
     expect(body.defaults).toMatchObject({ maxTradesPerDay: 3, squareOff: "15:15" });
   });
 
@@ -49,5 +49,16 @@ describe("backtest route", () => {
     expect(body.candles.length).toBe(body.sessions * 75);
     expect(body.notes.join(" ")).toMatch(/Setup funnel: \d+ liquidity sweeps/);
     for (const trade of body.trades) expect(trade.strategy).toBe("SMC liquidity sweep");
+  });
+
+  it("runs the trend-day strategy with the walk-forward optimizer", { timeout: 120_000 }, async () => {
+    const response = await post({ strategy: "TREND_PULLBACK", symbol: "NIFTY", from: "2026-04-06", to: "2026-09-25", source: "synthetic", settings: { trailR: 1 }, optimize: true });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.settings.trailR).toBe(1);
+    expect(body.notes.join(" ")).toMatch(/Setup funnel: \d+ 5m closes checked/);
+    expect(body.optimization.tested).toBe(648);
+    expect(body.optimization.inSample.to < body.optimization.outOfSample.from).toBe(true);
+    expect(body.optimization.baseline.inSample.trades + body.optimization.baseline.outOfSample.trades).toBe(body.metrics.trades);
   });
 });

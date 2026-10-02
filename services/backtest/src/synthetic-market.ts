@@ -18,7 +18,12 @@ const weekdays = (from: string, to: string) => {
   return days;
 };
 
-export function syntheticSessions(from: string, to: string, options: { start?: number; seed?: number } = {}) {
+/**
+ * `regimes: true` mixes ~35% trend days (a persistent drift with shallow pullbacks) with ~65%
+ * mean-reverting chop days around the open, closer to how an index actually behaves. Used to check
+ * that a regime filter trades the trend days and sits out the chop; it is still not real data.
+ */
+export function syntheticSessions(from: string, to: string, options: { start?: number; seed?: number; regimes?: boolean } = {}) {
   const random = rng(options.seed ?? 7);
   let price = options.start ?? 25_000;
   const minute: Bar[] = [];
@@ -27,10 +32,17 @@ export function syntheticSessions(from: string, to: string, options: { start?: n
     const open = price * (1 + (random() - 0.5) * 0.006);
     price = open;
     let drift = (random() - 0.5) * 1.2;
+    const trendDay = options.regimes ? random() < 0.35 : false;
+    const trendSign = random() < 0.5 ? -1 : 1;
     const sessionStart = Date.parse(`${day}T09:15:00+05:30`) / 1000;
     let high = open; let low = open;
     for (let m = 0; m < 375; m += 1) {
-      if (m % 45 === 0) drift = (random() - 0.5) * 1.6;
+      if (options.regimes) {
+        if (trendDay) {
+          // Trend legs with periodic pullbacks; the first 30 minutes are a two-sided opening range.
+          if (m % 25 === 0) drift = m < 30 ? (random() - 0.5) * 1.5 : random() < 0.75 ? trendSign * (0.9 + random() * 0.9) : -trendSign * (0.6 + random() * 0.6);
+        } else drift = -0.04 * (price - open) + (random() - 0.5) * 0.6;
+      } else if (m % 45 === 0) drift = (random() - 0.5) * 1.6;
       const o = price;
       const c = o + drift + (random() - 0.5) * 9;
       const h = Math.max(o, c) + random() * 4;
