@@ -6,7 +6,7 @@ const post = (body: Record<string, unknown>) => POST(new Request("http://localho
 describe("backtest route", () => {
   it("lists strategies and defaults", async () => {
     const body = await (await GET()).json();
-    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "SMC_SWEEP", "TREND_PULLBACK"]);
+    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "SMC_SWEEP", "TREND_PULLBACK", "SMART_COMBO"]);
     expect(body.defaults).toMatchObject({ maxTradesPerDay: 3, squareOff: "15:15" });
   });
 
@@ -49,6 +49,9 @@ describe("backtest route", () => {
     expect(body.candles.length).toBe(body.sessions * 75);
     expect(body.notes.join(" ")).toMatch(/Setup funnel: \d+ liquidity sweeps/);
     for (const trade of body.trades) expect(trade.strategy).toBe("SMC liquidity sweep");
+    // 1-minute candles ship for every trade day so the replay prints minute by minute.
+    expect(Object.keys(body.replayMinutes).sort()).toEqual([...new Set(body.trades.map((trade: { day: string }) => trade.day))].sort());
+    for (const rows of Object.values(body.replayMinutes) as unknown[][]) expect(rows).toHaveLength(375);
   });
 
   it("runs the trend-day strategy with the walk-forward optimizer", { timeout: 120_000 }, async () => {
@@ -60,5 +63,17 @@ describe("backtest route", () => {
     expect(body.optimization.tested).toBe(648);
     expect(body.optimization.inSample.to < body.optimization.outOfSample.from).toBe(true);
     expect(body.optimization.baseline.inSample.trades + body.optimization.baseline.outOfSample.trades).toBe(body.metrics.trades);
+  });
+
+  it("runs the smart combo with all four playbooks (ORB via Python) and explains its routing", { timeout: 180_000 }, async () => {
+    process.env.PYTHON_EXECUTABLE ??= "python3";
+    const response = await post({ strategy: "SMART_COMBO", symbol: "NIFTY", from: "2026-07-01", to: "2026-09-25", source: "synthetic", settings: { trailR: 1.5, timeStopMinutes: 45 } });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    const notes = body.notes.join(" ");
+    expect(notes).toMatch(/Regime: \d+% of minutes on trend days/);
+    expect(notes).toMatch(/Playbook signals: trend \d+, sweep \d+, ORB \d+/);
+    expect(notes).not.toMatch(/ORB playbook skipped/);
+    for (const trade of body.trades) expect(trade.strategy).toMatch(/^Smart combo · /);
   });
 });

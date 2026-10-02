@@ -14,7 +14,7 @@ import { analyzeMultiTimeframe, type Bar } from "../../ai-monitoring/src/mtf-dec
  * estimate; the index-points view is exact for the given candles.
  */
 
-export type StrategyId = "MTF_AI" | "ORB_RETEST" | "SMC_SWEEP" | "TREND_PULLBACK";
+export type StrategyId = "MTF_AI" | "ORB_RETEST" | "SMC_SWEEP" | "TREND_PULLBACK" | "SMART_COMBO";
 export type PnlMode = "OPTION" | "POINTS";
 
 export type BacktestSettings = {

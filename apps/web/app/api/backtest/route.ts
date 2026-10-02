@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { DEFAULT_BACKTEST_SETTINGS, aggregate, istDay, listSignalSource, mtfSignalSource, runBacktest, type BacktestSettings, type Signal, type StrategyId } from "../../../../../services/backtest/src/strategy-backtest";
 import { smcSignalSource } from "../../../../../services/backtest/src/smc-strategy";
 import { trendPullbackSignalSource } from "../../../../../services/backtest/src/trend-pullback-strategy";
+import { smartSignalSource } from "../../../../../services/backtest/src/smart-strategy";
 import { optimizeSettings, precomputeSignals } from "../../../../../services/backtest/src/optimizer";
 import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, validateSourceRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
@@ -11,9 +12,10 @@ const STRATEGIES: Record<StrategyId, string> = {
   ORB_RETEST: "V5 ORB break-and-retest (strategy rules)",
   SMC_SWEEP: "SMC liquidity sweep (S/R, CHoCH, FVG/OB, candle psychology)",
   TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
+  SMART_COMBO: "Smart combo (regime-routed trend / ORB / SMC, AI multi-timeframe vote)",
 };
-/** Above this many sessions the chart gets 5-minute candles to keep the response small. */
-const MINUTE_CANDLE_SESSIONS = 45;
+/** Above this many sessions the chart gets 5-minute candles to keep the response small (about 3 months). */
+const MINUTE_CANDLE_SESSIONS = 70;
 
 const clampNumber = (value: unknown, fallback: number, min: number, max: number) => { const parsed = Number(value); return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback; };
 const hhmm = (value: unknown, fallback: string) => (typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value) ? value : fallback);
@@ -72,16 +74,30 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: `No 1-minute candles for ${symbol} between ${from} and ${to}. ${hint}`, issues: data.issues }, { status: 422 });
   }
 
+  // The V5 ORB rules live in the Python engine: replay them once per request.
+  const orbSignals = async () => {
+    const replay = await runPythonModule<{ signals: Array<{ time: number; side: 1 | -1; stop: number; target1: number; reason: string }> }>("tradepulse_quant.backtest.orb_backtest", { symbol, from, candles_5m: aggregate(data.minute, 5), daily_candles: data.daily }, 120_000);
+    return replay.signals.map((signal): Signal => ({ ...signal, strategy: "ORB retest", target2: null }));
+  };
   let signalAt: Parameters<typeof runBacktest>[0]["signalAt"];
+  let smartFunnel: ReturnType<typeof smartSignalSource>["funnel"] | null = null;
+  let orbNote: string | null = null;
   let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
   let trendFunnel: ReturnType<typeof trendPullbackSignalSource>["funnel"] | null = null;
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
   else if (strategy === "SMC_SWEEP") { const smc = smcSignalSource(symbol, data.minute, data.daily); funnel = smc.funnel; signalAt = smc; }
   else if (strategy === "TREND_PULLBACK") { const trend = trendPullbackSignalSource(symbol, data.minute, data.daily); trendFunnel = trend.funnel; signalAt = trend; }
+  else if (strategy === "SMART_COMBO") {
+    // ORB is one of four playbooks here: if the Python replay is unavailable, run without it.
+    let orb: Signal[] | null = null;
+    try { orb = await orbSignals(); } catch (error) { orbNote = `ORB playbook skipped: ${error instanceof Error ? error.message : "python error"}`; }
+    const smart = smartSignalSource(symbol, data.minute, data.daily, { orbSignals: orb });
+    smartFunnel = smart.funnel;
+    signalAt = smart;
+  }
   else {
     try {
-      const replay = await runPythonModule<{ signals: Array<{ time: number; side: 1 | -1; stop: number; target1: number; reason: string }> }>("tradepulse_quant.backtest.orb_backtest", { symbol, from, candles_5m: aggregate(data.minute, 5), daily_candles: data.daily }, 120_000);
-      signalAt = listSignalSource(replay.signals.map((signal): Signal => ({ ...signal, strategy: "ORB retest", target2: null })));
+      signalAt = listSignalSource(await orbSignals());
     } catch (error) {
       return NextResponse.json({ error: `ORB strategy replay failed: ${error instanceof Error ? error.message : "python error"}` }, { status: 503 });
     }
@@ -96,6 +112,15 @@ export async function POST(request: Request) {
     if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.counterTrend} counter-trend, ${funnel.lateSession} after 14:30. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
     notes.push("SMC rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m rejection or engulfing. Stop beyond the sweep; T1 1.5R or opposing liquidity; T2 next opposing liquidity. Counter-trend (vs 15m structure) only off a daily level.");
   }
+  else if (strategy === "SMART_COMBO") {
+    if (smartFunnel) {
+      const f = smartFunnel;
+      const bars = f.regimeBars.TREND + f.regimeBars.RANGE + f.regimeBars.UNDECIDED || 1;
+      notes.push(`Regime: ${Math.round(100 * f.regimeBars.TREND / bars)}% of minutes on trend days, ${Math.round(100 * f.regimeBars.RANGE / bars)}% range, ${Math.round(100 * f.regimeBars.UNDECIDED / bars)}% undecided. Playbook signals: trend ${f.candidates.TREND}, sweep ${f.candidates.SMC}, ORB ${f.candidates.ORB} → taken by the router: trend ${f.accepted.TREND}, sweep ${f.accepted.SMC}, ORB ${f.accepted.ORB}. Blocked by regime ${f.rejectedByRegime}, vetoed by the AI multi-timeframe read ${f.vetoedByAi}; AI confirmed ${f.confirmedByAi}, multi-playbook confluence ${f.confluence}.`);
+    }
+    notes.push("Smart combo: trend day → trend pullbacks, ORB and sweeps only in the trend's direction; range day → sweep reversals only; undecided → sweeps of daily levels and ORB with the day's direction. The AI multi-timeframe engine votes (an opposite read vetoes, an agreeing one adds confidence). Stops and targets come from the playbook that fired.");
+    if (orbNote) notes.push(orbNote);
+  }
   else if (strategy === "TREND_PULLBACK") {
     if (trendFunnel) notes.push(`Setup funnel: ${trendFunnel.evaluated} 5m closes checked → ${trendFunnel.trendBars} on a confirmed trend day → ${trendFunnel.pullbacks} pullbacks into value → ${trendFunnel.triggers} resumption candles (${trendFunnel.extended} too far from VWAP, ${trendFunnel.tooWide} stop > 1.6 ATR).`);
     notes.push("Trend-day rules: 30 min on one side of a sloping VWAP + opening-range break or ≥ 0.5 ADR from the open + 15m EMA20 agreeing → pullback to VWAP/EMA20 that holds → 5m resumption candle. Stop beyond the pullback (0.6–1.6 ATR). Best with a trailing runner (Trail = 1.5R, 45-min time stop).");
@@ -108,6 +133,11 @@ export async function POST(request: Request) {
   // aggregates other timeframes.
   const tested = data.minute.filter((bar) => { const day = istDay(bar.time); return day >= from && day <= to; });
   const candleMinutes = data.sessions > MINUTE_CANDLE_SESSIONS ? 5 : 1;
-  const candles = (candleMinutes === 1 ? tested : aggregate(tested, candleMinutes)).map((bar) => [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0]);
-  return NextResponse.json({ ...result, optimization, candles, candleMinutes, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
+  const row = (bar: { time: number; open: number; high: number; low: number; close: number; volume?: number | null }) => [bar.time, bar.open, bar.high, bar.low, bar.close, bar.volume ?? 0];
+  const candles = (candleMinutes === 1 ? tested : aggregate(tested, candleMinutes)).map(row);
+  // With 5-minute chart candles, still ship 1-minute candles for every day that had a trade, so the
+  // day replay prints minute by minute (a 5-minute trade would otherwise open and close in one candle).
+  const tradeDays = new Set(result.trades.map((trade) => trade.day));
+  const replayMinutes = candleMinutes === 1 ? null : Object.fromEntries([...tradeDays].map((day) => [day, tested.filter((bar) => istDay(bar.time) === day).map(row)]));
+  return NextResponse.json({ ...result, optimization, candles, candleMinutes, replayMinutes, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
 }
