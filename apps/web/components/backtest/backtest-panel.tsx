@@ -11,6 +11,7 @@ type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
 const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
   { id: "MTF_AI", title: "AI multi-timeframe", detail: "1D context · 15m direction · 5m pullback · 1m candle trigger, with the AI monitor's entry/stop/target rules." },
+  { id: "ORB_PRO", title: "ORB retest Pro", detail: "Gap & prior-day sentiment → conviction breakout of the 15/30-min range → retest that holds → 1m turn above VWAP. Stop beyond the retest low and round numbers; skipped if too wide." },
   { id: "ORB_RETEST", title: "V5 ORB retest", detail: "Opening-range break, retest and hold with a structural stop and 2R target capped at PDH/PDL." },
   { id: "SMART_COMBO", title: "★ Smart combo", detail: "Reads the day first (trend / range), then routes to the playbook that fits it: trend pullback, ORB, or liquidity sweep. AI multi-timeframe votes; confluence adds conviction." },
   { id: "TREND_PULLBACK", title: "Trend-day VWAP pullback", detail: "Trades only confirmed trend days: 30 min on one side of a sloping VWAP, OR break, 15m agreeing → pullback into VWAP/EMA20 → 5m resumption candle. Trailing runner." },
@@ -24,9 +25,9 @@ const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0
 const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getUTCDay(); return dow !== 0 && dow !== 6; };
 /** Per-strategy time stop: retest/zone entries (ORB, SMC) often need 20–40 minutes to work. */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, SMC_SWEEP: 30, TREND_PULLBACK: 45, SMART_COMBO: 45 };
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 30, SMC_SWEEP: 30, TREND_PULLBACK: 45, SMART_COMBO: 45 };
 /** Trend entries are built for a trailing runner; the others default to fixed T1/T2. */
-const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, SMC_SWEEP: 0, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5 };
+const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 0, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5 };
 type Preset = { key: string; label: string; sessions?: number; months?: number };
 const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
 function lastMonths(months: number) {

@@ -3,6 +3,7 @@ import { DEFAULT_BACKTEST_SETTINGS, aggregate, istDay, listSignalSource, mtfSign
 import { smcSignalSource } from "../../../../../services/backtest/src/smc-strategy";
 import { trendPullbackSignalSource } from "../../../../../services/backtest/src/trend-pullback-strategy";
 import { smartSignalSource } from "../../../../../services/backtest/src/smart-strategy";
+import { orbProSignalSource } from "../../../../../services/backtest/src/orb-pro-strategy";
 import { optimizeSettings, precomputeSignals } from "../../../../../services/backtest/src/optimizer";
 import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, validateSourceRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
@@ -10,6 +11,7 @@ import { runPythonModule } from "../../../lib/python";
 const STRATEGIES: Record<StrategyId, string> = {
   MTF_AI: "AI multi-timeframe (1D/15m/5m/1m + candle psychology)",
   ORB_RETEST: "V5 ORB break-and-retest (strategy rules)",
+  ORB_PRO: "ORB retest Pro (sentiment, conviction breakout, held retest, structural stop)",
   SMC_SWEEP: "SMC liquidity sweep (S/R, CHoCH, FVG/OB, candle psychology)",
   TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
   SMART_COMBO: "Smart combo (regime-routed trend / ORB / SMC, AI multi-timeframe vote)",
@@ -81,12 +83,14 @@ export async function POST(request: Request) {
   };
   let signalAt: Parameters<typeof runBacktest>[0]["signalAt"];
   let smartFunnel: ReturnType<typeof smartSignalSource>["funnel"] | null = null;
+  let orbProFunnel: ReturnType<typeof orbProSignalSource>["funnel"] | null = null;
   let orbNote: string | null = null;
   let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
   let trendFunnel: ReturnType<typeof trendPullbackSignalSource>["funnel"] | null = null;
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
   else if (strategy === "SMC_SWEEP") { const smc = smcSignalSource(symbol, data.minute, data.daily); funnel = smc.funnel; signalAt = smc; }
   else if (strategy === "TREND_PULLBACK") { const trend = trendPullbackSignalSource(symbol, data.minute, data.daily); trendFunnel = trend.funnel; signalAt = trend; }
+  else if (strategy === "ORB_PRO") { const pro = orbProSignalSource(symbol, data.minute, data.daily); orbProFunnel = pro.funnel; signalAt = pro; }
   else if (strategy === "SMART_COMBO") {
     // ORB is one of four playbooks here: if the Python replay is unavailable, run without it.
     let orb: Signal[] | null = null;
@@ -111,6 +115,13 @@ export async function POST(request: Request) {
   else if (strategy === "SMC_SWEEP") {
     if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.counterTrend} counter-trend, ${funnel.lateSession} after 14:30. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
     notes.push("SMC rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m rejection or engulfing. Stop beyond the sweep; T1 1.5R or opposing liquidity; T2 next opposing liquidity. Counter-trend (vs 15m structure) only off a daily level.");
+  }
+  else if (strategy === "ORB_PRO") {
+    if (orbProFunnel) {
+      const f = orbProFunnel;
+      notes.push(`Setup funnel: ${f.days} sessions (${f.gapDays} gap days, ${f.orTooWide} skipped for an opening range > 0.6 ADR) → ${f.breakouts} conviction breakouts (${f.weakBreakouts} weak pokes ignored) → ${f.retests} retests → ${f.triggers} 1m triggers. Dropped: ${f.failedBreakouts} failed back inside, ${f.deepRetests} retest past the range midpoint, ${f.expired} no retest/trigger in time, ${f.notAccepted} not accepted beyond the level, ${f.choppy} choppy session (efficiency < 0.30), ${f.againstVwap} wrong side of VWAP, ${f.stopTooWide} honest stop > 1.3 ATR, ${f.noRoom} previous-day high/low within 1R.`);
+    }
+    notes.push("ORB Pro rules: 15-min opening range (30 on gap days) → 5m breakout with body, outer close and range expansion → acceptance (another 5m close beyond the level) on a directional session (efficiency ≥ 0.30) → retest of the level that holds (no close back inside, no wick past mid-range) → 1m turn beyond the level on the right side of VWAP. Stop beyond the retest extreme and the level + buffer, pushed past nearby round numbers, ≥ 0.5 ATR, skipped if > 1.3 ATR. T1 measured move (1–1.5R), T2 two range-widths capped at the previous-day high/low and 4R.");
   }
   else if (strategy === "SMART_COMBO") {
     if (smartFunnel) {

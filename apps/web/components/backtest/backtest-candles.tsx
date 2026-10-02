@@ -313,7 +313,12 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
         const remaining = 1 - trade.visibleLegs.reduce((sum, leg) => sum + leg.fraction, 0);
         liveR = (booked + remaining * (lastBar.close - trade.entryPrice) * side) / risk;
       }
-      list.push({ id: trade.id, long: side > 0, fromIndex, toIndex, entry: trade.entryPrice, stop: trade.stop, target1: trade.target1, target2: trade.target2, resultR: trade.open ? null : trade.rMultiple, liveR, focused: trade.id === focusId || trade.open });
+      // Only the stop moves that have happened by now (replay), placed on their candle.
+      const stopPath = (trade.stopPath ?? []).filter((move) => move.time < cutoff).flatMap((move) => {
+        const index = indexByTime.get(bucketOf(move.time, tf));
+        return index === undefined ? [] : [{ index, price: move.price, reason: move.reason }];
+      });
+      list.push({ id: trade.id, long: side > 0, fromIndex, toIndex, entry: trade.entryPrice, stop: trade.stop, target1: trade.target1, target2: trade.target2, resultR: trade.open ? null : trade.rMultiple, liveR, focused: trade.id === focusId || trade.open, stopPath });
     }
     boxes.current.setBoxes(list);
   }, [visibleTrades, bars, indexByTime, tf, showTrades, focusId, hasVolume]);

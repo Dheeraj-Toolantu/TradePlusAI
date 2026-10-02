@@ -20,6 +20,8 @@ export type RiskRewardBox = {
   /** Live R of an open trade (replay), shown instead of the result. */
   liveR?: number | null;
   focused: boolean;
+  /** Stop moves after entry (logical index where the new stop takes effect), e.g. breakeven, trail. */
+  stopPath?: Array<{ index: number; price: number; reason: "BREAKEVEN" | "TRAIL" }>;
 };
 
 type DrawTarget = Parameters<IPrimitivePaneRenderer["draw"]>[0];
@@ -28,6 +30,7 @@ const RISK_FILL = "rgba(214, 116, 60, 0.20)";
 const RISK_EDGE = "rgba(214, 116, 60, 0.75)";
 const REWARD_FILL = "rgba(61, 147, 214, 0.18)";
 const REWARD_EDGE = "rgba(61, 147, 214, 0.75)";
+const STOP_LINE = "rgba(240, 140, 90, 1)";
 
 export class RiskRewardPrimitive implements ISeriesPrimitive<Time> {
   private chart: IChartApiBase<Time> | null = null;
@@ -84,6 +87,30 @@ export class RiskRewardPrimitive implements ISeriesPrimitive<Time> {
         // Entry line (solid) and T1 line (dashed).
         ctx.strokeStyle = "rgba(228, 241, 241, 0.9)"; ctx.beginPath(); ctx.moveTo(x1, yEntry); ctx.lineTo(x2, yEntry); ctx.stroke();
         ctx.setLineDash([4, 3]); ctx.strokeStyle = REWARD_EDGE; ctx.beginPath(); ctx.moveTo(x1, yT1); ctx.lineTo(x2, yT1); ctx.stroke(); ctx.setLineDash([]);
+        // Stop-loss: the initial stop as a heavy line until it first moves, then the stop's path
+        // (breakeven at T1, then the trail) as a stepped dashed line to the exit.
+        const moves = (box.stopPath ?? []).map((move) => ({ ...move, x: time.logicalToCoordinate(move.index as Logical), y: series.priceToCoordinate(move.price) }))
+          .filter((move): move is typeof move & { x: number; y: number } => move.x !== null && move.y !== null);
+        const firstMoveX = moves.length ? Math.min(Math.max(moves[0].x, x1), x2) : x2;
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = STOP_LINE; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x1, yStop); ctx.lineTo(firstMoveX, yStop); ctx.stroke();
+        if (moves.length) {
+          ctx.lineWidth = 1.5; ctx.setLineDash([5, 3]);
+          ctx.beginPath(); ctx.moveTo(firstMoveX, yStop);
+          moves.forEach((move, index) => {
+            const x = Math.min(Math.max(move.x, x1), x2);
+            const nextX = index + 1 < moves.length ? Math.min(Math.max(moves[index + 1].x, x1), x2) : x2;
+            ctx.lineTo(x, move.y); ctx.lineTo(nextX, move.y);
+          });
+          ctx.stroke(); ctx.setLineDash([]);
+          const be = moves.find((move) => move.reason === "BREAKEVEN");
+          const lastTrail = [...moves].reverse().find((move) => move.reason === "TRAIL");
+          ctx.font = "600 10px 'DM Mono', monospace"; ctx.fillStyle = "#f0a57a";
+          if (be && box.focused) ctx.fillText("SL → BE", Math.min(Math.max(be.x, x1), x2) + 3, be.y + (box.long ? 12 : -4));
+          if (lastTrail && box.focused) ctx.fillText(`trail ${lastTrail.price.toFixed(1)}`, Math.min(Math.max(lastTrail.x, x1), x2) + 3, lastTrail.y + (box.long ? 12 : -4));
+        }
+        ctx.globalAlpha = alpha;
         // Labels (only when there is room, always for the focused trade).
         if (box.focused || width > 70) {
           const risk = Math.abs(box.entry - box.stop) || 1;
@@ -101,7 +128,7 @@ export class RiskRewardPrimitive implements ISeriesPrimitive<Time> {
           };
           const rewardAbove = box.long;
           label(`#${box.id} R:R 1:${rr2.toFixed(1)} (T1 ${rr1.toFixed(1)}R)`, yT2, "#9fd0f5", rewardAbove);
-          label(`risk ${risk.toFixed(1)} pts`, yStop, "#f0a57a", !rewardAbove);
+          label(`SL ${box.stop.toFixed(1)} · −1R (${risk.toFixed(1)} pts)`, yStop, "#f0a57a", !rewardAbove);
           const outcome = box.resultR !== null ? `${box.resultR >= 0 ? "+" : "−"}${Math.abs(box.resultR).toFixed(2)}R` : box.liveR !== undefined && box.liveR !== null ? `open ${box.liveR >= 0 ? "+" : "−"}${Math.abs(box.liveR).toFixed(2)}R` : null;
           if (outcome) {
             ctx.font = "700 11px 'DM Mono', monospace";
