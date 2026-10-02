@@ -477,12 +477,16 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         risk = abs(entry - stop)
         if risk <= 0 or (orb.side == "BUY" and stop >= entry) or (orb.side == "SELL" and stop <= entry):
             return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Structural stop is not on the invalidation side of entry", "confidence": 0, "calculations": orb_calc, "setup": None}
+        if orb.atr and risk > 2 * orb.atr:
+            return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": f"Structural stop is {risk / orb.atr:.1f} ATR away (max 2): the retest was too deep for a tight ORB trade", "confidence": 0, "calculations": orb_calc, "setup": None}
         direction = 1 if orb.side == "BUY" else -1
         target = entry + risk * config.rr_minimum * direction
         # Spec 15: never force 2R through a major structural level. The previous day's high
         # (for longs) / low (for shorts) is the obstacle; the reward is measured to it.
-        _, previous = _split_sessions(candles)
-        obstacle = (max(c.high for c in previous) if direction > 0 else min(c.low for c in previous)) if previous else None
+        # Prefer the exchange daily bar for PDH/PDL; a 1-minute feed with holes understates it.
+        today = _parse_timestamp(candles[-1].timestamp)
+        prior_days = _daily_bars(candles, daily_candles, today.date()) if today is not None else []
+        obstacle = (prior_days[-1].high if direction > 0 else prior_days[-1].low) if prior_days else None
         reward = abs(target - entry)
         obstacle_label = None
         if obstacle is not None and 0 < (obstacle - entry) * direction < reward:

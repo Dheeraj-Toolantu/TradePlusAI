@@ -20,8 +20,8 @@ const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnl
 const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
 const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getUTCDay(); return dow !== 0 && dow !== 6; };
-/** Per-strategy time stop: the SMC entry needs room to retrace from the zone before it runs. */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 15, SMC_SWEEP: 30 };
+/** Per-strategy time stop: retest/zone entries (ORB, SMC) often need 20–40 minutes to work. */
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, SMC_SWEEP: 30 };
 type Preset = { key: string; label: string; sessions?: number; months?: number };
 const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
 function lastMonths(months: number) {

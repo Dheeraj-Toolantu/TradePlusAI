@@ -21,6 +21,13 @@ import { aggregate, istDay, istMinute, type Signal } from "./strategy-backtest";
  *  7. Context score: 15m structure bias (BOS), premium/discount of the 15m dealing range, VWAP side,
  *     daily-level sweeps, FVG/OB overlap, displacement strength. Counter-trend setups are only taken
  *     off a daily level.
+ *  8. Trader psychology / session behaviour:
+ *     - Timing: the 09:30–11:30 window carries the day's real liquidity (+); 11:45–13:15 is lunch chop
+ *       where sweeps fail more often (−); no new entries after 14:30 (no time left for T2).
+ *     - Exhaustion: once the day's range exceeds ~1.2× the average daily range (ADR), chasing the trend
+ *       is a late-entry trap (−), while a reversal off a daily extreme is the crowd being trapped (+).
+ *     - Conviction: a CHoCH within two candles of the sweep (fast, violent rejection) scores higher than
+ *       a slow drift back.
  *
  * Every decision uses only candles completed at decision time; 5m/15m bars are processed only after
  * they close.
@@ -37,6 +44,8 @@ type Setup = {
   breakLevel: number;
   zone?: { lo: number; hi: number; kind: "FVG" | "OB" | "FVG+OB" };
   displacement?: number;
+  /** 5m bars from the sweep to the CHoCH candle (1 = the very next candle). */
+  chochBars?: number;
   barsLeft: number;
   armedAt?: number;
   expiresAt?: number;
@@ -50,8 +59,10 @@ const fmt = (value: number) => value.toLocaleString("en-IN", { maximumFractionDi
 const KIND_LABEL: Record<Pool["kind"], string> = { PDH: "previous-day high", PDL: "previous-day low", ORH: "opening-range high", ORL: "opening-range low", SWING: "5m swing", EQUAL: "equal highs/lows" };
 
 /** How many setups reached each stage, and why the rest were dropped. */
-export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number };
-const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0 });
+export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; lateSession: number };
+const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, lateSession: 0 });
+/** Last minute (IST) at which a new SMC entry is allowed: later trades have no time to reach T2. */
+const LAST_ENTRY_MINUTE = 14 * 60 + 30;
 
 export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
   const m5 = aggregate(minute, 5);
@@ -72,6 +83,8 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       // 5m internal swings
       lastSwingHigh5: NaN, lastSwingLow5: NaN,
       sessionHigh: -Infinity, sessionLow: Infinity,
+      /** Completed session ranges (most recent last), for the average daily range. */
+      ranges: [] as number[],
       pending: null as Signal | null, pendingIndex: -1,
     };
   }
@@ -86,6 +99,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     const s = state;
     const fromMinutes = Number.isFinite(s.sessionHigh) && s.day !== "";
     const prior = fromMinutes ? { high: s.sessionHigh, low: s.sessionLow } : priorDaily(day);
+    if (fromMinutes) s.ranges = [...s.ranges, s.sessionHigh - s.sessionLow].slice(-10);
     s.day = day;
     s.pdh = prior ? prior.high : NaN;
     s.pdl = prior ? prior.low : NaN;
@@ -97,6 +111,15 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     s.pools = s.pools.filter((pool) => !pool.swept && (pool.kind === "SWING" || pool.kind === "EQUAL")).slice(-12);
     if (Number.isFinite(s.pdh)) s.pools.push({ price: s.pdh, time: 0, kind: "PDH", side: 1, swept: false });
     if (Number.isFinite(s.pdl)) s.pools.push({ price: s.pdl, time: 0, kind: "PDL", side: -1, swept: false });
+  }
+
+  /** Average daily range: completed sessions in the data, topped up with prior daily bars. */
+  function adr() {
+    const s = state;
+    const dayStart = Date.parse(`${s.day}T00:00:00Z`) / 1000 - 330 * 60;
+    const fromDaily = daily.filter((bar) => bar.time < dayStart && istDay(bar.time) < s.day).slice(-10).map((bar) => bar.high - bar.low);
+    const ranges = [...fromDaily.slice(0, Math.max(0, 10 - s.ranges.length)), ...s.ranges].filter((range) => range > 0);
+    return ranges.length >= 3 ? ranges.reduce((sum, range) => sum + range, 0) / ranges.length : NaN;
   }
 
   function on1m(index: number) {
@@ -247,6 +270,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       if (displaced && (bar.close - setup.breakLevel) * dir > 0) {
         funnel.choch += 1;
         setup.displacement = body / Math.max(atr, 1e-9);
+        setup.chochBars = k - setup.sweepIndex;
         setup.stage = "WAIT_ZONE";
         setup.barsLeft = 3;
         locateZone(setup, k);
@@ -301,6 +325,8 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       // Strong close: a directional candle that tested the zone and closed in its top (bottom) third.
       const strongClose = directional && (dir > 0 ? (bar.close - bar.low) / range >= 0.67 : (bar.high - bar.close) / range >= 0.67);
       if (!(engulfing || rejection || (directional && reclaimed) || strongClose)) continue;
+      const clock = istMinute(t);
+      if (clock > LAST_ENTRY_MINUTE) { setup.barsLeft = 0; funnel.lateSession += 1; continue; }
       const entry = bar.close;
       let risk = (entry - stop) * dir;
       if (risk > 2.5 * atr) { setup.barsLeft = 0; funnel.stopTooWide += 1; continue; } // structural stop too wide for intraday
@@ -314,8 +340,10 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       const nearest = opposing[0];
       if (nearest && nearest.distance < 1 * risk) { setup.barsLeft = 0; funnel.srTooClose += 1; continue; } // walking into S/R
       const t1Distance = nearest && nearest.distance < 1.5 * risk ? Math.max(risk, nearest.distance - 0.05 * risk) : 1.5 * risk;
-      const beyond = opposing.find((item) => item.distance >= 2 * risk && item.distance <= 4 * risk);
-      const t2Distance = beyond ? beyond.distance - 0.05 * risk : 3 * risk;
+      // T2: the next opposing liquidity beyond T1 (front-run by 0.05R), capped at 4R; 3R when the path
+      // is clear. Never place T2 behind a level price has to break first.
+      const nextWall = opposing.find((item) => item.distance > t1Distance + 0.25 * risk);
+      const t2Distance = nextWall ? Math.min(4 * risk, Math.max(t1Distance + 0.25 * risk, nextWall.distance - 0.05 * risk)) : 3 * risk;
 
       // Confluence score.
       const daily = setup.pool.kind === "PDH" || setup.pool.kind === "PDL";
@@ -339,6 +367,16 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       if (setup.sweepWick >= 0.4) { confidence += 7; reasons.push("rejection wick on the sweep"); }
       if (engulfing) { confidence += 5; reasons.push("1m engulfing"); }
       if (t2Distance >= 2.5 * risk) confidence += 5;
+      // Session timing.
+      if (clock >= 9 * 60 + 30 && clock <= 11 * 60 + 30) { confidence += 5; reasons.push("morning liquidity window"); }
+      else if (clock >= 11 * 60 + 45 && clock <= 13 * 60 + 15) { confidence -= 8; reasons.push("midday chop (−)"); }
+      // Exhaustion: how much of the usual daily range has already been used.
+      const averageRange = adr();
+      const extended = Number.isFinite(averageRange) && s.sessionHigh - s.sessionLow > 1.2 * averageRange;
+      if (extended && aligned && !daily) { confidence -= 8; reasons.push("day already beyond 1.2× ADR: late trend entry (−)"); }
+      else if (extended && daily) { confidence += 5; reasons.push("exhausted move trapped at a daily level"); }
+      // Conviction of the rejection.
+      if ((setup.chochBars ?? 99) <= 2) { confidence += 5; reasons.push("fast rejection (CHoCH within 2 candles)"); }
       confidence = Math.max(0, Math.min(100, Math.round(confidence)));
 
       const pattern = engulfing ? `1m ${dir > 0 ? "bullish" : "bearish"} engulfing` : rejection ? `1m ${dir > 0 ? "hammer/pin-bar" : "shooting-star"} rejection` : reclaimed ? `1m close back ${dir > 0 ? "above" : "below"} the zone` : `1m strong ${dir > 0 ? "bullish" : "bearish"} close off the zone`;

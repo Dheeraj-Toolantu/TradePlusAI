@@ -37,6 +37,27 @@ describe("trade simulator", () => {
     expect(gap.trades[0].exitPrice).toBe(24_980);
   });
 
+  it("still delivers a list signal when the exact 1-minute bar is missing, but refuses a stale fill after a gap", () => {
+    // The 09:36 bar is missing: the signal stamped 09:36 arrives on the 09:37 close and fills at 09:37.
+    const holed = session(runner()).filter((_, m) => m !== minute25);
+    const result = runBacktest({ ...base, minute: holed, signalAt: listSignalSource([signal(minute25)]), settings: flat });
+    expect(result.trades).toHaveLength(1);
+    expect(result.signalsSeen).toBe(1);
+    // A 5-minute hole after the decision: the next bar is too late to fill at the planned price.
+    const gapped = session().filter((_, m) => m < minute25 + 1 || m > minute25 + 5);
+    const late = runBacktest({ ...base, minute: gapped, signalAt: listSignalSource([signal(minute25)]), settings: flat });
+    expect(late.trades).toHaveLength(0);
+    expect(late.skipped.map((item) => item.reason)).toContain("Data gap before the fill");
+  });
+
+  it("passes on a fill that has already run to T1 instead of booking a fake target hit", () => {
+    // The next bar opens at 25,018: only 2 of the 20 points to T1 are left against 28 points of risk.
+    const bars = session({ [minute25 + 1]: { open: 25_018, high: 25_019, low: 25_017, close: 25_018 } });
+    const result = runBacktest({ ...base, minute: bars, signalAt: listSignalSource([signal(minute25)]), settings: flat });
+    expect(result.trades).toHaveLength(0);
+    expect(result.skipped.map((item) => item.reason)).toContain("Fill too close to T1 (reward under 0.5R)");
+  });
+
   it("applies the time stop and the 15:15 square-off", () => {
     const timeStopped = runBacktest({ ...base, minute: session(), signalAt: listSignalSource([signal(minute25)]), settings: { ...flat, timeStopMinutes: 15 } });
     expect(timeStopped.trades[0].exitReason).toBe("TIME_STOP");
