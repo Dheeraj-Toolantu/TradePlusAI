@@ -14,7 +14,7 @@ import { analyzeMultiTimeframe, type Bar } from "../../ai-monitoring/src/mtf-dec
  * estimate; the index-points view is exact for the given candles.
  */
 
-export type StrategyId = "MTF_AI" | "ORB_RETEST" | "SMC_SWEEP" | "TREND_PULLBACK" | "SMART_COMBO";
+export type StrategyId = "MTF_AI" | "ORB_RETEST" | "ORB_PRO" | "SMC_SWEEP" | "TREND_PULLBACK" | "SMART_COMBO";
 export type PnlMode = "OPTION" | "POINTS";
 
 export type BacktestSettings = {
@@ -65,6 +65,8 @@ export type BacktestTrade = {
   signalTime: number; entryTime: number; entryPrice: number; stop: number; target1: number; target2: number;
   exitTime: number; exitPrice: number; exitReason: string; legs: TradeLeg[];
   points: number; rMultiple: number; pnl: number; holdMinutes: number; mfeR: number; maeR: number;
+  /** Every move of the stop after entry (to breakeven at T1, then trailing), for the chart. */
+  stopPath: Array<{ time: number; price: number; reason: "BREAKEVEN" | "TRAIL" }>;
 };
 
 export type BacktestMetrics = {
@@ -213,6 +215,13 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
     let t1Hit = false;
     const trailing = settings.trailR > 0;
     let best = entry; // best price reached up to the previous bar (no same-bar look-ahead)
+    const stopPath: BacktestTrade["stopPath"] = [];
+    // Trail updates are recorded only when the stop moves by ≥ 0.1R, to keep the path light.
+    const moveStop = (time: number, price: number, reason: "BREAKEVEN" | "TRAIL") => {
+      const last = stopPath.at(-1);
+      if (reason === "TRAIL" && last && Math.abs(price - last.price) < 0.1 * riskPts) return;
+      stopPath.push({ time, price: round2(price), reason });
+    };
     const legs: TradeLeg[] = [];
     let mfe = 0; let mae = 0;
     let j = i + 1;
@@ -225,7 +234,7 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
       mfe = Math.max(mfe, favourable / riskPts); mae = Math.max(mae, adverse / riskPts);
       if (trailing && t1Hit) {
         const trail = best - side * settings.trailR * riskPts;
-        if ((trail - stop) * side > 0) stop = trail;
+        if ((trail - stop) * side > 0) { stop = trail; moveStop(b.time, trail, "TRAIL"); }
       }
       const stopTouched = side > 0 ? b.low <= stop : b.high >= stop;
       if (stopTouched) {
@@ -235,8 +244,8 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
         legs.push({ time: end, price: fill, fraction: remaining, reason }); remaining = 0; break;
       }
       if (!t1Hit && (side > 0 ? b.high >= target1 : b.low <= target1)) {
-        if (settings.partialAtT1) { legs.push({ time: end, price: target1, fraction: 0.5, reason: "TARGET_1" }); remaining = 0.5; t1Hit = true; stop = entry; }
-        else if (trailing) { t1Hit = true; stop = entry; }
+        if (settings.partialAtT1) { legs.push({ time: end, price: target1, fraction: 0.5, reason: "TARGET_1" }); remaining = 0.5; t1Hit = true; stop = entry; moveStop(end, entry, "BREAKEVEN"); }
+        else if (trailing) { t1Hit = true; stop = entry; moveStop(end, entry, "BREAKEVEN"); }
         else { legs.push({ time: end, price: target1, fraction: remaining, reason: "TARGET_1" }); remaining = 0; break; }
       }
       if (t1Hit && !trailing && (side > 0 ? b.high >= target2 : b.low <= target2)) { legs.push({ time: end, price: target2, fraction: remaining, reason: "TARGET_2" }); remaining = 0; break; }
@@ -260,7 +269,7 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
       id: trades.length + 1, day, strategy: signal.strategy, side: side > 0 ? "LONG" : "SHORT", reason: signal.reason, confidence: signal.confidence ?? null,
       signalTime: signal.time, entryTime: next.time, entryPrice: round2(entry), stop: round2(signal.stop), target1: round2(target1), target2: round2(target2),
       exitTime, exitPrice: round2(exitPrice), exitReason: finalReason, legs: legs.map((leg) => ({ ...leg, price: round2(leg.price) })),
-      points: round2(points), rMultiple: round2(points / riskPts), pnl, holdMinutes, mfeR: round2(mfe), maeR: round2(mae),
+      points: round2(points), rMultiple: round2(points / riskPts), pnl, holdMinutes, mfeR: round2(mfe), maeR: round2(mae), stopPath,
     });
     state.trades += 1;
     state.realized += pnl;

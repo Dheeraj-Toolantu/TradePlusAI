@@ -708,9 +708,16 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 }
 
 /* Backtest candlestick chart */
-.bt-candles { display: grid; gap: 0; background: #081c24; }
-.bt-candles:fullscreen { grid-template-rows: auto 1fr auto; padding: 10px; }
-.bt-candles:fullscreen .bt-candles-canvas { height: 100%; }
+.bt-candles { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; background: #081c24; }
+/* Full screen: a fixed-height flex column. The chart stage takes the leftover space and the canvas
+   host is absolutely positioned inside it, so its size never depends on its own content (which made
+   autoSize and the layout feed each other and the chart jitter / grow). */
+.bt-candles:fullscreen { display: flex; flex-direction: column; width: 100vw; height: 100vh; padding: 10px; box-sizing: border-box; overflow: hidden; }
+.bt-candles.is-full > :not(.bt-candles-stage) { flex: 0 0 auto; }
+.bt-candles.is-full .bt-candles-stage { flex: 1 1 0; min-height: 0; overflow: hidden; }
+.bt-candles.is-full .bt-candles-canvas { position: absolute; inset: 0; height: auto; }
+.bt-candles.is-full .bt-candles-hint, .bt-candles.is-full .bt-candles-trade { max-height: 22vh; overflow-y: auto; }
+.bt-candles:fullscreen::backdrop { background: #081c24; }
 .bt-candles-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .bt-seg { display: inline-flex; align-items: center; border: 1px solid #23505a; border-radius: 5px; overflow: hidden; }
 .bt-seg button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; color: #8eadb2; background: transparent; border: 0; border-right: 1px solid #23505a; font: 10px "DM Mono", monospace; cursor: pointer; }
@@ -723,8 +730,8 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .bt-seg-nav span { padding: 0 10px; color: #b5cbcd; font: 10px "DM Mono", monospace; white-space: nowrap; }
 .bt-seg-nav button { font-size: 14px; padding: 3px 10px; }
 .bt-candles-day { padding: 6px 8px; color: #b5cbcd; background: #0b2631; border: 1px solid #23505a; border-radius: 5px; font: 10px "DM Mono", monospace; }
-.bt-candles-stage { position: relative; }
-.bt-candles-canvas { height: 460px; }
+.bt-candles-stage { position: relative; min-width: 0; }
+.bt-candles-canvas { height: 460px; min-width: 0; overflow: hidden; }
 .bt-ohlc { position: absolute; z-index: 3; top: 8px; left: 12px; right: 80px; display: flex; flex-wrap: wrap; gap: 4px 12px; pointer-events: none; color: #7f9fa5; font: 11px "DM Mono", monospace; }
 .bt-ohlc strong { color: #e4f1f1; font-weight: 500; }
 .bt-ohlc b { color: #d4e5e6; font-weight: 400; }

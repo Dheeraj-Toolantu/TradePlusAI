@@ -6,7 +6,7 @@ const post = (body: Record<string, unknown>) => POST(new Request("http://localho
 describe("backtest route", () => {
   it("lists strategies and defaults", async () => {
     const body = await (await GET()).json();
-    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "SMC_SWEEP", "TREND_PULLBACK", "SMART_COMBO"]);
+    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "TREND_PULLBACK", "SMART_COMBO"]);
     expect(body.defaults).toMatchObject({ maxTradesPerDay: 3, squareOff: "15:15" });
   });
 
@@ -75,5 +75,17 @@ describe("backtest route", () => {
     expect(notes).toMatch(/Playbook signals: trend \d+, sweep \d+, ORB \d+/);
     expect(notes).not.toMatch(/ORB playbook skipped/);
     for (const trade of body.trades) expect(trade.strategy).toMatch(/^Smart combo · /);
+  });
+
+  it("runs ORB retest Pro, reports its funnel and ships each trade's stop path", { timeout: 120_000 }, async () => {
+    const response = await post({ strategy: "ORB_PRO", symbol: "NIFTY", from: "2026-04-06", to: "2026-09-25", source: "synthetic", settings: { trailR: 1, timeStopMinutes: 30 } });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.notes.join(" ")).toMatch(/Setup funnel: \d+ sessions \(\d+ gap days/);
+    for (const trade of body.trades) {
+      expect(trade.strategy).toBe("ORB retest Pro");
+      expect(Array.isArray(trade.stopPath)).toBe(true);
+      expect(trade.reason).toMatch(/SL [\d,.]+ \([\d.]+ pts\)/);
+    }
   });
 });
