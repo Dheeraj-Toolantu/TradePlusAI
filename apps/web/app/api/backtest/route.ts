@@ -62,7 +62,9 @@ export async function POST(request: Request) {
   const started = Date.now();
   const data = await loadBacktestData({ symbol, from, to, source, origin: new URL(request.url).origin });
   if (!data.sessions) {
-    const hint = source === "groww" ? "Check that the Groww API is connected (GROWW_API_KEY / secret) and that the dates are trading days." : "Yahoo only serves the last ~30 days of 1-minute candles; use Groww history for older periods.";
+    // Lead with the provider's own explanation when there is one (first issue is the missing-days list).
+    const cause = data.issues.find((issue) => !issue.startsWith("No 1-minute candles for"));
+    const hint = cause ?? (source === "groww" ? "Check that the Groww API is connected (GROWW_API_KEY / secret) and that the dates are trading days." : "Yahoo only serves the last ~30 days of 1-minute candles; use Groww history for older periods.");
     return NextResponse.json({ error: `No 1-minute candles for ${symbol} between ${from} and ${to}. ${hint}`, issues: data.issues }, { status: 422 });
   }
 

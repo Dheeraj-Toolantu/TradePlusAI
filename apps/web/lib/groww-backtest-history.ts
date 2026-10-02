@@ -53,9 +53,31 @@ export function weekChunks(from: string, to: string) {
   return chunks;
 }
 
-export async function fetchGrowwBacktestMinutes(transport: GrowwTransport, symbol: string, from: string, to: string): Promise<Bar[]> {
+const istMinuteOf = (epochS: number) => { const d = new Date((epochS + IST_S) * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+
+/**
+ * Guards against a feed that stamps IST wall-clock times as if they were UTC (or the reverse): the
+ * session would then appear to open at 14:45 (or 03:45) IST. Shift it back to 09:15.
+ */
+export function alignToSession(bars: Bar[]): { bars: Bar[]; shiftedBy: number } {
+  if (!bars.length) return { bars, shiftedBy: 0 };
+  const open = Math.min(...bars.map((bar) => istMinuteOf(bar.time)));
+  const shift = open >= 870 && open <= 900 ? -IST_S : open >= 210 && open <= 240 ? IST_S : 0;
+  return { bars: shift ? bars.map((bar) => ({ ...bar, time: bar.time + shift })) : bars, shiftedBy: shift };
+}
+
+export type GrowwMinutesResult = { bars: Bar[]; rows: number; firstRaw: unknown; shiftedBy: number };
+
+/** Throws on transport errors and on a `status: "FAILURE"` body (Groww can send those with HTTP 200). */
+export async function fetchGrowwBacktestMinutes(transport: GrowwTransport, symbol: string, from: string, to: string): Promise<GrowwMinutesResult> {
   const market = GROWW_INDEX_SYMBOLS[symbol];
   if (!market) throw new Error(`No Groww backtesting symbol for ${symbol}`);
   const query = new URLSearchParams({ exchange: market.exchange, segment: "CASH", groww_symbol: market.growwSymbol, start_time: `${from} 09:15:00`, end_time: `${to} 15:30:00`, candle_interval: "1minute" });
-  return parseBacktestCandles(await transport.request(`/v1/historical/candles?${query.toString()}`, { method: "GET" }));
+  const body = await transport.request(`/v1/historical/candles?${query.toString()}`, { method: "GET" }) as { status?: string; error?: { code?: string; message?: string }; payload?: { candles?: unknown[] }; candles?: unknown[] };
+  if (body?.status === "FAILURE") throw new Error(`Groww ${body.error?.code ?? "FAILURE"}: ${body.error?.message ?? "request failed"}`);
+  const rows = (body?.payload?.candles ?? body?.candles ?? []) as unknown[];
+  const firstRow = rows[0];
+  const firstRaw = Array.isArray(firstRow) ? firstRow[0] : firstRow && typeof firstRow === "object" ? (firstRow as Record<string, unknown>).timestamp ?? (firstRow as Record<string, unknown>).time : firstRow;
+  const { bars, shiftedBy } = alignToSession(parseBacktestCandles(body));
+  return { bars, rows: rows.length, firstRaw, shiftedBy };
 }
