@@ -44,7 +44,7 @@ const LABEL: Record<Component, string> = { TREND: "trend pullback", SMC: "liquid
 
 export function smartSignalSource(symbol: string, minute: Bar[], daily: Bar[], options: { orbSignals?: Signal[] | null } = {}) {
   const trend = trendPullbackSignalSource(symbol, minute, daily);
-  const smc = smcSignalSource(symbol, minute, daily);
+  const smc = smcSignalSource(symbol, minute, daily, { legacy: true });
   const orb = options.orbSignals ? listSignalSource(options.orbSignals) : null;
   const mtf = mtfSignalSource(symbol, minute, daily);
   const m5 = aggregate(minute, 5);

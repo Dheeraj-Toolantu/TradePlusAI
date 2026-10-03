@@ -15,7 +15,7 @@ const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
   { id: "ORB_RETEST", title: "V5 ORB retest", detail: "Opening-range break, retest and hold with a structural stop and 2R target capped at PDH/PDL." },
   { id: "SMART_COMBO", title: "★ Smart combo", detail: "Reads the day first (trend / range), then routes to the playbook that fits it: trend pullback, ORB, or liquidity sweep. AI multi-timeframe votes; confluence adds conviction." },
   { id: "TREND_PULLBACK", title: "Trend-day VWAP pullback", detail: "Trades only confirmed trend days: 30 min on one side of a sloping VWAP, OR break, 15m agreeing → pullback into VWAP/EMA20 → 5m resumption candle. Trailing runner." },
-  { id: "SMC_SWEEP", title: "SMC liquidity sweep", detail: "S/R + liquidity sweep → CHoCH with displacement → retrace into the FVG / order block → 1m candle confirmation. Stop beyond the sweep, targets at opposing liquidity." },
+  { id: "SMC_SWEEP", title: "SMC liquidity sweep + 9 EMA", detail: "Liquidity sweep → CHoCH with displacement → retrace into the FVG / order block → 1m close back out of the zone, only with the 15m 9 EMA trend and VWAP. Stop beyond the sweep, T1 1R, trailing runner." },
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };
@@ -28,9 +28,12 @@ const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getU
  * Per-strategy time stop: retest/zone entries often need 20–40 minutes to work. ORB retest Pro runs
  * without one: on real NIFTY data (2024–26) its 30-minute time stop cut trades that later hit target.
  */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 30, TREND_PULLBACK: 45, SMART_COMBO: 45 };
-/** Trend entries are built for a trailing runner; the others default to fixed T1/T2. */
-const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 0, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5 };
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, TREND_PULLBACK: 45, SMART_COMBO: 45 };
+/**
+ * Trend entries are built for a trailing runner; the others default to fixed T1/T2. SMC + 9 EMA: a 1.5R
+ * trail with a 45-min time stop was best on real NIFTY and BANKNIFTY data (2018–26).
+ */
+const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 1.5, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5 };
 type Preset = { key: string; label: string; sessions?: number; months?: number };
 const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
 function lastMonths(months: number) {

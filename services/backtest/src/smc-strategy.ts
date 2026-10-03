@@ -2,7 +2,7 @@ import type { Bar } from "../../ai-monitoring/src/mtf-decision-engine";
 import { aggregate, istDay, istMinute, type Signal } from "./strategy-backtest";
 
 /**
- * SMC liquidity-sweep strategy ("sweep → shift → retrace").
+ * SMC liquidity-sweep strategy v2 ("sweep → shift → retrace, with the 9 EMA trend").
  *
  * The idea a discretionary index trader would trade, written as rules:
  *  1. Map liquidity and support/resistance: previous-day high/low (PDH/PDL), the 09:15–09:30 opening
@@ -12,22 +12,30 @@ import { aggregate, istDay, istMinute, type Signal } from "./strategy-backtest";
  *  3. Demand proof: a CHANGE OF CHARACTER (CHoCH) within six 5m bars — a displacement candle (big
  *     body, closes on its extreme) that closes through the last internal swing in the new direction.
  *  4. Entry zone: the FAIR VALUE GAP left by the displacement (3-candle imbalance), else the ORDER
- *     BLOCK (last opposite candle before the move). Wait for price to RETRACE into it.
- *  5. Trigger on 1m candle psychology inside the zone: rejection wick (hammer / shooting star),
- *     engulfing, a close back out of the zone, or a strong directional close off the zone. No retrace within an hour = no trade (never chase).
- *  6. Stop beyond the sweep extreme (the level that must hold for the idea to be right). T1 at 1.5R
- *     (or the nearest opposing liquidity if closer, min 1R), T2 at the next opposing liquidity pool.
- *     Skip when opposing S/R sits closer than 1R or the stop is wider than 2.5 ATR (5m).
- *  7. Context score: 15m structure bias (BOS), premium/discount of the 15m dealing range, VWAP side,
- *     daily-level sweeps, FVG/OB overlap, displacement strength. Counter-trend setups are only taken
- *     off a daily level.
- *  8. Trader psychology / session behaviour:
- *     - Timing: the 09:30–11:30 window carries the day's real liquidity (+); 11:45–13:15 is lunch chop
- *       where sweeps fail more often (−); no new entries after 14:30 (no time left for T2).
- *     - Exhaustion: once the day's range exceeds ~1.2× the average daily range (ADR), chasing the trend
- *       is a late-entry trap (−), while a reversal off a daily extreme is the crowd being trapped (+).
- *     - Conviction: a CHoCH within two candles of the sweep (fast, violent rejection) scores higher than
- *       a slow drift back.
+ *     BLOCK (last opposite candle before the move). Wait for price to RETRACE into it (no retrace
+ *     within an hour = no trade; never chase).
+ *  5. TREND CONFIRMATION with the 9 EMA: only trade in the direction of the 15-minute 9 EMA — the last
+ *     closed 15m candle is beyond the EMA and the EMA slopes the trade's way — and with the 1m close on
+ *     the trade's side of VWAP. A sweep against the 15m 9 EMA is a trap more often than a reversal.
+ *  6. Trigger: after the zone is tapped, a 1m candle in the trade's direction that CLOSES back out of
+ *     the zone (the zone held). A wick or pin bar that closes inside the zone is not enough.
+ *  7. Stop beyond the sweep extreme (the level that must hold for the idea to be right). T1 at 1R (or
+ *     the nearest opposing liquidity if closer), then breakeven and a trailing runner / T2 at the next
+ *     opposing liquidity pool. Skip when opposing S/R sits closer than 1R, the stop is wider than
+ *     2.5 ATR (5m), or it is after 14:30.
+ *  8. Confidence: entry at value (within 0.3 ATR of the 5m 9 EMA, not stretched away from it), an FVG
+ *     inside the order block, and a daily-level sweep add conviction.
+ *
+ * Validation on real 1-minute index data, Jan 2018 – Oct 2026 (BANKNIFTY to Apr 2026), index points,
+ * 1-pt slippage per side, half at T1, 1.5R trail, 45-min time stop:
+ *   NIFTY      v1 206 trades, 45% win, -0.05R/trade, PF 1.14  →  v2  82 trades, 59% win, +0.19R, PF 1.64
+ *   BANKNIFTY  v1 215 trades, 41% win, -0.12R/trade, PF 0.86  →  v2  94 trades, 55% win, +0.19R, PF 1.70
+ * BANKNIFTY was not used to design the rules. Without the 15m 9 EMA gate v2 makes PF 1.36 (NIFTY) and
+ * 1.40 (BANKNIFTY). With minimum confidence 65: NIFTY 53 trades, 60% win, +0.27R; BANKNIFTY 63
+ * trades, 59% win, +0.29R. Few trades (~10 a year): this is an A+ setup filter, not a daily signal.
+ *
+ * `legacy: true` keeps the original v1 rules (any 1m candle pattern in the zone, 15m BOS bias,
+ * T1 1.5R, session/exhaustion scoring); the Smart combo router still uses them for range-day fades.
  *
  * Every decision uses only candles completed at decision time; 5m/15m bars are processed only after
  * they close.
@@ -46,6 +54,10 @@ type Setup = {
   displacement?: number;
   /** 5m bars from the sweep to the CHoCH candle (1 = the very next candle). */
   chochBars?: number;
+  /** 1m index of the first touch of the zone (v2 waits for a confirming close after it). */
+  tappedAt?: number;
+  /** Last v2 gate that held a confirmed trigger back, for the funnel if the setup then expires. */
+  blocked?: "EMA" | "VWAP";
   barsLeft: number;
   armedAt?: number;
   expiresAt?: number;
@@ -59,12 +71,19 @@ const fmt = (value: number) => value.toLocaleString("en-IN", { maximumFractionDi
 const KIND_LABEL: Record<Pool["kind"], string> = { PDH: "previous-day high", PDL: "previous-day low", ORH: "opening-range high", ORL: "opening-range low", SWING: "5m swing", EQUAL: "equal highs/lows" };
 
 /** How many setups reached each stage, and why the rest were dropped. */
-export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; lateSession: number };
-const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, lateSession: 0 });
+export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; againstEma: number; againstVwap: number; lateSession: number };
+const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, againstEma: 0, againstVwap: 0, lateSession: 0 });
 /** Last minute (IST) at which a new SMC entry is allowed: later trades have no time to reach T2. */
 const LAST_ENTRY_MINUTE = 14 * 60 + 30;
 
-export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
+export type SmcOptions = {
+  /** The original (v1) rules: any 1m candle pattern in the zone, 15m BOS bias, T1 1.5R, no 9 EMA/VWAP gate. */
+  legacy?: boolean;
+};
+const ema = (prev: number, value: number, period: number) => (Number.isFinite(prev) ? prev + (2 / (period + 1)) * (value - prev) : value);
+
+export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], options: SmcOptions = {}) {
+  const legacy = options.legacy === true;
   const m5 = aggregate(minute, 5);
   const funnel = emptyFunnel();
   const m15 = aggregate(minute, 15);
@@ -86,6 +105,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       /** Completed session ranges (most recent last), for the average daily range. */
       ranges: [] as number[],
       pending: null as Signal | null, pendingIndex: -1,
+      ema5: NaN, ema15: NaN, ema15Hist: [] as number[], close15: NaN,
     };
   }
 
@@ -150,6 +170,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     const s = state;
     const bar = m15[k];
     const prev = m15[k - 1];
+    s.ema15 = ema(s.ema15, bar.close, 9); s.ema15Hist = [...s.ema15Hist, s.ema15].slice(-3); s.close15 = bar.close;
     s.atr15 = wilder(s.atr15, prev ? Math.max(bar.high - bar.low, Math.abs(bar.high - prev.close), Math.abs(bar.low - prev.close)) : bar.high - bar.low, 14);
     // Fractal swings (confirmed two bars later), then break of structure on a close.
     const p = k - PIVOT;
@@ -169,6 +190,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     const prev = m5[k - 1];
     const tr = prev ? Math.max(bar.high - bar.low, Math.abs(bar.high - prev.close), Math.abs(bar.low - prev.close)) : bar.high - bar.low;
     s.atr5 = wilder(s.atr5, tr, 14);
+    s.ema5 = ema(s.ema5, bar.close, 9);
     const atr = s.atr5;
     const sameDay = istDay(bar.time) === s.day;
 
@@ -260,7 +282,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     const dir = setup.dir;
     // Invalidated: a 5m close beyond the sweep extreme means the level did not hold.
     if ((bar.close - setup.sweepExtreme) * dir < 0) { setup.barsLeft = 0; funnel.invalidated += 1; return; }
-    if (setup.stage === "ARMED") { setup.barsLeft -= 1; if (setup.barsLeft === 0) funnel.expired += 1; return; }
+    if (setup.stage === "ARMED") { setup.barsLeft -= 1; if (setup.barsLeft === 0) expire(setup); return; }
     if (setup.stage === "SWEPT") {
       if (k === setup.sweepIndex) return;
       setup.barsLeft -= 1;
@@ -297,6 +319,69 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     setup.barsLeft = 12;
   }
 
+  /** A setup that ran out of time: counted against the v2 gate that held it back, if any. */
+  function expire(setup: Setup) {
+    if (setup.blocked === "EMA") funnel.againstEma += 1;
+    else if (setup.blocked === "VWAP") funnel.againstVwap += 1;
+    else funnel.expired += 1;
+  }
+
+  /**
+   * v2 confidence, kept to what held up on real NIFTY/BANKNIFTY 1-minute data (2018–2026): entering at
+   * value near the 5m 9 EMA (not stretched away from it), an FVG inside the order block, and a sweep
+   * of a daily level. The 15m 9 EMA trend and VWAP side are already hard requirements.
+   */
+  function v2Score(args: { setup: Setup; dir: 1 | -1; entry: number; atr: number }) {
+    const s = state;
+    const { setup, dir, entry, atr } = args;
+    let confidence = 60;
+    const reasons = [`15m 9 EMA ${dir > 0 ? "up" : "down"}trend`, `${dir > 0 ? "above" : "below"} VWAP`];
+    const stretch = (entry - s.ema5) * dir / Math.max(atr, 1e-9);
+    if (stretch <= 0.3) { confidence += 12; reasons.push(`entry at value (within 0.3 ATR of the 5m 9 EMA ${fmt(s.ema5)})`); }
+    else if (stretch > 1) { confidence -= 5; reasons.push("stretched > 1 ATR from the 5m 9 EMA (−)"); }
+    if (setup.zone?.kind === "FVG+OB") { confidence += 8; reasons.push("FVG inside order block"); }
+    if (setup.pool.kind === "PDH" || setup.pool.kind === "PDL") { confidence += 6; reasons.push("daily level"); }
+    return { confidence: Math.max(0, Math.min(100, Math.round(confidence))), reasons };
+  }
+
+  /** v1 confluence score; null = counter-trend against the 15m structure off a non-daily level (skip). */
+  function legacyScore(args: { setup: Setup; dir: 1 | -1; entry: number; risk: number; clock: number; engulfing: boolean; t2Distance: number }) {
+    const s = state;
+    const { setup, dir, entry, risk, clock, engulfing, t2Distance } = args;
+    const daily = setup.pool.kind === "PDH" || setup.pool.kind === "PDL";
+    const aligned = s.bias15 === dir;
+    const against = s.bias15 === -dir;
+    if (against && !daily) return null;
+    const rangeHigh = s.swingHigh15; const rangeLow = s.swingLow15;
+    const position = Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) && rangeHigh > rangeLow ? (entry - rangeLow) / (rangeHigh - rangeLow) : 0.5;
+    const discountOk = dir > 0 ? position <= 0.5 : position >= 0.5;
+    const vwapOk = Number.isFinite(s.vwap) && (entry - s.vwap) * dir >= 0;
+    let confidence = 45;
+    const reasons: string[] = [];
+    if (daily) { confidence += 15; reasons.push("daily level"); }
+    else if (setup.pool.kind === "EQUAL") { confidence += 8; reasons.push("equal highs/lows"); }
+    else if (setup.pool.kind === "ORH" || setup.pool.kind === "ORL") { confidence += 6; reasons.push("opening range"); }
+    if (aligned) { confidence += 12; reasons.push(`15m ${dir > 0 ? "bullish" : "bearish"} structure`); } else if (against) confidence -= 10;
+    if (discountOk) { confidence += 8; reasons.push(dir > 0 ? "discount" : "premium"); }
+    if (vwapOk) { confidence += 5; reasons.push(`${dir > 0 ? "above" : "below"} VWAP`); }
+    if (setup.zone?.kind === "FVG+OB") { confidence += 8; reasons.push("FVG inside order block"); }
+    if ((setup.displacement ?? 0) >= 1) { confidence += 7; reasons.push("strong displacement"); }
+    if (setup.sweepWick >= 0.4) { confidence += 7; reasons.push("rejection wick on the sweep"); }
+    if (engulfing) { confidence += 5; reasons.push("1m engulfing"); }
+    if (t2Distance >= 2.5 * risk) confidence += 5;
+    // Session timing.
+    if (clock >= 9 * 60 + 30 && clock <= 11 * 60 + 30) { confidence += 5; reasons.push("morning liquidity window"); }
+    else if (clock >= 11 * 60 + 45 && clock <= 13 * 60 + 15) { confidence -= 8; reasons.push("midday chop (−)"); }
+    // Exhaustion: how much of the usual daily range has already been used.
+    const averageRange = adr();
+    const extended = Number.isFinite(averageRange) && s.sessionHigh - s.sessionLow > 1.2 * averageRange;
+    if (extended && aligned && !daily) { confidence -= 8; reasons.push("day already beyond 1.2× ADR: late trend entry (−)"); }
+    else if (extended && daily) { confidence += 5; reasons.push("exhausted move trapped at a daily level"); }
+    // Conviction of the rejection.
+    if ((setup.chochBars ?? 99) <= 2) { confidence += 5; reasons.push("fast rejection (CHoCH within 2 candles)"); }
+    return { confidence: Math.max(0, Math.min(100, Math.round(confidence))), reasons };
+  }
+
   /** 1m candle-psychology trigger inside an armed zone. Emits a signal at this bar's close. */
   function trigger(index: number) {
     const s = state;
@@ -305,7 +390,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
     const prev = minute[index - 1];
     for (const setup of s.setups) {
       if (setup.stage !== "ARMED" || !setup.zone || setup.armedAt === undefined || bar.time < setup.armedAt) continue;
-      if (t > (setup.expiresAt ?? 0)) { setup.barsLeft = 0; funnel.expired += 1; continue; }
+      if (t > (setup.expiresAt ?? 0)) { setup.barsLeft = 0; expire(setup); continue; }
       const dir = setup.dir;
       const zone = setup.zone;
       const atr = s.atr5 ?? Math.max(bar.high - bar.low, 1);
@@ -313,7 +398,9 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       const stop = setup.sweepExtreme - dir * buffer;
       if ((bar.close - stop) * dir <= 0) { setup.barsLeft = 0; funnel.invalidated += 1; continue; }
       const touched = dir > 0 ? bar.low <= zone.hi : bar.high >= zone.lo;
-      if (!touched) continue;
+      if (touched) setup.tappedAt ??= index;
+      // v2 waits for the confirming close after the first tap; legacy needs the trigger bar itself in the zone.
+      if (legacy ? !touched : setup.tappedAt === undefined) continue;
       const range = Math.max(bar.high - bar.low, 1e-9);
       const lowerWick = (Math.min(bar.open, bar.close) - bar.low) / range;
       const upperWick = (bar.high - Math.max(bar.open, bar.close)) / range;
@@ -324,7 +411,13 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
       const rejection = wick >= 0.45 && (bar.close - (bar.high + bar.low) / 2) * dir >= 0;
       // Strong close: a directional candle that tested the zone and closed in its top (bottom) third.
       const strongClose = directional && (dir > 0 ? (bar.close - bar.low) / range >= 0.67 : (bar.high - bar.close) / range >= 0.67);
-      if (!(engulfing || rejection || (directional && reclaimed) || strongClose)) continue;
+      if (legacy ? !(engulfing || rejection || (directional && reclaimed) || strongClose) : !(directional && reclaimed)) continue;
+      // v2 trend confirmation: the 15m close is beyond a 9 EMA sloping the trade's way, and the 1m close
+      // is on the trade's side of VWAP. A setup that fails waits (it may still qualify before expiry).
+      const ema15Ok = (s.close15 - s.ema15) * dir > 0 && ((s.ema15Hist.at(-1) ?? NaN) - (s.ema15Hist.at(-3) ?? NaN)) * dir > 0;
+      const vwapOk = Number.isFinite(s.vwap) && (bar.close - s.vwap) * dir >= 0;
+      if (!legacy && !ema15Ok) { setup.blocked = "EMA"; continue; }
+      if (!legacy && !vwapOk) { setup.blocked = "VWAP"; continue; }
       const clock = istMinute(t);
       if (clock > LAST_ENTRY_MINUTE) { setup.barsLeft = 0; funnel.lateSession += 1; continue; }
       const entry = bar.close;
@@ -339,48 +432,23 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[]) {
         .sort((a, b) => a.distance - b.distance);
       const nearest = opposing[0];
       if (nearest && nearest.distance < 1 * risk) { setup.barsLeft = 0; funnel.srTooClose += 1; continue; } // walking into S/R
-      const t1Distance = nearest && nearest.distance < 1.5 * risk ? Math.max(risk, nearest.distance - 0.05 * risk) : 1.5 * risk;
+      // T1: 1R in v2 (1.5R legacy), or the nearest opposing liquidity if closer (front-run by 0.05R, min 1R).
+      const t1R = legacy ? 1.5 : 1;
+      const t1Distance = nearest && nearest.distance < t1R * risk ? Math.max(risk, nearest.distance - 0.05 * risk) : t1R * risk;
       // T2: the next opposing liquidity beyond T1 (front-run by 0.05R), capped at 4R; 3R when the path
       // is clear. Never place T2 behind a level price has to break first.
       const nextWall = opposing.find((item) => item.distance > t1Distance + 0.25 * risk);
       const t2Distance = nextWall ? Math.min(4 * risk, Math.max(t1Distance + 0.25 * risk, nextWall.distance - 0.05 * risk)) : 3 * risk;
 
-      // Confluence score.
-      const daily = setup.pool.kind === "PDH" || setup.pool.kind === "PDL";
-      const aligned = s.bias15 === dir;
-      const against = s.bias15 === -dir;
-      if (against && !daily) { setup.barsLeft = 0; funnel.counterTrend += 1; continue; }
-      const rangeHigh = s.swingHigh15; const rangeLow = s.swingLow15;
-      const position = Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) && rangeHigh > rangeLow ? (entry - rangeLow) / (rangeHigh - rangeLow) : 0.5;
-      const discountOk = dir > 0 ? position <= 0.5 : position >= 0.5;
-      const vwapOk = Number.isFinite(s.vwap) && (entry - s.vwap) * dir >= 0;
-      let confidence = 45;
-      const reasons: string[] = [];
-      if (daily) { confidence += 15; reasons.push("daily level"); }
-      else if (setup.pool.kind === "EQUAL") { confidence += 8; reasons.push("equal highs/lows"); }
-      else if (setup.pool.kind === "ORH" || setup.pool.kind === "ORL") { confidence += 6; reasons.push("opening range"); }
-      if (aligned) { confidence += 12; reasons.push(`15m ${dir > 0 ? "bullish" : "bearish"} structure`); } else if (against) confidence -= 10;
-      if (discountOk) { confidence += 8; reasons.push(dir > 0 ? "discount" : "premium"); }
-      if (vwapOk) { confidence += 5; reasons.push(`${dir > 0 ? "above" : "below"} VWAP`); }
-      if (zone.kind === "FVG+OB") { confidence += 8; reasons.push("FVG inside order block"); }
-      if ((setup.displacement ?? 0) >= 1) { confidence += 7; reasons.push("strong displacement"); }
-      if (setup.sweepWick >= 0.4) { confidence += 7; reasons.push("rejection wick on the sweep"); }
-      if (engulfing) { confidence += 5; reasons.push("1m engulfing"); }
-      if (t2Distance >= 2.5 * risk) confidence += 5;
-      // Session timing.
-      if (clock >= 9 * 60 + 30 && clock <= 11 * 60 + 30) { confidence += 5; reasons.push("morning liquidity window"); }
-      else if (clock >= 11 * 60 + 45 && clock <= 13 * 60 + 15) { confidence -= 8; reasons.push("midday chop (−)"); }
-      // Exhaustion: how much of the usual daily range has already been used.
-      const averageRange = adr();
-      const extended = Number.isFinite(averageRange) && s.sessionHigh - s.sessionLow > 1.2 * averageRange;
-      if (extended && aligned && !daily) { confidence -= 8; reasons.push("day already beyond 1.2× ADR: late trend entry (−)"); }
-      else if (extended && daily) { confidence += 5; reasons.push("exhausted move trapped at a daily level"); }
-      // Conviction of the rejection.
-      if ((setup.chochBars ?? 99) <= 2) { confidence += 5; reasons.push("fast rejection (CHoCH within 2 candles)"); }
-      confidence = Math.max(0, Math.min(100, Math.round(confidence)));
-
-      const pattern = engulfing ? `1m ${dir > 0 ? "bullish" : "bearish"} engulfing` : rejection ? `1m ${dir > 0 ? "hammer/pin-bar" : "shooting-star"} rejection` : reclaimed ? `1m close back ${dir > 0 ? "above" : "below"} the zone` : `1m strong ${dir > 0 ? "bullish" : "bearish"} close off the zone`;
-      const reason = `${dir > 0 ? "Buy CE" : "Buy PE"}: swept ${KIND_LABEL[setup.pool.kind]} ${fmt(setup.pool.price)} (${dir > 0 ? "sell" : "buy"}-side liquidity) → ${dir > 0 ? "bullish" : "bearish"} CHoCH through ${fmt(setup.breakLevel)} → retrace into ${zone.kind} ${fmt(zone.lo)}–${fmt(zone.hi)} → ${pattern}${reasons.length ? `. Confluence: ${reasons.join(", ")}` : ""}.`;
+      const scored = legacy ? legacyScore({ setup, dir, entry, risk, clock, engulfing, t2Distance }) : v2Score({ setup, dir, entry, atr });
+      if (scored === null) { setup.barsLeft = 0; funnel.counterTrend += 1; continue; }
+      const { confidence, reasons } = scored;
+      const candle = engulfing ? `${dir > 0 ? "bullish" : "bearish"} engulfing` : rejection ? `${dir > 0 ? "hammer/pin-bar" : "shooting-star"} rejection` : null;
+      const pattern = legacy
+        ? candle ? `1m ${candle}` : reclaimed ? `1m close back ${dir > 0 ? "above" : "below"} the zone` : `1m strong ${dir > 0 ? "bullish" : "bearish"} close off the zone`
+        : `1m close back ${dir > 0 ? "above" : "below"} the zone${candle ? ` (${candle})` : ""}`;
+      const trend = legacy ? "" : ` with the 15m 9 EMA ${dir > 0 ? "rising" : "falling"} (${fmt(s.ema15)}) and price ${dir > 0 ? "above" : "below"} VWAP`;
+      const reason = `${dir > 0 ? "Buy CE" : "Buy PE"}: swept ${KIND_LABEL[setup.pool.kind]} ${fmt(setup.pool.price)} (${dir > 0 ? "sell" : "buy"}-side liquidity) → ${dir > 0 ? "bullish" : "bearish"} CHoCH through ${fmt(setup.breakLevel)} → retrace into ${zone.kind} ${fmt(zone.lo)}–${fmt(zone.hi)} → ${pattern}${trend}${reasons.length ? `. Confluence: ${reasons.join(", ")}` : ""}.`;
       setup.barsLeft = 0; // one trade per setup
       funnel.entries += 1;
       if (index === s.pendingIndex || s.pending === null) { s.pending = { time: t, side: dir, stop: Math.round(finalStop * 100) / 100, target1: Math.round((entry + dir * t1Distance) * 100) / 100, target2: Math.round((entry + dir * t2Distance) * 100) / 100, confidence, strategy: SMC_NAME, reason }; s.pendingIndex = index; }
