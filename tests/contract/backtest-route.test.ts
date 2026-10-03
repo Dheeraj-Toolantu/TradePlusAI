@@ -6,7 +6,7 @@ const post = (body: Record<string, unknown>) => POST(new Request("http://localho
 describe("backtest route", () => {
   it("lists strategies and defaults", async () => {
     const body = await (await GET()).json();
-    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "TREND_PULLBACK", "SMART_COMBO"]);
+    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "SMC_PLUS", "TREND_PULLBACK", "SMART_COMBO"]);
     expect(body.defaults).toMatchObject({ maxTradesPerDay: 3, squareOff: "15:15" });
   });
 

@@ -13,6 +13,7 @@ const STRATEGIES: Record<StrategyId, string> = {
   ORB_RETEST: "V5 ORB break-and-retest (strategy rules)",
   ORB_PRO: "ORB retest Pro (sentiment, conviction breakout, held retest, structural stop)",
   SMC_SWEEP: "SMC liquidity sweep + 9 EMA (S/R, CHoCH, FVG/OB, 15m 9 EMA trend, 1m close-back confirmation)",
+  SMC_PLUS: "SMC sweep + BOS retest (adds 5m BOS → FVG/OB retest continuation entries; ~2× trades)",
   TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
   SMART_COMBO: "Smart combo (regime-routed trend / ORB / SMC, AI multi-timeframe vote)",
 };
@@ -88,7 +89,7 @@ export async function POST(request: Request) {
   let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
   let trendFunnel: ReturnType<typeof trendPullbackSignalSource>["funnel"] | null = null;
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
-  else if (strategy === "SMC_SWEEP") { const smc = smcSignalSource(symbol, data.minute, data.daily); funnel = smc.funnel; signalAt = smc; }
+  else if (strategy === "SMC_SWEEP" || strategy === "SMC_PLUS") { const smc = smcSignalSource(symbol, data.minute, data.daily, { bosRetest: strategy === "SMC_PLUS" }); funnel = smc.funnel; signalAt = smc; }
   else if (strategy === "TREND_PULLBACK") { const trend = trendPullbackSignalSource(symbol, data.minute, data.daily); trendFunnel = trend.funnel; signalAt = trend; }
   else if (strategy === "ORB_PRO") { const pro = orbProSignalSource(symbol, data.minute, data.daily); orbProFunnel = pro.funnel; signalAt = pro; }
   else if (strategy === "SMART_COMBO") {
@@ -112,10 +113,12 @@ export async function POST(request: Request) {
   const optimization = body.optimize ? optimizeSettings({ strategy, symbol, from, to, minute: data.minute, signalAt, settings, usesConfidence: strategy !== "ORB_RETEST" }) : null;
   const notes = [...result.notes];
   if (strategy === "MTF_AI") notes.push("Replays the deterministic multi-timeframe engine the AI monitor relies on. The LLM's discretionary layer, live OI/PCR flow and sentiment cannot be replayed historically.");
-  else if (strategy === "SMC_SWEEP") {
+  else if (strategy === "SMC_SWEEP" || strategy === "SMC_PLUS") {
+    if (funnel && strategy === "SMC_PLUS") notes.push(`BOS retest: ${funnel.bos} 5m breaks of structure with displacement → ${funnel.bosEntries} retest entries (included in the funnel below).`);
+    if (strategy === "SMC_PLUS") notes.push("SMC sweep + BOS retest, validated on real 1-minute data 2018–2026 (trail 1.5R, 45-min time stop): NIFTY 166 trades (~19 a year), 58% win, +0.21R/trade, points PF 1.86 (sweep entries +0.21R, BOS retests +0.20R). BANKNIFTY 178 trades, 50% win, +0.06R, PF 1.18: its BOS retests were slightly negative (−0.04R), so prefer the plain SMC + 9 EMA strategy there.");
     if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.againstEma} against the 15m 9 EMA trend, ${funnel.againstVwap} wrong side of VWAP, ${funnel.lateSession} after 14:30. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
     notes.push("SMC + 9 EMA rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m candle closing back out of the zone. Only with the 15m 9 EMA trend (15m close beyond a 9 EMA sloping the trade's way) and on the trade's side of VWAP. Stop beyond the sweep; T1 1R or opposing liquidity, then breakeven; runner trails (1.5R) or T2 at the next opposing liquidity. Confidence rises for an entry at value near the 5m 9 EMA, an FVG inside the order block and a daily-level sweep.");
-    notes.push("Validated on real 1-minute data 2018–2026 (trail 1.5R, 45-min time stop): NIFTY 82 trades, 59% win, +0.19R/trade, points PF 1.64; BANKNIFTY (not used for design) 94 trades, 55% win, +0.19R, PF 1.70. The previous rules lost on the same data (−0.05R / −0.12R). Expect ~10 trades a year: an A+ setup, not a daily signal.");
+    if (strategy === "SMC_SWEEP") notes.push("Validated on real 1-minute data 2018–2026 (trail 1.5R, 45-min time stop): NIFTY 82 trades, 59% win, +0.19R/trade, points PF 1.64; BANKNIFTY (not used for design) 94 trades, 55% win, +0.19R, PF 1.70. The previous rules lost on the same data (−0.05R / −0.12R). Expect ~10 trades a year: an A+ setup, not a daily signal.");
   }
   else if (strategy === "ORB_PRO") {
     if (orbProFunnel) {
