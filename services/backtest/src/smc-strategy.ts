@@ -39,17 +39,25 @@ import { aggregate, istDay, istMinute, type Signal } from "./strategy-backtest";
  * a 5m 9 EMA trend filter instead of 15m → 67 trades, +0.11R, PF 1.47; confirming the retest on a 5m
  * close instead of 1m → 24 trades, −0.02R. Both were worse, so the 15m 9 EMA and the 1m close stay.
  *
- * `chochRetest: true` ("SMC sweep + CHoCH retest") adds a 5m CHoCH continuation entry and lets sweeps also
- * use the 5m 9 EMA trend. Real data 2018–2026 (1.5R trail, 45-min time stop), vs the earlier BOS-retest
- * version (BOS with displacement → retest ≥ 20 min later → plain 1m close back):
- *   NIFTY      BOS version 166 trades, 58% win, +0.21R, PF 1.86  →  CHoCH version 191 trades, 58% win, +0.18R, PF 1.60
- *   BANKNIFTY  BOS version 178 trades, 50% win, +0.06R, PF 1.18  →  CHoCH version 207 trades, 54% win, +0.13R, PF 1.38
- * Continuation entries alone: NIFTY 93 trades, 57% win, +0.16R; BANKNIFTY 89 trades, 56% win, +0.11R (the BOS
- * retests there: 47%, −0.04R). No losing year on NIFTY (the BOS version lost in 2018 and 2019).
- * What was tested for the continuation entry (NIFTY 2018–22 / 2023–26 / BANKNIFTY): BOS vs CHoCH (CHoCH was
- * positive in all three, BOS lost on BANKNIFTY); 1m confirmation = close back out / strong close / engulfing /
- * close beyond the 1m 9 EMA / two closes out (strong close: most trades at similar quality); retest wait
- * 0–20 min (0 with a strong close); T1 0.75R (more T1 hits, lower expectancy, not used).
+ * `chochRetest: true` ("SMC sweep + CHoCH retest") adds a 5m CHoCH continuation entry, lets sweeps also use
+ * the 5m 9 EMA trend, and applies a trader's quality checks to both entry types:
+ *   - Draw on liquidity: an unswept opposing pool within 3R must be there to pull price (none → skip).
+ *   - Room: that pool may be as close as 0.8R (T1 then front-runs it; elsewhere the minimum is 1R).
+ *   - Imbalance required: an order block without an FVG is skipped; sweeps of equal highs/lows are skipped.
+ *   - Confirmation: CHoCH retests need a strong 1m close (outer third), or any close back out at value
+ *     (at or through the 5m 9 EMA). Sweeps keep the plain close back out.
+ *   - No time stop (UI default): winners here often need more than 45 minutes to reach T1.
+ * Real 1-minute data 2018–2026, 1.5R trail, index points (previous CHoCH version with a 45-min time stop →
+ * this version):
+ *   NIFTY      191 trades, 58% win, T1 36%, +0.18R, PF 1.60, 944 pts → 183 trades, 63% win, T1 60%, +0.32R, PF 1.78, 1,864 pts
+ *   BANKNIFTY  207 trades, 54% win, T1 31%, +0.13R, PF 1.38, 2,464 pts → 230 trades, 55% win, T1 50%, +0.17R, PF 1.31, 3,226 pts
+ * By half (NIFTY 2018–22 / 2023–26): 61% / 67% win, +0.29R / +0.37R. No losing year on NIFTY.
+ * How it was found: per-trade analysis of the previous version on NIFTY 2018–22, NIFTY 2023–26 and BANKNIFTY;
+ * only patterns that held in all three were kept (no target or a target > 3R lost in all three; OB-only zones
+ * and equal-high/low sweeps lost in all three; entries at the 5m 9 EMA won 61–67%). Tested and not kept:
+ * requiring a 50–79% (OTE) retracement or an entry at the 5m 9 EMA (best quality, but cut trades by half to
+ * two-thirds), stops up to 3 ATR and room down to 0.5R (more trades, clearly worse). The room limit trades
+ * count for quality smoothly from 0.75R to 1R; 0.8R keeps the trade count of the previous version.
  *
  * `legacy: true` keeps the original v1 rules (any 1m candle pattern in the zone, 15m BOS bias,
  * T1 1.5R, session/exhaustion scoring); the Smart combo router still uses them for range-day fades.
@@ -90,8 +98,8 @@ const fmt = (value: number) => value.toLocaleString("en-IN", { maximumFractionDi
 const KIND_LABEL: Record<Pool["kind"], string> = { PDH: "previous-day high", PDL: "previous-day low", ORH: "opening-range high", ORL: "opening-range low", SWING: "5m swing", EQUAL: "equal highs/lows" };
 
 /** How many setups reached each stage, and why the rest were dropped. */
-export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; againstEma: number; chochBreaks: number; chochEntries: number; againstVwap: number; lateSession: number };
-const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, againstEma: 0, chochBreaks: 0, chochEntries: 0, againstVwap: 0, lateSession: 0 });
+export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; againstEma: number; chochBreaks: number; chochEntries: number; noTarget: number; obOnly: number; equalPool: number; againstVwap: number; lateSession: number };
+const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, againstEma: 0, chochBreaks: 0, chochEntries: 0, noTarget: 0, obOnly: 0, equalPool: 0, againstVwap: 0, lateSession: 0 });
 /** Last minute (IST) at which a new SMC entry is allowed: later trades have no time to reach T2. */
 const LAST_ENTRY_MINUTE = 14 * 60 + 30;
 
@@ -110,6 +118,9 @@ export type SmcOptions = {
 /** CHoCH-retest entry: minimum displacement body (in 5m ATR) and the impulse-leg lookback (5m bars) for the stop. */
 const CHOCH_BODY_ATR = 0.8;
 const CHOCH_LEG_BARS = 6;
+/** CHoCH-retest mode: the nearest opposing liquidity must be at least 0.8R away and the target within 3R. */
+const CHOCH_MIN_ROOM_R = 0.8;
+const CHOCH_MAX_TARGET_R = 3;
 const ema = (prev: number, value: number, period: number) => (Number.isFinite(prev) ? prev + (2 / (period + 1)) * (value - prev) : value);
 
 export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], options: SmcOptions = {}) {
@@ -470,7 +481,9 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
       const strongClose = directional && (dir > 0 ? (bar.close - bar.low) / range >= 0.67 : (bar.high - bar.close) / range >= 0.67);
       // v2 trigger: a directional 1m candle closing back out of the zone; for the CHoCH retest it must also
       // close in its outer third (a strong close: the zone was defended, not just left).
-      const confirmed = directional && reclaimed && (setup.model !== "CHOCH" || strongClose);
+      // At value (the close is at or through the 5m 9 EMA) any close back out of the zone is enough.
+      const atValue = (bar.close - s.ema5) * dir <= 0;
+      const confirmed = directional && reclaimed && (setup.model !== "CHOCH" || strongClose || atValue);
       if (legacy ? !(engulfing || rejection || (directional && reclaimed) || strongClose) : !confirmed) continue;
       // v2 trend confirmation: the 15m close is beyond a 9 EMA sloping the trade's way (in CHoCH-retest mode a
       // sweep may also use the 5m 9 EMA), and for sweeps the 1m close is on the trade's side of VWAP. A setup
@@ -495,15 +508,25 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
         .map((pool) => ({ pool, distance: (pool.price - entry) * dir }))
         .sort((a, b) => a.distance - b.distance);
       const nearest = opposing[0];
-      if (nearest && nearest.distance < 1 * risk) { setup.barsLeft = 0; funnel.srTooClose += 1; continue; } // walking into S/R
+      // In CHoCH-retest mode a liquidity pool from 0.8R is a valid first target (T1 front-runs it).
+      const minRoom = chochRetest ? CHOCH_MIN_ROOM_R : 1;
+      if (nearest && nearest.distance < minRoom * risk) { setup.barsLeft = 0; funnel.srTooClose += 1; continue; } // walking into S/R
       // T1: 1R in v2 (1.5R legacy), or the nearest opposing liquidity if closer (front-run by 0.05R, min 1R).
       const t1R = legacy ? 1.5 : 1;
-      const t1Distance = nearest && nearest.distance < t1R * risk ? Math.max(risk, nearest.distance - 0.05 * risk) : t1R * risk;
+      const t1Distance = nearest && nearest.distance < t1R * risk ? Math.max(minRoom * risk, nearest.distance - 0.05 * risk) : t1R * risk;
       // T2: the next opposing liquidity beyond T1 (front-run by 0.05R), capped at 4R; 3R when the path
       // is clear. Never place T2 behind a level price has to break first.
       const nextWall = opposing.find((item) => item.distance > t1Distance + 0.25 * risk);
       const t2Distance = nextWall ? Math.min(4 * risk, Math.max(t1Distance + 0.25 * risk, nextWall.distance - 0.05 * risk)) : 3 * risk;
 
+      if (chochRetest) {
+        // Draw on liquidity: an unswept opposing pool within 3R is the target; without one there is no reason
+        // for price to travel. An order block without an imbalance (no FVG) and a sweep of equal highs/lows
+        // (often run straight through) were losing setups on real data.
+        if (!nearest || nearest.distance > CHOCH_MAX_TARGET_R * risk) { setup.barsLeft = 0; funnel.noTarget += 1; continue; }
+        if (zone.kind === "OB") { setup.barsLeft = 0; funnel.obOnly += 1; continue; }
+        if (setup.pool.kind === "EQUAL") { setup.barsLeft = 0; funnel.equalPool += 1; continue; }
+      }
       const scored = legacy ? legacyScore({ setup, dir, entry, risk, clock, engulfing, t2Distance }) : v2Score({ setup, dir, entry, atr, vwapOk });
       if (scored === null) { setup.barsLeft = 0; funnel.counterTrend += 1; continue; }
       const { confidence, reasons } = scored;

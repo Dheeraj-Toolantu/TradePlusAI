@@ -101,12 +101,13 @@ function signalsOf(minute: Bar[], options: SmcOptions = {}) {
  * 25,075 (higher high over 25,045, higher low 25,012), then a 5m pullback closes below 25,012 (5m structure
  * turns bearish) and makes a lower high at 25,050. At 10:25 a displacement candle closes back through
  * 25,050: a bullish CHoCH with the 15m trend. 10:30 leaves an FVG 25,036–25,070; price taps it at 10:42 and
- * the 10:43 1m candle closes strongly back above 25,070.
+ * the 10:43 1m candle closes strongly back above 25,070. The 09:15 spike to 25,180 is untaken buy-side liquidity
+ * (opening-range high), ~1.5R above the entry: the draw on liquidity the CHoCH-retest mode requires.
  */
 function chochScenario() {
   const day = "2026-09-22";
   const bars5 = [
-    [25_000, 25_012, 24_995, 25_010], [25_010, 25_030, 25_008, 25_028], [25_028, 25_045, 25_025, 25_040], // 09:15 swing high 25,045 at 09:25
+    [25_000, 25_180, 24_995, 25_010], [25_010, 25_030, 25_008, 25_028], [25_028, 25_045, 25_025, 25_040], // 09:15 spike to 25,180 (opening-range high: the target)
     [25_040, 25_042, 25_020, 25_024], [25_024, 25_028, 25_012, 25_018], [25_018, 25_040, 25_016, 25_038], // higher low 25,012 at 09:35
     [25_038, 25_060, 25_035, 25_058], [25_058, 25_075, 25_055, 25_070], [25_070, 25_072, 25_040, 25_044], // higher high 25,075 at 09:50
     [25_044, 25_046, 25_006, 25_008], // 10:00 closes below 25,012: 5m structure bearish
@@ -254,6 +255,7 @@ describe("SMC liquidity-sweep strategy", () => {
     expect(signal.stop).toBeLessThan(25_006); // beyond the impulse leg's origin
     expect(signal.stop).toBeGreaterThan(24_990);
     expect(signal.target1 - 25_073).toBeCloseTo(25_073 - signal.stop, 0); // T1 = 1R
+    expect(signal.target2!).toBeCloseTo(25_180 - 0.05 * (25_073 - signal.stop), 0); // T2 front-runs the 25,180 liquidity
     expect(signal.reason).toMatch(/bullish CHoCH through the swing 25,050/);
     expect(signal.reason).toMatch(/strong close/);
     expect(signal.reason).toMatch(/15m 9 EMA rising/);
@@ -273,6 +275,16 @@ describe("SMC liquidity-sweep strategy", () => {
     // Without the 10:00–10:10 dip below the higher low, the 10:25 break continues a bullish 5m structure.
     const noFlip = minute.map((bar) => (bar.time >= at("2026-09-22", "10:00") && bar.time < at("2026-09-22", "10:10") ? { ...bar, low: Math.max(bar.low, 25_014), close: Math.max(bar.close, 25_014), open: Math.max(bar.open, 25_014) } : bar));
     expect(signalsOf(noFlip, { chochRetest: true }).out.filter(({ signal }) => signal.strategy === "SMC CHoCH retest")).toHaveLength(0);
+  });
+
+  it("CHoCH retest: no trade without a liquidity target within 3R", () => {
+    const { minute } = chochScenario();
+    // Remove the 09:15 spike: nothing above the entry pulls price, so the retest is skipped.
+    const spike = at("2026-09-22", "09:15");
+    const noTarget = [...minute.filter((bar) => bar.time < spike || bar.time >= spike + 300), ...minutesOf(spike, [25_000, 25_012, 24_995, 25_010])].sort((x, y) => x.time - y.time);
+    const { out, funnel } = signalsOf(noTarget, { chochRetest: true });
+    expect(out.filter(({ signal }) => signal.strategy === "SMC CHoCH retest")).toHaveLength(0);
+    expect(funnel.noTarget).toBeGreaterThan(0);
   });
 
   it("CHoCH retest entries are off by default", () => {
