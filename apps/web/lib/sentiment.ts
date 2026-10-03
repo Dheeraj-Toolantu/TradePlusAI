@@ -10,11 +10,17 @@ export type Sentiment = {
   top_bullish: Headline[];
   top_bearish: Headline[];
   global_headlines: Headline[];
-  sources: Array<{ id: string; name: string; region: string; audience: string; ok: boolean; items: number; error: string | null }>;
+  sources: Array<{ id: string; name: string; region: string; audience: string; ok: boolean; items: number; error: string | null; cached_hours?: number | null; note?: string | null }>;
   sources_ok: number;
   sources_total: number;
+  /** Market data + text tone behind the composites (missing in scans from older engines). */
+  factors?: SentimentFactor[];
+  composite?: SentimentComposite;
   method: string;
 };
+export type SentimentFactor = { id: string; name: string; group: "INDIA" | "GLOBAL" | "RETAIL"; weight: number; why: string; ok: boolean; score: number | null; value: string | null; error: string | null };
+export type CompositeReading = { score: number | null; label: string; coverage: string };
+export type SentimentComposite = { india: CompositeReading; global: CompositeReading; retail: CompositeReading; overall: CompositeReading; notes: string[] };
 type Headline = { title: string; link: string; source: string; audience: string; published: string; age_hours: number; score: number; topic: string };
 
 // Public feeds move slowly and must not be hammered: one scan per 10 minutes per server,
@@ -25,7 +31,7 @@ export const MANUAL_REFRESH_MIN_MS = 60_000;
 const store = globalThis as typeof globalThis & { __tradepulseSentiment?: { at: number; value: Sentiment } | null; __tradepulseSentimentJob?: Promise<Sentiment> | null };
 
 function refresh(): Promise<Sentiment> {
-  store.__tradepulseSentimentJob ??= runPythonModule<Sentiment>("tradepulse_quant.sentiment.engine", {}, 45_000)
+  store.__tradepulseSentimentJob ??= runPythonModule<Sentiment>("tradepulse_quant.sentiment.engine", {}, 55_000)
     .then((value) => { store.__tradepulseSentiment = { at: Date.now(), value }; return value; })
     .finally(() => { store.__tradepulseSentimentJob = null; });
   return store.__tradepulseSentimentJob;
@@ -53,5 +59,11 @@ export function sentimentForIntel(value: Sentiment | null) {
     global_label: value.summary.global.label,
     event_risk: value.event_risk.map((event) => event.event),
     contrarian_note: value.contrarian_note,
+    // Composites of market data + text tone (null when unavailable).
+    india_market_score: value.composite?.india.score ?? null,
+    global_market_score: value.composite?.global.score ?? null,
+    retail_mood_score: value.composite?.retail.score ?? null,
+    overall_score: value.composite?.overall.score ?? null,
+    overall_label: value.composite?.overall.label ?? null,
   };
 }
