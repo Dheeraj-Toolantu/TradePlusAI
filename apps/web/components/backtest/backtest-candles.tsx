@@ -55,6 +55,8 @@ const DOWN = "#fa6b78";
 const GAIN = "#3d93d6";
 const LOSS = "#d6743c";
 const EMA_COLOR = "#eebd54";
+/** The 9 EMA the SMC liquidity-sweep strategy confirms its trend with (15m) and measures value against (5m). */
+const EMA9_COLOR = "#7aa2ff";
 const VWAP_COLOR = "#b493f5";
 const ENTRY_COLOR = "#e4f1f1";
 
@@ -106,7 +108,7 @@ const legReason = (reason: string) => LEG_LABEL[reason] ?? reason;
 /** Exit legs are stamped at the END of the 1-minute bar that filled them; markers go on that bar. */
 const fillBar = (exitEpochS: number) => exitEpochS - 60;
 
-type Legend = { bar: Bar; ema?: number; vwap?: number };
+type Legend = { bar: Bar; ema9?: number; ema?: number; vwap?: number };
 /** Replay of one session: `cursor` is the number of base candles of that day already printed. */
 type Replay = { day: string; cursor: number; playing: boolean; speed: number };
 const SPEEDS = [1, 3, 10, 30, 60];
@@ -115,6 +117,7 @@ type VisibleTrade = BacktestTrade & { visibleLegs: TradeLeg[]; open: boolean };
 
 export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinutes = null, dailyCandles = null, trades, focusId, onFocus }: { symbol: string; candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; dailyCandles?: CandleRow[] | null; trades: BacktestTrade[]; focusId: number | null; onFocus: (id: number | null) => void }) {
   const [tf, setTf] = useState<Timeframe>(5);
+  const [showEma9, setShowEma9] = useState(true);
   const [showEma, setShowEma] = useState(true);
   const [showVwap, setShowVwap] = useState(true);
   const [showTrades, setShowTrades] = useState(true);
@@ -142,6 +145,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const chart = useRef<IChartApi | null>(null);
   const candleSeries = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeries = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const ema9Series = useRef<ISeriesApi<"Line"> | null>(null);
   const emaSeries = useRef<ISeriesApi<"Line"> | null>(null);
   const vwapSeries = useRef<ISeriesApi<"Line"> | null>(null);
   const markers = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
@@ -170,6 +174,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const cutoff = replayRows ? visibleRows.at(-1)![0] + baseMinutes * 60 : Infinity;
 
   const bars = useMemo(() => aggregate(visibleRows, tf), [visibleRows, tf]);
+  const ema9Values = useMemo(() => ema(bars, 9), [bars]);
   const emaValues = useMemo(() => ema(bars, 20), [bars]);
   const vwapValues = useMemo(() => vwap(bars), [bars]);
   const hasVolume = useMemo(() => candles.some((row) => row[5] > 0), [candles]);
@@ -184,8 +189,8 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     }), [sorted, cutoff]);
   const focused = sorted.find((trade) => trade.id === focusId) ?? null;
   const focusIndex = focused ? sorted.indexOf(focused) : -1;
-  const lookup = useRef({ bars, emaValues, vwapValues, indexByTime });
-  lookup.current = { bars, emaValues, vwapValues, indexByTime };
+  const lookup = useRef({ bars, ema9Values, emaValues, vwapValues, indexByTime });
+  lookup.current = { bars, ema9Values, emaValues, vwapValues, indexByTime };
 
   // Create the chart once (re-created only if the feed gains/loses volume, which adds a pane).
   useEffect(() => {
@@ -201,6 +206,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
       localization: { locale: "en-IN" },
     });
     candleSeries.current = instance.addSeries(CandlestickSeries, { upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN, priceLineColor: "#4f7d86", priceFormat: { type: "price", precision: 2, minMove: 0.01 } });
+    ema9Series.current = instance.addSeries(LineSeries, { color: EMA9_COLOR, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
     emaSeries.current = instance.addSeries(LineSeries, { color: EMA_COLOR, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
     vwapSeries.current = instance.addSeries(LineSeries, { color: VWAP_COLOR, lineWidth: 2, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
     volumeSeries.current = hasVolume ? instance.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceLineVisible: false, lastValueVisible: false }, 1) : null;
@@ -211,14 +217,14 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     boxes.current = new RiskRewardPrimitive();
     candleSeries.current.attachPrimitive(boxes.current);
     const onMove = (param: MouseEventParams<Time>) => {
-      const { bars: list, emaValues: e, vwapValues: v, indexByTime: map } = lookup.current;
+      const { bars: list, ema9Values: e9, emaValues: e, vwapValues: v, indexByTime: map } = lookup.current;
       const index = param.time === undefined ? list.length - 1 : map.get((param.time as number) - IST_S);
       if (index === undefined || !list[index]) return;
-      setLegend({ bar: list[index], ema: e[index], vwap: v[index] });
+      setLegend({ bar: list[index], ema9: e9[index], ema: e[index], vwap: v[index] });
     };
     instance.subscribeCrosshairMove(onMove);
     chart.current = instance;
-    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; srLines.current = []; };
+    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; ema9Series.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; srLines.current = []; };
   }, [hasVolume]);
 
   // Price, volume and indicator data.
@@ -226,10 +232,11 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     if (!candleSeries.current) return;
     candleSeries.current.setData(bars.map((bar) => ({ time: chartTime(bar.time), open: bar.open, high: bar.high, low: bar.low, close: bar.close })));
     volumeSeries.current?.setData(bars.map((bar) => ({ time: chartTime(bar.time), value: bar.volume, color: bar.close >= bar.open ? "rgba(34,213,155,.45)" : "rgba(250,107,120,.45)" })));
+    ema9Series.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: ema9Values[index] })));
     emaSeries.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: emaValues[index] })));
     vwapSeries.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: vwapValues[index] })));
-    if (bars.length) setLegend({ bar: bars.at(-1)!, ema: emaValues.at(-1), vwap: vwapValues.at(-1) });
-  }, [bars, emaValues, vwapValues, hasVolume]);
+    if (bars.length) setLegend({ bar: bars.at(-1)!, ema9: ema9Values.at(-1), ema: emaValues.at(-1), vwap: vwapValues.at(-1) });
+  }, [bars, ema9Values, emaValues, vwapValues, hasVolume]);
 
   // Smart-money overlays, computed from the candles on screen (so a replay only sees the past).
   const anyLayer = layers.fvg || layers.ob || layers.liquidity || layers.structure;
@@ -274,6 +281,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     }));
   }, [srLevels, hasVolume]);
 
+  useEffect(() => { ema9Series.current?.applyOptions({ visible: showEma9 }); }, [showEma9, hasVolume]);
   useEffect(() => { emaSeries.current?.applyOptions({ visible: showEma }); }, [showEma, hasVolume]);
   useEffect(() => { vwapSeries.current?.applyOptions({ visible: showVwap }); }, [showVwap, hasVolume]);
 
@@ -452,6 +460,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
           {timeframes.map((value) => <button key={value} type="button" className={tf === value ? "on" : ""} aria-pressed={tf === value} onClick={() => setTf(value)}>{tfLabel(value)}</button>)}
         </div>
         <div className="bt-seg" role="group" aria-label="Overlays">
+          <button type="button" className={showEma9 ? "on" : ""} aria-pressed={showEma9} onClick={() => setShowEma9(!showEma9)}><i style={{ background: EMA9_COLOR }} />EMA 9</button>
           <button type="button" className={showEma ? "on" : ""} aria-pressed={showEma} onClick={() => setShowEma(!showEma)}><i style={{ background: EMA_COLOR }} />EMA 20</button>
           <button type="button" className={showVwap ? "on" : ""} aria-pressed={showVwap} onClick={() => setShowVwap(!showVwap)}><i className="dashed" style={{ borderColor: VWAP_COLOR }} />VWAP</button>
           <button type="button" className={showTrades ? "on" : ""} aria-pressed={showTrades} onClick={() => setShowTrades(!showTrades)}>Trades</button>
@@ -531,6 +540,7 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
             <span>O <b>{fmt(legend.bar.open)}</b></span><span>H <b>{fmt(legend.bar.high)}</b></span><span>L <b>{fmt(legend.bar.low)}</b></span><span>C <b>{fmt(legend.bar.close)}</b></span>
             <span className={change >= 0 ? "up" : "down"}>{change >= 0 ? "+" : "−"}{fmt(Math.abs(change))} ({change >= 0 ? "+" : "−"}{Math.abs(changePct).toFixed(2)}%)</span>
             {hasVolume ? <span className="opt">Vol <b>{legend.bar.volume.toLocaleString("en-IN")}</b></span> : null}
+            {showEma9 && legend.ema9 !== undefined ? <span className="opt" style={{ color: EMA9_COLOR }}>EMA9 {fmt(legend.ema9)}</span> : null}
             {showEma && legend.ema !== undefined ? <span className="opt" style={{ color: EMA_COLOR }}>EMA20 {fmt(legend.ema)}</span> : null}
             {showVwap && legend.vwap !== undefined ? <span className="opt" style={{ color: VWAP_COLOR }}>VWAP {fmt(legend.vwap)}</span> : null}
           </div>
