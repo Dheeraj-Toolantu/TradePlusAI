@@ -13,12 +13,18 @@ type Sentiment = {
   top_bullish: Headline[];
   top_bearish: Headline[];
   global_headlines: Headline[];
-  sources: Array<{ id: string; name: string; ok: boolean; items: number; error: string | null }>;
+  sources: Array<{ id: string; name: string; ok: boolean; items: number; error: string | null; cached_hours?: number | null; note?: string | null }>;
   sources_ok: number;
   sources_total: number;
+  factors?: Factor[];
+  composite?: Composite;
   method: string;
   error?: string;
 };
+type Factor = { id: string; name: string; group: "INDIA" | "GLOBAL" | "RETAIL"; weight: number; why: string; ok: boolean; score: number | null; value: string | null; error: string | null };
+type Reading = { score: number | null; label: string; coverage: string };
+type Composite = { india: Reading; global: Reading; retail: Reading; overall: Reading; notes: string[] };
+const GROUPS: Array<{ key: Factor["group"]; title: string }> = [{ key: "INDIA", title: "Indian market" }, { key: "GLOBAL", title: "Global market" }, { key: "RETAIL", title: "Retail mood" }];
 
 const REFRESH_MS = 10 * 60_000;
 const tone = (score: number) => (score >= 12 ? "gain" : score <= -12 ? "loss" : "warning");
@@ -32,6 +38,41 @@ function Gauge({ title, data, note }: { title: string; data: Aggregate; note?: s
       <b className={insufficient ? "" : tone(data.score)}>{insufficient ? "--" : `${data.score > 0 ? "+" : ""}${data.score.toFixed(0)}`}</b>
       <div className="snt-bar"><i style={{ left: `${(Math.max(-100, Math.min(100, data.score)) + 100) / 2}%` }} /></div>
       <em title="Bull/bear shares are weighted by relevance and recency, like the score">{insufficient ? `only ${data.items} posts` : `${label(data.label)} · ${data.items} posts · ${data.bullish_pct.toFixed(0)}% bull / ${data.bearish_pct.toFixed(0)}% bear`}</em>
+    </div>
+  );
+}
+
+const coverage = (reading: Reading) => (reading.coverage.includes("group") ? reading.coverage : `${reading.coverage} factors`);
+
+function CompositeGauge({ title, reading }: { title: string; reading: Reading }) {
+  const missing = reading.score === null;
+  const score = reading.score ?? 0;
+  return (
+    <div className="snt-gauge">
+      <small>{title}</small>
+      <b className={missing ? "" : tone(score)}>{missing ? "--" : `${score > 0 ? "+" : ""}${score.toFixed(0)}`}</b>
+      <div className="snt-bar"><i style={{ left: `${(Math.max(-100, Math.min(100, score)) + 100) / 2}%` }} /></div>
+      <em>{missing ? `not enough data (${coverage(reading)})` : `${label(reading.label)} · ${coverage(reading)}`}</em>
+    </div>
+  );
+}
+
+function FactorTable({ factors }: { factors: Factor[] }) {
+  return (
+    <div className="snt-factors">
+      {GROUPS.map((group) => (
+        <div key={group.key}>
+          <b>{group.title}</b>
+          <ul>
+            {factors.filter((factor) => factor.group === group.key).map((factor) => (
+              <li key={factor.id} title={factor.why}>
+                <span className={factor.ok && factor.score !== null ? tone(factor.score) : "snt-off"}>{factor.ok && factor.score !== null ? `${factor.score > 0 ? "+" : ""}${factor.score.toFixed(0)}` : "--"}</span>
+                <span>{factor.name}<small>{factor.ok ? factor.value : `unavailable: ${factor.error ?? "no data"}`}</small></span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
     </div>
   );
 }
@@ -83,6 +124,20 @@ export function SentimentPanel() {
           {data.event_risk.length > 0 && <div className="snt-alert"><b>Event risk:</b> {data.event_risk.map((event) => <a key={event.event} href={event.link} target="_blank" rel="noreferrer noopener">{event.event} ({event.mentions} mentions)</a>)}</div>}
           {data.contrarian_note && <div className="snt-alert snt-contrarian">{data.contrarian_note}</div>}
           {data.divergence && <div className="snt-note">{data.divergence}</div>}
+          {data.composite && (
+            <>
+              <div className="snt-subhead">Market mood · prices, flows, volatility and crowd indices combined with the text tone below</div>
+              {data.composite.notes.map((note) => <div key={note} className="snt-alert snt-contrarian">{note}</div>)}
+              <div className="snt-gauges">
+                <CompositeGauge title="Overall (for Indian index trades)" reading={data.composite.overall} />
+                <CompositeGauge title="Indian market" reading={data.composite.india} />
+                <CompositeGauge title="Global market" reading={data.composite.global} />
+                <CompositeGauge title="Retail mood" reading={data.composite.retail} />
+              </div>
+              {data.factors && <details className="mi-learn"><summary>What drives these readings ({data.factors.filter((factor) => factor.ok).length}/{data.factors.length} factors live)</summary><FactorTable factors={data.factors} /></details>}
+              <div className="snt-subhead">News and forum tone</div>
+            </>
+          )}
           <div className="snt-gauges">
             <Gauge title="India · overall" data={data.summary.india} note={data.summary.india_retail.items === 0 ? "news only, forums unavailable" : undefined} />
             <Gauge title="India · retail forums" data={data.summary.india_retail} />
@@ -97,7 +152,7 @@ export function SentimentPanel() {
           <details className="mi-learn">
             <summary>Sources and method</summary>
             <p>{data.method} Extreme crowd readings are treated as contrarian warnings, not signals.</p>
-            <ul className="snt-sources">{data.sources.map((source) => <li key={source.id} className={source.ok ? "gain" : "loss"}>{source.ok ? "●" : "○"} {source.name}<small>{source.ok ? ` ${source.items} items` : ` ${source.error ?? "unavailable"}`}</small></li>)}</ul>
+            <ul className="snt-sources">{data.sources.map((source) => <li key={source.id} className={source.cached_hours != null ? "warning" : source.ok ? "gain" : "loss"} title={source.note ?? undefined}>{source.ok ? "●" : "○"} {source.name}<small>{source.cached_hours != null ? ` ${source.items} items · cached ${source.cached_hours.toFixed(1)} h ago (live fetch blocked)` : source.ok ? ` ${source.items} items` : ` ${source.error ?? "unavailable"}`}</small></li>)}</ul>
           </details>
         </>
       )}

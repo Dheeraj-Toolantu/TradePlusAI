@@ -2,21 +2,34 @@
 
 stdin/stdout JSON entry point: ``python -m tradepulse_quant.sentiment.engine``.
 Payload keys (all optional): ``now`` (ISO), ``sources`` (override list), ``fixtures``
-({source_id: raw feed text}) so tests and offline runs never touch the network.
+({source_id: raw feed text}) and ``factor_fixtures`` (see ``factors.fetch_raw``) so tests and
+offline runs never touch the network; ``cache_dir`` overrides the last-good feed cache location.
+
+Reddit: with REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET set, subreddits are read through Reddit's
+official OAuth API (app-only), which is not subject to the anonymous "403 Blocked" wall. Without
+them, subreddits are fetched one at a time (Reddit blocks bursts of anonymous requests) with a
+Reddit-style User-Agent (override: REDDIT_USER_AGENT), falling back www → old.reddit JSON → RSS.
+Any source that fails serves its last good scan (up to 12 h, marked as cached) instead of nothing.
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 import math
+import os
 import re
 import sys
+import tempfile
+import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
+from .factors import composites, market_factors, text_factors
 from .lexicon import event_flags, relevance, score_text
 from .sources import configured_sources
 
@@ -39,10 +52,103 @@ def _strip_publisher(title: str, publisher: str | None) -> str:
     return title
 
 
-def _fetch(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, application/json;q=0.9, */*;q=0.5"})
+# Reddit asks API clients for "<platform>:<app id>:<version> (by /u/<username>)" and blocks generic agents.
+REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "").strip() or "web:tradepulse-sentiment:1.2 (market research bot)"
+REDDIT_SPACING_SECONDS = 1.5
+# All subreddits share this budget so a fully blocked Reddit cannot stall the scan; the rest serve their cache.
+REDDIT_BUDGET_SECONDS = 25.0
+CACHE_MAX_HOURS = 12.0
+
+
+def _fetch(url: str, user_agent: str = USER_AGENT, headers: dict | None = None) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": user_agent, "Accept": "application/rss+xml, application/xml, application/json;q=0.9, */*;q=0.5", **(headers or {})})
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed public feed URLs
         return response.read(MAX_BYTES).decode("utf-8", errors="replace")
+
+
+_reddit_token: dict = {}
+
+
+def _reddit_oauth_token() -> str | None:
+    """App-only OAuth token (client_credentials) when REDDIT_CLIENT_ID/SECRET are configured."""
+    client_id, secret = os.environ.get("REDDIT_CLIENT_ID", "").strip(), os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+    if not client_id or not secret:
+        return None
+    if _reddit_token.get("expires", 0) > time.time() + 60:
+        return _reddit_token["value"]
+    auth = base64.b64encode(f"{client_id}:{secret}".encode()).decode()
+    request = urllib.request.Request("https://www.reddit.com/api/v1/access_token", data=b"grant_type=client_credentials", method="POST",
+                                     headers={"User-Agent": REDDIT_USER_AGENT, "Authorization": f"Basic {auth}", "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310 - Reddit's token endpoint
+        body = json.loads(response.read(100_000).decode("utf-8"))
+    _reddit_token.update(value=body["access_token"], expires=time.time() + float(body.get("expires_in", 3600)))
+    return _reddit_token["value"]
+
+
+def reddit_candidates(url: str) -> list[tuple[str, str]]:
+    """(url, kind) attempts for one subreddit, most reliable first."""
+    base, _, query = url.partition("?")
+    path = urllib.parse.urlparse(base).path  # /r/X/new.json
+    json_path = path if path.endswith(".json") else f"{path.rstrip('/')}.json"
+    suffix = f"?{query}" if query else ""
+    return [(f"https://www.reddit.com{json_path}{suffix}", "json"), (f"https://old.reddit.com{json_path}{suffix}", "json"),
+            (reddit_rss_url(f"https://www.reddit.com{json_path}{suffix}"), "rss"), (reddit_rss_url(f"https://old.reddit.com{json_path}{suffix}"), "rss")]
+
+
+def fetch_reddit(url: str, deadline: float | None = None) -> list[dict]:
+    """OAuth when configured, else anonymous JSON/RSS attempts. Raises the last error if all fail."""
+    token = _reddit_oauth_token()
+    if token:
+        path = urllib.parse.urlparse(url).path.removesuffix(".json")
+        query = urllib.parse.urlparse(url).query
+        raw = _fetch(f"https://oauth.reddit.com{path}?{query + '&' if query else ''}raw_json=1", REDDIT_USER_AGENT, {"Authorization": f"bearer {token}"})
+        return parse_reddit(raw)
+    last_error: Exception | None = None
+    for attempt, (candidate, kind) in enumerate(reddit_candidates(url)):
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        if attempt:
+            time.sleep(0.5)
+        try:
+            raw = _fetch(candidate, REDDIT_USER_AGENT)
+            parsed = parse_reddit(raw) if kind == "json" else parse_rss(raw)
+            if parsed:
+                return parsed
+        except Exception as error:  # noqa: BLE001 - try the next endpoint
+            last_error = error
+    raise last_error or ValueError("Reddit returned no readable items")
+
+
+def _cache_path(cache_dir: str, source_id: str) -> str:
+    return os.path.join(cache_dir, f"{re.sub(r'[^a-z0-9_]', '_', source_id.lower())}.json")
+
+
+def save_cache(cache_dir: str | None, source_id: str, items: list[dict], now: datetime) -> None:
+    if not cache_dir:
+        return
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        rows = [{**item, "published": item["published"].isoformat() if item.get("published") else None} for item in items]
+        with open(_cache_path(cache_dir, source_id), "w", encoding="utf-8") as handle:
+            json.dump({"saved_at": now.isoformat(), "items": rows}, handle)
+    except OSError:
+        pass
+
+
+def load_cache(cache_dir: str | None, source_id: str, now: datetime) -> tuple[list[dict], float] | None:
+    """Last good items for a source if saved within CACHE_MAX_HOURS: (items, age in hours)."""
+    if not cache_dir:
+        return None
+    try:
+        with open(_cache_path(cache_dir, source_id), encoding="utf-8") as handle:
+            body = json.load(handle)
+        age = (now - datetime.fromisoformat(body["saved_at"])).total_seconds() / 3600.0
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if age > CACHE_MAX_HOURS or age < 0:
+        return None
+    items = [{**item, "published": datetime.fromisoformat(item["published"]) if item.get("published") else None} for item in body.get("items", [])]
+    return (items, age) if items else None
 
 
 def _clean(text: str | None) -> str:
@@ -117,32 +223,64 @@ def reddit_rss_url(url: str) -> str:
     return f"{base.rstrip('/')}/.rss" + (f"?{query}" if query else "")
 
 
-def collect(sources: list[dict], fixtures: dict[str, str] | None) -> tuple[list[dict], list[dict]]:
-    def load(source: dict) -> tuple[dict, list[dict], str | None]:
+def collect(sources: list[dict], fixtures: dict[str, str] | None, cache_dir: str | None = None, now: datetime | None = None) -> tuple[list[dict], list[dict]]:
+    now = now or datetime.now(timezone.utc)
+
+    reddit_deadline = time.monotonic() + REDDIT_BUDGET_SECONDS
+
+    def live(source: dict) -> list[dict]:
+        if fixtures is not None:
+            if source["id"] not in fixtures:
+                raise LookupError("No fixture supplied")
+            raw = fixtures[source["id"]]
+            return parse_reddit(raw) if source["kind"] == "reddit" else parse_rss(raw)
+        if source["kind"] == "reddit":
+            if time.monotonic() > reddit_deadline:
+                raise TimeoutError(f"skipped: Reddit time budget ({REDDIT_BUDGET_SECONDS:.0f} s) used up")
+            return fetch_reddit(source["url"], reddit_deadline)
+        return parse_rss(_fetch(source["url"]))
+
+    def load(source: dict) -> tuple[dict, list[dict], str | None, float | None]:
         try:
-            raw = fixtures[source["id"]] if fixtures is not None and source["id"] in fixtures else (None if fixtures is not None else _fetch(source["url"]))
-            if raw is None:
-                return source, [], "No fixture supplied"
-            parsed = parse_reddit(raw) if source["kind"] == "reddit" else parse_rss(raw)
-            return source, parsed, None if parsed else "Feed returned no readable items"
-        except Exception as error:  # network, TLS, HTTP errors: reported per source, never fatal
-            if source["kind"] == "reddit" and fixtures is None:
-                # Reddit often refuses unauthenticated .json; its public Atom feed usually still works.
-                try:
-                    parsed = parse_rss(_fetch(reddit_rss_url(source["url"])))
-                    if parsed:
-                        return source, parsed, None
-                except Exception:  # noqa: BLE001 - report the original error below
-                    pass
-            return source, [], f"{type(error).__name__}: {str(error)[:120]}"
+            parsed = live(source)
+            if parsed:
+                save_cache(cache_dir, source["id"], parsed, now)
+                return source, parsed, None, None
+            error = "Feed returned no readable items"
+        except Exception as failure:  # network, TLS, HTTP errors: reported per source, never fatal
+            error = f"{type(failure).__name__}: {str(failure)[:120]}"
+        cached = load_cache(cache_dir, source["id"], now)
+        if cached:
+            return source, cached[0], error, cached[1]
+        return source, [], error, None
+
+    def load_reddit_serially(group: list[dict]) -> list[tuple]:
+        # Anonymous Reddit requests in a burst get "403 Blocked": one subreddit at a time, spaced out.
+        results = []
+        for index, source in enumerate(group):
+            if index and fixtures is None:
+                time.sleep(REDDIT_SPACING_SECONDS)
+            results.append(load(source))
+        return results
+
+    reddit_sources = [source for source in sources if source["kind"] == "reddit"]
+    other_sources = [source for source in sources if source["kind"] != "reddit"]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        reddit_job = pool.submit(load_reddit_serially, reddit_sources)
+        results = list(pool.map(load, other_sources)) + reddit_job.result()
+    order = {source["id"]: index for index, source in enumerate(sources)}
+    results.sort(key=lambda row: order[row[0]["id"]])
 
     items: list[dict] = []
     health: list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for source, parsed, error in pool.map(load, sources):
-            health.append({"id": source["id"], "name": source.get("name", source["id"]), "region": source["region"], "audience": source["audience"], "ok": error is None, "items": len(parsed), "error": error})
-            for item in parsed:
-                items.append({**item, "source": source.get("name", source["id"]), "region": source["region"], "audience": source["audience"]})
+    for source, parsed, error, cached_age in results:
+        ok = bool(parsed)
+        health.append({"id": source["id"], "name": source.get("name", source["id"]), "region": source["region"], "audience": source["audience"],
+                       "ok": ok, "items": len(parsed), "error": error if not ok else None,
+                       "cached_hours": round(cached_age, 1) if cached_age is not None else None,
+                       "note": f"live fetch failed ({error}); showing the scan from {cached_age:.1f} h ago" if cached_age is not None else None})
+        for item in parsed:
+            items.append({**item, "source": source.get("name", source["id"]), "region": source["region"], "audience": source["audience"]})
     return items, health
 
 
@@ -199,7 +337,19 @@ def analyze_sentiment(payload: dict | None = None) -> dict:
     except ValueError:
         now = datetime.now(timezone.utc)
     sources = payload.get("sources") or configured_sources()
-    raw_items, health = collect(sources, payload.get("fixtures"))
+    fixtures = payload.get("fixtures")
+    # The last-good cache is on for live scans; tests opt in with an explicit cache_dir.
+    cache_dir = payload.get("cache_dir") or (None if fixtures is not None else os.environ.get("SENTIMENT_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "tradepulse-sentiment"))
+    factor_fixtures = payload.get("factor_fixtures")
+    with ThreadPoolExecutor(max_workers=1) as factor_pool:
+        # Market data is fetched while the feeds are being read; offline runs without factor
+        # fixtures skip the network entirely.
+        factor_job = factor_pool.submit(market_factors, factor_fixtures if factor_fixtures is not None else ({} if fixtures is not None else None))
+        raw_items, health = collect(sources, fixtures, cache_dir, now)
+        try:
+            market = factor_job.result()
+        except Exception as error:  # noqa: BLE001 - factors are additive; the text scan still stands
+            market = [{"id": "market_data", "name": "Market data", "group": "INDIA", "weight": 0.0, "why": "", "ok": False, "score": None, "value": None, "error": f"{type(error).__name__}: {str(error)[:100]}"}]
 
     seen: set[str] = set()
     scored: list[dict] = []
@@ -257,6 +407,9 @@ def analyze_sentiment(payload: dict | None = None) -> dict:
             events[name]["mentions"] += 1
     event_risk = sorted((event for event in events.values() if event["mentions"] >= 2), key=lambda event: -event["mentions"])
 
+    factor_list = [factor for factor in market if factor["id"] != "market_data"] + text_factors(summary)
+    composite = composites(factor_list)
+
     ranked = sorted((item for item in india if abs(item["score"]) >= 0.2), key=lambda item: item["weight"] * abs(item["score"]), reverse=True)
     public = lambda item: {key: item[key] for key in ("title", "link", "source", "audience", "published", "age_hours", "score", "topic")}
     return {
@@ -271,7 +424,9 @@ def analyze_sentiment(payload: dict | None = None) -> dict:
         "sources": health,
         "sources_ok": sum(1 for source in health if source["ok"]),
         "sources_total": len(health),
-        "method": "Finance lexicon scoring (incl. Indian retail slang), 6-hour recency half-life, engagement-weighted forums and relevance weighting (index news 1.0, India macro 0.7, global macro 0.6, other 0.35, single-stock items 0.15). The score is the weighted net tone of items that express a direction; neutral headlines are counted but do not dilute it. Scores range -100 (max bearish) to +100.",
+        "factors": factor_list,
+        "composite": composite,
+        "method": "Finance lexicon scoring (incl. Indian retail slang), 6-hour recency half-life, engagement-weighted forums and relevance weighting (index news 1.0, India macro 0.7, global macro 0.6, other 0.35, single-stock items 0.15). The score is the weighted net tone of items that express a direction; neutral headlines are counted but do not dilute it. Scores range -100 (max bearish) to +100. Composites add market data: Indian market = NIFTY/BANK NIFTY trend, India VIX, FII/DII flows, breadth and India news; global market = crude, dollar, rupee, US yields and futures, Asia, CBOE VIX and global news; retail mood = India and global forums, Tickertape Market Mood Index, CNN Fear & Greed and StockTwits. Overall = 50% Indian market, 30% global, 20% retail; unavailable factors drop out of the weights.",
     }
 
 

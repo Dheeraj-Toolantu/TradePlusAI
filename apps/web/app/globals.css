@@ -542,6 +542,13 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .snt-headlines small { display: block; color: var(--muted); font-size: 10px; }
 .snt-sources { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 12px; margin: 6px 0 0; padding: 0; list-style: none; font-size: 11px; }
 .snt-sources small { color: var(--muted); }
+.snt-subhead { color: var(--muted); font-size: 11px; letter-spacing: .02em; }
+.snt-factors { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 6px; }
+.snt-factors ul { display: grid; gap: 5px; margin: 4px 0 0; padding: 0; list-style: none; font-size: 12px; }
+.snt-factors li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 6px; align-items: baseline; }
+.snt-factors li > span:first-child { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+.snt-factors small { display: block; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.snt-off { color: var(--muted); }
 @media (max-width: 1100px) {
   .exec-grid, .snt-columns { grid-template-columns: minmax(0, 1fr); }
   .exec-score { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -552,7 +559,7 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
   .exec-content { padding: 10px 12px 20px; }
   .exec-fields, .exec-calcs, .live-ticket dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .exec-actions { grid-template-columns: minmax(0, 1fr); }
-  .snt-sources { grid-template-columns: minmax(0, 1fr); }
+  .snt-sources, .snt-factors { grid-template-columns: minmax(0, 1fr); }
 }
 .exec-badge-button { cursor: pointer; }
 .exec-badge-button:disabled { opacity: .6; cursor: wait; }
