@@ -16,7 +16,7 @@ const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
   { id: "SMART_COMBO", title: "★ Smart combo", detail: "Reads the day first (trend / range), then routes to the playbook that fits it: trend pullback, ORB, or liquidity sweep. AI multi-timeframe votes; confluence adds conviction." },
   { id: "TREND_PULLBACK", title: "Trend-day VWAP pullback", detail: "Trades only confirmed trend days: 30 min on one side of a sloping VWAP, OR break, 15m agreeing → pullback into VWAP/EMA20 → 5m resumption candle. Trailing runner." },
   { id: "SMC_SWEEP", title: "SMC liquidity sweep + 9 EMA", detail: "Liquidity sweep → CHoCH with displacement → retrace into the FVG / order block → 1m close back out of the zone, only with the 15m 9 EMA trend and VWAP. Stop beyond the sweep, T1 1R, trailing runner." },
-  { id: "SMC_PLUS", title: "SMC sweep + BOS retest", detail: "More trades: the sweep setups plus 5m BOS with displacement → FVG / order block retest after a ≥ 20-min pullback → 1m close back out, with the 15m 9 EMA. ~2× trades; validated on NIFTY, breakeven on BANKNIFTY." },
+  { id: "SMC_PLUS", title: "SMC sweep + CHoCH retest", detail: "Sweeps plus the 5m pullback's CHoCH in the 9 EMA trend → FVG retest → 1m strong close (or any close at the 5m 9 EMA). Only with a liquidity target within 3R. ~21–26 trades a year, ~60% wins." },
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };
@@ -27,9 +27,11 @@ const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:0
 const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getUTCDay(); return dow !== 0 && dow !== 6; };
 /**
  * Per-strategy time stop: retest/zone entries often need 20–40 minutes to work. ORB retest Pro runs
- * without one: on real NIFTY data (2024–26) its 30-minute time stop cut trades that later hit target.
+ * without one: on real NIFTY data (2024–26) its 30-minute time stop cut trades that later hit target. So
+ * does SMC sweep + CHoCH retest: on NIFTY 2018–26 dropping its 45-minute time stop took T1 hits from 41%
+ * to 60%.
  */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, SMC_PLUS: 45, TREND_PULLBACK: 45, SMART_COMBO: 45 };
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, SMC_PLUS: 0, TREND_PULLBACK: 45, SMART_COMBO: 45 };
 /**
  * Trend entries are built for a trailing runner; the others default to fixed T1/T2. SMC + 9 EMA: a 1.5R
  * trail with a 45-min time stop was best on real NIFTY and BANKNIFTY data (2018–26).
