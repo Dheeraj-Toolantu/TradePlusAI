@@ -96,6 +96,28 @@ function signalsOf(minute: Bar[], options: SmcOptions = {}) {
   return { out, funnel: source.funnel };
 }
 
+/**
+ * BOS-retest scenario: day 1 trades 150 points lower, so the 15m 9 EMA rises under day 2. Day 2 builds a
+ * 5m swing high at 25,050 (09:35), coils above 25,030, and at 10:00 a displacement candle closes through
+ * it (BOS). 10:05 leaves an FVG 25,049–25,060. Price pulls back into it from 10:20 and a 1m candle closes
+ * back above 25,060 at 10:31, 21 minutes after the zone formed.
+ */
+function bosScenario() {
+  const day = "2026-09-22";
+  const bars5 = [
+    [24_990, 25_010, 24_985, 25_005], [25_005, 25_025, 25_000, 25_020], [25_020, 25_038, 25_018, 25_032],
+    [25_032, 25_042, 25_030, 25_040], [25_040, 25_050, 25_036, 25_044], [25_044, 25_048, 25_034, 25_038],
+    [25_038, 25_046, 25_032, 25_040], [25_040, 25_047, 25_033, 25_044], [25_044, 25_049, 25_036, 25_046],
+    [25_046, 25_110, 25_044, 25_106], // 10:00 BOS through 25,050
+    [25_106, 25_150, 25_060, 25_140], // 10:05 completes the FVG 25,049–25,060
+    [25_140, 25_152, 25_120, 25_125], [25_125, 25_130, 25_090, 25_095], [25_095, 25_100, 25_058, 25_070], // pullback, tap at 10:22
+    [25_070, 25_075, 25_055, 25_058], [25_058, 25_085, 25_056, 25_082], // 10:31 close back above the FVG
+    ...Array.from({ length: 59 }, (_, index) => { const p = 25_082 + index * 2; return [p, p + 8, p - 4, p + 2]; }),
+  ];
+  const day1 = session("2026-09-21", dayOne()).map((bar) => ({ ...bar, open: bar.open - 150, high: bar.high - 150, low: bar.low - 150, close: bar.close - 150 }));
+  return { minute: [...day1, ...session(day, bars5)], triggerTime: at(day, "10:31") + 60 };
+}
+
 describe("SMC liquidity-sweep strategy", () => {
   it("fixture bars aggregate to the intended 5m candles", () => {
     const { minute } = scenario();
@@ -217,6 +239,28 @@ describe("SMC liquidity-sweep strategy", () => {
     const unconfirmed = minute.map((bar) => (bar.time + 60 === triggerTime ? { ...bar, close: 25_058, low: 25_050 } : bar));
     const { out } = signalsOf(unconfirmed);
     expect(out.every(({ signal }) => signal.time > triggerTime)).toBe(true);
+  });
+
+  it("BOS retest: buys the FVG retest after a 5m break of structure, only after a 20-minute pullback", () => {
+    const { minute, triggerTime } = bosScenario();
+    const { out, funnel } = signalsOf(minute, { bosRetest: true });
+    const bos = out.filter(({ signal }) => signal.strategy === "SMC BOS retest");
+    expect(bos).toHaveLength(1);
+    const { signal } = bos[0];
+    // 10:23 and 10:25 already closed back above the FVG, but inside the 20-minute wait.
+    expect(signal.time).toBe(triggerTime);
+    expect(signal.side).toBe(1);
+    expect(signal.stop).toBeLessThan(25_030); // beyond the impulse leg's origin
+    expect(signal.stop).toBeGreaterThan(25_015);
+    expect(signal.target1 - 25_070.5).toBeCloseTo(25_070.5 - signal.stop, 0); // T1 = 1R
+    expect(signal.reason).toMatch(/bullish BOS through the 5m swing 25,050/);
+    expect(signal.reason).toMatch(/15m 9 EMA rising/);
+    expect(funnel.bosEntries).toBe(1);
+  });
+
+  it("BOS retest entries are off by default", () => {
+    const { minute } = bosScenario();
+    expect(signalsOf(minute).out.filter(({ signal }) => signal.strategy === "SMC BOS retest")).toHaveLength(0);
   });
 
   it("is causal: signals on truncated data match signals on the full data", () => {
