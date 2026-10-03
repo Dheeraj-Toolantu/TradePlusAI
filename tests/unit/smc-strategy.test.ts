@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Bar } from "../../services/ai-monitoring/src/mtf-decision-engine";
-import { smcSignalSource } from "../../services/backtest/src/smc-strategy";
+import { smcSignalSource, type SmcOptions } from "../../services/backtest/src/smc-strategy";
 import { aggregate, istDay, runBacktest } from "../../services/backtest/src/strategy-backtest";
 import { syntheticSessions } from "../../services/backtest/src/synthetic-market";
 
@@ -68,8 +68,29 @@ function scenario() {
   return { minute: [...session("2026-09-21", dayOne()), ...bars], triggerTime };
 }
 
-function signalsOf(minute: Bar[]) {
-  const source = smcSignalSource("NIFTY", minute, []);
+/**
+ * v2 scenario: the same day-2 sweep → CHoCH → FVG retrace, but inside a 15m DOWNTREND. Day 1 trades
+ * 300 points higher, so day 2 opens below it and the 15m 9 EMA is falling above price. The opening
+ * range high (25,105, a 5m swing high) is buy-side liquidity; the 10:00 bar sweeps it (wick to 25,112,
+ * close 25,090), the 10:05 displacement closes through the 09:20 swing low. At 10:16 a 1m bar taps the FVG, at 10:17 a bearish 1m candle closes back below it.
+ */
+function trendScenario() {
+  const day = "2026-09-22";
+  const { bars, triggerTime } = dayTwo();
+  const openingRange: Record<string, number[]> = {
+    "09:15": [25_050, 25_075, 25_045, 25_070], "09:20": [25_070, 25_074, 25_040, 25_046], "09:25": [25_046, 25_105, 25_042, 25_066],
+    "09:30": [25_066, 25_078, 25_064, 25_077], "09:35": [25_077, 25_084, 25_075, 25_083],
+    // The displacement closes through the 09:20 swing low (25,040): a CHoCH.
+    "10:05": [25_090, 25_092, 25_030, 25_032],
+  };
+  const replaced = Object.entries(openingRange).flatMap(([clock, ohlc]) => minutesOf(at(day, clock), ohlc));
+  const day2 = bars.filter((bar) => bar.time >= at(day, "09:40") && (bar.time < at(day, "10:05") || bar.time >= at(day, "10:10"))).concat(replaced).sort((a, b) => a.time - b.time);
+  const day1 = session("2026-09-21", dayOne()).map((bar) => ({ ...bar, open: bar.open + 300, high: bar.high + 300, low: bar.low + 300, close: bar.close + 300 }));
+  return { minute: [...day1, ...day2], triggerTime };
+}
+
+function signalsOf(minute: Bar[], options: SmcOptions = {}) {
+  const source = smcSignalSource("NIFTY", minute, [], options);
   const out: Array<{ index: number; signal: NonNullable<ReturnType<typeof source>> }> = [];
   for (let index = 0; index < minute.length; index += 1) { const signal = source(index); if (signal) out.push({ index, signal }); }
   return { out, funnel: source.funnel };
@@ -83,9 +104,9 @@ describe("SMC liquidity-sweep strategy", () => {
     expect(m5[10]).toMatchObject({ open: 25_090, high: 25_092, low: 25_035, close: 25_040 });
   });
 
-  it("shorts the retrace into the FVG after a PDH sweep and bearish CHoCH, stop beyond the sweep", () => {
+  it("legacy: shorts the retrace into the FVG after a PDH sweep and bearish CHoCH, stop beyond the sweep", () => {
     const { minute, triggerTime } = scenario();
-    const { out, funnel } = signalsOf(minute);
+    const { out, funnel } = signalsOf(minute, { legacy: true });
     expect(out).toHaveLength(1);
     const { signal } = out[0];
     expect(signal.time).toBe(triggerTime);
@@ -105,11 +126,11 @@ describe("SMC liquidity-sweep strategy", () => {
     expect(funnel).toMatchObject({ choch: 1, zones: 1, entries: 1 });
   });
 
-  it("mirrors to a long after a PDL sweep", () => {
+  it("legacy: mirrors to a long after a PDL sweep", () => {
     const { minute, triggerTime } = scenario();
     const mirror = (p: number) => 50_000 - p;
     const flipped = minute.map((bar) => ({ ...bar, open: mirror(bar.open), close: mirror(bar.close), high: mirror(bar.low), low: mirror(bar.high) }));
-    const { out } = signalsOf(flipped);
+    const { out } = signalsOf(flipped, { legacy: true });
     expect(out).toHaveLength(1);
     expect(out[0].signal).toMatchObject({ time: triggerTime, side: 1 });
     expect(out[0].signal.stop).toBeLessThan(mirror(25_112));
@@ -117,7 +138,7 @@ describe("SMC liquidity-sweep strategy", () => {
   });
 
   it("takes no new entry after 14:30: no time left to reach T2", () => {
-    const { minute } = scenario();
+    const { minute } = trendScenario();
     const day2 = at("2026-09-22", "09:15");
     const shift = 265 * 60; // day 2 moved 4h25m later: the 10:17 shooting star now prints at 14:42
     const late = minute.map((bar) => (bar.time >= day2 ? { ...bar, time: bar.time + shift } : bar));
@@ -126,9 +147,9 @@ describe("SMC liquidity-sweep strategy", () => {
     expect(funnel.lateSession).toBe(1);
   });
 
-  it("never places T2 behind an opposing level that T1 has not cleared", () => {
+  it("legacy: never places T2 behind an opposing level that T1 has not cleared", () => {
     const { minute } = scenario();
-    const { out } = signalsOf(minute);
+    const { out } = signalsOf(minute, { legacy: true });
     const { signal } = out[0];
     const risk = signal.stop - 25_051;
     // Day 1 left equal lows at 24,958 (1.4R away) and the PDL at 24,900. T1 front-runs the equal lows
@@ -138,7 +159,7 @@ describe("SMC liquidity-sweep strategy", () => {
   });
 
   it("does not trade when price never retraces into the zone", () => {
-    const { minute } = scenario();
+    const { minute } = trendScenario();
     const start = at("2026-09-22", "10:15");
     // Replace the retrace with bars that keep falling away from the FVG.
     const noRetrace = minute.map((bar) => (bar.time >= start && bar.time < start + 300 ? { ...bar, open: 25_040, high: 25_044, low: 25_030, close: 25_032 } : bar));
@@ -146,10 +167,56 @@ describe("SMC liquidity-sweep strategy", () => {
   });
 
   it("does not trade when the sweep is accepted (5m close above the level)", () => {
-    const { minute } = scenario();
+    const { minute } = trendScenario();
     const start = at("2026-09-22", "10:00");
     const accepted = minute.map((bar) => (bar.time === start + 240 ? { ...bar, close: 25_105, high: 25_112 } : bar));
     expect(signalsOf(accepted).out).toHaveLength(0);
+  });
+
+  it("v2: shorts the FVG retrace after an ORH sweep when the 15m 9 EMA is falling, T1 at 1R", () => {
+    const { minute, triggerTime } = trendScenario();
+    const { out, funnel } = signalsOf(minute);
+    expect(out).toHaveLength(1);
+    const { signal } = out[0];
+    expect(signal.time).toBe(triggerTime);
+    expect(signal.side).toBe(-1);
+    expect(signal.stop).toBeGreaterThan(25_112);
+    expect(signal.stop).toBeLessThan(25_125);
+    const entry = 25_051;
+    const risk = signal.stop - entry;
+    expect(entry - signal.target1).toBeCloseTo(risk, 0);
+    expect(signal.target2!).toBeLessThan(signal.target1);
+    expect(signal.reason).toMatch(/opening-range high 25,105/);
+    expect(signal.reason).toMatch(/1m close back below the zone/);
+    expect(signal.reason).toMatch(/15m 9 EMA falling/);
+    expect(signal.reason).toMatch(/below VWAP/);
+    expect(signal.confidence).toBeGreaterThanOrEqual(60);
+    expect(funnel).toMatchObject({ choch: 1, zones: 1, entries: 1 });
+  });
+
+  it("v2: mirrors to a long when the 15m 9 EMA is rising", () => {
+    const { minute, triggerTime } = trendScenario();
+    const mirror = (p: number) => 50_000 - p;
+    const flipped = minute.map((bar) => ({ ...bar, open: mirror(bar.open), close: mirror(bar.close), high: mirror(bar.low), low: mirror(bar.high) }));
+    const { out } = signalsOf(flipped);
+    expect(out).toHaveLength(1);
+    expect(out[0].signal).toMatchObject({ time: triggerTime, side: 1 });
+    expect(out[0].signal.reason).toMatch(/15m 9 EMA rising/);
+  });
+
+  it("v2: does not short a sweep while the 15m 9 EMA is still rising (counter-trend)", () => {
+    const { minute, triggerTime } = scenario();
+    const { out } = signalsOf(minute);
+    expect(out.filter(({ signal }) => signal.time === triggerTime)).toHaveLength(0);
+    for (const { signal } of out) expect(signal.reason).toMatch(/15m 9 EMA falling/);
+  });
+
+  it("v2: waits for a 1m close back out of the zone; a wick alone is not a trigger", () => {
+    const { minute, triggerTime } = trendScenario();
+    // The 10:17 candle still wicks into the FVG but closes inside it (25,058): no confirmation yet.
+    const unconfirmed = minute.map((bar) => (bar.time + 60 === triggerTime ? { ...bar, close: 25_058, low: 25_050 } : bar));
+    const { out } = signalsOf(unconfirmed);
+    expect(out.every(({ signal }) => signal.time > triggerTime)).toBe(true);
   });
 
   it("is causal: signals on truncated data match signals on the full data", () => {

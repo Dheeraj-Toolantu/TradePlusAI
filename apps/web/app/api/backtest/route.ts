@@ -12,7 +12,7 @@ const STRATEGIES: Record<StrategyId, string> = {
   MTF_AI: "AI multi-timeframe (1D/15m/5m/1m + candle psychology)",
   ORB_RETEST: "V5 ORB break-and-retest (strategy rules)",
   ORB_PRO: "ORB retest Pro (sentiment, conviction breakout, held retest, structural stop)",
-  SMC_SWEEP: "SMC liquidity sweep (S/R, CHoCH, FVG/OB, candle psychology)",
+  SMC_SWEEP: "SMC liquidity sweep + 9 EMA (S/R, CHoCH, FVG/OB, 15m 9 EMA trend, 1m close-back confirmation)",
   TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
   SMART_COMBO: "Smart combo (regime-routed trend / ORB / SMC, AI multi-timeframe vote)",
 };
@@ -113,8 +113,9 @@ export async function POST(request: Request) {
   const notes = [...result.notes];
   if (strategy === "MTF_AI") notes.push("Replays the deterministic multi-timeframe engine the AI monitor relies on. The LLM's discretionary layer, live OI/PCR flow and sentiment cannot be replayed historically.");
   else if (strategy === "SMC_SWEEP") {
-    if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.counterTrend} counter-trend, ${funnel.lateSession} after 14:30. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
-    notes.push("SMC rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m rejection or engulfing. Stop beyond the sweep; T1 1.5R or opposing liquidity; T2 next opposing liquidity. Counter-trend (vs 15m structure) only off a daily level.");
+    if (funnel) notes.push(`Setup funnel: ${funnel.sweeps} liquidity sweeps → ${funnel.choch} CHoCH with displacement → ${funnel.zones} FVG/OB zones → ${funnel.entries} entry triggers. Dropped: ${funnel.invalidated} sweep not held, ${funnel.noChoch} no CHoCH, ${funnel.expired} no retrace within 60 min, ${funnel.stopTooWide} stop > 2.5 ATR, ${funnel.srTooClose} S/R within 1R, ${funnel.againstEma} against the 15m 9 EMA trend, ${funnel.againstVwap} wrong side of VWAP, ${funnel.lateSession} after 14:30. Entry triggers can exceed trades: the daily risk limits and one-position rule apply after.`);
+    notes.push("SMC + 9 EMA rules: liquidity sweep of PDH/PDL, opening range, swing or equal highs/lows → CHoCH with displacement → retrace into the FVG/order block → 1m candle closing back out of the zone. Only with the 15m 9 EMA trend (15m close beyond a 9 EMA sloping the trade's way) and on the trade's side of VWAP. Stop beyond the sweep; T1 1R or opposing liquidity, then breakeven; runner trails (1.5R) or T2 at the next opposing liquidity. Confidence rises for an entry at value near the 5m 9 EMA, an FVG inside the order block and a daily-level sweep.");
+    notes.push("Validated on real 1-minute data 2018–2026 (trail 1.5R, 45-min time stop): NIFTY 82 trades, 59% win, +0.19R/trade, points PF 1.64; BANKNIFTY (not used for design) 94 trades, 55% win, +0.19R, PF 1.70. The previous rules lost on the same data (−0.05R / −0.12R). Expect ~10 trades a year: an A+ setup, not a daily signal.");
   }
   else if (strategy === "ORB_PRO") {
     if (orbProFunnel) {
