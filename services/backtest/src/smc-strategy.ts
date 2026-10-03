@@ -39,11 +39,17 @@ import { aggregate, istDay, istMinute, type Signal } from "./strategy-backtest";
  * a 5m 9 EMA trend filter instead of 15m → 67 trades, +0.11R, PF 1.47; confirming the retest on a 5m
  * close instead of 1m → 24 trades, −0.02R. Both were worse, so the 15m 9 EMA and the 1m close stay.
  *
- * `bosRetest: true` ("SMC sweep + BOS retest") adds a continuation entry — 5m BOS with displacement in
- * the 15m 9 EMA trend → retest of its FVG/OB at least 20 min later → 1m close back out — for more trades:
- *   NIFTY      166 trades (~19 a year), 58% win, +0.21R, PF 1.86 (BOS retests alone: 92, 57%, +0.20R)
- *   BANKNIFTY  178 trades, 50% win, +0.06R, PF 1.18 (BOS retests alone: 94, 47%, −0.04R)
- * Unfiltered BOS retests (no wait, no displacement minimum) were breakeven to negative on both indices.
+ * `chochRetest: true` ("SMC sweep + CHoCH retest") adds a 5m CHoCH continuation entry and lets sweeps also
+ * use the 5m 9 EMA trend. Real data 2018–2026 (1.5R trail, 45-min time stop), vs the earlier BOS-retest
+ * version (BOS with displacement → retest ≥ 20 min later → plain 1m close back):
+ *   NIFTY      BOS version 166 trades, 58% win, +0.21R, PF 1.86  →  CHoCH version 191 trades, 58% win, +0.18R, PF 1.60
+ *   BANKNIFTY  BOS version 178 trades, 50% win, +0.06R, PF 1.18  →  CHoCH version 207 trades, 54% win, +0.13R, PF 1.38
+ * Continuation entries alone: NIFTY 93 trades, 57% win, +0.16R; BANKNIFTY 89 trades, 56% win, +0.11R (the BOS
+ * retests there: 47%, −0.04R). No losing year on NIFTY (the BOS version lost in 2018 and 2019).
+ * What was tested for the continuation entry (NIFTY 2018–22 / 2023–26 / BANKNIFTY): BOS vs CHoCH (CHoCH was
+ * positive in all three, BOS lost on BANKNIFTY); 1m confirmation = close back out / strong close / engulfing /
+ * close beyond the 1m 9 EMA / two closes out (strong close: most trades at similar quality); retest wait
+ * 0–20 min (0 with a strong close); T1 0.75R (more T1 hits, lower expectancy, not used).
  *
  * `legacy: true` keeps the original v1 rules (any 1m candle pattern in the zone, 15m BOS bias,
  * T1 1.5R, session/exhaustion scoring); the Smart combo router still uses them for range-day fades.
@@ -69,8 +75,8 @@ type Setup = {
   tappedAt?: number;
   /** Last v2 gate that held a confirmed trigger back, for the funnel if the setup then expires. */
   blocked?: "EMA" | "VWAP";
-  /** SWEEP = liquidity sweep → CHoCH (default); BOS = break of structure in the trend → retest. */
-  model?: "SWEEP" | "BOS";
+  /** SWEEP = liquidity sweep → CHoCH (default); CHOCH = 5m CHoCH continuation in the 15m trend → retest. */
+  model?: "SWEEP" | "CHOCH";
   barsLeft: number;
   armedAt?: number;
   expiresAt?: number;
@@ -84,8 +90,8 @@ const fmt = (value: number) => value.toLocaleString("en-IN", { maximumFractionDi
 const KIND_LABEL: Record<Pool["kind"], string> = { PDH: "previous-day high", PDL: "previous-day low", ORH: "opening-range high", ORL: "opening-range low", SWING: "5m swing", EQUAL: "equal highs/lows" };
 
 /** How many setups reached each stage, and why the rest were dropped. */
-export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; againstEma: number; bos: number; bosEntries: number; againstVwap: number; lateSession: number };
-const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, againstEma: 0, bos: 0, bosEntries: 0, againstVwap: 0, lateSession: 0 });
+export type SmcFunnel = { sweeps: number; choch: number; zones: number; entries: number; noChoch: number; invalidated: number; noZone: number; expired: number; stopTooWide: number; srTooClose: number; counterTrend: number; againstEma: number; chochBreaks: number; chochEntries: number; againstVwap: number; lateSession: number };
+const emptyFunnel = (): SmcFunnel => ({ sweeps: 0, choch: 0, zones: 0, entries: 0, noChoch: 0, invalidated: 0, noZone: 0, expired: 0, stopTooWide: 0, srTooClose: 0, counterTrend: 0, againstEma: 0, chochBreaks: 0, chochEntries: 0, againstVwap: 0, lateSession: 0 });
 /** Last minute (IST) at which a new SMC entry is allowed: later trades have no time to reach T2. */
 const LAST_ENTRY_MINUTE = 14 * 60 + 30;
 
@@ -93,22 +99,22 @@ export type SmcOptions = {
   /** The original (v1) rules: any 1m candle pattern in the zone, 15m BOS bias, T1 1.5R, no 9 EMA/VWAP gate. */
   legacy?: boolean;
   /**
-   * Add the BOS-retest continuation entry ("SMC sweep + BOS retest" strategy): a 5m displacement candle
-   * (body ≥ 0.8 ATR) closes through the last 5m swing in the 15m 9 EMA trend's direction → its FVG /
-   * order block → a retest at least 20 minutes later → 1m close back out of the zone. Stop beyond the
-   * impulse leg's origin. Roughly doubles the trade count; see the validation notes in the header.
+   * "SMC sweep + CHoCH retest": add the 5m CHoCH continuation entry — the 5m pullback's structure (last
+   * swing break against the trade) flips back with a displacement candle (body ≥ 0.8 ATR) in the 15m 9 EMA
+   * trend's direction → its FVG / order block → retest → 1m strong close back out of the zone. Sweep
+   * entries in this mode also accept a 5m 9 EMA trend (5m close beyond a sloping 5m 9 EMA) when the
+   * 15m one has not turned yet. See the validation notes in the header.
    */
-  bosRetest?: boolean;
+  chochRetest?: boolean;
 };
-/** BOS-retest entry: minimum displacement body (in 5m ATR), impulse-leg lookback (5m bars) and minimum wait for the retest. */
-const BOS_BODY_ATR = 0.8;
-const BOS_LEG_BARS = 6;
-const BOS_MIN_RETEST_MINUTES = 20;
+/** CHoCH-retest entry: minimum displacement body (in 5m ATR) and the impulse-leg lookback (5m bars) for the stop. */
+const CHOCH_BODY_ATR = 0.8;
+const CHOCH_LEG_BARS = 6;
 const ema = (prev: number, value: number, period: number) => (Number.isFinite(prev) ? prev + (2 / (period + 1)) * (value - prev) : value);
 
 export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], options: SmcOptions = {}) {
   const legacy = options.legacy === true;
-  const bosRetest = !legacy && options.bosRetest === true;
+  const chochRetest = !legacy && options.chochRetest === true;
   const m5 = aggregate(minute, 5);
   const funnel = emptyFunnel();
   const m15 = aggregate(minute, 15);
@@ -130,7 +136,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
       /** Completed session ranges (most recent last), for the average daily range. */
       ranges: [] as number[],
       pending: null as Signal | null, pendingIndex: -1,
-      ema5: NaN, ema15: NaN, ema15Hist: [] as number[], close15: NaN,
+      ema5: NaN, ema5Hist: [] as number[], close5: NaN, struct5: 0 as -1 | 0 | 1, ema15: NaN, ema15Hist: [] as number[], close15: NaN,
     };
   }
 
@@ -215,7 +221,7 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
     const prev = m5[k - 1];
     const tr = prev ? Math.max(bar.high - bar.low, Math.abs(bar.high - prev.close), Math.abs(bar.low - prev.close)) : bar.high - bar.low;
     s.atr5 = wilder(s.atr5, tr, 14);
-    s.ema5 = ema(s.ema5, bar.close, 9);
+    s.ema5 = ema(s.ema5, bar.close, 9); s.ema5Hist = [...s.ema5Hist, s.ema5].slice(-3); s.close5 = bar.close;
     const atr = s.atr5;
     const sameDay = istDay(bar.time) === s.day;
 
@@ -243,6 +249,11 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
       }
     }
 
+    // 5m market structure: the side of the last close through a confirmed swing.
+    const priorStruct = s.struct5;
+    if (Number.isFinite(s.lastSwingHigh5) && bar.close > s.lastSwingHigh5) s.struct5 = 1;
+    else if (Number.isFinite(s.lastSwingLow5) && bar.close < s.lastSwingLow5) s.struct5 = -1;
+
     // 2) Advance existing setups with this closed 5m bar.
     for (const setup of s.setups) advanceSetup(setup, k, atr);
     s.setups = s.setups.filter((setup) => setup.barsLeft > 0);
@@ -261,20 +272,23 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
       funnel.sweeps += 1;
       s.setups.push({ dir: -1, stage: "SWEPT", pool: buySide, sweepIndex: k, sweepExtreme: bar.high, sweepWick: (bar.high - Math.max(bar.open, bar.close)) / range, breakLevel: internalLevel(k, -1), barsLeft: 6 });
     }
-    // 4) BOS-retest continuation (optional): a displacement candle that is the first close through the last
-    // 5m swing, with no sweep setup already running that way. The trend gate is applied at the trigger.
-    if (bosRetest) for (const dir of [1, -1] as const) {
+    // 4) CHoCH-retest continuation (optional): a displacement candle that is the first close through the
+    // last 5m swing AGAINST the 5m structure (the pullback's lower highs / higher lows), i.e. a 5m change
+    // of character. Breaks in the direction the 5m structure already had (BOS) are not traded: on real
+    // data they lost on BANKNIFTY. The 15m 9 EMA trend gate is applied at the trigger.
+    if (chochRetest) for (const dir of [1, -1] as const) {
+      if (priorStruct === dir) continue;
       const level = dir > 0 ? s.lastSwingHigh5 : s.lastSwingLow5;
       const body = Math.abs(bar.close - bar.open);
-      const displaced = (bar.close - bar.open) * dir > 0 && body >= BOS_BODY_ATR * atr && body / range >= 0.5;
+      const displaced = (bar.close - bar.open) * dir > 0 && body >= CHOCH_BODY_ATR * atr && body / range >= 0.5;
       if (!Number.isFinite(level) || !displaced || !prev || (bar.close - level) * dir <= 0 || (prev.close - level) * dir > 0) continue;
       // A bar that also swept the opposite side is a two-sided liquidity grab, not a clean break.
       if (s.setups.some((setup) => setup.dir === dir) || (dir > 0 ? buySide : sellSide)) continue;
       // The stop goes beyond the origin of the impulse leg: the extreme of the last six 5m bars.
-      const leg = m5.slice(Math.max(0, k - BOS_LEG_BARS), k + 1);
+      const leg = m5.slice(Math.max(0, k - CHOCH_LEG_BARS), k + 1);
       const origin = dir > 0 ? Math.min(...leg.map((item) => item.low)) : Math.max(...leg.map((item) => item.high));
-      funnel.bos += 1;
-      const setup: Setup = { dir, stage: "WAIT_ZONE", model: "BOS", pool: { price: level, time: bar.time, kind: "SWING", side: dir === 1 ? 1 : -1, swept: true }, sweepIndex: k - 1, sweepExtreme: origin, sweepWick: 0, breakLevel: level, displacement: body / Math.max(atr, 1e-9), chochBars: 1, barsLeft: 3 };
+      funnel.chochBreaks += 1;
+      const setup: Setup = { dir, stage: "WAIT_ZONE", model: "CHOCH", pool: { price: level, time: bar.time, kind: "SWING", side: dir, swept: true }, sweepIndex: k - 1, sweepExtreme: origin, sweepWick: 0, breakLevel: level, displacement: body / Math.max(atr, 1e-9), chochBars: 1, barsLeft: 3 };
       s.setups.push(setup);
       locateZone(setup, k);
     }
@@ -454,16 +468,20 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
       const rejection = wick >= 0.45 && (bar.close - (bar.high + bar.low) / 2) * dir >= 0;
       // Strong close: a directional candle that tested the zone and closed in its top (bottom) third.
       const strongClose = directional && (dir > 0 ? (bar.close - bar.low) / range >= 0.67 : (bar.high - bar.close) / range >= 0.67);
-      if (legacy ? !(engulfing || rejection || (directional && reclaimed) || strongClose) : !(directional && reclaimed)) continue;
-      // v2 trend confirmation: the 15m close is beyond a 9 EMA sloping the trade's way, and the 1m close
-      // is on the trade's side of VWAP. A setup that fails waits (it may still qualify before expiry).
+      // v2 trigger: a directional 1m candle closing back out of the zone; for the CHoCH retest it must also
+      // close in its outer third (a strong close: the zone was defended, not just left).
+      const confirmed = directional && reclaimed && (setup.model !== "CHOCH" || strongClose);
+      if (legacy ? !(engulfing || rejection || (directional && reclaimed) || strongClose) : !confirmed) continue;
+      // v2 trend confirmation: the 15m close is beyond a 9 EMA sloping the trade's way (in CHoCH-retest mode a
+      // sweep may also use the 5m 9 EMA), and for sweeps the 1m close is on the trade's side of VWAP. A setup
+      // that fails waits (it may still qualify before expiry).
       const ema15Ok = (s.close15 - s.ema15) * dir > 0 && ((s.ema15Hist.at(-1) ?? NaN) - (s.ema15Hist.at(-3) ?? NaN)) * dir > 0;
+      const ema5Ok = (s.close5 - s.ema5) * dir > 0 && ((s.ema5Hist.at(-1) ?? NaN) - (s.ema5Hist.at(-3) ?? NaN)) * dir > 0;
+      const trendTf = ema15Ok ? "15m" : chochRetest && setup.model !== "CHOCH" && ema5Ok ? "5m" : null;
       const vwapOk = Number.isFinite(s.vwap) && (bar.close - s.vwap) * dir >= 0;
-      if (!legacy && !ema15Ok) { setup.blocked = "EMA"; continue; }
-      // BOS retest: only a real pullback (≥ 20 min after the zone formed); an instant dip is noise. VWAP is
-      // not required here: in a trend pullback price often dips through VWAP into the zone.
-      if (setup.model === "BOS" && t - (setup.armedAt ?? t) < BOS_MIN_RETEST_MINUTES * 60) continue;
-      if (!legacy && !vwapOk && setup.model !== "BOS") { setup.blocked = "VWAP"; continue; }
+      if (!legacy && !trendTf) { setup.blocked = "EMA"; continue; }
+      // VWAP is not required for the CHoCH retest: in a trend pullback price often dips through VWAP.
+      if (!legacy && !vwapOk && setup.model !== "CHOCH") { setup.blocked = "VWAP"; continue; }
       const clock = istMinute(t);
       if (clock > LAST_ENTRY_MINUTE) { setup.barsLeft = 0; funnel.lateSession += 1; continue; }
       const entry = bar.close;
@@ -493,14 +511,14 @@ export function smcSignalSource(symbol: string, minute: Bar[], daily: Bar[], opt
       const pattern = legacy
         ? candle ? `1m ${candle}` : reclaimed ? `1m close back ${dir > 0 ? "above" : "below"} the zone` : `1m strong ${dir > 0 ? "bullish" : "bearish"} close off the zone`
         : `1m close back ${dir > 0 ? "above" : "below"} the zone${candle ? ` (${candle})` : ""}`;
-      const trend = legacy ? "" : ` with the 15m 9 EMA ${dir > 0 ? "rising" : "falling"} (${fmt(s.ema15)})${vwapOk ? ` and price ${dir > 0 ? "above" : "below"} VWAP` : ""}`;
-      const reason = setup.model === "BOS"
-        ? `${dir > 0 ? "Buy CE" : "Buy PE"}: ${dir > 0 ? "bullish" : "bearish"} BOS through the 5m swing ${fmt(setup.breakLevel)} with displacement → retest of the ${zone.kind} ${fmt(zone.lo)}–${fmt(zone.hi)} after a pullback → ${pattern}${trend}${reasons.length ? `. Confluence: ${reasons.join(", ")}` : ""}.`
+      const trend = legacy ? "" : ` with the ${trendTf} 9 EMA ${dir > 0 ? "rising" : "falling"} (${fmt(trendTf === "5m" ? s.ema5 : s.ema15)})${vwapOk ? ` and price ${dir > 0 ? "above" : "below"} VWAP` : ""}`;
+      const reason = setup.model === "CHOCH"
+        ? `${dir > 0 ? "Buy CE" : "Buy PE"}: 5m pullback ends with a ${dir > 0 ? "bullish" : "bearish"} CHoCH through the swing ${fmt(setup.breakLevel)} with displacement → retest of the ${zone.kind} ${fmt(zone.lo)}–${fmt(zone.hi)} → ${pattern}${strongClose ? " (strong close)" : ""}${trend}${reasons.length ? `. Confluence: ${reasons.join(", ")}` : ""}.`
         : `${dir > 0 ? "Buy CE" : "Buy PE"}: swept ${KIND_LABEL[setup.pool.kind]} ${fmt(setup.pool.price)} (${dir > 0 ? "sell" : "buy"}-side liquidity) → ${dir > 0 ? "bullish" : "bearish"} CHoCH through ${fmt(setup.breakLevel)} → retrace into ${zone.kind} ${fmt(zone.lo)}–${fmt(zone.hi)} → ${pattern}${trend}${reasons.length ? `. Confluence: ${reasons.join(", ")}` : ""}.`;
       setup.barsLeft = 0; // one trade per setup
       funnel.entries += 1;
-      if (setup.model === "BOS") funnel.bosEntries += 1;
-      if (index === s.pendingIndex || s.pending === null) { s.pending = { time: t, side: dir, stop: Math.round(finalStop * 100) / 100, target1: Math.round((entry + dir * t1Distance) * 100) / 100, target2: Math.round((entry + dir * t2Distance) * 100) / 100, confidence, strategy: setup.model === "BOS" ? "SMC BOS retest" : SMC_NAME, reason }; s.pendingIndex = index; }
+      if (setup.model === "CHOCH") funnel.chochEntries += 1;
+      if (index === s.pendingIndex || s.pending === null) { s.pending = { time: t, side: dir, stop: Math.round(finalStop * 100) / 100, target1: Math.round((entry + dir * t1Distance) * 100) / 100, target2: Math.round((entry + dir * t2Distance) * 100) / 100, confidence, strategy: setup.model === "CHOCH" ? "SMC CHoCH retest" : SMC_NAME, reason }; s.pendingIndex = index; }
     }
     s.setups = s.setups.filter((setup) => setup.barsLeft > 0);
   }

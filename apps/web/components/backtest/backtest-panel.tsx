@@ -16,7 +16,7 @@ const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
   { id: "SMART_COMBO", title: "★ Smart combo", detail: "Reads the day first (trend / range), then routes to the playbook that fits it: trend pullback, ORB, or liquidity sweep. AI multi-timeframe votes; confluence adds conviction." },
   { id: "TREND_PULLBACK", title: "Trend-day VWAP pullback", detail: "Trades only confirmed trend days: 30 min on one side of a sloping VWAP, OR break, 15m agreeing → pullback into VWAP/EMA20 → 5m resumption candle. Trailing runner." },
   { id: "SMC_SWEEP", title: "SMC liquidity sweep + 9 EMA", detail: "Liquidity sweep → CHoCH with displacement → retrace into the FVG / order block → 1m close back out of the zone, only with the 15m 9 EMA trend and VWAP. Stop beyond the sweep, T1 1R, trailing runner." },
-  { id: "SMC_PLUS", title: "SMC sweep + BOS retest", detail: "More trades: the sweep setups plus 5m BOS with displacement → FVG / order block retest after a ≥ 20-min pullback → 1m close back out, with the 15m 9 EMA. ~2× trades; validated on NIFTY, breakeven on BANKNIFTY." },
+  { id: "SMC_PLUS", title: "SMC sweep + CHoCH retest", detail: "More trades: the sweep setups (15m or 5m 9 EMA trend) plus the 5m pullback's CHoCH with displacement in the 15m 9 EMA trend → FVG / order block retest → 1m strong close back out. ~22 trades a year." },
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };

@@ -97,25 +97,27 @@ function signalsOf(minute: Bar[], options: SmcOptions = {}) {
 }
 
 /**
- * BOS-retest scenario: day 1 trades 150 points lower, so the 15m 9 EMA rises under day 2. Day 2 builds a
- * 5m swing high at 25,050 (09:35), coils above 25,030, and at 10:00 a displacement candle closes through
- * it (BOS). 10:05 leaves an FVG 25,049–25,060. Price pulls back into it from 10:20 and a 1m candle closes
- * back above 25,060 at 10:31, 21 minutes after the zone formed.
+ * CHoCH-retest scenario: day 1 trades 150 points lower, so the 15m 9 EMA rises under day 2. Day 2 rallies to
+ * 25,075 (higher high over 25,045, higher low 25,012), then a 5m pullback closes below 25,012 (5m structure
+ * turns bearish) and makes a lower high at 25,050. At 10:25 a displacement candle closes back through
+ * 25,050: a bullish CHoCH with the 15m trend. 10:30 leaves an FVG 25,036–25,070; price taps it at 10:42 and
+ * the 10:43 1m candle closes strongly back above 25,070.
  */
-function bosScenario() {
+function chochScenario() {
   const day = "2026-09-22";
   const bars5 = [
-    [24_990, 25_010, 24_985, 25_005], [25_005, 25_025, 25_000, 25_020], [25_020, 25_038, 25_018, 25_032],
-    [25_032, 25_042, 25_030, 25_040], [25_040, 25_050, 25_036, 25_044], [25_044, 25_048, 25_034, 25_038],
-    [25_038, 25_046, 25_032, 25_040], [25_040, 25_047, 25_033, 25_044], [25_044, 25_049, 25_036, 25_046],
-    [25_046, 25_110, 25_044, 25_106], // 10:00 BOS through 25,050
-    [25_106, 25_150, 25_060, 25_140], // 10:05 completes the FVG 25,049–25,060
-    [25_140, 25_152, 25_120, 25_125], [25_125, 25_130, 25_090, 25_095], [25_095, 25_100, 25_058, 25_070], // pullback, tap at 10:22
-    [25_070, 25_075, 25_055, 25_058], [25_058, 25_085, 25_056, 25_082], // 10:31 close back above the FVG
-    ...Array.from({ length: 59 }, (_, index) => { const p = 25_082 + index * 2; return [p, p + 8, p - 4, p + 2]; }),
+    [25_000, 25_012, 24_995, 25_010], [25_010, 25_030, 25_008, 25_028], [25_028, 25_045, 25_025, 25_040], // 09:15 swing high 25,045 at 09:25
+    [25_040, 25_042, 25_020, 25_024], [25_024, 25_028, 25_012, 25_018], [25_018, 25_040, 25_016, 25_038], // higher low 25,012 at 09:35
+    [25_038, 25_060, 25_035, 25_058], [25_058, 25_075, 25_055, 25_070], [25_070, 25_072, 25_040, 25_044], // higher high 25,075 at 09:50
+    [25_044, 25_046, 25_006, 25_008], // 10:00 closes below 25,012: 5m structure bearish
+    [25_008, 25_020, 25_006, 25_016], [25_016, 25_050, 25_012, 25_040], [25_040, 25_044, 25_026, 25_030], [25_030, 25_036, 25_022, 25_028], // lower high 25,050 at 10:10
+    [25_028, 25_090, 25_026, 25_086], // 10:25 bullish CHoCH through 25,050
+    [25_086, 25_130, 25_070, 25_125], // 10:30 completes the FVG 25,036–25,070
+    [25_125, 25_128, 25_090, 25_095], [25_095, 25_098, 25_066, 25_080], // 10:42 tap, 10:43 strong close back above
+    ...Array.from({ length: 57 }, (_, index) => { const p = 25_082 + index * 2; return [p, p + 8, p - 4, p + 2]; }),
   ];
   const day1 = session("2026-09-21", dayOne()).map((bar) => ({ ...bar, open: bar.open - 150, high: bar.high - 150, low: bar.low - 150, close: bar.close - 150 }));
-  return { minute: [...day1, ...session(day, bars5)], triggerTime: at(day, "10:31") + 60 };
+  return { minute: [...day1, ...session(day, bars5)], triggerTime: at(day, "10:43") + 60 };
 }
 
 describe("SMC liquidity-sweep strategy", () => {
@@ -241,26 +243,41 @@ describe("SMC liquidity-sweep strategy", () => {
     expect(out.every(({ signal }) => signal.time > triggerTime)).toBe(true);
   });
 
-  it("BOS retest: buys the FVG retest after a 5m break of structure, only after a 20-minute pullback", () => {
-    const { minute, triggerTime } = bosScenario();
-    const { out, funnel } = signalsOf(minute, { bosRetest: true });
-    const bos = out.filter(({ signal }) => signal.strategy === "SMC BOS retest");
-    expect(bos).toHaveLength(1);
-    const { signal } = bos[0];
-    // 10:23 and 10:25 already closed back above the FVG, but inside the 20-minute wait.
+  it("CHoCH retest: buys the FVG retest after the 5m pullback's CHoCH in the 15m 9 EMA uptrend", () => {
+    const { minute, triggerTime } = chochScenario();
+    const { out, funnel } = signalsOf(minute, { chochRetest: true });
+    const choch = out.filter(({ signal }) => signal.strategy === "SMC CHoCH retest");
+    expect(choch).toHaveLength(1);
+    const { signal } = choch[0];
     expect(signal.time).toBe(triggerTime);
     expect(signal.side).toBe(1);
-    expect(signal.stop).toBeLessThan(25_030); // beyond the impulse leg's origin
-    expect(signal.stop).toBeGreaterThan(25_015);
-    expect(signal.target1 - 25_070.5).toBeCloseTo(25_070.5 - signal.stop, 0); // T1 = 1R
-    expect(signal.reason).toMatch(/bullish BOS through the 5m swing 25,050/);
+    expect(signal.stop).toBeLessThan(25_006); // beyond the impulse leg's origin
+    expect(signal.stop).toBeGreaterThan(24_990);
+    expect(signal.target1 - 25_073).toBeCloseTo(25_073 - signal.stop, 0); // T1 = 1R
+    expect(signal.reason).toMatch(/bullish CHoCH through the swing 25,050/);
+    expect(signal.reason).toMatch(/strong close/);
     expect(signal.reason).toMatch(/15m 9 EMA rising/);
-    expect(funnel.bosEntries).toBe(1);
+    expect(funnel.chochEntries).toBe(1);
   });
 
-  it("BOS retest entries are off by default", () => {
-    const { minute } = bosScenario();
-    expect(signalsOf(minute).out.filter(({ signal }) => signal.strategy === "SMC BOS retest")).toHaveLength(0);
+  it("CHoCH retest: needs a strong 1m close, not just any close back out of the zone", () => {
+    const { minute, triggerTime } = chochScenario();
+    // 10:43 still closes above the FVG (25,071) but in the lower half of its range: not a strong close.
+    const weak = minute.map((bar) => (bar.time + 60 === triggerTime ? { ...bar, high: 25_080, close: 25_071 } : bar));
+    const { out } = signalsOf(weak, { chochRetest: true });
+    expect(out.filter(({ signal }) => signal.strategy === "SMC CHoCH retest" && signal.time === triggerTime)).toHaveLength(0);
+  });
+
+  it("CHoCH retest: a break in the direction the 5m structure already had (BOS) is not traded", () => {
+    const { minute } = chochScenario();
+    // Without the 10:00–10:10 dip below the higher low, the 10:25 break continues a bullish 5m structure.
+    const noFlip = minute.map((bar) => (bar.time >= at("2026-09-22", "10:00") && bar.time < at("2026-09-22", "10:10") ? { ...bar, low: Math.max(bar.low, 25_014), close: Math.max(bar.close, 25_014), open: Math.max(bar.open, 25_014) } : bar));
+    expect(signalsOf(noFlip, { chochRetest: true }).out.filter(({ signal }) => signal.strategy === "SMC CHoCH retest")).toHaveLength(0);
+  });
+
+  it("CHoCH retest entries are off by default", () => {
+    const { minute } = chochScenario();
+    expect(signalsOf(minute).out.filter(({ signal }) => signal.strategy === "SMC CHoCH retest")).toHaveLength(0);
   });
 
   it("is causal: signals on truncated data match signals on the full data", () => {
