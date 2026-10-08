@@ -826,6 +826,14 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .scalper-switch-auto input:checked + span { background: #22c58b; }
 .scalper-switch input:checked + span::after { transform: translateX(12px); }
 .scalper-switch input:focus-visible + span { outline: 2px solid #5aa9ff; outline-offset: 2px; }
+.scalper-engine-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 10px; border: 1px solid #1f2b30; border-radius: 8px; background: #121a1d; }
+.scalper-trade-mode { display: inline-flex; align-items: center; gap: 3px; padding: 3px; border-radius: 999px; background: #151c1f; }
+.scalper-trade-mode small { padding: 0 6px 0 8px; color: #8a9ba0; font-size: 11px; font-weight: 700; }
+.scalper-trade-mode button { padding: 5px 14px; color: #8a9ba0; border: 0; border-radius: 999px; background: transparent; font: 700 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-trade-mode button.on { color: #0b1012; background: #8fe36b; }
+.scalper-trade-mode button:focus-visible, .scalper-take:focus-visible { outline: 2px solid #5aa9ff; outline-offset: 2px; }
+.scalper-take { margin-left: auto; padding: 7px 14px; color: #0b1012; border: 0; border-radius: 6px; background: #f0b232; font: 800 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-take:disabled { color: #8a9ba0; background: #1f2a2e; cursor: not-allowed; }
 .scalper-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; padding: 8px; border: 1px solid #1f2b30; border-radius: 8px; background: #121a1d; }
 .scalper-controls label { display: grid; gap: 3px; color: #8a9ba0; font-size: 10px; }
 .scalper-engine { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px; border: 1px solid #1f2b30; border-radius: 8px; background: #121a1d; }

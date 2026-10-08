@@ -77,6 +77,22 @@ describe("SmartScalper decisions", () => {
     expect(result.positions[0].stop).toBeLessThan(result.positions[0].entry);
   });
 
+  it("in manual mode only signals, and enters when the trader takes the signal", async () => {
+    const bars = uptrendWithPullback();
+    const spot = bars.at(-1)!.close;
+    const scalper = new SmartScalper({ now: at("10:30"), hydrate: false });
+    const signal = await scalper.scan({ symbol: "NIFTY", spot, bars, contracts: chain(spot), autoEntries: false, settings: { maxLossPerTrade: 5000 } });
+    expect(signal.positions).toHaveLength(0);
+    expect(signal.signalReady).toBe(true);
+    expect(signal.summary).toContain("Take trade");
+    const taken = await scalper.take("NIFTY", chain(spot), { settings: { maxLossPerTrade: 5000 } });
+    expect(taken.positions).toHaveLength(1);
+    expect(taken.positions[0].kind).toBe("SCALP");
+    expect(taken.tradesToday).toBe(1);
+    const again = await scalper.take("NIFTY", chain(spot));
+    expect("error" in again && again.error).toContain("No fresh engine signal");
+  });
+
   it("switches to a debit-spread hedge when options are expensive", async () => {
     const bars = uptrendWithPullback();
     const spot = bars.at(-1)!.close;

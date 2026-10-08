@@ -45,6 +45,12 @@ export async function POST(request: Request) {
       const result = action === "buy" ? await scalper.buy(symbol, contract, numberOf(body.lots) || 1) : await scalper.sell(symbol, contract, numberOf(body.lots) || 1);
       return NextResponse.json(result, { status: "error" in result && result.error ? 409 : 200 });
     }
+    if (action === "take") {
+      const safety = readSafeModeState();
+      const entryBlockedReason = safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : safety.safeMode ? `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` : undefined;
+      const result = await scalper.take(symbol, contracts, { entryBlockedReason, settings: (body.settings && typeof body.settings === "object" ? body.settings : {}) as Partial<ScalperSettings> });
+      return NextResponse.json(result, { status: "error" in result && result.error ? 409 : 200 });
+    }
     if (action === "exit" || action === "exitAll") {
       const ids = action === "exitAll" ? "ALL" as const : (Array.isArray(body.ids) ? body.ids.map(String) : []);
       return NextResponse.json(await scalper.exit(symbol, ids, contracts));
@@ -55,9 +61,9 @@ export async function POST(request: Request) {
     const safety = readSafeModeState();
     const entryBlockedReason = safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : safety.safeMode ? `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` : undefined;
     const autoEntries = Boolean(body.autoEntries);
-    // Market intel (cached 20 s) adds 5m demand/supply zones and the VIX regime when entries are on.
+    // Market intel (cached 20 s) adds 5m demand/supply zones and the VIX regime, in both trade modes.
     let intel: MarketIntel | null = null;
-    if (autoEntries && isIntelSymbol(symbol)) intel = await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
+    if (isIntelSymbol(symbol)) intel = await getMarketIntel(symbol, { origin: new URL(request.url).origin }).catch(() => null);
     const zones = intel?.available ? intel.smart_entry?.zones ?? [] : [];
     const result = await scalper.scan({
       symbol, spot, bars, contracts, autoEntries, zones, entryBlockedReason,

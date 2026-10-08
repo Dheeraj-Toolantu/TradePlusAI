@@ -124,7 +124,7 @@ export type ScanInput = {
   /** Underlying 1-minute candles, oldest first. */
   bars: ScalperBar[];
   contracts: ScalperContract[];
-  /** Take new engine entries (false = manage open positions only). */
+  /** AUTOMATIC: the engine places its own entries. MANUAL (false): it only suggests; the trader takes the signal with `take`. */
   autoEntries: boolean;
   settings?: Partial<ScalperSettings>;
   /** Higher-timeframe demand/supply zones (e.g. market-intel 5m zones). */
@@ -406,6 +406,7 @@ export class SmartScalper {
   private hydrated = false;
   private queue: Promise<unknown> = Promise.resolve();
   private sequence = 0;
+  private lastSignal: { symbol: string; at: number; key: string } | null = null;
   private lastDecision: ScalperDecision = { mode: "WAIT", side: null, read: null, reasons: ["Engine has not scanned yet"], gates: [], plan: null, daysToExpiry: null };
 
   constructor(options: { now?: () => Date; slippagePct?: number; hydrate?: boolean } = {}) {
@@ -533,23 +534,54 @@ export class SmartScalper {
       this.mark(input.contracts);
       this.manageExits(input, settings);
       let decision = this.decide(input, settings);
-      const block = input.entryBlockedReason ?? (input.vixRegime === "EXTREME" ? "India VIX is EXTREME" : undefined) ?? this.dailyBlock(settings) ?? (istMinutes(now) >= SQUARE_OFF ? "after the 15:15 IST square-off" : undefined);
-      const openEngine = this.positions.some((position) => position.status === "OPEN" && position.kind !== "MANUAL" && position.underlying === input.symbol);
+      const block = this.entryBlock(input.symbol, settings, input.entryBlockedReason ?? (input.vixRegime === "EXTREME" ? "India VIX is EXTREME" : undefined));
+      const key = decision.plan ? `${decision.plan.kind}:${decision.side}:${decision.plan.spot.stop}:${input.bars.at(-1)?.time}` : "";
       let summary: string;
-      if (!input.autoEntries) summary = `Auto entries off. Engine reads ${decision.mode}${decision.side ? ` ${decision.side}` : ""}.`;
-      else if (block) { summary = `Entries paused: ${block}. Open positions are still managed.`; decision = { ...decision, reasons: [...decision.reasons, `Entries paused: ${block}`] }; }
-      else if (openEngine) summary = "Managing the open engine position; one engine trade at a time.";
-      else if (decision.plan) {
-        const key = `${decision.plan.kind}:${decision.side}:${decision.plan.spot.stop}:${input.bars.at(-1)?.time}`;
-        if (this.consumedSetups.has(key)) summary = "Setup already traded.";
-        else {
-          this.consumedSetups.add(key);
-          const position = this.open(input.symbol, decision.plan, input.contracts);
-          summary = `${position.kind} entered: ${position.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.entry}`).join(" + ")} · SL ${position.stop} · T ${position.target}`;
-        }
-      } else summary = decision.reasons.at(-1) ?? "Waiting for a setup";
+      if (block) { summary = `Entries paused: ${block}. Open positions are still managed.`; decision = { ...decision, reasons: [...decision.reasons, `Entries paused: ${block}`] }; }
+      else if (!decision.plan) summary = decision.reasons.at(-1) ?? "Waiting for a setup";
+      else if (this.consumedSetups.has(key)) summary = "Setup already traded.";
+      else if (!input.autoEntries) summary = `Manual mode · signal ready: ${decision.plan.kind} ${decision.plan.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.price}`).join(" + ")} · SL ${decision.plan.stop} · T ${decision.plan.target} · ${decision.plan.riskReward}R. Press "Take trade" to enter.`;
+      else {
+        this.consumedSetups.add(key);
+        const position = this.open(input.symbol, decision.plan, input.contracts);
+        summary = `${position.kind} entered: ${position.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.entry}`).join(" + ")} · SL ${position.stop} · T ${position.target}`;
+      }
+      this.lastSignal = decision.plan && !block && !this.consumedSetups.has(key) ? { symbol: input.symbol, at: now.getTime(), key } : null;
       this.lastDecision = decision;
-      return { ...this.state(input.symbol), decision, summary };
+      return { ...this.state(input.symbol), decision, summary, signalReady: this.lastSignal !== null };
+    });
+  }
+
+  /** Why new engine entries are not allowed right now (undefined = allowed). */
+  private entryBlock(symbol: string, settings: ScalperSettings, external?: string) {
+    if (external) return external;
+    const daily = this.dailyBlock(settings);
+    if (daily) return daily;
+    if (istMinutes(this.clock()) >= SQUARE_OFF) return "after the 15:15 IST square-off";
+    if (this.positions.some((position) => position.status === "OPEN" && position.kind !== "MANUAL" && position.underlying === symbol)) return "an engine position is already open (one at a time)";
+    return undefined;
+  }
+
+  /**
+   * Manual mode: enter the engine's latest signal on the trader's click. The signal must be from
+   * the last minute; legs are re-priced at the live premium and the stop keeps its planned distance.
+   */
+  take(symbol: string, contracts: ScalperContract[], input: { settings?: Partial<ScalperSettings>; entryBlockedReason?: string } = {}) {
+    return this.serial(async () => {
+      await this.hydrate();
+      this.rollDay();
+      const settings = SmartScalper.settings(input.settings);
+      const signal = this.lastSignal;
+      const plan = this.lastDecision.plan;
+      if (!signal || !plan || signal.symbol !== symbol || this.clock().getTime() - signal.at > 60_000 || this.consumedSetups.has(signal.key)) return { ...this.state(symbol), decision: this.lastDecision, signalReady: false, error: "No fresh engine signal to take. Wait for the next setup." };
+      const block = this.entryBlock(symbol, settings, input.entryBlockedReason);
+      if (block) return { ...this.state(symbol), decision: this.lastDecision, signalReady: false, error: `Entry blocked: ${block}` };
+      const prices = new Map(contracts.map((item) => [norm(item.symbol), item]));
+      const legs = plan.legs.map((leg) => { const live = prices.get(norm(leg.symbol)); return live ? { ...leg, price: leg.side === "BUY" ? (live.ask || live.premium) : (live.bid || live.premium) } : leg; });
+      this.consumedSetups.add(signal.key);
+      this.lastSignal = null;
+      const position = this.open(symbol, { ...plan, legs }, contracts);
+      return { ...this.state(symbol), decision: this.lastDecision, signalReady: false, summary: `${position.kind} taken: ${position.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.entry}`).join(" + ")} · SL ${position.stop} · T ${position.target}` };
     });
   }
 

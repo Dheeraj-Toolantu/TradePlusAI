@@ -5,7 +5,7 @@ import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel } f
 import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 
 export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; lotSize?: number; tickSize?: number };
-type ScalperState = { positions: PositionView[]; closed: PositionView[]; unrealizedPnl: number; realizedPnl: number; tradesToday: number; decision?: ScalperDecision; summary?: string; error?: string };
+type ScalperState = { positions: PositionView[]; closed: PositionView[]; unrealizedPnl: number; realizedPnl: number; tradesToday: number; decision?: ScalperDecision; summary?: string; error?: string; signalReady?: boolean };
 type View = "CALL" | "SPOT" | "PUT";
 
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
@@ -54,14 +54,17 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
   const [timeframe, setTimeframe] = useState<(typeof TIMEFRAMES)[number]>(1);
   const [instant, setInstant] = useState(true);
-  const [auto, setAuto] = useState(false);
+  // AUTOMATIC: the engine places its own trades. MANUAL: it only signals; you take the trade.
+  const [tradeMode, setTradeMode] = useState<"AUTOMATIC" | "MANUAL">("MANUAL");
+  const [engineOn, setEngineOn] = useState(false);
+  const auto = engineOn && tradeMode === "AUTOMATIC";
   const [showControls, setShowControls] = useState(false);
   const [callOffset, setCallOffset] = useState(0);
   const [putOffset, setPutOffset] = useState(0);
   const [callLots, setCallLots] = useState(1);
   const [putLots, setPutLots] = useState(1);
   const [state, setState] = useState<ScalperState>({ positions: [], closed: [], unrealizedPnl: 0, realizedPnl: 0, tradesToday: 0 });
-  const [notice, setNotice] = useState("Paper scalper. Pick strikes and trade with the buttons or Shift + arrow keys, or switch the auto engine on.");
+  const [notice, setNotice] = useState("Paper scalper. Start the engine and choose Automatic (engine trades) or Manual (you take its signals), or trade the cards directly.");
   const [positionsTab, setPositionsTab] = useState<"OPEN" | "CLOSED">("OPEN");
   const [selected, setSelected] = useState<string[]>([]);
   const [spotBars, setSpotBars] = useState<ChartBar[]>([]);
@@ -73,13 +76,14 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
 
   useEffect(() => {
     setSettings(load(SETTINGS_KEY, DEFAULT_SETTINGS));
-    const prefs = load(PREFS_KEY, { views: ["CALL", "PUT"] as View[], timeframe: 1, instant: true });
+    const prefs = load(PREFS_KEY, { views: ["CALL", "PUT"] as View[], timeframe: 1, instant: true, tradeMode: "MANUAL" as "AUTOMATIC" | "MANUAL" });
+    setTradeMode(prefs.tradeMode === "AUTOMATIC" ? "AUTOMATIC" : "MANUAL");
     setViews(prefs.views);
     setTimeframe(TIMEFRAMES.includes(prefs.timeframe as 1) ? prefs.timeframe as 1 : 1);
     setInstant(prefs.instant);
   }, []);
   useEffect(() => { save(SETTINGS_KEY, settings); }, [settings]);
-  useEffect(() => { save(PREFS_KEY, { views, timeframe, instant }); }, [views, timeframe, instant]);
+  useEffect(() => { save(PREFS_KEY, { views, timeframe, instant, tradeMode }); }, [views, timeframe, instant, tradeMode]);
   useEffect(() => { onAutoChange?.(auto); }, [auto, onAutoChange]);
 
   // ---- strike ladder ------------------------------------------------------------------
@@ -160,13 +164,13 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   const hasOpen = state.positions.length > 0;
   // Scan every 10 s while the engine is on or positions are open, and right after each 1m close.
   useEffect(() => {
-    if (!auto && !hasOpen) return;
+    if (!engineOn && !hasOpen) return;
     void scanRef.current();
     const timer = setInterval(() => { if (document.visibilityState === "visible") void scanRef.current(); }, 10_000);
     return () => clearInterval(timer);
-  }, [auto, hasOpen]);
+  }, [engineOn, tradeMode, hasOpen]);
   const lastBarTime = spotBars.at(-1)?.time;
-  useEffect(() => { if (auto && lastBarTime) void scanRef.current(); }, [auto, lastBarTime]);
+  useEffect(() => { if (engineOn && lastBarTime) void scanRef.current(); }, [engineOn, lastBarTime]);
 
   const trade = useCallback(async (action: "buy" | "sell", contract: ScalperChainRow | null, lots: number) => {
     if (!contract) { setNotice("No contract at that strike in the live chain yet."); return; }
@@ -176,6 +180,14 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
     apply(data);
     if (!data.error) onLog?.(`[Scalper] ${data.summary ?? label}`, action === "buy" ? "entry" : "exit");
   }, [apply, chain, instant, onLog, post]);
+  const takeSignal = useCallback(async () => {
+    const signal = state.decision?.plan;
+    if (!signal) return;
+    if (!instant && !window.confirm(`Take the engine's ${signal.kind} signal?\n${signal.legs.map((leg) => `${leg.side} ${leg.symbol} @ ~₹${money(leg.price)}`).join("\n")}\nSL ${money(signal.stop)} · Target ${money(signal.target)} · ${signal.riskReward}R\nPaper order.`)) return;
+    const { data } = await post({ action: "take", contracts: chain, settings });
+    apply(data);
+    if (!data.error) onLog?.(`[Scalper] ${data.summary}`, "entry");
+  }, [apply, chain, instant, onLog, post, settings, state.decision?.plan]);
   const exit = useCallback(async (ids: string[] | "ALL") => {
     if (!instant && !window.confirm(ids === "ALL" ? "Exit all scalper positions?" : `Exit ${ids.length} position(s)?`)) return;
     const { data } = await post(ids === "ALL" ? { action: "exitAll", contracts: chain } : { action: "exit", ids, contracts: chain });
@@ -301,7 +313,18 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
           <span className="scalper-views">{(["CALL", "SPOT", "PUT"] as View[]).map((view) => <button key={view} type="button" className={views.includes(view) ? "on" : ""} onClick={() => toggleView(view)}>{view}</button>)}</span>
           <button type="button" className="scalper-controls-button" onClick={() => setShowControls((value) => !value)}>⚙ Controls</button>
           <label className="scalper-switch"><input type="checkbox" checked={instant} onChange={(event) => setInstant(event.target.checked)} /><span /> Instant mode</label>
-          <label className="scalper-switch scalper-switch-auto"><input type="checkbox" checked={auto} onChange={(event) => { setAuto(event.target.checked); setNotice(event.target.checked ? "Auto engine on: scanning the 1m tape" : "Auto engine off: open positions are still managed"); }} /><span /> Auto engine</label>
+        </div>
+
+        <div className="scalper-engine-bar" role="group" aria-label="Auto option engine">
+          <span className="algo-kicker">AUTO OPTION ENGINE · PAPER</span>
+          <label className="scalper-switch scalper-switch-auto"><input type="checkbox" checked={engineOn} onChange={(event) => { setEngineOn(event.target.checked); setNotice(event.target.checked ? `Engine on (${tradeMode === "AUTOMATIC" ? "automatic: it places its own trades" : "manual: it signals, you take the trade"}). Scanning the 1m tape.` : "Engine off: open positions are still managed."); }} /><span /> Engine</label>
+          <span className="scalper-trade-mode" role="radiogroup" aria-label="Trade selection">
+            <small>Trade</small>
+            {(["AUTOMATIC", "MANUAL"] as const).map((value) => (
+              <button key={value} type="button" role="radio" aria-checked={tradeMode === value} className={tradeMode === value ? "on" : ""} onClick={() => { setTradeMode(value); setNotice(value === "AUTOMATIC" ? "Automatic: the engine enters its own signals within your risk limits." : "Manual: the engine only signals; press Take trade to enter, or use the Buy/Sell cards."); }}>{value === "AUTOMATIC" ? "Automatic" : "Manual"}</button>
+            ))}
+          </span>
+          {engineOn && tradeMode === "MANUAL" ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -317,7 +340,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
         )}
 
         <div className={`scalper-engine ${decision?.mode === "WAIT" || !decision ? "" : "scalper-engine-live"}`}>
-          <span className={`scalper-mode scalper-mode-${(decision?.mode ?? "WAIT").toLowerCase()}`}>{auto ? decision?.mode ?? "SCANNING" : "ENGINE OFF"}</span>
+          <span className={`scalper-mode scalper-mode-${(decision?.mode ?? "WAIT").toLowerCase()}`}>{engineOn ? `${decision?.mode ?? "SCANNING"} · ${tradeMode === "AUTOMATIC" ? "AUTO" : "MANUAL"}` : "ENGINE OFF"}</span>
           {decision?.side ? <span className={decision.side === "CE" ? "scalper-side gain" : "scalper-side loss"}>{decision.side === "CE" ? "CE · bullish" : "PE · bearish"}</span> : null}
           {decision?.read ? <span className="scalper-read">{decision.read.regime} · {decision.read.trend} · ATR {money(decision.read.atr)} · RSI {money(decision.read.rsi, 0)}{decision.daysToExpiry !== null ? ` · ${decision.daysToExpiry === 0 ? "expiry day" : `${decision.daysToExpiry}d to expiry`}` : ""}</span> : null}
           <p>{notice}</p>
