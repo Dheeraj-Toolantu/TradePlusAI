@@ -804,3 +804,117 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .bt-sr-frames label { padding: 6px 7px; }
 .bt-sr-frames label.off { color: #557377; cursor: not-allowed; }
 .bt-sr-frames input { accent-color: #5fd3a3; }
+
+/* Smart scalper desk (execution page): CALL/PUT premium charts, option cards, positions rail. */
+.scalper { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 10px; padding: 10px; border: 1px solid #1d2a2e; border-radius: 10px; background: #0e1315; color: #e4ecee; }
+.scalper .gain { color: #8fe36b; }
+.scalper .loss { color: #ff5a63; }
+.scalper-main { display: grid; gap: 8px; min-width: 0; }
+.scalper-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #1f2b30; }
+.scalper-title { font-weight: 800; font-size: 14px; }
+.scalper-title small { margin-left: 4px; color: #8a9ba0; font-weight: 500; font-size: 10px; }
+.scalper-toolbar select, .scalper-controls select, .scalper-index select { padding: 6px 8px; color: #e4ecee; border: 1px solid #2a3a40; border-radius: 6px; background: #151c1f; font: 600 12px "Manrope", sans-serif; }
+.scalper-views { display: inline-flex; gap: 3px; padding: 3px; border-radius: 999px; background: #151c1f; }
+.scalper-views button { padding: 5px 14px; color: #8a9ba0; border: 0; border-radius: 999px; background: transparent; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
+.scalper-views button.on { color: #fff; background: #2c3a40; }
+.scalper-controls-button { padding: 6px 10px; color: #dfe8ea; border: 1px solid #2a3a40; border-radius: 6px; background: #151c1f; font: 600 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-switch { display: inline-flex; align-items: center; gap: 6px; color: #dfe8ea; font-weight: 600; cursor: pointer; }
+.scalper-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.scalper-switch span { position: relative; width: 28px; height: 16px; border-radius: 999px; background: #33434a; transition: background .15s; }
+.scalper-switch span::after { position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; content: ""; border-radius: 50%; background: #fff; transition: transform .15s; }
+.scalper-switch input:checked + span { background: #f0b232; }
+.scalper-switch-auto input:checked + span { background: #22c58b; }
+.scalper-switch input:checked + span::after { transform: translateX(12px); }
+.scalper-switch input:focus-visible + span { outline: 2px solid #5aa9ff; outline-offset: 2px; }
+.scalper-engine-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 10px; border: 1px solid #1f2b30; border-radius: 8px; background: #121a1d; }
+.scalper-trade-mode { display: inline-flex; align-items: center; gap: 3px; padding: 3px; border-radius: 999px; background: #151c1f; }
+.scalper-trade-mode small { padding: 0 6px 0 8px; color: #8a9ba0; font-size: 11px; font-weight: 700; }
+.scalper-trade-mode button { padding: 5px 14px; color: #8a9ba0; border: 0; border-radius: 999px; background: transparent; font: 700 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-trade-mode button.on { color: #0b1012; background: #8fe36b; }
+.scalper-trade-mode button:focus-visible, .scalper-take:focus-visible { outline: 2px solid #5aa9ff; outline-offset: 2px; }
+.scalper-take { margin-left: auto; padding: 7px 14px; color: #0b1012; border: 0; border-radius: 6px; background: #f0b232; font: 800 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-take:disabled { color: #8a9ba0; background: #1f2a2e; cursor: not-allowed; }
+.scalper-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; padding: 8px; border: 1px solid #1f2b30; border-radius: 8px; background: #121a1d; }
+.scalper-controls label { display: grid; gap: 3px; color: #8a9ba0; font-size: 10px; }
+.scalper-engine { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px; border: 1px solid #1f2b30; border-radius: 8px; background: #121a1d; }
+.scalper-engine-live { border-color: #2f6b55; }
+.scalper-engine p { flex: 1 1 100%; margin: 0; color: #c3d0d3; }
+.scalper-engine details { flex: 1 1 100%; color: #aebdc1; font-size: 11px; }
+.scalper-engine summary { cursor: pointer; color: #8fb8ff; }
+.scalper-engine ul { margin: 6px 0; padding-left: 18px; }
+.scalper-mode { padding: 3px 9px; border-radius: 4px; color: #0b1012; background: #8a9ba0; font: 800 11px "DM Mono", monospace; }
+.scalper-mode-scalp { background: #8fe36b; }
+.scalper-mode-hedge { background: #f0b232; }
+.scalper-side { font-weight: 800; }
+.scalper-read { color: #8a9ba0; font: 11px "DM Mono", monospace; }
+.scalper-gates { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.scalper-gates span { padding: 2px 7px; border-radius: 10px; font-size: 10px; }
+.scalper-gates .pass { color: #0b1012; background: rgba(143, 227, 107, .85); }
+.scalper-gates .fail { color: #ffd9dd; border: 1px solid rgba(255, 90, 99, .5); background: rgba(255, 90, 99, .18); }
+.scalper-plan { display: grid; gap: 2px; padding: 6px 8px; border-radius: 6px; background: #0e1517; font: 11px "DM Mono", monospace; }
+.scalper-charts { display: grid; gap: 8px; }
+.scalper-chart { min-width: 0; overflow: hidden; border: 1px solid #1f2b30; border-radius: 8px; background: #11181b; }
+.scalper-chart:focus-within, .scalper-chart:hover { border-color: #2f5f8f; }
+.scalper-chart-head { display: flex; justify-content: space-between; gap: 8px; padding: 8px 10px 4px; }
+.scalper-chart-head b { display: block; font-size: 13px; }
+.scalper-chart-head small { color: #8a9ba0; font: 11px "DM Mono", monospace; }
+.scalper-chart-head small em { margin: 0 6px 0 1px; color: #8fe36b; font-style: normal; }
+.scalper-chart-canvas { width: 100%; }
+.scalper-quote { display: flex; align-items: stretch; gap: 4px; }
+.scalper-quote button { display: grid; min-width: 62px; padding: 4px 8px; border: 0; border-radius: 4px; cursor: pointer; text-align: center; }
+.scalper-quote button b { font: 700 13px "DM Mono", monospace; }
+.scalper-quote button small { font-size: 9px; font-weight: 700; color: inherit; }
+.scalper-quote-sell { color: #fff; background: #f0464f; }
+.scalper-quote-buy { color: #0b1012; background: #8fe36b; }
+.scalper-quote > span { display: grid; place-items: center; min-width: 34px; color: #dfe8ea; }
+.scalper-quote > span small { font-size: 9px; }
+.scalper-cards { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .7fr) minmax(0, 1fr); gap: 8px; }
+.scalper-card { display: grid; gap: 8px; padding: 10px; border: 1px solid #1f2b30; border-radius: 10px; }
+.scalper-card-call { background: linear-gradient(180deg, #16241a, #10161a 60%); }
+.scalper-card-put { background: linear-gradient(180deg, #2a1517, #10161a 60%); }
+.scalper-card-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.scalper-strike { display: inline-flex; align-items: center; gap: 4px; }
+.scalper-strike em { color: #8a9ba0; font-size: 11px; font-style: normal; }
+.scalper-strike button { padding: 0 4px; color: #aebdc1; border: 1px solid #2a3a40; border-radius: 3px; background: transparent; font-size: 9px; cursor: pointer; }
+.scalper-card-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; align-items: center; text-align: center; }
+.scalper-card-meta > span { display: grid; gap: 3px; }
+.scalper-card-meta small { color: #8a9ba0; font-size: 10px; }
+.scalper-card-meta b { font: 600 11px "DM Mono", monospace; }
+.scalper-lots > span { display: flex; align-items: center; justify-content: space-between; border: 1px solid #2a3a40; border-radius: 6px; }
+.scalper-lots button { padding: 6px 10px; color: #dfe8ea; border: 0; background: transparent; font-size: 14px; cursor: pointer; }
+.scalper-card-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.scalper-card-actions button { padding: 10px; border: 0; border-radius: 6px; font: 800 13px "Manrope", sans-serif; cursor: pointer; }
+.scalper-buy { color: #0b1012; background: #8fe36b; }
+.scalper-sell { color: #fff; background: #f0464f; }
+.scalper-card-actions button:active, .scalper-quote button:active { transform: translateY(1px); }
+.scalper-keys { display: grid; grid-template-columns: 1fr 1fr; justify-items: center; }
+.scalper-keys kbd { padding: 1px 6px; color: #8a9ba0; border: 1px solid #2a3a40; border-radius: 4px; font: 10px "DM Mono", monospace; }
+.scalper-center { display: grid; align-content: center; justify-items: center; gap: 6px; padding: 10px; border: 1px solid #1f2b30; border-radius: 10px; background: #10161a; }
+.scalper-index { display: flex; gap: 6px; }
+.scalper-expiry { padding: 6px 10px; border-radius: 999px; background: #1b2427; font: 700 12px "Manrope", sans-serif; }
+.scalper-center > small { color: #aebdc1; font-weight: 700; }
+.scalper-center > b { font: 800 22px "DM Mono", monospace; }
+.scalper-exit-all, .scalper-exit-selected { width: 100%; padding: 9px; color: #dfe8ea; border: 0; border-radius: 6px; background: #1f2a2e; font: 700 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-exit-all:disabled { opacity: .45; cursor: not-allowed; }
+.scalper-side-panel { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 8px; border-left: 1px solid #1f2b30; }
+.scalper-tabs { display: flex; gap: 4px; }
+.scalper-tabs button { flex: 1; padding: 7px; color: #8a9ba0; border: 0; border-radius: 999px; background: transparent; font: 700 12px "Manrope", sans-serif; cursor: pointer; }
+.scalper-tabs button.on { color: #fff; background: #1f2a2e; }
+.scalper-pnl { display: grid; gap: 4px; }
+.scalper-pnl > small { color: #aebdc1; font-weight: 700; font-size: 11px; }
+.scalper-pnl > b { font: 800 22px "DM Mono", monospace; }
+.scalper-pnl span { display: flex; justify-content: space-between; color: #8a9ba0; font-size: 11px; }
+.scalper-pnl em { font: 700 12px "DM Mono", monospace; font-style: normal; color: #dfe8ea; }
+.scalper-positions { display: grid; gap: 4px; max-height: 520px; overflow-y: auto; }
+.scalper-position { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 2px 8px; padding: 8px 4px; border-bottom: 1px solid #1a2427; }
+.scalper-position label { grid-column: 1; grid-row: 1; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.scalper-position label b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.scalper-position > em { grid-column: 2; grid-row: 1; font: 700 12px "DM Mono", monospace; font-style: normal; text-align: right; }
+.scalper-position > button { grid-column: 3; grid-row: 1 / span 2; padding: 0 4px; color: #8a9ba0; border: 0; background: transparent; cursor: pointer; }
+.scalper-position > button:hover { color: #ff5a63; }
+.scalper-position > small { grid-column: 1; grid-row: 2; color: #8a9ba0; font-size: 10px; }
+.scalper-position > small.scalper-qty { grid-column: 2; text-align: right; }
+.scalper-position > small.scalper-levels { grid-column: 1 / -1; grid-row: 3; }
+.scalper-footnote { margin: auto 0 0; color: #6f8287; font-size: 10px; line-height: 1.45; }
+@media (max-width: 1100px) { .scalper { grid-template-columns: minmax(0, 1fr); } .scalper-side-panel { border-left: 0; border-top: 1px solid #1f2b30; } }
+@media (max-width: 760px) { .scalper-charts { grid-template-columns: minmax(0, 1fr) !important; } .scalper-cards { grid-template-columns: minmax(0, 1fr); } .scalper-chart-head { flex-direction: column; } }
