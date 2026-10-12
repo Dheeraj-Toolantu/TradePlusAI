@@ -1006,3 +1006,19 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
   .isa-drivers { grid-template-columns: 1fr; }
   .isa-card-score strong { font-size: 34px; }
 }
+.isa-split { display: flex; height: 8px; min-width: 70px; border-radius: 4px; overflow: hidden; background: #132b37; }
+.isa-split i { display: block; height: 100%; }
+.isa-split-empty { opacity: .5; }
+.isa-col-split { min-width: 120px; width: 13%; }
+.isa-col-split small { margin-top: 3px; }
+.isa-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin: 12px 0 8px; }
+.isa-stats p { margin: 0; }
+.isa-stats b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.isa-stats small { color: #7f9ba3; font-size: 11px; }
+.isa-fresh { margin: 0 0 10px; color: #7fe6c4; font-size: 12px; }
+.isa-mini { margin-top: 10px; display: grid; gap: 4px; }
+.isa-mini > small { color: #a2bcc2; margin-top: 4px; }
+.isa-mini .isa-facts { margin: 0; }
+.isa-tier { display: inline-block; margin-right: 4px; padding: 0 5px; border-radius: 3px; font-size: 10px; border: 1px solid #2a4c58; }
+.isa-tier-premium { color: #7fe6c4; border-color: #1f5b4c; }
+.isa-tier-blog { color: #c5b3ff; border-color: #4b3f75; }

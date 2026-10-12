@@ -191,6 +191,8 @@ def parse_rss(raw: str) -> list[dict]:
             "link": link.strip(),
             "published": _parse_date(node.findtext("pubDate") or node.findtext("published") or node.findtext("updated")),
             "engagement": 0,
+            # Google News names the outlet here; per-stock scans weight items by publisher quality.
+            "publisher": publisher,
         })
     return [item for item in items if item["title"]]
 
