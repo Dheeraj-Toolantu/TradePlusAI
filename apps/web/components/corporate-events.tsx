@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import type { ConstituentSentiment, CorporateEvent, Deal, IndexSentimentReading } from "../lib/index-sentiment";
 
 const tone = (score: number | null | undefined) => (score === null || score === undefined ? "isa-muted" : score >= 12 ? "isa-up" : score <= -12 ? "isa-down" : "isa-flat");
@@ -83,7 +84,7 @@ export function StockEvents({ stock }: { stock: ConstituentSentiment }) {
 }
 
 /** Index-wide corporate events: results season, deals, calendar and the events that matter most. */
-export function IndexCorporatePanel({ reading }: { reading: IndexSentimentReading }) {
+export const IndexCorporatePanel = memo(function IndexCorporatePanel({ reading }: { reading: IndexSentimentReading }) {
   const corporate = reading.corporate;
   const deals = corporate.deals;
   return (
@@ -122,4 +123,4 @@ export function IndexCorporatePanel({ reading }: { reading: IndexSentimentReadin
       ) : <p className="isa-muted">No block or bulk deals in constituents over the last 7 days (or NSE deal data unavailable).</p>}
     </section>
   );
-}
+});

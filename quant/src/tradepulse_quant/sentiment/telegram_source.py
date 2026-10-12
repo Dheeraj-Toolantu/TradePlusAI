@@ -19,7 +19,11 @@ from __future__ import annotations
 import html
 import os
 import re
+import time
 from datetime import datetime, timezone
+
+from .engine import _fetch, load_cache, save_cache
+from .factors import BROWSER_UA
 
 MESSAGE = re.compile(r'<div class="tgme_widget_message[^"]*"[^>]*data-post="([^"]+)"(.*?)(?=<div class="tgme_widget_message_wrap|\Z)', re.S)
 TEXT = re.compile(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', re.S)
@@ -141,3 +145,44 @@ def telegram_stats(items: list[dict], patterns: list[re.Pattern]) -> dict:
         item["call"] = direction
         item["has_levels"] = has_levels
     return {"posts": sum(1 for item in items if item.get("telegram")), "buy_calls": buy, "sell_calls": sell, "hype_posts": hype, "channels": len(channels), "views": views}
+
+
+def fetch_channel(channel: str, now: datetime, *, cache_dir: str | None, max_age_hours: float, deadline: float | None = None,
+                  reuse_seconds: float = 0.0, raws: list[str] | str | None = None) -> tuple[list[dict], dict]:
+    """Items for one channel and its health row. ``raws`` (fixture pages) skips the network.
+
+    ``reuse_seconds`` serves the channel's last scan when it is younger than that, so the full
+    sentiment scan does not re-read channels the live Telegram poller fetched a minute ago.
+    """
+    cache_id = f"telegram_{channel}"
+    within = lambda post: post["published"] and (now - post["published"]).total_seconds() <= max_age_hours * 3600
+    if raws is not None:
+        posts = [post for raw in ([raws] if isinstance(raws, str) else raws) for post in parse_preview(raw)]
+        return to_items(channel, posts), {"name": f"@{channel}", "ok": bool(posts), "items": len(posts), "fresh": sum(1 for post in posts if within(post)), "error": None if posts else "no readable posts"}
+    if reuse_seconds > 0:
+        cached = load_cache(cache_dir, cache_id, now)
+        if cached and cached[1] * 3600 <= reuse_seconds:
+            items = cached[0]
+            return items, {"name": f"@{channel}", "ok": True, "items": len(items), "fresh": sum(1 for item in items if within(item)), "error": None, "reused": True}
+    posts, url, error = [], PREVIEW_URL.format(channel=channel), None
+    for _ in range(pages()):
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        try:
+            page = parse_preview(_fetch(url, BROWSER_UA))
+        except Exception as failure:  # noqa: BLE001 - one channel failing never blocks the scan
+            error = f"{type(failure).__name__}: {str(failure)[:80]}"
+            break
+        posts += page
+        before = oldest_id(page)
+        if not page or before is None or any(post["published"] and not within(post) for post in page):
+            break
+        url = f"{PREVIEW_URL.format(channel=channel)}?before={before}"
+    if posts:
+        items = to_items(channel, posts)
+        save_cache(cache_dir, cache_id, items, now)
+        return items, {"name": f"@{channel}", "ok": True, "items": len(posts), "fresh": sum(1 for post in posts if within(post)), "error": None}
+    cached = load_cache(cache_dir, cache_id, now)
+    if cached:
+        return cached[0], {"name": f"@{channel}", "ok": True, "items": len(cached[0]), "fresh": sum(1 for item in cached[0] if within(item)), "error": error, "cached": True}
+    return [], {"name": f"@{channel}", "ok": False, "items": 0, "fresh": 0, "error": error or "no readable posts (channel private, renamed or without a web preview)"}

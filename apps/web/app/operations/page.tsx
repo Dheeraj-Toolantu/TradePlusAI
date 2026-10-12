@@ -1,12 +1,15 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EventChips, IndexCorporatePanel, StockEvents } from "../../components/corporate-events";
 import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
+import { TelegramLiveFeed } from "../../components/telegram-live-feed";
 import { TelegramOptionsDesk } from "../../components/telegram-options";
+import { useLiveFeeds } from "../../components/use-live-feeds";
+import { mergeTelegram } from "../../lib/telegram-merge";
+import type { TelegramLive } from "../../lib/telegram-live";
 import type { ConstituentSentiment, IndexId, IndexSentiment, IndexSentimentReading, Lens } from "../../lib/index-sentiment";
 
-const REFRESH_MS = 10 * 60_000;
 const LENSES: Array<{ key: Lens; title: string; weight: string }> = [
   { key: "price", title: "Price action", weight: "25%" },
   { key: "volume", title: "Volume (accumulation / distribution)", weight: "10%" },
@@ -60,9 +63,9 @@ function Breadth({ reading }: { reading: IndexSentimentReading }) {
   );
 }
 
-function IndexCard({ reading, active, onSelect }: { reading: IndexSentimentReading; active: boolean; onSelect: () => void }) {
+const IndexCard = memo(function IndexCard({ reading, active, onSelect }: { reading: IndexSentimentReading; active: boolean; onSelect: (id: IndexId) => void }) {
   return (
-    <button type="button" className={`isa-card${active ? " active" : ""}`} onClick={onSelect} aria-pressed={active}>
+    <button type="button" className={`isa-card${active ? " active" : ""}`} onClick={() => onSelect(reading.id)} aria-pressed={active}>
       <div className="isa-card-head">
         <b>{reading.name}</b>
         {reading.quote ? <span className={tone((reading.quote.change_pct ?? 0) * 40)}>{reading.quote.price.toLocaleString("en-IN", { maximumFractionDigits: 2 })} ({signed(reading.quote.change_pct, 2)}%)</span> : null}
@@ -76,7 +79,7 @@ function IndexCard({ reading, active, onSelect }: { reading: IndexSentimentReadi
       <small className="isa-card-foot">{reading.coverage.stocks_scored}/{reading.coverage.stocks_total} stocks scored · {active ? "showing constituents" : "click for constituents"}</small>
     </button>
   );
-}
+});
 
 function ConstituentDetail({ stock }: { stock: ConstituentSentiment }) {
   return (
@@ -127,7 +130,7 @@ function ConstituentDetail({ stock }: { stock: ConstituentSentiment }) {
   );
 }
 
-function ConstituentTable({ reading }: { reading: IndexSentimentReading }) {
+const ConstituentTable = memo(function ConstituentTable({ reading }: { reading: IndexSentimentReading }) {
   const [sort, setSort] = useState<SortKey>("weight");
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
@@ -185,9 +188,9 @@ function ConstituentTable({ reading }: { reading: IndexSentimentReading }) {
       <small className="isa-muted">Impact = index weight × score: the points this stock adds to or takes from the index reading. Buyers / sellers = pending buy vs sell quantity in the NSE order book. Click a row for the full breakdown and the latest headlines.</small>
     </section>
   );
-}
+});
 
-function IndexDetail({ reading }: { reading: IndexSentimentReading }) {
+const IndexDetail = memo(function IndexDetail({ reading }: { reading: IndexSentimentReading }) {
   const lens = reading.lenses;
   return (
     <>
@@ -262,21 +265,24 @@ function IndexDetail({ reading }: { reading: IndexSentimentReading }) {
       <ConstituentTable reading={reading} />
     </>
   );
-}
+});
 
 export default function OperationsPage() {
-  const [data, setData] = useState<IndexSentiment | null>(null);
+  const [scan, setScan] = useState<IndexSentiment | null>(null);
+  const [telegram, setTelegram] = useState<TelegramLive | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<IndexId | null>("NIFTY");
+  const scanTime = useRef<string | null>(null);
 
   const load = useCallback(async (force = false) => {
     setLoading(true);
     try {
-      const response = await fetch(`/api/index-sentiment${force ? "?refresh=1" : ""}`, { cache: "no-store" });
+      // "no-cache" revalidates with the ETag: an unchanged scan costs a 304, not a 100+ KB download.
+      const response = await fetch(`/api/index-sentiment${force ? "?refresh=1" : ""}`, { cache: force ? "no-store" : "no-cache" });
       const body = await response.json();
       if (!response.ok || body.error) throw new Error(body.error ?? "Index sentiment unavailable");
-      setData(body as IndexSentiment);
+      if (body.generated_at !== scanTime.current) { scanTime.current = body.generated_at; setScan(body as IndexSentiment); }
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Index sentiment unavailable");
@@ -285,11 +291,19 @@ export default function OperationsPage() {
     }
   }, []);
 
-  useEffect(() => {
-    void load();
-    const timer = setInterval(() => void load(), REFRESH_MS);
-    return () => clearInterval(timer);
+  useEffect(() => { void load(); }, [load]);
+  // Pushes over WebSocket (or HTTP polling as a fallback): Telegram every ~minute, and a notice
+  // when a new full scan exists, which is then fetched once. Nothing runs while the tab is hidden.
+  const { connection, telegramError } = useLiveFeeds({
+    onTelegram: setTelegram,
+    onNewScan: (generatedAt) => { if (generatedAt !== scanTime.current) void load(); },
+  });
+  const refresh = useCallback(() => {
+    void load(true);
+    void fetch("/api/telegram-live?refresh=1", { cache: "no-store" }).then((response) => response.json()).then((body) => { if (!body.error) setTelegram(body as TelegramLive); }).catch(() => undefined);
   }, [load]);
+  const toggle = useCallback((id: IndexId) => setSelected((current) => (current === id ? null : id)), []);
+  const data = useMemo(() => mergeTelegram(scan, telegram), [scan, telegram]);
 
   const reading = data?.indices.find((index) => index.id === selected) ?? null;
   return (
@@ -301,7 +315,7 @@ export default function OperationsPage() {
           <p className="isa-muted">NIFTY 50, BANK NIFTY and SENSEX read bottom-up from every constituent: free-float weight, price action, volume, NSE buyers vs sellers, the last few hours of Moneycontrol, Economic Times, Mint and market-blog news, and retail traders.</p>
         </div>
         <div className="isa-actions">
-          <button type="button" onClick={() => void load(true)} disabled={loading}>{loading ? "Scanning…" : "Refresh"}</button>
+          <button type="button" onClick={refresh} disabled={loading}>{loading ? "Scanning…" : "Refresh"}</button>
           {data ? <small>Updated {new Date(data.generated_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST</small> : null}
           <a href="/">Back to dashboard</a>
         </div>
@@ -313,10 +327,11 @@ export default function OperationsPage() {
       {data ? (
         <>
           <section className="isa-cards">
-            {data.indices.map((index) => <IndexCard key={index.id} reading={index} active={index.id === selected} onSelect={() => setSelected(selected === index.id ? null : index.id)} />)}
+            {data.indices.map((index) => <IndexCard key={index.id} reading={index} active={index.id === selected} onSelect={toggle} />)}
           </section>
           {data.retail_desk ? <RetailCrowdDesk desk={data.retail_desk} /> : null}
           {data.telegram_options ? <TelegramOptionsDesk options={data.telegram_options} /> : null}
+          <TelegramLiveFeed live={telegram} connection={connection} error={telegramError} />
           {reading ? <IndexDetail reading={reading} /> : <p className="isa-muted">Select an index to see its constituents.</p>}
           <section className="isa-panel isa-sources">
             <h3>Data sources</h3>

@@ -61,7 +61,7 @@ from .stock_text import STOCK_PHRASES, score_stock_text  # noqa: F401 - re-expor
 from .retail_desk import fetch_participant_oi, retail_desk
 from .sources import DEFAULT_SOURCES
 from .telegram_options import consensus as telegram_option_consensus
-from .telegram_source import PREVIEW_URL, configured_channels, oldest_id, pages, parse_preview, telegram_stats, to_items
+from .telegram_source import configured_channels, fetch_channel, telegram_stats
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=3mo"
@@ -128,6 +128,7 @@ NSE_WORKERS = 4
 FETCH_BUDGET_SECONDS = 45.0
 MACRO_BLEND = 0.2
 HEAVYWEIGHTS = 5
+TELEGRAM_REUSE_SECONDS = 180.0
 
 
 
@@ -480,37 +481,12 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
         return [{**item, "source": source["name"], "region": source["region"]} for item in parsed]
 
     def telegram(channel: str) -> list[dict]:
-        """Latest pages of one public channel's web preview."""
-        if fixtures is not None:
-            raws = (fixtures.get("telegram") or {}).get(channel) or []
-            posts = [post for raw in ([raws] if isinstance(raws, str) else raws) for post in parse_preview(raw)]
-        else:
-            posts, url = [], PREVIEW_URL.format(channel=channel)
-            for _ in range(pages()):
-                if time.monotonic() > deadline:
-                    break
-                try:
-                    page = parse_preview(_fetch(url, BROWSER_UA))
-                except Exception as error:  # noqa: BLE001 - one channel failing never blocks the scan
-                    note("telegram", False, f"@{channel}: {type(error).__name__}")
-                    break
-                posts += page
-                before = oldest_id(page)
-                if not page or before is None or any(post["published"] and (now - post["published"]).total_seconds() > MAX_AGE_HOURS * 3600 for post in page):
-                    break
-                url = f"{PREVIEW_URL.format(channel=channel)}?before={before}"
-            if posts:
-                save_cache(cache_dir, f"telegram_{channel}", to_items(channel, posts), now)
-            else:
-                cached = load_cache(cache_dir, f"telegram_{channel}", now)
-                if cached:
-                    note("telegram", True, cached=True)
-                    telegram_health[channel] = {"name": f"@{channel}", "ok": True, "items": len(cached[0]), "fresh": 0, "cached": True}
-                    return cached[0]
-        fresh = sum(1 for post in posts if post["published"] and (now - post["published"]).total_seconds() <= MAX_AGE_HOURS * 3600)
-        note("telegram", bool(posts), None if posts else f"@{channel}: no readable posts")
-        telegram_health[channel] = {"name": f"@{channel}", "ok": bool(posts), "items": len(posts), "fresh": fresh}
-        return to_items(channel, posts)
+        """Latest pages of one public channel's web preview (reusing the live poller's scan when fresh)."""
+        raws = (fixtures.get("telegram") or {}).get(channel) or [] if fixtures is not None else None
+        items, row = fetch_channel(channel, now, cache_dir=cache_dir, max_age_hours=MAX_AGE_HOURS, deadline=deadline, reuse_seconds=TELEGRAM_REUSE_SECONDS, raws=raws)
+        note("telegram", row["ok"], None if row["ok"] else f"@{channel}: {row['error']}", cached=bool(row.get("cached")))
+        telegram_health[channel] = {key: value for key, value in row.items() if key != "error"}
+        return items
 
     def nse_data() -> tuple[dict[str, dict], dict]:
         """Order books per stock plus deals, filings, corporate actions and the event calendar."""

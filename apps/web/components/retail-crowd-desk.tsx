@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import type { Contrarian, Participant, RetailDesk } from "../lib/index-sentiment";
 
 const PARTICIPANTS: Array<{ key: "CLIENT" | "PRO" | "FII" | "DII"; label: string }> = [
@@ -45,7 +46,7 @@ function ParticipantRow({ label, row }: { label: string; row: Participant }) {
   );
 }
 
-export function RetailCrowdDesk({ desk }: { desk: RetailDesk }) {
+export const RetailCrowdDesk = memo(function RetailCrowdDesk({ desk }: { desk: RetailDesk }) {
   return (
     <section className="isa-panel rcd">
       <div className="rcd-head">
@@ -102,4 +103,4 @@ export function RetailCrowdDesk({ desk }: { desk: RetailDesk }) {
       <p className="isa-muted rcd-method">{desk.method}</p>
     </section>
   );
-}
+});

@@ -1103,3 +1103,26 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .tgo-bias em { font-style: normal; font-size: 11px; text-transform: capitalize; }
 .tgo-table td small { display: block; color: #6a8790; font-size: 11px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 700px) { .tgo-top { grid-template-columns: 1fr; } }
+/* Telegram live feed. */
+.tgl { border-color: #2c4e72; }
+.tgl-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a2bcc2; }
+.tgl-status i { width: 8px; height: 8px; border-radius: 50%; background: #6a8790; }
+.tgl-live i { background: #25d69c; box-shadow: 0 0 8px #25d69c; animation: tgl-pulse 2s ease-in-out infinite; }
+.tgl-polling i { background: #f0bf66; }
+.tgl-paused i, .tgl-connecting i { background: #6a8790; }
+@keyframes tgl-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .tgl-live i { animation: none; } }
+.tgl-tools { display: flex; gap: 6px; margin-bottom: 10px; }
+.tgl-tools button { padding: 5px 10px; color: #a2bcc2; border: 1px solid #234654; border-radius: 6px; background: #0e2330; font: 12px "Manrope", sans-serif; cursor: pointer; }
+.tgl-tools button.active { color: #06141c; background: #30d4ca; border-color: #30d4ca; }
+.tgl-posts { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; max-height: 520px; overflow-y: auto; contain: content; }
+.tgl-posts li { padding: 9px 11px; border: 1px solid #1d3442; border-radius: 7px; }
+.tgl-posts li.new { border-color: #30d4ca; background: rgba(48, 212, 202, .06); }
+.tgl-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.tgl-meta a { color: #8cc8ff; font-weight: 700; font-size: 12px; text-decoration: none; }
+.tgl-meta small { color: #6a8790; font-size: 11px; }
+.tgl-new { padding: 0 5px; border-radius: 3px; background: #30d4ca; color: #06141c; font-size: 10px; }
+.tgl-ce { color: #7fe6c4; border-color: #1f5b4c; } .tgl-pe { color: #fa9aa4; border-color: #6a3540; }
+.tgl-posts p { margin: 5px 0 0; color: #d3e2e5; font-size: 12.5px; line-height: 1.45; white-space: pre-line; overflow-wrap: anywhere; }
+/* Long tables and lists render lazily off-screen. */
+.isa-panel:has(.isa-table-tools), .ce-panel, .rcd, .tgo { content-visibility: auto; contain-intrinsic-size: auto 900px; }

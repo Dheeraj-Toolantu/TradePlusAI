@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { TelegramOptionCall, TelegramOptions } from "../lib/index-sentiment";
 
 type Live = { premium: number; delta: number; iv: number; expiry: string };
@@ -22,24 +22,31 @@ function status(call: TelegramOptionCall, live: Live | undefined): Status {
   return { label: "Open", tone: "isa-flat", odds: Math.max(0, Math.min(1, odds)) };
 }
 
-export function TelegramOptionsDesk({ options }: { options: TelegramOptions }) {
+export const TelegramOptionsDesk = memo(function TelegramOptionsDesk({ options }: { options: TelegramOptions }) {
   const [live, setLive] = useState<Record<string, Live>>({});
   const [liveError, setLiveError] = useState<string | null>(null);
 
+  // Re-read the chain when the set of underlyings changes, and once a minute while the tab is visible.
+  const underlyingKey = [...new Set(options.consensus.slice(0, 10).map((call) => call.underlying))].slice(0, 4).join(",");
   useEffect(() => {
-    const underlyings = [...new Set(options.consensus.slice(0, 10).map((call) => call.underlying))].slice(0, 4);
+    const underlyings = underlyingKey ? underlyingKey.split(",") : [];
     if (!underlyings.length) return;
     let cancelled = false;
-    Promise.all(underlyings.map(async (symbol) => {
-      const response = await fetch(`/api/option-chain?symbol=${encodeURIComponent(symbol)}&full=1`, { cache: "no-store" });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Option chain unavailable");
-      return (body.contracts as Array<{ strike: number; contract: "CALL" | "PUT"; premium: number; delta: number; iv: number; expiry: string }>).map((row) => [`${symbol}|${row.strike}|${row.contract === "CALL" ? "CE" : "PE"}`, { premium: row.premium, delta: row.delta, iv: row.iv, expiry: row.expiry }] as const);
-    }))
-      .then((rows) => { if (!cancelled) { setLive(Object.fromEntries(rows.flat())); setLiveError(null); } })
-      .catch((error) => { if (!cancelled) setLiveError(error instanceof Error ? error.message : "Option chain unavailable"); });
-    return () => { cancelled = true; };
-  }, [options]);
+    const read = () => {
+      if (document.hidden) return;
+      Promise.all(underlyings.map(async (symbol) => {
+        const response = await fetch(`/api/option-chain?symbol=${encodeURIComponent(symbol)}&full=1`, { cache: "no-store" });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error ?? "Option chain unavailable");
+        return (body.contracts as Array<{ strike: number; contract: "CALL" | "PUT"; premium: number; delta: number; iv: number; expiry: string }>).map((row) => [`${symbol}|${row.strike}|${row.contract === "CALL" ? "CE" : "PE"}`, { premium: row.premium, delta: row.delta, iv: row.iv, expiry: row.expiry }] as const);
+      }))
+        .then((rows) => { if (!cancelled) { setLive(Object.fromEntries(rows.flat())); setLiveError(null); } })
+        .catch((error) => { if (!cancelled) setLiveError(error instanceof Error ? error.message : "Option chain unavailable"); });
+    };
+    read();
+    const timer = setInterval(read, 60_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [underlyingKey]);
 
   const key = (call: TelegramOptionCall) => `${call.underlying}|${call.strike}|${call.type}`;
   const top = options.top_pick;
@@ -117,4 +124,4 @@ export function TelegramOptionsDesk({ options }: { options: TelegramOptions }) {
       <small className="isa-muted">{liveError ? `Live option prices unavailable (${liveError}). ` : ""}Status uses the current premium only, not the path since the call. {options.method} Tip channels are often not SEBI-registered; SEBI's studies found about nine in ten individual F&amp;O traders lose money. This is a crowd reading, not a recommendation.</small>
     </section>
   );
-}
+});

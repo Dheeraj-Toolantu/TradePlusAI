@@ -31,10 +31,11 @@ server.listen(port, () => {
 });
 
 const sockets = new WebSocketServer({ server, path: "/ws/quotes", perMessageDeflate: false });
-const aiMonitoringUrl = process.env.AI_MONITORING_STATUS_URL ?? `${process.env.WEB_APP_URL ?? "http://localhost:3000"}/api/ai-monitoring`;
+const webAppUrl = process.env.WEB_APP_URL ?? "http://localhost:3000";
+const aiMonitoringUrl = process.env.AI_MONITORING_STATUS_URL ?? `${webAppUrl}/api/ai-monitoring`;
 const MAX_BUFFERED_BYTES = 1_000_000;
 
-type Client = { socket: WebSocket; alive: boolean; underlying: string; market: Set<string>; options: Set<string>; trades: Set<string>; ai: boolean; lastStatus: string };
+type Client = { socket: WebSocket; alive: boolean; underlying: string; market: Set<string>; options: Set<string>; trades: Set<string>; ai: boolean; channels: Set<string>; lastStatus: string };
 const clients = new Map<string, Client>();
 
 function send(socket: WebSocket, message: unknown) {
@@ -104,20 +105,78 @@ function ensureAiPoller() {
   void publishAiMonitoring();
 }
 
+// ---- Sentiment channels: one shared poll per channel, pushed only when the content changes ----
+// "telegram": the fast Telegram scan (channels, option-call consensus, live feed), ~every minute.
+// "index-sentiment": a small notice when a new full scan exists; pages then fetch it over HTTP
+// (gzip + ETag), so the 100+ KB payload never goes out to every socket.
+type Feed = { url: string; intervalMs: number; build: (body: Record<string, unknown>) => { version: string; message: Record<string, unknown> } | null };
+const FEEDS: Record<string, Feed> = {
+  telegram: {
+    url: `${webAppUrl}/api/telegram-live`,
+    intervalMs: Math.max(30_000, Number(process.env.TELEGRAM_POLL_MS) || 60_000),
+    build: (body) => typeof body.signature === "string" ? { version: `${body.signature}`, message: { type: "telegram", data: body } } : null,
+  },
+  "index-sentiment": {
+    url: `${webAppUrl}/api/index-sentiment?meta=1`,
+    intervalMs: Math.max(30_000, Number(process.env.INDEX_SENTIMENT_POLL_MS) || 60_000),
+    build: (body) => typeof body.generated_at === "string" ? { version: body.generated_at, message: { type: "index-sentiment", generated_at: body.generated_at } } : null,
+  },
+};
+const feedState = new Map<string, { timer: ReturnType<typeof setInterval> | null; busy: boolean; version: string | null; last: Record<string, unknown> | null }>();
+
+async function pollFeed(name: string) {
+  const feed = FEEDS[name];
+  const state = feedState.get(name)!;
+  const targets = [...clients.values()].filter((client) => client.channels.has(name));
+  if (!targets.length) { if (state.timer) clearInterval(state.timer); state.timer = null; return; }
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    // Telegram scans take a few seconds and the first full sentiment scan up to a minute.
+    const response = await fetch(feed.url, { cache: "no-store", headers: { "accept-encoding": "gzip" }, signal: AbortSignal.timeout(name === "telegram" ? 45_000 : 100_000) });
+    const built = response.ok ? feed.build(await response.json() as Record<string, unknown>) : null;
+    if (!built) throw new Error(`HTTP ${response.status}`);
+    if (built.version === state.version) return;
+    state.version = built.version;
+    state.last = built.message;
+    for (const client of clients.values()) if (client.channels.has(name)) send(client.socket, built.message);
+  } catch {
+    for (const client of targets) send(client.socket, { type: name, error: `${name} update unavailable` });
+  } finally {
+    state.busy = false;
+  }
+}
+
+function ensureFeed(name: string, client: Client) {
+  const feed = FEEDS[name];
+  if (!feed) return;
+  if (!feedState.has(name)) feedState.set(name, { timer: null, busy: false, version: null, last: null });
+  const state = feedState.get(name)!;
+  if (state.last) send(client.socket, state.last); // a new tab gets the latest state at once
+  if (!state.timer) {
+    state.timer = setInterval(() => { void pollFeed(name); }, feed.intervalMs);
+    void pollFeed(name);
+  }
+}
+
 const symbolList = (value: unknown, limit: number): string[] | null => Array.isArray(value)
   ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim().toUpperCase()).slice(0, limit)
   : null;
 
 sockets.on("connection", (socket) => {
   const id = randomUUID();
-  const client: Client = { socket, alive: true, underlying: "NIFTY", market: new Set(), options: new Set(), trades: new Set(), ai: false, lastStatus: "" };
+  const client: Client = { socket, alive: true, underlying: "NIFTY", market: new Set(), options: new Set(), trades: new Set(), ai: false, channels: new Set(), lastStatus: "" };
   clients.set(id, client);
   socket.on("pong", () => { client.alive = true; });
 
   socket.on("message", (raw) => {
     try {
       const message = JSON.parse(raw.toString()) as { underlying?: unknown; marketSymbols?: unknown; optionSymbols?: unknown; tradeSymbols?: unknown; symbols?: unknown; channels?: unknown };
-      client.ai = Array.isArray(message.channels) && message.channels.some((channel) => channel === "ai-monitoring");
+      const channels = Array.isArray(message.channels) ? message.channels.filter((channel): channel is string => typeof channel === "string") : [];
+      client.ai = channels.includes("ai-monitoring");
+      // Only a message that lists channels changes the sentiment subscriptions (quote messages don't).
+      const added = Array.isArray(message.channels) ? channels.filter((channel) => FEEDS[channel] && !client.channels.has(channel)) : [];
+      if (Array.isArray(message.channels)) client.channels = new Set(channels.filter((channel) => FEEDS[channel]));
       const quotesRequested = message.underlying !== undefined || message.marketSymbols !== undefined || message.optionSymbols !== undefined || message.tradeSymbols !== undefined || message.symbols !== undefined;
       if (quotesRequested) {
         if (typeof message.underlying === "string" && message.underlying.trim()) client.underlying = message.underlying.trim().toUpperCase();
@@ -132,6 +191,7 @@ sockets.on("connection", (socket) => {
         sendTicks(client, snapshot.cash, snapshot.fno);
       }
       if (client.ai) ensureAiPoller();
+      for (const channel of added) ensureFeed(channel, client);
     } catch { send(socket, { type: "error", message: "Invalid quote subscription." }); }
   });
 
