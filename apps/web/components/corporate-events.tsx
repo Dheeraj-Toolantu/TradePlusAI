@@ -19,6 +19,8 @@ export function EventChips({ stock }: { stock: ConstituentSentiment }) {
   if (types.has("BUYBACK") || types.has("BONUS_SPLIT") || types.has("DIVIDEND") || types.has("DILUTION")) chips.push({ label: "Corp action", className: "ce-chip" });
   const due = stock.events.upcoming.find((row) => row.is_results);
   if (due) chips.push({ label: `Results ${due.days === 0 ? "today" : `in ${due.days}d`}`, className: "ce-chip ce-chip-due" });
+  const tg = stock.retail.telegram;
+  if (tg.buy_calls + tg.sell_calls) chips.push({ label: `Telegram ${tg.buy_calls}↑ ${tg.sell_calls}↓${tg.hype_posts >= 2 ? " hype" : ""}`, className: tg.hype_posts >= 2 ? "ce-chip ce-chip-risk" : "ce-chip ce-chip-tg" });
   return chips.length ? <span className="ce-chips">{chips.map((chip) => <i key={chip.label} className={chip.className}>{chip.label}</i>)}</span> : null;
 }
 

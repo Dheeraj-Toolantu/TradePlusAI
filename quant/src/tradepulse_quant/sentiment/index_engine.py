@@ -60,6 +60,7 @@ from .corporate_events import nse_urls, parse_nse_events, split_event_headlines,
 from .stock_text import STOCK_PHRASES, score_stock_text  # noqa: F401 - re-exported for callers and tests
 from .retail_desk import fetch_participant_oi, retail_desk
 from .sources import DEFAULT_SOURCES
+from .telegram_source import PREVIEW_URL, configured_channels, oldest_id, pages, parse_preview, telegram_stats, to_items
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=3mo"
@@ -163,6 +164,9 @@ def _zone(score: float | None) -> str:
 
 def alias_patterns(symbol: str) -> list[re.Pattern]:
     aliases = STOCKS.get(symbol, (symbol, "Other", (re.escape(symbol.lower()),)))[2]
+    # Tip channels write NSE symbols ("BUY TATASTEEL"); short ones (LT, ITC) are covered by their aliases.
+    if len(symbol) >= 4 and symbol.isalpha() and not any(re.search(alias, symbol.lower()) for alias in aliases):
+        aliases = (*aliases, re.escape(symbol.lower()))
     patterns = []
     for alias in aliases:
         if not alias.startswith(r"\b"):
@@ -355,7 +359,7 @@ def text_items(raw_items: list[dict], patterns: list[re.Pattern], now: datetime,
         engagement = 1.0 + math.log1p(item.get("engagement") or 0) / 3.0
         items.append({
             "title": title[:200], "link": item.get("link", ""), "source": item.get("publisher") or item.get("source", ""), "region": item.get("region", ""),
-            "tier": tier, "age_hours": round(age, 1), "score": round(score, 3),
+            "tier": tier, "age_hours": round(age, 1), "score": round(score, 3), "body": (item.get("body") or "")[:600], "telegram": bool(item.get("telegram")),
             "weight": 0.5 ** (age / half_life) * (1.0 if in_title else 0.4) * engagement * region_weight * TIER_WEIGHTS.get(tier, 0.7),
         })
     return items
@@ -474,6 +478,39 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
                 note("forums", True)
         return [{**item, "source": source["name"], "region": source["region"]} for item in parsed]
 
+    def telegram(channel: str) -> list[dict]:
+        """Latest pages of one public channel's web preview."""
+        if fixtures is not None:
+            raws = (fixtures.get("telegram") or {}).get(channel) or []
+            posts = [post for raw in ([raws] if isinstance(raws, str) else raws) for post in parse_preview(raw)]
+        else:
+            posts, url = [], PREVIEW_URL.format(channel=channel)
+            for _ in range(pages()):
+                if time.monotonic() > deadline:
+                    break
+                try:
+                    page = parse_preview(_fetch(url, BROWSER_UA))
+                except Exception as error:  # noqa: BLE001 - one channel failing never blocks the scan
+                    note("telegram", False, f"@{channel}: {type(error).__name__}")
+                    break
+                posts += page
+                before = oldest_id(page)
+                if not page or before is None or any(post["published"] and (now - post["published"]).total_seconds() > MAX_AGE_HOURS * 3600 for post in page):
+                    break
+                url = f"{PREVIEW_URL.format(channel=channel)}?before={before}"
+            if posts:
+                save_cache(cache_dir, f"telegram_{channel}", to_items(channel, posts), now)
+            else:
+                cached = load_cache(cache_dir, f"telegram_{channel}", now)
+                if cached:
+                    note("telegram", True, cached=True)
+                    telegram_health[channel] = {"name": f"@{channel}", "ok": True, "items": len(cached[0]), "fresh": 0, "cached": True}
+                    return cached[0]
+        fresh = sum(1 for post in posts if post["published"] and (now - post["published"]).total_seconds() <= MAX_AGE_HOURS * 3600)
+        note("telegram", bool(posts), None if posts else f"@{channel}: no readable posts")
+        telegram_health[channel] = {"name": f"@{channel}", "ok": bool(posts), "items": len(posts), "fresh": fresh}
+        return to_items(channel, posts)
+
     def nse_data() -> tuple[dict[str, dict], dict]:
         """Order books per stock plus deals, filings, corporate actions and the event calendar."""
         if fixtures is not None:
@@ -523,12 +560,15 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
         return books, parse_nse_events(raws)
 
     health_rows_by_feed: dict[str, dict] = {}
+    telegram_health: dict[str, dict] = {}
+    channels = list((fixtures.get("telegram") or {}).keys()) if fixtures is not None else configured_channels()
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
         nse_job = pool.submit(nse_data)
         chart_jobs = [pool.submit(chart, symbol, yahoo_symbol(symbol)) for symbol in symbols]
         chart_jobs += [pool.submit(chart, index_id, ticker) for index_id, ticker in index_tickers.items()]
         feed_jobs = [pool.submit(feed, source) for source in INDEX_FEEDS]
         forum_jobs = [pool.submit(forum, source) for source in FORUM_SOURCES]
+        telegram_jobs = [pool.submit(telegram, channel) for channel in channels]
         news_jobs = [pool.submit(news, symbol, region) for symbol in symbols for region in ("INDIA", "GLOBAL")]
         charts = dict(job.result() for job in chart_jobs)
         news_items: dict[str, list[dict]] = {}
@@ -537,6 +577,7 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
             news_items.setdefault(symbol, []).extend(items)
         feed_news = [item for job in feed_jobs for item in job.result()]
         forum_items = [item for job in forum_jobs for item in job.result()]
+        forum_items += [item for job in telegram_jobs for item in job.result()]
         books, nse_events = nse_job.result()
 
     # Forums the market sentiment engine already read (its last-good cache) add retail coverage.
@@ -550,9 +591,12 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
 
     labels = {"market_data": "Yahoo Finance prices & volume", "orderbook": "NSE order book & delivery", "news_india": "Google News India (quality outlets, per stock)",
               "news_global": "Google News global (per stock)", "market_pages": "Moneycontrol / ET / Mint / BS pages", "blogs": "Indian market blogs",
-              "forums": "Retail trader forums (Reddit, ValuePickr)", "nse_events": "NSE deals, filings, corporate actions & calendar"}
+              "forums": "Retail trader forums (Reddit, ValuePickr)", "telegram": "Telegram stock channels", "nse_events": "NSE deals, filings, corporate actions & calendar"}
     health_rows = [{"id": key, "name": labels.get(key, key), **{k: v for k, v in row.items() if k != "id"}} for key, row in health.items()]
     feeds = [{"id": source["id"], **health_rows_by_feed[source["id"]]} for source in INDEX_FEEDS if source["id"] in health_rows_by_feed]
+    feeds += [{"id": f"telegram_{channel}", **row} for channel, row in telegram_health.items()]
+    if not channels:
+        health_rows.append({"id": "telegram", "name": "Telegram stock channels", "ok": 0, "failed": 0, "cached": 0, "errors": ["Not configured: set TELEGRAM_CHANNELS"]})
     return {"charts": charts, "news": news_items, "forums": forum_items, "feeds": feed_news, "books": books, "nse_events": nse_events, "health": health_rows, "feed_health": feeds}
 
 
@@ -571,11 +615,18 @@ def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news
     news, event_headlines = split_event_headlines(news)
     events = stock_events(symbol, name, nse_events, event_headlines, market["price"] if market else None, now)
     social = text_items(forums, patterns, now, half_life=SOCIAL_HALF_LIFE_HOURS, require_mention=True)
+    telegram = telegram_stats(social, patterns)
+    for item in social:
+        # An explicit "BUY X tgt/sl" call says more about the poster's stance than the words around it.
+        if item.get("call"):
+            item["score"] = round(0.7 * item["call"] + 0.3 * item["score"], 3)
     news_score = net_tone(news)
     social_score = net_tone(social)
 
     notes: list[str] = []
     social_used = social_score
+    if telegram["buy_calls"] >= 4 and telegram["hype_posts"] >= 2 and telegram["buy_calls"] >= 3 * max(1, telegram["sell_calls"]):
+        notes.append(f"Telegram pump alert: {telegram['buy_calls']} buy calls across {telegram['channels']} channel(s) with hype language. Late retail money is being herded in; distribution risk, don't chase.")
     if social_score is not None and len(social) >= 8 and abs(social_score) >= 55:
         social_used = round(social_score * 0.6, 1)
         notes.append("Crowded long on retail forums: euphoria is a contrarian warning, don't chase." if social_score > 0
@@ -627,7 +678,7 @@ def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news
         "latest_news_age_hours": min((item["age_hours"] for item in all_news), default=None),
         "social_count": len(social),
         "events": {key: value for key, value in events.items() if key not in ("score", "notes")},
-        "retail": {"posts": len(social), "bullish": sum(1 for item in social if item["score"] >= POLAR), "bearish": sum(1 for item in social if item["score"] <= -POLAR)},
+        "retail": {"posts": len(social), "bullish": sum(1 for item in social if item["score"] >= POLAR), "bearish": sum(1 for item in social if item["score"] <= -POLAR), "telegram": telegram},
         "notes": notes,
         "headlines": [{"title": item["title"], "link": item["link"], "source": item["source"], "tier": item["tier"], "score": round(item["score"] * 100), "age_hours": item["age_hours"],
                        "event": item.get("category")} for item in ranked[:5]],
@@ -838,6 +889,13 @@ def analyze_index(index_id: str, spec: dict, stock_rows: dict[str, dict], index_
         "bullish_pct": round(100 * bullish / (bullish + bearish), 1) if bullish + bearish else None,
         "mood": _weighted(social_rows), "mmi_score": context.get("mmi_score"), "mmi_value": context.get("mmi_value"), "retail_market_score": context.get("retail_score"),
         "most_discussed": [{"symbol": s["symbol"], "posts": s["retail"]["posts"], "mood": s["social_raw"]} for s in sorted(stocks, key=lambda s: -s["retail"]["posts"]) if s["retail"]["posts"]][:5],
+        "telegram": {
+            "posts": sum(s["retail"]["telegram"]["posts"] for s in stocks), "buy_calls": sum(s["retail"]["telegram"]["buy_calls"] for s in stocks),
+            "sell_calls": sum(s["retail"]["telegram"]["sell_calls"] for s in stocks), "hype_posts": sum(s["retail"]["telegram"]["hype_posts"] for s in stocks),
+            "most_tipped": [{"symbol": s["symbol"], "buy_calls": s["retail"]["telegram"]["buy_calls"], "sell_calls": s["retail"]["telegram"]["sell_calls"], "hype_posts": s["retail"]["telegram"]["hype_posts"]}
+                            for s in sorted(stocks, key=lambda s: -(s["retail"]["telegram"]["buy_calls"] + s["retail"]["telegram"]["sell_calls"]))
+                            if s["retail"]["telegram"]["buy_calls"] + s["retail"]["telegram"]["sell_calls"]][:6],
+        },
     }
     freshness = {
         "max_age_hours": MAX_AGE_HOURS, "fresh_window_hours": FRESH_HOURS,

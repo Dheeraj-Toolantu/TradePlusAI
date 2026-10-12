@@ -3,6 +3,7 @@ import { getSentiment } from "./sentiment";
 
 export type IndexId = "NIFTY" | "BANKNIFTY" | "SENSEX";
 export type Lens = "price" | "volume" | "orderflow" | "news" | "social" | "events";
+export type TelegramStats = { posts: number; buy_calls: number; sell_calls: number; hype_posts: number; channels: number; views: number };
 export type CorporateEvent = { type: string; label: string; title: string; source: string; age_hours: number | null; impact: number; link: string };
 export type Deal = { symbol?: string; kind: "BLOCK" | "BULK"; client: string; side: "BUY" | "SELL"; qty: number; price: number; value_cr: number; date: string | null; class: "INSTITUTION" | "PROMOTER" | "STRATEGIC" | "OTHER"; age_hours: number; vs_price_pct: number | null };
 export type DealsReading = { score: number; count: number; buy_value_cr: number; sell_value_cr: number; institution_buy_cr: number; institution_sell_cr: number; promoter_sell_cr: number; deals: Deal[] };
@@ -29,10 +30,10 @@ export type ConstituentSentiment = {
   premium_news_count: number;
   latest_news_age_hours: number | null;
   social_count: number;
-  retail: { posts: number; bullish: number; bearish: number };
+  retail: { posts: number; bullish: number; bearish: number; telegram: TelegramStats };
   events: { count: number; deals: DealsReading | null; upcoming: UpcomingEvent[]; events: CorporateEvent[] };
   notes: string[];
-  headlines: Array<{ title: string; link: string; source: string; tier: "PREMIUM" | "STANDARD" | "BLOG"; score: number; age_hours: number; event?: string | null }>;
+  headlines: Array<{ title: string; link: string; source: string; tier: "PREMIUM" | "STANDARD" | "BLOG" | "TELEGRAM"; score: number; age_hours: number; event?: string | null }>;
 };
 export type Driver = { symbol: string; name: string; score: number; weight: number; contribution: number };
 export type IndexSentimentReading = {
@@ -55,6 +56,7 @@ export type IndexSentimentReading = {
     posts: number; bullish: number; bearish: number; bullish_pct: number | null; mood: number | null;
     mmi_score: number | null; mmi_value: string | null; retail_market_score: number | null;
     most_discussed: Array<{ symbol: string; posts: number; mood: number | null }>;
+    telegram: { posts: number; buy_calls: number; sell_calls: number; hype_posts: number; most_tipped: Array<{ symbol: string; buy_calls: number; sell_calls: number; hype_posts: number }> };
   };
   corporate: {
     results: Array<{ symbol: string; weight: number; impact: number; title: string; source: string }>;
@@ -82,7 +84,7 @@ export type RetailDesk = {
   mmi_score: number | null;
   mmi_value: string | null;
   indices: Array<{ id: IndexId; name: string; crowd_score: number | null; crowd: string; inputs: number; forum_mood: number | null; posts: number; bullish_pct: number | null; index_sentiment: number | null; contrarian: Contrarian }>;
-  crowded_stocks: Array<{ symbol: string; name: string; posts: number; retail_mood: number; institutional_footprint: number | null; delivery_pct: number | null; change_pct: number | null; divergence: boolean; read: string }>;
+  crowded_stocks: Array<{ symbol: string; name: string; posts: number; retail_mood: number; institutional_footprint: number | null; delivery_pct: number | null; change_pct: number | null; divergence: boolean; read: string; telegram?: TelegramStats }>;
   notes: string[];
   method: string;
 };
@@ -91,7 +93,7 @@ export type IndexSentiment = {
   indices: IndexSentimentReading[];
   retail_desk?: RetailDesk;
   market_context: Record<string, number | string | null> | null;
-  feeds: Array<{ id: string; name: string; ok: boolean; items: number; fresh: number }>;
+  feeds: Array<{ id: string; name: string; ok: boolean; items: number; fresh: number; cached?: boolean }>;
   freshness: { max_age_hours: number; fresh_window_hours: number };
   sources: Array<{ id: string; name: string; ok: number; failed: number; cached: number; errors: string[] }>;
   method: string;

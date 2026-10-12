@@ -149,11 +149,15 @@ def crowded_stocks(stocks: list[dict]) -> list[dict]:
         rows.append({
             "symbol": stock["symbol"], "name": stock["name"], "posts": posts, "retail_mood": mood,
             "institutional_footprint": smart, "delivery_pct": delivery, "change_pct": stock.get("change_pct"),
-            "divergence": diverges,
+            "divergence": diverges, "telegram": retail.get("telegram"),
             "read": (f"Retail bullish ({mood:+.0f}) while volume/order book show distribution ({smart:+.0f}): crowd is buying what strong hands sell." if diverges and mood > 0
                      else f"Retail bearish ({mood:+.0f}) while volume/order book show accumulation ({smart:+.0f}): strong hands are absorbing retail selling." if diverges
                      else f"Retail {'bullish' if mood > 0 else 'bearish'} ({mood:+.0f}) and price action agrees: crowded but not yet wrong; wait for the footprint to turn."),
         })
+    for row in rows:
+        tg = row["telegram"] or {}
+        if tg.get("buy_calls", 0) >= 4 and tg.get("hype_posts", 0) >= 2:
+            row["read"] += f" Telegram: {tg['buy_calls']} buy calls with hype across {tg['channels']} channel(s), a classic pump pattern."
     return sorted(rows, key=lambda row: (not row["divergence"], -row["posts"] * abs(row["retail_mood"])))[:10]
 
 

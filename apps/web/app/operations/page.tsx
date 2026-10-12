@@ -15,14 +15,14 @@ const LENSES: Array<{ key: Lens; title: string; weight: string }> = [
   { key: "events", title: "Corporate events (deals, results, filings)", weight: "12%" },
 ];
 type SortKey = "weight" | "score" | "change" | "contribution";
-type Filter = "ALL" | "BULLISH" | "BEARISH" | "NEUTRAL";
+type Filter = "ALL" | "TIPPED" | "BULLISH" | "BEARISH" | "NEUTRAL";
 
 const tone = (score: number | null | undefined) => (score === null || score === undefined ? "isa-muted" : score >= 12 ? "isa-up" : score <= -12 ? "isa-down" : "isa-flat");
 const signed = (value: number | null | undefined, digits = 0) => (value === null || value === undefined ? "--" : `${value > 0 ? "+" : ""}${value.toFixed(digits)}`);
 const words = (value: string) => value.replaceAll("_", " ").toLowerCase();
 const age = (hours: number | null | undefined) => (hours === null || hours === undefined ? "--" : hours < 1 ? `${Math.max(1, Math.round(hours * 60))}m ago` : `${hours.toFixed(1)}h ago`);
 const qty = (value: number | null | undefined) => (value === null || value === undefined ? "--" : value >= 1e7 ? `${(value / 1e7).toFixed(2)} Cr` : value >= 1e5 ? `${(value / 1e5).toFixed(1)} L` : value.toLocaleString("en-IN"));
-const TIER_LABEL: Record<string, string> = { PREMIUM: "Top outlet", STANDARD: "News", BLOG: "Blog" };
+const TIER_LABEL: Record<string, string> = { PREMIUM: "Top outlet", STANDARD: "News", BLOG: "Blog", TELEGRAM: "Telegram" };
 
 /** Two-sided split: buyers (green, left) vs sellers (red, right). */
 function SplitBar({ left, label }: { left: number | null | undefined; label: string }) {
@@ -100,6 +100,7 @@ function ConstituentDetail({ stock }: { stock: ConstituentSentiment }) {
             {stock.orderflow.delivery_pct !== null ? ` · delivery ${stock.orderflow.delivery_pct.toFixed(0)}%` : ""}</p>
           <small>Retail traders</small>
           <p className="isa-facts">{stock.retail.posts ? `${stock.retail.posts} posts · ${stock.retail.bullish} bullish / ${stock.retail.bearish} bearish` : "No retail chatter in the window."}</p>
+          {stock.retail.telegram.posts ? <p className="isa-facts">Telegram: {stock.retail.telegram.posts} posts in {stock.retail.telegram.channels} channel(s) · <span className="isa-up">{stock.retail.telegram.buy_calls} buy</span> / <span className="isa-down">{stock.retail.telegram.sell_calls} sell</span> calls{stock.retail.telegram.hype_posts ? ` · ${stock.retail.telegram.hype_posts} hype posts` : ""}</p> : null}
           <small>News freshness</small>
           <p className="isa-facts">{stock.news_count ? `${stock.news_count} items (${stock.news_fresh_count} in the last 4h, ${stock.premium_news_count} from top outlets) · latest ${age(stock.latest_news_age_hours)}` : "No news in the freshness window."}</p>
         </div>
@@ -134,6 +135,7 @@ function ConstituentTable({ reading }: { reading: IndexSentimentReading }) {
     const needle = query.trim().toLowerCase();
     const matches = reading.constituents.filter((stock) => {
       if (needle && !`${stock.symbol} ${stock.name} ${stock.sector}`.toLowerCase().includes(needle)) return false;
+      if (filter === "TIPPED") return stock.retail.telegram.buy_calls + stock.retail.telegram.sell_calls > 0;
       if (filter === "BULLISH") return (stock.score ?? 0) >= 12;
       if (filter === "BEARISH") return (stock.score ?? 0) <= -12;
       if (filter === "NEUTRAL") return stock.score !== null && Math.abs(stock.score) < 12;
@@ -149,7 +151,7 @@ function ConstituentTable({ reading }: { reading: IndexSentimentReading }) {
         <h3>{reading.name} constituents <small>({reading.constituents.length})</small></h3>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search stock or sector" aria-label="Search constituents" />
         <select value={filter} onChange={(event) => setFilter(event.target.value as Filter)} aria-label="Filter by sentiment">
-          <option value="ALL">All</option><option value="BULLISH">Bullish</option><option value="NEUTRAL">Neutral</option><option value="BEARISH">Bearish</option>
+          <option value="ALL">All</option><option value="TIPPED">Tipped on Telegram</option><option value="BULLISH">Bullish</option><option value="NEUTRAL">Neutral</option><option value="BEARISH">Bearish</option>
         </select>
         <select value={sort} onChange={(event) => setSort(event.target.value as SortKey)} aria-label="Sort constituents">
           <option value="weight">Sort: index weight</option><option value="score">Sort: sentiment score</option><option value="change">Sort: day change</option><option value="contribution">Sort: impact on index</option>
@@ -229,6 +231,13 @@ function IndexDetail({ reading }: { reading: IndexSentimentReading }) {
             <p><b>{reading.retail.posts}</b><small>posts ({reading.retail.bullish} bull / {reading.retail.bearish} bear)</small></p>
             <p><b className={tone(reading.retail.mmi_score)}>{reading.retail.mmi_value ?? "--"}</b><small>Market Mood Index</small></p>
             <p><b className={tone(reading.retail.retail_market_score)}>{signed(reading.retail.retail_market_score)}</b><small>retail mood composite</small></p>
+          </div>
+          <div className="tg-row">
+            <small>Telegram channels</small>
+            {reading.retail.telegram.posts ? (
+              <p className="isa-facts">{reading.retail.telegram.posts} posts · <span className="isa-up">{reading.retail.telegram.buy_calls} buy</span> / <span className="isa-down">{reading.retail.telegram.sell_calls} sell</span> calls{reading.retail.telegram.hype_posts ? ` · ${reading.retail.telegram.hype_posts} hype posts` : ""}
+                {reading.retail.telegram.most_tipped.length ? ` · most tipped: ${reading.retail.telegram.most_tipped.map((row) => `${row.symbol} (${row.buy_calls}↑/${row.sell_calls}↓${row.hype_posts ? `, ${row.hype_posts} hype` : ""})`).join(", ")}` : ""}</p>
+            ) : <p className="isa-muted">No Telegram calls on these stocks in the window{reading.retail.telegram.posts === 0 ? " (set TELEGRAM_CHANNELS to scan channels)" : ""}.</p>}
           </div>
           {reading.retail.most_discussed.length ? <small className="isa-muted">Most discussed: {reading.retail.most_discussed.map((row) => `${row.symbol} (${row.posts})`).join(", ")}</small> : <small className="isa-muted">No retail chatter on these stocks in the window.</small>}
         </div>

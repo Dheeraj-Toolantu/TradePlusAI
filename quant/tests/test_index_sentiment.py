@@ -196,6 +196,27 @@ class IndexTests(unittest.TestCase):
         self.assertTrue(any("Earnings week" in note for note in nifty["psychology"]))
         self.assertIsNotNone(nifty["lenses"]["events"])
 
+    def test_telegram_channels_feed_retail_mood_and_pump_alerts(self):
+        from test_telegram_source import preview
+
+        payload = self.payload(indices=["NIFTY"])
+        payload["fixtures"]["telegram"] = {
+            "demo_calls": preview("demo_calls", [("JACKPOT 🚀 BUY TATASTEEL CMP 152 TGT 175 operator stock", 1, "50K"), ("BUY TATASTEEL above 153 SL 149, sure shot", 2, "20K"),
+                                                 ("BUY TATASTEEL tgt 170", 3, "18K"), ("Buy Tata Steel jackpot breakout stock", 4, "9K"), ("SELL ITC tgt 400 sl 430", 1, "7K"),
+                                                 ("Old: BUY TATASTEEL", 30, "1K")]),
+        }
+        result = analyze_indices(payload)
+        nifty = result["indices"][0]
+        steel = next(stock for stock in nifty["constituents"] if stock["symbol"] == "TATASTEEL")
+        telegram = steel["retail"]["telegram"]
+        self.assertEqual((telegram["buy_calls"], telegram["sell_calls"]), (4, 0))  # the 30 h-old post is outside the window
+        self.assertGreaterEqual(telegram["hype_posts"], 2)
+        self.assertGreater(steel["social_raw"], 30)
+        self.assertTrue(any("Telegram pump alert" in note for note in steel["notes"]))
+        self.assertEqual(nifty["retail"]["telegram"]["most_tipped"][0]["symbol"], "TATASTEEL")
+        self.assertEqual(nifty["retail"]["telegram"]["sell_calls"], 1)
+        self.assertIn("telegram_demo_calls", {feed["id"] for feed in result["feeds"]})
+
     def test_bank_nifty_follows_its_heavyweights(self):
         bank = analyze_indices(self.payload(indices=["BANKNIFTY"]))["indices"][0]
         self.assertEqual(len(bank["constituents"]), 14)

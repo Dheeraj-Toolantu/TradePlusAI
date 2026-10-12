@@ -1081,3 +1081,8 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .ce-results i { color: #6a8790; font-style: normal; font-size: 11px; }
 .ce-results span { font-weight: 700; font-variant-numeric: tabular-nums; }
 .ce-results small { color: #a2bcc2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tg-row { margin: 6px 0 8px; }
+.tg-row small { color: #a2bcc2; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; }
+.tg-row p { margin: 2px 0 0; }
+.ce-chip-tg { color: #8cc8ff; border-color: #2c4e72; }
+.isa-tier-telegram { color: #8cc8ff; border-color: #2c4e72; }
