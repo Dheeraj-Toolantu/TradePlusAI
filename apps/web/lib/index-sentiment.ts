@@ -55,9 +55,28 @@ export type IndexSentimentReading = {
   coverage: { stocks_scored: number; stocks_total: number; weight_scored_pct: number };
   constituents: ConstituentSentiment[];
 };
+export type Participant = {
+  futures_long: number; futures_short: number; futures_long_pct: number | null; futures_score: number | null; options_net: number | null;
+  call_long: number; put_long: number; call_short: number; put_short: number;
+  futures_long_change?: number; futures_short_change?: number; previous_date?: string; call_put_long_ratio?: number;
+};
+export type Contrarian = { bias: "BEARISH" | "LEAN_BEARISH" | "NONE" | "LEAN_BULLISH" | "BULLISH" | "NO_DATA"; strength: number; action: string };
+export type RetailDesk = {
+  generated_at: string;
+  participants: Partial<Record<"CLIENT" | "PRO" | "FII" | "DII", Participant>> | null;
+  participants_date: string | null;
+  participants_error: string | null;
+  mmi_score: number | null;
+  mmi_value: string | null;
+  indices: Array<{ id: IndexId; name: string; crowd_score: number | null; crowd: string; inputs: number; forum_mood: number | null; posts: number; bullish_pct: number | null; index_sentiment: number | null; contrarian: Contrarian }>;
+  crowded_stocks: Array<{ symbol: string; name: string; posts: number; retail_mood: number; institutional_footprint: number | null; delivery_pct: number | null; change_pct: number | null; divergence: boolean; read: string }>;
+  notes: string[];
+  method: string;
+};
 export type IndexSentiment = {
   generated_at: string;
   indices: IndexSentimentReading[];
+  retail_desk?: RetailDesk;
   market_context: Record<string, number | string | null> | null;
   feeds: Array<{ id: string; name: string; ok: boolean; items: number; fresh: number }>;
   freshness: { max_age_hours: number; fresh_window_hours: number };

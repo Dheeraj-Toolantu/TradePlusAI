@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
 import type { ConstituentSentiment, IndexId, IndexSentiment, IndexSentimentReading, Lens } from "../../lib/index-sentiment";
 
 const REFRESH_MS = 10 * 60_000;
@@ -298,6 +299,7 @@ export default function OperationsPage() {
           <section className="isa-cards">
             {data.indices.map((index) => <IndexCard key={index.id} reading={index} active={index.id === selected} onSelect={() => setSelected(selected === index.id ? null : index.id)} />)}
           </section>
+          {data.retail_desk ? <RetailCrowdDesk desk={data.retail_desk} /> : null}
           {reading ? <IndexDetail reading={reading} /> : <p className="isa-muted">Select an index to see its constituents.</p>}
           <section className="isa-panel isa-sources">
             <h3>Data sources</h3>

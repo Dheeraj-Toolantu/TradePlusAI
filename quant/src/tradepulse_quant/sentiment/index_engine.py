@@ -53,6 +53,7 @@ from .constituents import STOCKS, configured_indices, yahoo_symbol
 from .engine import _fetch, fetch_reddit, load_cache, parse_reddit, parse_rss, save_cache
 from .factors import BROWSER_UA, NSE_HOME
 from .lexicon import score_text
+from .retail_desk import fetch_participant_oi, retail_desk
 from .sources import DEFAULT_SOURCES
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -808,12 +809,17 @@ def analyze_indices(payload: dict | None = None) -> dict:
     macro = float(macro) if isinstance(macro, (int, float)) else None
 
     symbols = sorted({symbol for key in wanted for symbol in table[key]["weights"]})
-    data = collect(symbols, {key: table[key]["yahoo"] for key in wanted if table[key].get("yahoo")}, fixtures, cache_dir, now)
+    with ThreadPoolExecutor(max_workers=1) as side:
+        positioning_job = side.submit(fetch_participant_oi, now, fixtures)
+        data = collect(symbols, {key: table[key]["yahoo"] for key in wanted if table[key].get("yahoo")}, fixtures, cache_dir, now)
+        positioning = positioning_job.result()
     charts = data["charts"]
     stock_rows = {symbol: score_stock(symbol, charts.get(symbol), data["news"].get(symbol, []), data["feeds"], data["forums"], data["books"].get(symbol), now) for symbol in symbols}
+    indices = [analyze_index(key, table[key], stock_rows, charts.get(key), macro, now, context) for key in wanted]
     return {
         "generated_at": now.isoformat(),
-        "indices": [analyze_index(key, table[key], stock_rows, charts.get(key), macro, now, context) for key in wanted],
+        "indices": indices,
+        "retail_desk": retail_desk(indices, context, now, fixtures, positioning),
         "market_context": context or None,
         "sources": data["health"],
         "feeds": data["feed_health"],
