@@ -19,7 +19,7 @@ describe("index sentiment route", () => {
     runPythonModule.mockResolvedValueOnce(scan(22)).mockResolvedValueOnce(scan(-5));
     const first = await (await GET(new Request("http://localhost/api/index-sentiment"))).json();
     expect(first.indices[0].score).toBe(22);
-    expect(runPythonModule).toHaveBeenCalledWith("tradepulse_quant.sentiment.index_engine", { market_context: { overall_score: -30, india_score: -20, global_score: -40, retail_score: 10 } }, 90_000);
+    expect(runPythonModule).toHaveBeenCalledWith("tradepulse_quant.sentiment.index_engine", { market_context: { overall_score: -30, india_score: -20, global_score: -40, retail_score: 10, mmi_score: null, mmi_value: null } }, 90_000);
     // Within the minimum interval a manual refresh serves the cache.
     expect((await (await GET(new Request("http://localhost/api/index-sentiment?refresh=1"))).json()).indices[0].score).toBe(22);
     store.__tradepulseIndexSentiment!.at -= 3 * 60_000;
