@@ -88,10 +88,22 @@ export type RetailDesk = {
   notes: string[];
   method: string;
 };
+export type TelegramOptionCall = {
+  underlying: string; strike: number; type: "CE" | "PE"; side: "BUY" | "SELL"; contract: string; mentions: number; channels: string[]; channel_count: number;
+  consensus_score: number; entry: number | null; target: number | null; stop: number | null; plan_odds: number | null; reward_risk: number | null;
+  spot: number | null; moneyness_pct: number | null; otm: boolean | null; far_otm: boolean; latest_age_hours: number; views: number;
+  posts: Array<{ channel: string; text: string; link: string; age_hours: number }>;
+};
+export type TelegramOptions = {
+  window_hours: number; posts_scanned: number; calls_parsed: number; consensus: TelegramOptionCall[]; top_pick: TelegramOptionCall | null;
+  by_underlying: Array<{ underlying: string; ce_buys: number; pe_buys: number; ce_sells: number; pe_sells: number; bullish_pct: number | null; bias: string }>;
+  channels: Array<{ channel: string; posts: number; option_calls: number }>; notes: string[]; method: string;
+};
 export type IndexSentiment = {
   generated_at: string;
   indices: IndexSentimentReading[];
   retail_desk?: RetailDesk;
+  telegram_options?: TelegramOptions;
   market_context: Record<string, number | string | null> | null;
   feeds: Array<{ id: string; name: string; ok: boolean; items: number; fresh: number; cached?: boolean }>;
   freshness: { max_age_hours: number; fresh_window_hours: number };

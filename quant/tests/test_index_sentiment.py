@@ -216,6 +216,8 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(nifty["retail"]["telegram"]["most_tipped"][0]["symbol"], "TATASTEEL")
         self.assertEqual(nifty["retail"]["telegram"]["sell_calls"], 1)
         self.assertIn("telegram_demo_calls", {feed["id"] for feed in result["feeds"]})
+        self.assertEqual(result["telegram_options"]["posts_scanned"], 5)
+        self.assertEqual(result["telegram_options"]["calls_parsed"], 0)  # stock calls, no option contracts
 
     def test_bank_nifty_follows_its_heavyweights(self):
         bank = analyze_indices(self.payload(indices=["BANKNIFTY"]))["indices"][0]

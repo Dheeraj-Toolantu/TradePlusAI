@@ -1086,3 +1086,20 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .tg-row p { margin: 2px 0 0; }
 .ce-chip-tg { color: #8cc8ff; border-color: #2c4e72; }
 .isa-tier-telegram { color: #8cc8ff; border-color: #2c4e72; }
+/* Telegram option-call consensus. */
+.tgo { border-color: #2c4e72; }
+.tgo-channels { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.tgo-top { display: grid; grid-template-columns: minmax(220px, 1fr) 2fr; gap: 12px 20px; padding: 14px; margin-bottom: 12px; border: 1px solid #2c4e72; border-radius: 9px; background: #0b1828; }
+.tgo-top > div small { display: block; color: #8cc8ff; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; }
+.tgo-top strong { display: block; margin: 4px 0; font-size: 22px; }
+.tgo-top em { color: #a2bcc2; font-style: normal; font-size: 12px; }
+.tgo-top dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px 14px; margin: 0; }
+.tgo-top dt { color: #7f9ba3; font-size: 11px; }
+.tgo-top dd { margin: 2px 0 0; font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tgo-top p { grid-column: 1 / -1; margin: 0; }
+.tgo-bias { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; margin-bottom: 10px; }
+.tgo-bias small { color: #a2bcc2; font-size: 12px; }
+.tgo-bias .isa-split { margin: 4px 0 2px; }
+.tgo-bias em { font-style: normal; font-size: 11px; text-transform: capitalize; }
+.tgo-table td small { display: block; color: #6a8790; font-size: 11px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 700px) { .tgo-top { grid-template-columns: 1fr; } }

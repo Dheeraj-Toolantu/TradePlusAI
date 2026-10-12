@@ -60,6 +60,7 @@ from .corporate_events import nse_urls, parse_nse_events, split_event_headlines,
 from .stock_text import STOCK_PHRASES, score_stock_text  # noqa: F401 - re-exported for callers and tests
 from .retail_desk import fetch_participant_oi, retail_desk
 from .sources import DEFAULT_SOURCES
+from .telegram_options import consensus as telegram_option_consensus
 from .telegram_source import PREVIEW_URL, configured_channels, oldest_id, pages, parse_preview, telegram_stats, to_items
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -943,10 +944,15 @@ def analyze_indices(payload: dict | None = None) -> dict:
     charts = data["charts"]
     stock_rows = {symbol: score_stock(symbol, charts.get(symbol), data["news"].get(symbol, []), data["feeds"], data["forums"], data["books"].get(symbol), now, data["nse_events"]) for symbol in symbols}
     indices = [analyze_index(key, table[key], stock_rows, charts.get(key), macro, now, context) for key in wanted]
+    spots = {key: chart["rows"][-1]["close"] for key, chart in charts.items() if chart}
+    options = telegram_option_consensus(data["forums"], now, MAX_AGE_HOURS, spots)
+    desk = retail_desk(indices, context, now, fixtures, positioning)
+    desk["notes"] += options["notes"]
     return {
         "generated_at": now.isoformat(),
         "indices": indices,
-        "retail_desk": retail_desk(indices, context, now, fixtures, positioning),
+        "retail_desk": desk,
+        "telegram_options": options,
         "market_context": context or None,
         "sources": data["health"],
         "feeds": data["feed_health"],

@@ -6,8 +6,8 @@ indicator, not as advice: heavy one-sided calls and hype words ("jackpot", "oper
 sure", "multibagger") on a stock are a retail-euphoria (or pump) warning.
 
 Only public channels are read, through the same preview page anyone sees without logging in; no
-account, API key, private group or bot is involved. Channels come from ``TELEGRAM_CHANNELS``
-(comma-separated usernames, with or without @ / t.me/), e.g. ``TELEGRAM_CHANNELS=chan_a,chan_b``.
+account, API key, private group or bot is involved. Channels: ``DEFAULT_CHANNELS`` unless
+``TELEGRAM_CHANNELS`` (comma-separated usernames, with or without @ / t.me/) replaces them.
 Each scan reads the latest page plus up to ``TELEGRAM_PAGES`` older pages per channel, so a
 channel is a few requests per scan.
 
@@ -34,12 +34,21 @@ LEVELS = re.compile(r"\b(tgt|target|sl|stop ?loss|cmp|entry)\b", re.I)
 HYPE = re.compile(r"jackpot|operator|100 ?% ?(sure|profit|accuracy)|multibagger|sure ?shot|rocket|bumper|don'?t miss|guaranteed|upper circuit|blast|breakout stock|hero ?zero|zero ?hero", re.I)
 
 
+# Public Indian index/options tip channels chosen by the operator; TELEGRAM_CHANNELS replaces the list.
+DEFAULT_CHANNELS = [
+    "nifty50dominator", "TradeOps_Intraday_Options_Nifty", "Stockgainerss", "PowerOfStocks", "Nifty",
+    "rvsoption", "stockpro_online", "OptionsTrading_Stocks_Index", "stockmantraindex", "Stock_guru123",
+]
+
+
 def configured_channels() -> list[str]:
-    raw = os.environ.get("TELEGRAM_CHANNELS", "")
+    raw = os.environ.get("TELEGRAM_CHANNELS")
+    if raw is None or not raw.strip():
+        return list(DEFAULT_CHANNELS)
     names = []
     for part in raw.split(","):
         name = part.strip().removeprefix("https://").removeprefix("http://").removeprefix("t.me/s/").removeprefix("t.me/").lstrip("@").strip("/")
-        if re.fullmatch(r"[A-Za-z0-9_]{4,64}", name):
+        if re.fullmatch(r"[A-Za-z0-9_]{4,64}", name):  # Telegram usernames are 5-32 chars; be lenient
             names.append(name)
     return list(dict.fromkeys(names))
 

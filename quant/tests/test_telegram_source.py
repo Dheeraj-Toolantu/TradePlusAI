@@ -39,7 +39,10 @@ class ParseTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TELEGRAM_CHANNELS": "@chan_one, https://t.me/s/chan_two ,t.me/chan_three,bad name,chan_one"}):
             self.assertEqual(configured_channels(), ["chan_one", "chan_two", "chan_three"])
         with mock.patch.dict(os.environ, {"TELEGRAM_CHANNELS": ""}):
-            self.assertEqual(configured_channels(), [])
+            channels = configured_channels()
+        self.assertEqual(len(channels), 10)
+        self.assertIn("nifty50dominator", channels)
+        self.assertIn("Stock_guru123", channels)
 
 
 class CallTests(unittest.TestCase):
