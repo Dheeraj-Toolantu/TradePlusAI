@@ -2,7 +2,11 @@ import { runPythonModule } from "./python";
 import { getSentiment } from "./sentiment";
 
 export type IndexId = "NIFTY" | "BANKNIFTY" | "SENSEX";
-export type Lens = "price" | "volume" | "orderflow" | "news" | "social";
+export type Lens = "price" | "volume" | "orderflow" | "news" | "social" | "events";
+export type CorporateEvent = { type: string; label: string; title: string; source: string; age_hours: number | null; impact: number; link: string };
+export type Deal = { symbol?: string; kind: "BLOCK" | "BULK"; client: string; side: "BUY" | "SELL"; qty: number; price: number; value_cr: number; date: string | null; class: "INSTITUTION" | "PROMOTER" | "STRATEGIC" | "OTHER"; age_hours: number; vs_price_pct: number | null };
+export type DealsReading = { score: number; count: number; buy_value_cr: number; sell_value_cr: number; institution_buy_cr: number; institution_sell_cr: number; promoter_sell_cr: number; deals: Deal[] };
+export type UpcomingEvent = { date: string; days: number; purpose: string; detail: string; is_results: boolean };
 export type ConstituentSentiment = {
   symbol: string;
   name: string;
@@ -26,8 +30,9 @@ export type ConstituentSentiment = {
   latest_news_age_hours: number | null;
   social_count: number;
   retail: { posts: number; bullish: number; bearish: number };
+  events: { count: number; deals: DealsReading | null; upcoming: UpcomingEvent[]; events: CorporateEvent[] };
   notes: string[];
-  headlines: Array<{ title: string; link: string; source: string; tier: "PREMIUM" | "STANDARD" | "BLOG"; score: number; age_hours: number }>;
+  headlines: Array<{ title: string; link: string; source: string; tier: "PREMIUM" | "STANDARD" | "BLOG"; score: number; age_hours: number; event?: string | null }>;
 };
 export type Driver = { symbol: string; name: string; score: number; weight: number; contribution: number };
 export type IndexSentimentReading = {
@@ -50,6 +55,14 @@ export type IndexSentimentReading = {
     posts: number; bullish: number; bearish: number; bullish_pct: number | null; mood: number | null;
     mmi_score: number | null; mmi_value: string | null; retail_market_score: number | null;
     most_discussed: Array<{ symbol: string; posts: number; mood: number | null }>;
+  };
+  corporate: {
+    results: Array<{ symbol: string; weight: number; impact: number; title: string; source: string }>;
+    results_tone: number | null;
+    upcoming: Array<UpcomingEvent & { symbol: string; weight: number }>;
+    reporting_weight_7d: number;
+    deals: { buy_value_cr: number; sell_value_cr: number; institution_buy_cr: number; promoter_sell_cr: number; count: number; top: Array<Deal & { symbol: string }> };
+    notable: Array<CorporateEvent & { symbol: string; weight: number }>;
   };
   freshness: { max_age_hours: number; fresh_window_hours: number; news_items: number; fresh_items: number; premium_items: number; latest_news_age_hours: number | null; stocks_with_news: number };
   coverage: { stocks_scored: number; stocks_total: number; weight_scored_pct: number };

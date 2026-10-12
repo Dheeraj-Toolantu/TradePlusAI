@@ -2,23 +2,27 @@
 
 stdin/stdout JSON entry point: ``python -m tradepulse_quant.sentiment.index_engine``.
 
-Every constituent gets a -100..+100 score from five lenses, read the way a Dalal Street desk
+Every constituent gets a -100..+100 score from six lenses, read the way a Dalal Street desk
 reads a stock:
 
-- PRICE (28%): the day's move, 5-day momentum and distance from the 20-day average, each
+- PRICE (25%): the day's move, 5-day momentum and distance from the 20-day average, each
   scaled by the stock's own volatility (a 1% move in ITC is not a 1% move in Adani Ent).
-- VOLUME (12%): who is in control. Close location in the day's range plus the direction,
+- VOLUME (10%): who is in control. Close location in the day's range plus the direction,
   multiplied by relative volume (session-time adjusted). Up on heavy volume = accumulation,
   down on heavy volume = distribution, any move on thin volume = low conviction.
-- BUYERS vs SELLERS (15%): NSE order book (total pending buy vs sell quantity, live during
+- BUYERS vs SELLERS (14%): NSE order book (total pending buy vs sell quantity, live during
   market hours) and delivery % (high delivery on an up day = investors taking stock home; on a
   down day = genuine exits, not just intraday churn).
-- NEWS (28%): only the last few hours. Moneycontrol, Economic Times, Mint, Business Standard,
+- NEWS (25%): only the last few hours. Moneycontrol, Economic Times, Mint, Business Standard,
   BusinessLine, CNBC-TV18, NDTV Profit and Financial Express pages and per-company searches
   restricted to those outlets, plus Indian market blogs and the global edition. Publishers are
   quality-tiered: wire/business dailies count fully, aggregators and blogs less.
-- RETAIL (17%): Indian and global retail-trader forums (Reddit, ValuePickr) with bull/bear
+- RETAIL (14%): Indian and global retail-trader forums (Reddit, ValuePickr) with bull/bear
   post counts. Extremes are treated as contrarian: a euphoric crowd is damped, not rewarded.
+- EVENTS (12%): block/bulk deals (who bought, who sold), results, corporate actions, NSE filings
+  and event headlines (order wins, rating changes, regulatory action...); see ``corporate_events``.
+  Event headlines are scored here and removed from NEWS so nothing counts twice. Upcoming results
+  are flagged as event risk, not scored.
 
 Freshness: text older than ``INDEX_SENTIMENT_MAX_AGE_HOURS`` (default 8 h) is dropped, items
 without a timestamp are dropped, and a 3 h half-life makes the last 4 h dominate.
@@ -30,7 +34,7 @@ cues) when the caller passes it. Psychology notes explain what the reading means
 Payload keys (all optional): ``now`` (ISO), ``indices`` (subset of ids), ``market_context``
 ({overall_score, india_score, global_score, retail_score, mmi_score, mmi_value}), ``fixtures``
 ({charts: {symbol: raw}, news: {"SYMBOL:INDIA"|"SYMBOL:GLOBAL": raw rss}, feeds: {feed id: raw},
-forums: {source_id: raw}, orderbook: {symbol: raw NSE trade_info}}) so tests never touch the
+forums: {source_id: raw}, orderbook: {symbol: raw NSE trade_info}, nse_events: {large_deals|block|bulk|announcements|actions|calendar: raw}}) so tests never touch the
 network, ``cache_dir`` for the last-good cache.
 """
 from __future__ import annotations
@@ -52,7 +56,8 @@ from datetime import datetime, timedelta, timezone
 from .constituents import STOCKS, configured_indices, yahoo_symbol
 from .engine import _fetch, fetch_reddit, load_cache, parse_reddit, parse_rss, save_cache
 from .factors import BROWSER_UA, NSE_HOME
-from .lexicon import score_text
+from .corporate_events import nse_urls, parse_nse_events, split_event_headlines, stock_events
+from .stock_text import STOCK_PHRASES, score_stock_text  # noqa: F401 - re-exported for callers and tests
 from .retail_desk import fetch_participant_oi, retail_desk
 from .sources import DEFAULT_SOURCES
 
@@ -101,7 +106,7 @@ FORUM_SOURCES = [
 TIER_WEIGHTS = {"PREMIUM": 1.0, "STANDARD": 0.7, "BLOG": 0.6}
 PREMIUM_PUBLISHERS = ("moneycontrol", "economic times", "economictimes", "mint", "livemint", "business standard", "business-standard", "businessline",
                       "hindu businessline", "cnbc", "ndtv profit", "financial express", "reuters", "bloomberg", "the hindu", "financial times", "wsj", "wall street journal")
-COMPONENT_WEIGHTS = {"price": 0.28, "volume": 0.12, "orderflow": 0.15, "news": 0.28, "social": 0.17}
+COMPONENT_WEIGHTS = {"price": 0.25, "volume": 0.10, "orderflow": 0.14, "news": 0.25, "social": 0.14, "events": 0.12}
 
 
 def _max_age_hours() -> float:
@@ -122,17 +127,6 @@ FETCH_BUDGET_SECONDS = 45.0
 MACRO_BLEND = 0.2
 HEAVYWEIGHTS = 5
 
-# Company-level language the index lexicon does not carry.
-STOCK_PHRASES: dict[str, float] = {
-    "order win": 1.2, "bags order": 1.2, "wins order": 1.2, "secures order": 1.2, "bags contract": 1.2, "wins contract": 1.2,
-    "target raised": 1.2, "raises target": 1.2, "raise target": 1.2, "upgrades": 1.0, "downgrades": -1.0, "hikes target": 1.2, "target cut": -1.2, "cuts target": -1.2, "lowers target": -1.2,
-    "buy rating": 1.0, "sell rating": -1.0, "overweight": 0.8, "underweight": -0.8, "reiterates buy": 1.0,
-    "margin expansion": 1.0, "margins expand": 1.0, "margin pressure": -1.0, "margins contract": -1.0, "raises guidance": 1.5,
-    "guidance cut": -1.5, "cuts guidance": -1.5, "beats": 1.0, "misses": -1.0, "profit jumps": 1.5, "profit falls": -1.5,
-    "profit declines": -1.5, "record profit": 1.5, "raid": -1.5, "probe": -1.2, "penalty": -1.0, "fraud": -2.0, "resigns": -1.0,
-    "stake sale": -0.6, "pledge": -0.8, "npa": -0.8, "slippages": -1.0, "buyback": 1.0, "dividend": 0.4, "expansion": 0.6,
-    "acquisition": 0.4, "ban": -1.0, "recall": -1.0, "strike": -0.8, "fii stake": 0.4, "promoter buying": 1.2, "promoter selling": -1.2,
-}
 
 
 def _clamp(value: float, low: float = -100.0, high: float = 100.0) -> float:
@@ -165,15 +159,6 @@ def _zone(score: float | None) -> str:
     if score <= -15:
         return "Fear"
     return "Neutral"
-
-
-def score_stock_text(text: str) -> float:
-    """Lexicon compound plus company-level phrases, combined so the result stays in [-1, 1]."""
-    base = score_text(text)
-    lowered = f" {text.lower()} "
-    total = sum(weight * len(re.findall(rf"\b{re.escape(phrase)}\b", lowered)) for phrase, weight in STOCK_PHRASES.items())
-    extra = total / math.sqrt(total * total + 15.0) if total else 0.0
-    return (base + extra) / (1.0 + abs(base * extra))
 
 
 def alias_patterns(symbol: str) -> list[re.Pattern]:
@@ -489,18 +474,33 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
                 note("forums", True)
         return [{**item, "source": source["name"], "region": source["region"]} for item in parsed]
 
-    def order_books() -> dict[str, dict]:
+    def nse_data() -> tuple[dict[str, dict], dict]:
+        """Order books per stock plus deals, filings, corporate actions and the event calendar."""
         if fixtures is not None:
             books = {symbol: parse_trade_info(raw) for symbol, raw in (fixtures.get("orderbook") or {}).items()}
             for symbol in symbols:
                 note("orderbook", books.get(symbol) is not None)
-            return {symbol: book for symbol, book in books.items() if book}
+            raws = fixtures.get("nse_events") or {}
+            for key in ("large_deals", "block", "bulk", "announcements", "actions", "calendar"):
+                note("nse_events", bool(raws.get(key)))
+            return {symbol: book for symbol, book in books.items() if book}, parse_nse_events(raws)
         try:
             opener = _nse_opener()
-        except Exception as error:  # noqa: BLE001 - NSE blocks many cloud IPs; the lens just drops out
+        except Exception as error:  # noqa: BLE001 - NSE blocks many cloud IPs; these lenses just drop out
             note("orderbook", False, f"NSE session: {type(error).__name__}")
-            return {}
+            note("nse_events", False, f"NSE session: {type(error).__name__}")
+            return {}, parse_nse_events({})
         headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*", "Referer": NSE_HOME}
+
+        def get(key: str, url: str) -> tuple[str, str | None]:
+            try:
+                with opener.open(urllib.request.Request(url, headers=headers), timeout=10) as response:  # noqa: S310 - NSE public APIs
+                    raw = response.read(8_000_000).decode("utf-8", errors="replace")
+                note("nse_events", True)
+                return key, raw
+            except Exception as error:  # noqa: BLE001
+                note("nse_events", False, f"{key}: {type(error).__name__}")
+                return key, None
 
         def one(symbol: str) -> tuple[str, dict | None]:
             if time.monotonic() > deadline:
@@ -517,11 +517,14 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
                 return symbol, None
 
         with ThreadPoolExecutor(max_workers=NSE_WORKERS) as nse_pool:
-            return {symbol: book for symbol, book in nse_pool.map(one, symbols) if book}
+            event_jobs = [nse_pool.submit(get, key, url) for key, url in nse_urls(now).items()]
+            books = {symbol: book for symbol, book in nse_pool.map(one, symbols) if book}
+            raws = dict(job.result() for job in event_jobs)
+        return books, parse_nse_events(raws)
 
     health_rows_by_feed: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-        book_job = pool.submit(order_books)
+        nse_job = pool.submit(nse_data)
         chart_jobs = [pool.submit(chart, symbol, yahoo_symbol(symbol)) for symbol in symbols]
         chart_jobs += [pool.submit(chart, index_id, ticker) for index_id, ticker in index_tickers.items()]
         feed_jobs = [pool.submit(feed, source) for source in INDEX_FEEDS]
@@ -534,7 +537,7 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
             news_items.setdefault(symbol, []).extend(items)
         feed_news = [item for job in feed_jobs for item in job.result()]
         forum_items = [item for job in forum_jobs for item in job.result()]
-        books = book_job.result()
+        books, nse_events = nse_job.result()
 
     # Forums the market sentiment engine already read (its last-good cache) add retail coverage.
     if fixtures is None:
@@ -547,15 +550,15 @@ def collect(symbols: list[str], index_tickers: dict[str, str], fixtures: dict | 
 
     labels = {"market_data": "Yahoo Finance prices & volume", "orderbook": "NSE order book & delivery", "news_india": "Google News India (quality outlets, per stock)",
               "news_global": "Google News global (per stock)", "market_pages": "Moneycontrol / ET / Mint / BS pages", "blogs": "Indian market blogs",
-              "forums": "Retail trader forums (Reddit, ValuePickr)"}
+              "forums": "Retail trader forums (Reddit, ValuePickr)", "nse_events": "NSE deals, filings, corporate actions & calendar"}
     health_rows = [{"id": key, "name": labels.get(key, key), **{k: v for k, v in row.items() if k != "id"}} for key, row in health.items()]
     feeds = [{"id": source["id"], **health_rows_by_feed[source["id"]]} for source in INDEX_FEEDS if source["id"] in health_rows_by_feed]
-    return {"charts": charts, "news": news_items, "forums": forum_items, "feeds": feed_news, "books": books, "health": health_rows, "feed_health": feeds}
+    return {"charts": charts, "news": news_items, "forums": forum_items, "feeds": feed_news, "books": books, "nse_events": nse_events, "health": health_rows, "feed_health": feeds}
 
 
 # ---------- scoring ----------
 
-def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news: list[dict], forums: list[dict], book: dict | None, now: datetime) -> dict:
+def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news: list[dict], forums: list[dict], book: dict | None, now: datetime, nse_events: dict | None = None) -> dict:
     name, sector, _ = STOCKS.get(symbol, (symbol, "Other", ()))
     patterns = alias_patterns(symbol)
     market = market_lenses(chart, now) if chart else None
@@ -564,6 +567,9 @@ def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news
     news = text_items(news_raw, patterns, now, half_life=NEWS_HALF_LIFE_HOURS, require_mention=False)
     news = [{**item, "weight": item["weight"] * (0.8 if item["region"] == "GLOBAL" else 1.0)} for item in news]
     news += text_items(feed_news, patterns, now, half_life=NEWS_HALF_LIFE_HOURS, require_mention=True)
+    # Results, deals, order wins, ratings, filings... are scored once, by the events lens.
+    news, event_headlines = split_event_headlines(news)
+    events = stock_events(symbol, name, nse_events, event_headlines, market["price"] if market else None, now)
     social = text_items(forums, patterns, now, half_life=SOCIAL_HALF_LIFE_HOURS, require_mention=True)
     news_score = net_tone(news)
     social_score = net_tone(social)
@@ -580,6 +586,7 @@ def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news
         "orderflow": flow["orderflow_score"],
         "news": news_score,
         "social": social_used,
+        "events": events["score"],
     }
     available = {key: value for key, value in components.items() if value is not None}
     weight = sum(COMPONENT_WEIGHTS[key] for key in available)
@@ -604,8 +611,10 @@ def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news
         if flow["delivery_pct"] is not None and flow["delivery_pct"] >= 60 and abs(market["change_pct"]) >= 0.5:
             notes.append(f"High delivery ({flow['delivery_pct']:.0f}%): positional {'buying' if market['change_pct'] > 0 else 'selling'}, not intraday churn.")
 
-    ranked = sorted(news + social, key=lambda item: item["weight"] * abs(item["score"]), reverse=True)
-    fresh = [item for item in news if item["age_hours"] <= FRESH_HOURS]
+    notes += events["notes"]
+    ranked = sorted(news + event_headlines + social, key=lambda item: item["weight"] * abs(item["score"]), reverse=True)
+    all_news = news + event_headlines
+    fresh = [item for item in all_news if item["age_hours"] <= FRESH_HOURS]
     return {
         "symbol": symbol, "name": name, "sector": sector, "score": score, "label": _label(score),
         "confidence": "HIGH" if weight >= 0.8 else "MEDIUM" if weight >= 0.5 else "LOW" if weight else "NONE",
@@ -614,12 +623,14 @@ def score_stock(symbol: str, chart: dict | None, news_raw: list[dict], feed_news
         "five_day_pct": market["five_day_pct"] if market else None, "vs_20dma_pct": market["vs_20dma_pct"] if market else None,
         "volume_ratio": market["volume_ratio"] if market else None,
         "orderflow": {key: value for key, value in flow.items() if key != "orderflow_score"},
-        "news_count": len(news), "news_fresh_count": len(fresh), "premium_news_count": sum(1 for item in news if item["tier"] == "PREMIUM"),
-        "latest_news_age_hours": min((item["age_hours"] for item in news), default=None),
+        "news_count": len(all_news), "news_fresh_count": len(fresh), "premium_news_count": sum(1 for item in all_news if item["tier"] == "PREMIUM"),
+        "latest_news_age_hours": min((item["age_hours"] for item in all_news), default=None),
         "social_count": len(social),
+        "events": {key: value for key, value in events.items() if key not in ("score", "notes")},
         "retail": {"posts": len(social), "bullish": sum(1 for item in social if item["score"] >= POLAR), "bearish": sum(1 for item in social if item["score"] <= -POLAR)},
         "notes": notes,
-        "headlines": [{"title": item["title"], "link": item["link"], "source": item["source"], "tier": item["tier"], "score": round(item["score"] * 100), "age_hours": item["age_hours"]} for item in ranked[:5]],
+        "headlines": [{"title": item["title"], "link": item["link"], "source": item["source"], "tier": item["tier"], "score": round(item["score"] * 100), "age_hours": item["age_hours"],
+                       "event": item.get("category")} for item in ranked[:5]],
     }
 
 
@@ -629,7 +640,7 @@ def _weighted(rows: list[tuple[float, float]]) -> float | None:
 
 
 def psychology(index_id: str, name: str, score: float | None, stocks: list[dict], weights: dict[str, float], parts: dict, macro: float | None, sectors: list[dict], breadth: dict,
-               orderflow: dict | None = None, retail: dict | None = None) -> tuple[list[str], str]:
+               orderflow: dict | None = None, retail: dict | None = None, corporate: dict | None = None) -> tuple[list[str], str]:
     notes: list[str] = []
     if score is None:
         return ["Not enough constituent data for a reading."], "No call: wait for data."
@@ -664,6 +675,25 @@ def psychology(index_id: str, name: str, score: float | None, stocks: list[dict]
             notes.append("Retail forums are euphoric on the index constituents. When the crowd is all-in, smart money sells into strength: tighten stops.")
         elif social <= -50:
             notes.append("Retail forums are in panic. Capitulation is usually near a short-term bottom: avoid chasing puts at lows.")
+    corporate = corporate or {}
+    reporting = corporate.get("reporting_weight_7d") or 0
+    if reporting >= 15:
+        names = ", ".join(row["symbol"] for row in corporate["upcoming"][:4])
+        notes.append(f"Earnings week: {reporting:.0f}% of {name}'s weight reports within 7 days ({names}). Expect stock-specific gaps; index implied volatility stays bid until the heavyweights report, then crushes.")
+    tone = corporate.get("results_tone")
+    if tone is not None and len(corporate.get("results", [])) >= 2:
+        if tone >= 20:
+            notes.append(f"Results so far are beating expectations (weighted tone {tone:+.0f}): earnings support the index; dips on heavyweights are buyable.")
+        elif tone <= -20:
+            notes.append(f"Results so far are disappointing (weighted tone {tone:+.0f}): earnings downgrades follow misses; rallies are suspect until estimates reset.")
+    deals = corporate.get("deals") or {}
+    if deals.get("promoter_sell_cr", 0) >= 500:
+        notes.append(f"Promoters and strategic holders sold ₹{deals['promoter_sell_cr']:,.0f} Cr in block/bulk deals across {name}: fresh supply the market has to absorb.")
+    if deals.get("institution_buy_cr", 0) >= 500:
+        notes.append(f"Institutions bought ₹{deals['institution_buy_cr']:,.0f} Cr in block/bulk deals across {name}: big money is using blocks to build positions.")
+    negative = [row for row in corporate.get("notable", []) if row["type"] in ("REGULATORY", "AUDITOR_EXIT") and row["weight"] >= 2]
+    if negative:
+        notes.append(f"Governance/regulatory event in a significant constituent ({negative[0]['symbol']}: {negative[0]['label'].lower()}): such news can drag the whole sector.")
     flow_buy = (orderflow or {}).get("buy_pct")
     if flow_buy is not None:
         if flow_buy >= 60 and (price or 0) < -10:
@@ -706,6 +736,44 @@ def psychology(index_id: str, name: str, score: float | None, stocks: list[dict]
     return notes, bias
 
 
+def events_summary(stocks: list[dict], weights: dict[str, float]) -> dict:
+    """Index-wide view of results, deals, upcoming events and the most important corporate events."""
+    results, upcoming, notable = [], [], []
+    deal_totals = {"buy_value_cr": 0.0, "sell_value_cr": 0.0, "institution_buy_cr": 0.0, "promoter_sell_cr": 0.0, "count": 0}
+    top_deals = []
+    for stock in stocks:
+        events = stock.get("events") or {}
+        weight = weights[stock["symbol"]]
+        for event in events.get("events", []):
+            if event["type"] == "RESULTS":
+                results.append({"symbol": stock["symbol"], "weight": round(weight, 2), "impact": event["impact"], "title": event["title"], "source": event["source"]})
+            notable.append({"symbol": stock["symbol"], "weight": round(weight, 2), **event})
+        for row in events.get("upcoming", []):
+            upcoming.append({"symbol": stock["symbol"], "weight": round(weight, 2), **row})
+        deals = events.get("deals")
+        if deals:
+            for key in ("buy_value_cr", "sell_value_cr", "institution_buy_cr", "promoter_sell_cr"):
+                deal_totals[key] += deals[key]
+            deal_totals["count"] += deals["count"]
+            top_deals += [{"symbol": stock["symbol"], **deal} for deal in deals["deals"]]
+    best = {}
+    for row in results:  # one results reading per stock: the most impactful
+        if row["symbol"] not in best or abs(row["impact"]) > abs(best[row["symbol"]]["impact"]):
+            best[row["symbol"]] = row
+    results = sorted(best.values(), key=lambda row: -row["weight"])
+    upcoming.sort(key=lambda row: (row["days"], -row["weight"]))
+    reporting = {row["symbol"]: row["weight"] for row in upcoming if row["is_results"] and row["days"] <= 7}
+    total_weight = sum(row["weight"] for row in results)
+    return {
+        "results": results[:12],
+        "results_tone": round(sum(row["weight"] * row["impact"] for row in results) / total_weight, 1) if total_weight else None,
+        "upcoming": upcoming[:12],
+        "reporting_weight_7d": round(sum(reporting.values()), 1),
+        "deals": {**{key: round(value, 2) for key, value in deal_totals.items()}, "top": sorted(top_deals, key=lambda row: -row["value_cr"])[:8]},
+        "notable": sorted(notable, key=lambda row: -(row["weight"] * abs(row["impact"])))[:10],
+    }
+
+
 def analyze_index(index_id: str, spec: dict, stock_rows: dict[str, dict], index_chart: dict | None, macro: float | None, now: datetime, context: dict | None = None) -> dict:
     raw_weights = {symbol: float(weight) for symbol, weight in spec["weights"].items() if symbol in stock_rows}
     total = sum(raw_weights.values()) or 1.0
@@ -724,7 +792,7 @@ def analyze_index(index_id: str, spec: dict, stock_rows: dict[str, dict], index_
     social_rows = [(weights[s["symbol"]], s["social_raw"]) for s in stocks if s["social_raw"] is not None]
     parts = {
         "constituents": constituent_score, "price": lens("price", stocks), "volume": lens("volume", stocks), "orderflow": lens("orderflow", stocks),
-        "news": lens("news", stocks),
+        "news": lens("news", stocks), "events": lens("events", stocks),
         # A crowd reading on one or two names is not the index's crowd: need a quarter of the weight.
         "social": _weighted(social_rows) if sum(weight for weight, _ in social_rows) >= 25 else None,
         "heavyweights": _weighted([(weights[s["symbol"]], s["score"]) for s in heavy if s["score"] is not None]),
@@ -778,7 +846,8 @@ def analyze_index(index_id: str, spec: dict, stock_rows: dict[str, dict], index_
         "latest_news_age_hours": min((s["latest_news_age_hours"] for s in stocks if s["latest_news_age_hours"] is not None), default=None),
         "stocks_with_news": sum(1 for s in stocks if s["news_count"]),
     }
-    notes, bias = psychology(index_id, spec["name"], score, stocks, weights, parts, macro, sectors, breadth, orderflow, retail)
+    corporate = events_summary(stocks, weights)
+    notes, bias = psychology(index_id, spec["name"], score, stocks, weights, parts, macro, sectors, breadth, orderflow, retail, corporate)
 
     quote = None
     if index_chart:
@@ -788,7 +857,7 @@ def analyze_index(index_id: str, spec: dict, stock_rows: dict[str, dict], index_
         "id": index_id, "name": spec["name"], "score": score, "label": _label(score), "zone": _zone(score), "bias": bias,
         "constituent_score": constituent_score, "macro_score": macro, "lenses": parts, "breadth": breadth, "sectors": sectors,
         "drivers": {"positive": [pick(s) for s in reversed(contributions) if s["contribution"] > 0][:5], "negative": [pick(s) for s in contributions if s["contribution"] < 0][:5]},
-        "psychology": notes, "quote": quote, "orderflow": orderflow, "retail": retail, "freshness": freshness,
+        "psychology": notes, "quote": quote, "orderflow": orderflow, "retail": retail, "freshness": freshness, "corporate": corporate,
         "coverage": {"stocks_scored": len(scored), "stocks_total": len(stocks), "weight_scored_pct": round(sum(weights[s["symbol"]] for s in scored), 1)},
         "constituents": stocks,
     }
@@ -814,7 +883,7 @@ def analyze_indices(payload: dict | None = None) -> dict:
         data = collect(symbols, {key: table[key]["yahoo"] for key in wanted if table[key].get("yahoo")}, fixtures, cache_dir, now)
         positioning = positioning_job.result()
     charts = data["charts"]
-    stock_rows = {symbol: score_stock(symbol, charts.get(symbol), data["news"].get(symbol, []), data["feeds"], data["forums"], data["books"].get(symbol), now) for symbol in symbols}
+    stock_rows = {symbol: score_stock(symbol, charts.get(symbol), data["news"].get(symbol, []), data["feeds"], data["forums"], data["books"].get(symbol), now, data["nse_events"]) for symbol in symbols}
     indices = [analyze_index(key, table[key], stock_rows, charts.get(key), macro, now, context) for key in wanted]
     return {
         "generated_at": now.isoformat(),
@@ -824,11 +893,12 @@ def analyze_indices(payload: dict | None = None) -> dict:
         "sources": data["health"],
         "feeds": data["feed_health"],
         "freshness": {"max_age_hours": MAX_AGE_HOURS, "fresh_window_hours": FRESH_HOURS},
-        "method": f"Each constituent is scored -100..+100 from price action (28%: day move, 5-day momentum and distance from the 20-DMA, scaled by the stock's own volatility), "
-                  "volume (12%: close location and direction times session-adjusted relative volume, i.e. accumulation vs distribution), buyers vs sellers (15%: NSE order-book "
-                  "pending buy vs sell quantity and delivery %), news (28%: Moneycontrol, Economic Times, Mint, Business Standard, BusinessLine, CNBC-TV18 and Financial Express "
-                  "pages, per-company searches limited to those outlets, Indian market blogs and the global edition; premium outlets weigh 1.0, other news 0.7, blogs 0.6) and "
-                  f"retail traders (17%: Indian and global forums, extremes damped as contrarian). Only text from the last {MAX_AGE_HOURS:.0f} h is used, with a 3 h half-life so "
+        "method": f"Each constituent is scored -100..+100 from price action (25%: day move, 5-day momentum and distance from the 20-DMA, scaled by the stock's own volatility), "
+                  "volume (10%: close location and direction times session-adjusted relative volume, i.e. accumulation vs distribution), buyers vs sellers (14%: NSE order-book "
+                  "pending buy vs sell quantity and delivery %), news (25%: Moneycontrol, Economic Times, Mint, Business Standard, BusinessLine, CNBC-TV18 and Financial Express "
+                  "pages, per-company searches limited to those outlets, Indian market blogs and the global edition; premium outlets weigh 1.0, other news 0.7, blogs 0.6), "
+                  f"retail traders (14%: Indian and global forums, extremes damped as contrarian) and corporate events (12%: NSE block/bulk deals weighted by who "
+                  "bought and sold, results tone, corporate actions, filings and event headlines; upcoming results flagged as event risk). Only text from the last {MAX_AGE_HOURS:.0f} h is used, with a 3 h half-life so "
                   f"the last {FRESH_HOURS:.0f} h dominate; undated items are dropped. Missing lenses drop out. The index score is the free-float-weighted average of its "
                   "constituents, blended 80/20 with the macro backdrop (India VIX, FII/DII flows, global cues, retail mood) when available. Weights are approximate and "
                   "normalised; scores are a reading of sentiment, not a trade signal.",

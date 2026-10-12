@@ -1052,3 +1052,32 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .rcd-stocks p { margin: 4px 0 0; font-size: 12px; color: #c7dcdf; }
 .rcd-method { margin: 12px 0 0; }
 @media (min-width: 900px) { .rcd-grid { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); } }
+/* Corporate events, results & block deals. */
+.ce-label { display: block; margin: 12px 0 2px; color: #a2bcc2; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; }
+.ce-chips { display: inline-flex; flex-wrap: wrap; gap: 3px; margin-left: 6px; vertical-align: middle; }
+.ce-chip { display: inline-block; padding: 0 5px; border: 1px solid #2f5566; border-radius: 3px; color: #9fd2dd; font: 600 10px "Manrope", sans-serif; font-style: normal; }
+.ce-chip-due { color: #f0bf66; border-color: #6b5530; }
+.ce-chip-risk { color: #fa9aa4; border-color: #6a3540; }
+.ce-events { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 8px; }
+.ce-events li { display: grid; grid-template-columns: 40px 1fr; gap: 8px; font-size: 12px; }
+.ce-events li > b { font-variant-numeric: tabular-nums; }
+.ce-events div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
+.ce-events a, .ce-events span:not(.ce-type) { color: #d3e6e8; text-decoration: none; }
+.ce-events a:hover { color: #30d4ca; text-decoration: underline; }
+.ce-events small { flex-basis: 100%; color: #6a8790; font-size: 11px; }
+.ce-type { padding: 0 5px; border-radius: 3px; background: #15303c; color: #9fd2dd; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; }
+.ce-symbol { color: #e6f2f3; }
+.ce-upcoming { margin: 4px 0 6px; color: #f0bf66; font-size: 12px; }
+.ce-stock .isa-table-wrap { margin-top: 6px; }
+.ce-deals td, .ce-deals th { font-size: 12px !important; }
+.ce-deals td small { display: block; }
+.ce-panel h4 { margin: 14px 0 8px; font-size: 13px; color: #c7dcdf; }
+.ce-panel .ce-grid h4:first-child { margin-top: 0; }
+.ce-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 6px 16px; margin-bottom: 12px; font-size: 12px; }
+.ce-head h3 { margin: 0; }
+.ce-grid { margin: 0; }
+.ce-results { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.ce-results li { display: grid; grid-template-columns: minmax(80px, auto) 46px 44px 1fr; align-items: baseline; gap: 8px; font-size: 12px; }
+.ce-results i { color: #6a8790; font-style: normal; font-size: 11px; }
+.ce-results span { font-weight: 700; font-variant-numeric: tabular-nums; }
+.ce-results small { color: #a2bcc2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

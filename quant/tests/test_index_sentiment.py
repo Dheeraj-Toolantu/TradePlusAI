@@ -173,6 +173,29 @@ class IndexTests(unittest.TestCase):
         self.assertTrue(any("Market Mood Index is in extreme fear" in note for note in nifty["psychology"]))
         self.assertEqual({feed["id"] for feed in result["feeds"]} >= {"mc_buzzing", "et_stocks"}, True)
 
+    def test_corporate_events_roll_up_to_the_index(self):
+        payload = self.payload(indices=["NIFTY"])
+        payload["fixtures"]["nse_events"] = {
+            "large_deals": json.dumps({"BLOCK_DEALS_DATA": [
+                {"symbol": "BHARTIARTL", "clientName": "Bharti Telecom Ltd", "buySell": "SELL", "qty": 10000000, "watp": 95, "date": "12-Oct-2026"},
+                {"symbol": "BHARTIARTL", "clientName": "SBI Mutual Fund", "buySell": "BUY", "qty": 10000000, "watp": 95, "date": "12-Oct-2026"}], "BULK_DEALS_DATA": []}),
+            "calendar": json.dumps([{"symbol": "HDFCBANK", "purpose": "Financial Results", "bm_desc": "Q2", "date": "14-Oct-2026"},
+                                    {"symbol": "RELIANCE", "purpose": "Financial Results", "bm_desc": "Q2", "date": "16-Oct-2026"}]),
+        }
+        payload["fixtures"]["news"]["INFY:INDIA"] = rss("Infosys Q2 results: net profit jumps, beats estimates", "Infosys raises guidance as deal wins surge")
+        nifty = analyze_indices(payload)["indices"][0]
+        rows = {stock["symbol"]: stock for stock in nifty["constituents"]}
+        self.assertIsNotNone(rows["BHARTIARTL"]["components"]["events"])
+        self.assertEqual(rows["BHARTIARTL"]["events"]["deals"]["count"], 2)
+        self.assertGreater(rows["INFY"]["components"]["events"], 20)
+        self.assertIn("RESULTS", [event["type"] for event in rows["INFY"]["events"]["events"]])
+        corporate = nifty["corporate"]
+        self.assertEqual([row["symbol"] for row in corporate["upcoming"]], ["HDFCBANK", "RELIANCE"])
+        self.assertGreater(corporate["reporting_weight_7d"], 20)
+        self.assertEqual(corporate["deals"]["count"], 2)
+        self.assertTrue(any("Earnings week" in note for note in nifty["psychology"]))
+        self.assertIsNotNone(nifty["lenses"]["events"])
+
     def test_bank_nifty_follows_its_heavyweights(self):
         bank = analyze_indices(self.payload(indices=["BANKNIFTY"]))["indices"][0]
         self.assertEqual(len(bank["constituents"]), 14)

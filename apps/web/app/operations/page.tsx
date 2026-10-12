@@ -1,16 +1,18 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { EventChips, IndexCorporatePanel, StockEvents } from "../../components/corporate-events";
 import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
 import type { ConstituentSentiment, IndexId, IndexSentiment, IndexSentimentReading, Lens } from "../../lib/index-sentiment";
 
 const REFRESH_MS = 10 * 60_000;
 const LENSES: Array<{ key: Lens; title: string; weight: string }> = [
-  { key: "price", title: "Price action", weight: "28%" },
-  { key: "volume", title: "Volume (accumulation / distribution)", weight: "12%" },
-  { key: "orderflow", title: "Buyers vs sellers (order book, delivery)", weight: "15%" },
-  { key: "news", title: "News (Moneycontrol, ET, Mint, blogs, global)", weight: "28%" },
-  { key: "social", title: "Retail traders (forums)", weight: "17%" },
+  { key: "price", title: "Price action", weight: "25%" },
+  { key: "volume", title: "Volume (accumulation / distribution)", weight: "10%" },
+  { key: "orderflow", title: "Buyers vs sellers (order book, delivery)", weight: "14%" },
+  { key: "news", title: "News (Moneycontrol, ET, Mint, blogs, global)", weight: "25%" },
+  { key: "social", title: "Retail traders (forums)", weight: "14%" },
+  { key: "events", title: "Corporate events (deals, results, filings)", weight: "12%" },
 ];
 type SortKey = "weight" | "score" | "change" | "contribution";
 type Filter = "ALL" | "BULLISH" | "BEARISH" | "NEUTRAL";
@@ -104,9 +106,12 @@ function ConstituentDetail({ stock }: { stock: ConstituentSentiment }) {
       </div>
       <div>
         {stock.notes.length ? <ul className="isa-notes">{stock.notes.map((note) => <li key={note}>{note}</li>)}</ul> : null}
-        {stock.headlines.length ? (
+        <small className="ce-label">Corporate events &amp; deals</small>
+        <StockEvents stock={stock} />
+        <small className="ce-label">Latest news &amp; retail chatter</small>
+        {stock.headlines.some((headline) => !headline.event) ? (
           <ul className="isa-headlines">
-            {stock.headlines.map((headline) => (
+            {stock.headlines.filter((headline) => !headline.event).map((headline) => (
               <li key={headline.link + headline.title}>
                 <b className={tone(headline.score)}>{signed(headline.score)}</b>
                 <a href={headline.link} target="_blank" rel="noreferrer">{headline.title}</a>
@@ -157,7 +162,7 @@ function ConstituentTable({ reading }: { reading: IndexSentimentReading }) {
             {rows.map((stock) => (
               <Fragment key={stock.symbol}>
                 <tr className={open === stock.symbol ? "open" : ""} onClick={() => setOpen(open === stock.symbol ? null : stock.symbol)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setOpen(open === stock.symbol ? null : stock.symbol); } }} aria-expanded={open === stock.symbol}>
-                  <td><b>{stock.symbol}</b><small>{stock.name} · {stock.sector}</small></td>
+                  <td><b>{stock.symbol}</b><EventChips stock={stock} /><small>{stock.name} · {stock.sector}</small></td>
                   <td>{stock.weight.toFixed(1)}%</td>
                   <td>{stock.price === null ? "--" : stock.price.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</td>
                   <td className={tone((stock.change_pct ?? 0) * 20)}>{signed(stock.change_pct, 2)}%</td>
@@ -243,6 +248,7 @@ function IndexDetail({ reading }: { reading: IndexSentimentReading }) {
           </div>
         </div>
       </section>
+      <IndexCorporatePanel reading={reading} />
       <ConstituentTable reading={reading} />
     </>
   );
