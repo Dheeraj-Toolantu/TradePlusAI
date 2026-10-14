@@ -5,6 +5,7 @@ import { EventChips, IndexCorporatePanel, StockEvents } from "../../components/c
 import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
 import { TelegramLiveFeed } from "../../components/telegram-live-feed";
 import { TelegramOptionsDesk } from "../../components/telegram-options";
+import { TelegramChannelAnalysis } from "../../components/telegram-channel-analysis";
 import { useLiveFeeds } from "../../components/use-live-feeds";
 import { mergeTelegram } from "../../lib/telegram-merge";
 import type { TelegramLive } from "../../lib/telegram-live";
@@ -331,6 +332,7 @@ export default function OperationsPage() {
           </section>
           {data.retail_desk ? <RetailCrowdDesk desk={data.retail_desk} /> : null}
           {data.telegram_options ? <TelegramOptionsDesk options={data.telegram_options} /> : null}
+          <TelegramChannelAnalysis />
           <TelegramLiveFeed live={telegram} connection={connection} error={telegramError} />
           {reading ? <IndexDetail reading={reading} /> : <p className="isa-muted">Select an index to see its constituents.</p>}
           <section className="isa-panel isa-sources">

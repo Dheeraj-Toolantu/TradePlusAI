@@ -99,8 +99,11 @@ def _median(values: list[float]) -> float | None:
     return values[middle] if len(values) % 2 else round((values[middle - 1] + values[middle]) / 2, 2)
 
 
-def consensus(items: list[dict], now: datetime, max_age_hours: float, spots: dict[str, float]) -> dict:
-    """Group option calls from Telegram items into ranked consensus calls."""
+def consensus(items: list[dict], now: datetime, max_age_hours: float, spots: dict[str, float], full: bool = False) -> dict:
+    """Group option calls from Telegram items into ranked consensus calls.
+
+    ``full`` adds ``all`` (every ranked call, with ``channel_mentions`` per channel) for the channel analysis.
+    """
     groups: dict[tuple, dict] = {}
     channels: dict[str, dict] = {}
     seen: set[tuple] = set()
@@ -126,10 +129,11 @@ def consensus(items: list[dict], now: datetime, max_age_hours: float, spots: dic
             seen.add((key, channel, item.get("link")))
             parsed += 1
             row["option_calls"] += 1
-            group = groups.setdefault(key, {"underlying": key[0], "strike": key[1], "type": key[2], "side": key[3], "mentions": 0, "channels": set(),
+            group = groups.setdefault(key, {"underlying": key[0], "strike": key[1], "type": key[2], "side": key[3], "mentions": 0, "channels": set(), "channel_mentions": {},
                                             "entries": [], "targets": [], "stops": [], "latest_age_hours": age, "posts": [], "views": 0})
             group["mentions"] += 1
             group["channels"].add(channel)
+            group["channel_mentions"][channel] = group["channel_mentions"].get(channel, 0) + 1
             group["views"] += (item.get("engagement") or 0) * 200
             group["latest_age_hours"] = min(group["latest_age_hours"], age)
             for field, value in (("entries", call["entry"]), ("targets", call["target"]), ("stops", call["stop"])):
@@ -151,6 +155,7 @@ def consensus(items: list[dict], now: datetime, max_age_hours: float, spots: dic
             "plan_odds": plan_odds(group["side"], entry, target, stop), "reward_risk": round((target - entry) / (entry - stop), 2) if entry and target and stop and entry > stop and target > entry else None,
             "spot": spot, "moneyness_pct": moneyness, "otm": otm, "far_otm": bool(otm and moneyness is not None and abs(moneyness) > 2.5),
             "latest_age_hours": round(group["latest_age_hours"], 1), "views": group["views"], "posts": sorted(group["posts"], key=lambda p: p["age_hours"])[:4],
+            **({"channel_mentions": group["channel_mentions"]} if full else {}),
         })
     ranked.sort(key=lambda row: (-row["channel_count"], -row["mentions"], row["latest_age_hours"]))
 
@@ -171,7 +176,9 @@ def consensus(items: list[dict], now: datetime, max_age_hours: float, spots: dic
             notes.append(f"Telegram crowd is {bucket['bullish_pct']:.0f}% bullish on {bucket['underlying']} options ({bucket['ce_buys']} CE / {bucket['pe_buys']} PE buy calls). "
                          f"When option buyers crowd one side, writers on the other side usually collect the premium; treat it as a contrarian tell.")
     top = next((row for row in ranked if row["channel_count"] >= 2), ranked[0] if ranked else None)
+    extra = {"all": ranked} if full else {}
     return {
+        **extra,
         "window_hours": max_age_hours, "posts_scanned": scanned, "calls_parsed": parsed, "consensus": ranked[:15], "top_pick": top,
         "by_underlying": sorted(by_underlying.values(), key=lambda b: b["underlying"]),
         "channels": sorted(channels.values(), key=lambda c: -c["option_calls"]), "notes": notes,

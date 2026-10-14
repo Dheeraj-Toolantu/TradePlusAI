@@ -45,16 +45,27 @@ DEFAULT_CHANNELS = [
 ]
 
 
+def normalize_channel(raw: str) -> str | None:
+    """"@name", "t.me/name", "https://t.me/s/name" -> "name"; None if it is not a channel username."""
+    name = str(raw or "").strip().removeprefix("https://").removeprefix("http://").removeprefix("www.").removeprefix("t.me/s/").removeprefix("t.me/").lstrip("@").strip("/")
+    return name if re.fullmatch(r"[A-Za-z0-9_]{4,64}", name) else None  # Telegram usernames are 5-32 chars; be lenient
+
+
+def normalize_channels(raw: list[str]) -> list[str]:
+    """Valid, de-duplicated (case-insensitively, first spelling kept) channel usernames."""
+    names: dict[str, str] = {}
+    for part in raw:
+        name = normalize_channel(part)
+        if name:
+            names.setdefault(name.lower(), name)
+    return list(names.values())
+
+
 def configured_channels() -> list[str]:
     raw = os.environ.get("TELEGRAM_CHANNELS")
     if raw is None or not raw.strip():
         return list(DEFAULT_CHANNELS)
-    names = []
-    for part in raw.split(","):
-        name = part.strip().removeprefix("https://").removeprefix("http://").removeprefix("t.me/s/").removeprefix("t.me/").lstrip("@").strip("/")
-        if re.fullmatch(r"[A-Za-z0-9_]{4,64}", name):  # Telegram usernames are 5-32 chars; be lenient
-            names.append(name)
-    return list(dict.fromkeys(names))
+    return normalize_channels(raw.split(","))
 
 
 def pages() -> int:
@@ -148,11 +159,12 @@ def telegram_stats(items: list[dict], patterns: list[re.Pattern]) -> dict:
 
 
 def fetch_channel(channel: str, now: datetime, *, cache_dir: str | None, max_age_hours: float, deadline: float | None = None,
-                  reuse_seconds: float = 0.0, raws: list[str] | str | None = None) -> tuple[list[dict], dict]:
+                  reuse_seconds: float = 0.0, raws: list[str] | str | None = None, max_pages: int | None = None) -> tuple[list[dict], dict]:
     """Items for one channel and its health row. ``raws`` (fixture pages) skips the network.
 
     ``reuse_seconds`` serves the channel's last scan when it is younger than that, so the full
     sentiment scan does not re-read channels the live Telegram poller fetched a minute ago.
+    ``max_pages`` overrides ``TELEGRAM_PAGES`` (a longer window needs more preview pages).
     """
     cache_id = f"telegram_{channel}"
     within = lambda post: post["published"] and (now - post["published"]).total_seconds() <= max_age_hours * 3600
@@ -165,7 +177,7 @@ def fetch_channel(channel: str, now: datetime, *, cache_dir: str | None, max_age
             items = cached[0]
             return items, {"name": f"@{channel}", "ok": True, "items": len(items), "fresh": sum(1 for item in items if within(item)), "error": None, "reused": True}
     posts, url, error = [], PREVIEW_URL.format(channel=channel), None
-    for _ in range(pages()):
+    for _ in range(max_pages or pages()):
         if deadline is not None and time.monotonic() > deadline:
             break
         try:
