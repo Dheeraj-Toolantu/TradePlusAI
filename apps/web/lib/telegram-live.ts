@@ -21,7 +21,7 @@ const store = globalThis as typeof globalThis & {
 };
 
 /** Last prices from the cached index scan, so option strikes get moneyness without another fetch. */
-function spots(): Record<string, number> {
+export function spots(): Record<string, number> {
   const scan = store.__tradepulseIndexSentiment?.value;
   const out: Record<string, number> = {};
   for (const index of scan?.indices ?? []) {
