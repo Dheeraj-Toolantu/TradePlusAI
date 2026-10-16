@@ -1148,3 +1148,31 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .tgl-posts p { margin: 5px 0 0; color: #d3e2e5; font-size: 12.5px; line-height: 1.45; white-space: pre-line; overflow-wrap: anywhere; }
 /* Long tables and lists render lazily off-screen. */
 .isa-panel:has(.isa-table-tools), .ce-panel, .rcd, .tgo { content-visibility: auto; contain-intrinsic-size: auto 900px; }
+/* Live alerts: toasts, alert log and settings on the sentiment page. */
+.sal-toasts { position: fixed; top: 16px; right: 16px; z-index: 50; display: flex; flex-direction: column; gap: 8px; width: min(360px, calc(100vw - 32px)); pointer-events: none; }
+.sal-toast { pointer-events: auto; padding: 10px 12px; border: 1px solid #173944; border-left: 4px solid #6a8790; border-radius: 8px; background: #0d2330; box-shadow: 0 8px 24px rgba(0, 0, 0, .45); animation: sal-in .25s ease-out; }
+.sal-toast.sal-up, .sal-log li.sal-up { border-left-color: #25d69c; }
+.sal-toast.sal-down, .sal-log li.sal-down { border-left-color: #fa6b78; }
+.sal-toast-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; color: #7f9ba3; font-size: 11px; }
+.sal-toast-head button { margin-left: auto; padding: 0 4px; border: 0; background: none; color: #a2bcc2; font-size: 16px; line-height: 1; cursor: pointer; }
+.sal-toast b, .sal-log b { display: block; color: #e6f1f3; font-size: 13px; overflow-wrap: anywhere; }
+.sal-toast a, .sal-log a { color: inherit; }
+.sal-toast p, .sal-log p { margin: 3px 0 0; color: #a2bcc2; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.sal-kind { padding: 1px 6px; border-radius: 3px; background: #173944; color: #7fe6c4; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+.sal-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.sal-actions button, .sal-clear { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid #1f4a57; border-radius: 6px; background: #0d2330; color: #cfe2e6; font: 600 12px "Manrope", sans-serif; cursor: pointer; }
+.sal-actions button:disabled { opacity: .7; cursor: default; }
+.sal-actions button i { width: 8px; height: 8px; border-radius: 50%; background: #6a8790; }
+.sal-actions button.sal-on { border-color: #1f5b4c; color: #7fe6c4; }
+.sal-actions button.sal-on i { background: #25d69c; box-shadow: 0 0 8px #25d69c; }
+.sal-help { margin: 6px 0 10px; font-size: 12px; }
+.sal-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 12px; padding: 10px; border: 1px solid #173944; border-radius: 8px; }
+.sal-settings small { display: block; margin: 4px 0; color: #7f9ba3; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.sal-check, .sal-num { display: flex; align-items: center; gap: 8px; margin: 4px 0; color: #cfe2e6; font-size: 12.5px; }
+.sal-num input { width: 64px; margin-left: auto; padding: 3px 6px; border: 1px solid #1f4a57; border-radius: 4px; background: #06141c; color: #e6f1f3; }
+.sal-log { max-height: 340px; margin: 0 0 8px; padding: 0; overflow-y: auto; list-style: none; }
+.sal-log li { display: grid; grid-template-columns: auto auto 1fr; align-items: start; gap: 8px; padding: 7px 8px; border-bottom: 1px solid #12303a; border-left: 3px solid #6a8790; }
+.sal-log li > small { color: #7f9ba3; font-size: 11px; font-variant-numeric: tabular-nums; }
+@media (max-width: 560px) { .sal-log li { grid-template-columns: auto 1fr; } .sal-log li > div { grid-column: 1 / -1; } }
+@keyframes sal-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .sal-toast { animation: none; } }

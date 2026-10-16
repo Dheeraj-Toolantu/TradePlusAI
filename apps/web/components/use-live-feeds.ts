@@ -11,14 +11,17 @@ const SENTIMENT_POLL_MS = 120_000;
 
 /**
  * Live sentiment feeds. Prefers the API WebSocket ("telegram" pushes, "index-sentiment" new-scan
- * notices); if it can't connect, polls the same endpoints over HTTP. Nothing is fetched while the
- * tab is hidden, and both catch up as soon as it is visible again.
+ * notices); if it can't connect, polls the same endpoints over HTTP. With `background` off nothing
+ * is fetched while the tab is hidden (both catch up once it is visible); with it on, the feeds keep
+ * running in a hidden tab so alerts can fire (browsers throttle background timers to ~1/minute).
  */
-export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void; onNewScan: (generatedAt: string) => void }): { connection: Connection; telegramError: string | null } {
+export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void; onNewScan: (generatedAt: string) => void; background?: boolean }): { connection: Connection; telegramError: string | null } {
   const [connection, setConnection] = useState<Connection>("connecting");
   const [telegramError, setTelegramError] = useState<string | null>(null);
   const handlers = useRef(options);
   handlers.current = options;
+  const background = useRef(Boolean(options.background));
+  background.current = Boolean(options.background);
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -29,9 +32,10 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
     let pollSentiment: ReturnType<typeof setInterval> | null = null;
     let lastSignature = "";
     let closed = false;
+    const paused = () => document.hidden && !background.current;
 
     const telegramOverHttp = async () => {
-      if (document.hidden) return;
+      if (paused()) return;
       try {
         const response = await fetch("/api/telegram-live", { cache: "no-cache" });
         const body = await response.json();
@@ -41,7 +45,7 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
       } catch (error) { setTelegramError(error instanceof Error ? error.message : "Telegram scan unavailable"); }
     };
     const sentimentOverHttp = async () => {
-      if (document.hidden) return;
+      if (paused()) return;
       try {
         const body = await (await fetch("/api/index-sentiment?meta=1", { cache: "no-store" })).json();
         if (typeof body.generated_at === "string") handlers.current.onNewScan(body.generated_at);
@@ -49,7 +53,7 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
     };
     const startPolling = () => {
       if (pollTelegram || closed) return;
-      setConnection(document.hidden ? "paused" : "polling");
+      setConnection(paused() ? "paused" : "polling");
       void telegramOverHttp();
       pollTelegram = setInterval(() => void telegramOverHttp(), TELEGRAM_POLL_MS);
       pollSentiment = setInterval(() => void sentimentOverHttp(), SENTIMENT_POLL_MS);
@@ -71,7 +75,7 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
         retry = 1_000;
         if (fallbackTimer) clearTimeout(fallbackTimer);
         stopPolling();
-        setConnection(document.hidden ? "paused" : "live");
+        setConnection(paused() ? "paused" : "live");
         socket?.send(JSON.stringify({ channels: ["telegram", "index-sentiment"] }));
       };
       socket.onmessage = (event) => {
@@ -97,7 +101,7 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
     };
 
     const onVisibility = () => {
-      if (document.hidden) { setConnection("paused"); return; }
+      if (paused()) { setConnection("paused"); return; }
       setConnection(socket?.readyState === WebSocket.OPEN ? "live" : pollTelegram ? "polling" : "connecting");
       if (pollTelegram) { void telegramOverHttp(); void sentimentOverHttp(); }
     };
