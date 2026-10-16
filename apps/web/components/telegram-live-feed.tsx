@@ -4,7 +4,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import type { TelegramLive } from "../lib/telegram-live";
 import type { Connection } from "./use-live-feeds";
 
-const LABEL: Record<Connection, string> = { live: "Live · WebSocket", polling: "Auto-refresh · HTTP", connecting: "Connecting…", paused: "Paused (tab hidden)" };
+const LABEL: Record<Connection, string> = { live: "Live · WebSocket", polling: "Auto-refresh · HTTP", connecting: "Connecting…", paused: "Paused (tab hidden, alerts off)" };
 const ago = (iso: string, now: number) => {
   const minutes = Math.max(0, Math.round((now - new Date(iso).getTime()) / 60_000));
   return minutes < 60 ? `${minutes}m ago` : `${(minutes / 60).toFixed(1)}h ago`;

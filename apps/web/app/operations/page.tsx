@@ -6,6 +6,7 @@ import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
 import { TelegramLiveFeed } from "../../components/telegram-live-feed";
 import { TelegramOptionsDesk } from "../../components/telegram-options";
 import { TelegramChannelAnalysis } from "../../components/telegram-channel-analysis";
+import { AlertCenter, AlertToasts, useSentimentAlerts } from "../../components/sentiment-alerts";
 import { useLiveFeeds } from "../../components/use-live-feeds";
 import { mergeTelegram } from "../../lib/telegram-merge";
 import type { TelegramLive } from "../../lib/telegram-live";
@@ -293,11 +294,14 @@ export default function OperationsPage() {
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+  const alerts = useSentimentAlerts(scan, telegram);
   // Pushes over WebSocket (or HTTP polling as a fallback): Telegram every ~minute, and a notice
-  // when a new full scan exists, which is then fetched once. Nothing runs while the tab is hidden.
+  // when a new full scan exists, which is then fetched once. With alert monitoring on, this keeps
+  // running in a background tab; with it off, nothing runs while the tab is hidden.
   const { connection, telegramError } = useLiveFeeds({
     onTelegram: setTelegram,
     onNewScan: (generatedAt) => { if (generatedAt !== scanTime.current) void load(); },
+    background: alerts.monitoring,
   });
   const refresh = useCallback(() => {
     void load(true);
@@ -321,6 +325,9 @@ export default function OperationsPage() {
           <a href="/">Back to dashboard</a>
         </div>
       </header>
+
+      <AlertToasts toasts={alerts.toasts} dismiss={alerts.dismiss} />
+      <AlertCenter alerts={alerts} />
 
       {error ? <p className="isa-alert">{error}{data ? " (showing the last good scan)" : ""}</p> : null}
       {!data && !error ? <p className="isa-panel isa-muted">Scanning 60+ stocks, per-company news and forums… the first scan can take up to a minute.</p> : null}
