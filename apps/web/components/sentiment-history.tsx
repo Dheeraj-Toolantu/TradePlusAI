@@ -2,11 +2,13 @@
 
 import { Fragment, memo, useCallback, useEffect, useMemo, useState } from "react";
 import type { HistoryReading, StoredReversal, StoredSnapshot } from "../lib/sentiment-history";
+import { SentimentChart, seriesColor } from "./sentiment-chart";
 
 type History = { snapshots: StoredSnapshot[]; reversals: StoredReversal[] };
 type Row = { snapshot: StoredSnapshot; reading: HistoryReading & Record<string, unknown>; kind: "INDEX" | "COMMODITY" };
 
 const LATEST = "";
+const DEFAULT_SHOWN = ["NIFTY", "BANKNIFTY", "SENSEX"];
 const ORDER = ["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"];
 const IST_OFFSET_MS = 330 * 60_000;
 const today = () => new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
@@ -80,6 +82,7 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
+  const [shown, setShown] = useState<string[]>(DEFAULT_SHOWN);
 
   const load = useCallback(async (day: string) => {
     setLoading(true);
@@ -129,6 +132,9 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
     }
   };
 
+  const chartSeries = useMemo(() => instrument === "ALL" ? instruments.filter((item) => shown.includes(item.id)) : instruments.filter((item) => item.id === instrument), [instrument, instruments, shown]);
+  const toggle = (id: string) => setShown((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+
   const latest = snapshots[0];
   return (
     <section className="isa-panel smh">
@@ -151,6 +157,24 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
       {error ? <p className="isa-alert">{error}</p> : null}
 
       {history && !snapshots.length ? <p className="isa-muted">No snapshots {date ? `on ${date}` : "yet"}.</p> : null}
+
+      {snapshots.length ? (
+        <div className="smc-block">
+          <div className="smc-head">
+            <h4 className="smh-sub">Sentiment score over time</h4>
+            {instrument === "ALL" ? (
+              <div className="smc-legend" role="group" aria-label="Lines shown">
+                {instruments.map((item) => (
+                  <button type="button" key={item.id} className={shown.includes(item.id) ? "on" : ""} aria-pressed={shown.includes(item.id)} onClick={() => toggle(item.id)}>
+                    <i style={{ background: seriesColor(item.id) }} />{item.name}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          {chartSeries.length ? <SentimentChart snapshots={snapshots} series={chartSeries} /> : <p className="isa-muted">Pick at least one line above.</p>}
+        </div>
+      ) : null}
 
       {instrument === "ALL" && snapshots.length ? (
         <div className="isa-table-wrap smh-wrap">

@@ -1206,3 +1206,33 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .smh-tag.smh-up { border-color: #1f6b52; color: #25d69c; }
 .smh-tag.smh-down { border-color: #7a2f36; color: #f07a84; }
 .smh-sub { margin: 4px 0 8px; font-size: 14px; }
+
+/* Sentiment score over time (history chart). */
+.smc-block { margin-bottom: 14px; }
+.smc-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 14px; margin-bottom: 6px; }
+.smc-head .smh-sub { margin: 0; }
+.smc-legend { display: flex; flex-wrap: wrap; gap: 6px; }
+.smc-legend button { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; color: #7f9ba3; border: 1px solid #1d3442; border-radius: 12px; background: transparent; font: 12px "Manrope", sans-serif; cursor: pointer; }
+.smc-legend button.on { color: #e6f1f3; border-color: #2a6170; background: #0e2330; }
+.smc-legend button i { width: 14px; height: 2px; border-radius: 1px; opacity: .35; }
+.smc-legend button.on i { opacity: 1; }
+.smc { position: relative; width: 100%; min-height: 40px; }
+.smc svg { display: block; outline: none; touch-action: pan-y; }
+.smc svg:focus-visible { box-shadow: 0 0 0 1px #30d4ca; border-radius: 6px; }
+.smc-grid { stroke: #132b37; stroke-width: 1; }
+.smc-zero { stroke: #2a4a57; stroke-width: 1; }
+.smc-band { fill: #ffffff; fill-opacity: .03; }
+.smc-axis { fill: #7f9ba3; font: 11px "Manrope", sans-serif; font-variant-numeric: tabular-nums; }
+.smc-note { display: block; margin-top: 4px; color: #7f9ba3; font-size: 11px; }
+.smc-label { fill: #a2bcc2; font: 11px "Manrope", sans-serif; }
+.smc-label-value { fill: #e6f1f3; font-weight: 700; }
+.smc-flip { fill: #0a1c27; stroke-width: 2; }
+.smc-cross { stroke: #5d7880; stroke-width: 1; }
+.smc-tip { position: absolute; z-index: 2; display: grid; gap: 3px; min-width: 170px; padding: 8px 10px; border: 1px solid #234654; border-radius: 8px; background: #08161f; box-shadow: 0 6px 18px rgba(0, 0, 0, .4); pointer-events: none; }
+.smc-tip small { color: #7f9ba3; font-size: 11px; }
+.smc-tip div { display: grid; grid-template-columns: 12px 34px 1fr auto; align-items: center; gap: 6px; font-size: 12px; }
+.smc-tip i { width: 12px; height: 2px; border-radius: 1px; }
+.smc-tip b { color: #e6f1f3; font-variant-numeric: tabular-nums; }
+.smc-tip span { color: #a2bcc2; }
+.smc-tip em { color: #7f9ba3; font-style: normal; font-variant-numeric: tabular-nums; }
+.smc-tip .smc-tip-flip { color: #f0bf66; }
