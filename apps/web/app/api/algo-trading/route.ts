@@ -8,6 +8,7 @@ import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/grow
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
 import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-intel";
 import { DAILY_RISK_RULES, evaluateDailyRisk } from "../../../lib/daily-risk";
+import { getIndexSentiment } from "../../../lib/index-sentiment";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -19,7 +20,13 @@ import {
 let paperOrders: Array<OrderRecord> = [];
 let firestoreHydrated = false;
 const supported = ["NIFTY", "BANKNIFTY", "SENSEX", "RELIANCE", "TCS", "INFY", "HDFCBANK"];
-const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL"]);
+const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "INTRINSIC_VALUE"]);
+const strategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK", "INTRINSIC_VALUE"]);
+const sentimentIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+// INTRINSIC_VALUE sentiment direction. CONTRARIAN (the default) buys a PE on very positive and a
+// CE on very negative index sentiment; FOLLOW trades with the sentiment.
+const sentimentMappings = new Set(["CONTRARIAN", "FOLLOW"]);
+const mappingOf = (value: unknown) => { const text = String(value ?? "").toUpperCase(); return sentimentMappings.has(text) ? text : "CONTRARIAN"; };
 
 type RecordValue = Record<string, unknown>;
 
@@ -77,6 +84,11 @@ async function markedPaperOrders() {
       const entry = Number(order.price); const quantity = Number(order.quantity);
       const direction = String(order.side).toUpperCase() === "SELL" ? -1 : 1;
       const pnl = (currentPrice - entry) * quantity * direction;
+      // Trailing paper stops follow the highest premium seen; keep it on the stored order.
+      if (order.trailingDistance && currentPrice > Number(order.highWaterMark ?? entry)) {
+        order.highWaterMark = currentPrice;
+        void updateOrderInFirestore(order.id, { highWaterMark: currentPrice });
+      }
       return { ...order, currentPrice, pnl, pnlPercent: entry ? (currentPrice - entry) / entry * 100 * direction : 0, quoteSource: "Groww real-time F&O quote" };
     } catch {
       return { ...order, currentPrice: order.price, pnl: 0, pnlPercent: 0, quoteSource: "Entry price (quote unavailable)" };
@@ -96,7 +108,34 @@ async function growwAccountSummary() {
   return { available, used, total: available === null ? null : available + (collateral ?? 0) + (used ?? 0), currency: "INR", source: "Groww margin detail", updatedAt: new Date().toISOString() };
 }
 
-async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}) {
+function runPythonEngine(payload: Record<string, unknown>) {
+  const root = existsSync(path.resolve(process.cwd(), "quant")) ? process.cwd() : path.resolve(process.cwd(), "../..");
+  const executable = process.env.PYTHON_EXECUTABLE ?? "python";
+  return new Promise<RecordValue>((resolve, reject) => {
+    const child = spawn(executable, ["-m", "tradepulse_quant.algo_engine.engine"], { cwd: root, env: { ...process.env, PYTHONPATH: path.join(root, "quant", "src") }, windowsHide: true });
+    let output = ""; let error = "";
+    child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { error += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => { if (code !== 0) reject(new Error(error || `Algo engine exited with ${code}`)); else { try { resolve(JSON.parse(output) as RecordValue); } catch { reject(new Error("Algo engine returned invalid JSON")); } } });
+    child.stdin.end(JSON.stringify(payload));
+  });
+}
+
+// Inputs only the intrinsic-value strategy reads: the index's sentiment reading (never waits on a
+// cold scan for long; missing sentiment makes the engine return NO_TRADE) and the strike ladder.
+async function intrinsicInputs(symbol: string, origin: string) {
+  const [sentiment, chain] = await Promise.all([
+    sentimentIndices.has(symbol) ? withTimeout(getIndexSentiment(), 10_000, "Index sentiment").then((value) => {
+      const reading = value.indices.find((item) => item.id === symbol);
+      return reading ? { score: reading.score, label: reading.label, zone: reading.zone, bias: reading.bias, generated_at: value.generated_at } : null;
+    }).catch(() => null) : Promise.resolve(null),
+    fetch(`${origin}/api/option-chain?symbol=${encodeURIComponent(symbol)}&full=1`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as Promise<{ spot?: number; expiry?: string; contracts?: unknown[] } | null>,
+  ]);
+  return { index_sentiment: sentiment, option_chain: chain && Array.isArray(chain.contracts) ? { spot: chain.spot ?? null, expiry: chain.expiry ?? null, contracts: chain.contracts } : null };
+}
+
+async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, sentimentMapping = "CONTRARIAN") {
   // 5m index candles carry near-month futures volume (index volume is always zero); daily
   // candles give the true ATR14 used by the gap-day rule.
   const [historyResponse, daily] = await Promise.all([
@@ -107,8 +146,6 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
   if (!historyResponse.ok) throw new Error(String(history.error ?? "Market history unavailable"));
   // A delayed (Yahoo fallback) chart is minutes behind the market: never let it confirm a setup.
   if (history.delayed) throw new Error("Live 5-minute candles are unavailable (only delayed data); the strategy engine will not evaluate on stale prices.");
-  const root = existsSync(path.resolve(process.cwd(), "quant")) ? process.cwd() : path.resolve(process.cwd(), "../..");
-  const executable = process.env.PYTHON_EXECUTABLE ?? "python";
   // Option evidence comes from the market-intel engine: signed OI-flow direction score from
   // 5-minute OI change, delta-normalised option relative strength, India VIX regime and
   // strike liquidity. The V5 engine decides whether it supports the setup's direction.
@@ -120,16 +157,17 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
       optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>;
     } catch { optionEvidence = {}; }
   }
-  const payload = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence };
-  return new Promise<RecordValue>((resolve, reject) => {
-    const child = spawn(executable, ["-m", "tradepulse_quant.algo_engine.engine"], { cwd: root, env: { ...process.env, PYTHONPATH: path.join(root, "quant", "src") }, windowsHide: true });
-    let output = ""; let error = "";
-    child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { error += chunk.toString(); });
-    child.on("error", reject);
-    child.on("close", (code) => { if (code !== 0) reject(new Error(error || `Algo engine exited with ${code}`)); else { try { resolve(JSON.parse(output) as RecordValue); } catch { reject(new Error("Algo engine returned invalid JSON")); } } });
-    child.stdin.end(JSON.stringify(payload));
-  });
+  const payload: RecordValue = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence };
+  if (strategy !== "INTRINSIC_VALUE") return runPythonEngine(payload);
+  // Pass 1 picks the key value and the OTM strike; pass 2 reads that premium's own 5m candles
+  // for the pullback-and-continuation entry.
+  Object.assign(payload, await intrinsicInputs(symbol, origin), { sentiment_mapping: sentimentMapping });
+  const first = await runPythonEngine(payload);
+  const contract = typeof first.needs_premium_candles === "string" ? first.needs_premium_candles : null;
+  if (!contract) return first;
+  const premium = await fetch(`${origin}/api/market-data/option-history?symbol=${encodeURIComponent(contract)}&timeframe=5m`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as { candles?: unknown[] } | null;
+  if (!premium || !Array.isArray(premium.candles) || !premium.candles.length) return first;
+  return runPythonEngine({ ...payload, premium_candles: { symbol: contract, candles: premium.candles } });
 }
 
 // Operational evidence for the V5 no-trade gate. Previously only broker health, SAFE_MODE and
@@ -181,6 +219,7 @@ export async function GET(request: Request) {
   const provider = url.searchParams.get("provider") ?? "groww";
   const strategy = url.searchParams.get("strategy") ?? "ORB_RETEST";
   const historyOnly = url.searchParams.get("history") === "true";
+  const sentimentMapping = mappingOf(url.searchParams.get("mapping"));
   const config = readGrowwConfig();
 
   if (historyOnly) {
@@ -189,7 +228,7 @@ export async function GET(request: Request) {
   }
 
   if (!supported.includes(symbol)) return NextResponse.json({ error: "Unsupported symbol" }, { status: 400 });
-  if (!new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK"]).has(strategy)) return NextResponse.json({ error: "Unsupported strategy" }, { status: 400 });
+  if (!strategies.has(strategy)) return NextResponse.json({ error: "Unsupported strategy" }, { status: 400 });
   if (provider !== "groww") return NextResponse.json({ error: "Groww is the only supported market-data and execution provider for the algo trading page." }, { status: 400 });
 
   const safeModeState = readSafeModeState();
@@ -200,7 +239,7 @@ export async function GET(request: Request) {
     const brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
     const evidence = await operationalEvidence(symbol, brokerHealthy, safeModeState);
     const [analysis, account, liveOrders, history] = await Promise.all([
-      runEngine(symbol, provider, url.origin, strategy, evidence),
+      runEngine(symbol, provider, url.origin, strategy, evidence, sentimentMapping),
       provider === "groww" ? growwAccountSummary().catch(() => null) : Promise.resolve(null),
       markedPaperOrders(),
       getAllOrdersFromFirestore(30),
@@ -315,7 +354,7 @@ export async function POST(request: Request) {
     // Manual paper entries are explicitly user-authorized and skip this gate only; the
     // kill-switch, SAFE_MODE, broker-health, contract-master, lot/freeze, and minimum-2R
     // checks still apply to every order.
-    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState));
+    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState), mappingOf(body.sentimentMapping));
     const pipeline = serverAnalysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
     if (pipeline?.decision !== "CONFIRMED") {
       return NextResponse.json({ error: "V5 no-trade gate rejected the paper entry.", reasons: pipeline?.reasons ?? ["SERVER_PIPELINE_UNAVAILABLE"] }, { status: 403 });
@@ -325,6 +364,11 @@ export async function POST(request: Request) {
     const optionType = String(body.optionType ?? "").toUpperCase();
     if ((setupSide === "BUY" && optionType !== "CE") || (setupSide === "SELL" && optionType !== "PE")) {
       return NextResponse.json({ error: `V5 setup is ${setupSide === "BUY" ? "bullish: buy a CE" : "bearish: buy a PE"}; ${optionType || "this contract"} does not match the signal direction.` }, { status: 409 });
+    }
+    // The intrinsic-value strategy selects the strike itself; only that contract may be bought.
+    const selected = (serverAnalysis.setup as { contract?: { symbol?: string } } | undefined)?.contract?.symbol;
+    if (strategy === "INTRINSIC_VALUE" && selected !== String(body.symbol ?? "")) {
+      return NextResponse.json({ error: `The intrinsic-value setup selected ${selected ?? "no contract"}; ${String(body.symbol ?? "this contract")} is not the confirmed strike.` }, { status: 409 });
     }
   }
 
@@ -341,6 +385,8 @@ export async function POST(request: Request) {
   }
 
   const symbol = String(body.symbol);
+  // Optional premium trail: the stop follows the highest premium at this distance (never lower).
+  const trailingDistance = Number(body.trailingDistance);
 
   const order: OrderRecord = {
     id: `paper-${Date.now()}`,
@@ -355,6 +401,7 @@ export async function POST(request: Request) {
     price: entryPrice,
     target,
     stopLoss,
+    ...(Number.isFinite(trailingDistance) && trailingDistance > 0 && trailingDistance < entryPrice ? { trailingDistance, initialStopLoss: stopLoss, highWaterMark: entryPrice } : {}),
     status: "OPEN",
     mode: "PAPER",
     source: liveEntryPrice ? "Paper broker · Groww F&O quote" : "Paper broker · submitted price",
