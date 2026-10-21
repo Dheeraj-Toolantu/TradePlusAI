@@ -1176,3 +1176,15 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 @media (max-width: 560px) { .sal-log li { grid-template-columns: auto 1fr; } .sal-log li > div { grid-column: 1 / -1; } }
 @keyframes sal-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .sal-toast { animation: none; } }
+
+/* Commodity sentiment and Firestore sentiment history. */
+.cms .isa-cards { margin-bottom: 10px; }
+.cms-card { cursor: default; }
+.cms-card:hover { transform: none; }
+.cms-card .isa-card-score small { display: block; margin-top: 2px; text-transform: none; }
+.cms-lenses { display: flex; flex-wrap: wrap; gap: 4px 10px; color: #7f9ba3; font-size: 11px; }
+.cms-headline { overflow: hidden; color: #8cc8ff; font-size: 12px; text-decoration: none; white-space: nowrap; text-overflow: ellipsis; }
+.smh-list { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 6px; }
+.smh-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 7px 10px; border: 1px solid #1d3442; border-radius: 7px; font-size: 13px; }
+.smh-list li small { color: #7f9ba3; font-size: 11px; }
+.smh-list i { font-style: normal; font-weight: 700; }

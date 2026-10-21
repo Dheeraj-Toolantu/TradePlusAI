@@ -210,3 +210,29 @@ const heartbeat = setInterval(() => {
   }
 }, 30_000);
 sockets.on("close", () => clearInterval(heartbeat));
+
+// ---- Sentiment history: index + commodity sentiment into Firestore ----
+// Every minute (whether or not a tab is open) ask the web app to record; it stores one snapshot
+// per 15-minute slot and another as soon as an index or commodity reverses. SENTIMENT_RECORDER=off
+// disables it (e.g. when an external scheduler calls POST /api/sentiment-history instead).
+const recorderMs = Math.max(30_000, Number(process.env.SENTIMENT_RECORD_MS) || 60_000);
+let recording = false;
+async function recordSentimentHistory() {
+  if (recording) return;
+  recording = true;
+  try {
+    const response = await fetch(`${webAppUrl}/api/sentiment-history`, { method: "POST", cache: "no-store", signal: AbortSignal.timeout(120_000) });
+    const body = await response.json() as { recorded?: boolean; snapshotId?: string; reasons?: string[]; reversals?: Array<{ name: string; type: string; from: string; to: string }>; error?: string };
+    if (!response.ok) console.warn(`Sentiment history: ${body.error ?? `HTTP ${response.status}`}`);
+    else if (body.recorded) console.log(`Sentiment history: saved ${body.snapshotId} (${body.reasons?.join(", ")})${body.reversals?.length ? ` · ${body.reversals.map((item) => `${item.name} ${item.type.toLowerCase()} ${item.from}→${item.to}`).join("; ")}` : ""}`);
+  } catch (error) {
+    console.warn(`Sentiment history: ${error instanceof Error ? error.message : "request failed"}`);
+  } finally {
+    recording = false;
+  }
+}
+if (process.env.SENTIMENT_RECORDER !== "off") {
+  const recorder = setInterval(() => { void recordSentimentHistory(); }, recorderMs);
+  setTimeout(() => { void recordSentimentHistory(); }, 15_000); // give the web app a moment to start
+  sockets.on("close", () => clearInterval(recorder));
+}
