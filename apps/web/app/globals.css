@@ -1132,6 +1132,7 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .tgl-live i { background: #25d69c; box-shadow: 0 0 8px #25d69c; animation: tgl-pulse 2s ease-in-out infinite; }
 .tgl-polling i { background: #f0bf66; }
 .tgl-paused i, .tgl-connecting i { background: #6a8790; }
+.tgl-synced i { background: #25d69c; }
 @keyframes tgl-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .tgl-live i { animation: none; } }
 .tgl-tools { display: flex; gap: 6px; margin-bottom: 10px; }
@@ -1236,3 +1237,4 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .smc-tip span { color: #a2bcc2; }
 .smc-tip em { color: #7f9ba3; font-style: normal; font-variant-numeric: tabular-nums; }
 .smc-tip .smc-tip-flip { color: #f0bf66; }
+.isa-auto { display: block; max-width: 300px; color: #7f9ba3; font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
