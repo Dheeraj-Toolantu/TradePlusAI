@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Literal
 
-from . import indicators
+from . import indicators, intrinsic_value
 from .configuration import StrategyConfiguration
 from .data_quality_gate import DataQualityGate
 from .gap_engine import evaluate_gap_day
@@ -342,6 +342,9 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "vix_regime": iv_regime,
         "option_quote_fresh": option_evidence.get("option_quote_fresh"),
         "liquidity_score": liquidity_score,
+        # Observed, so a caller can never switch these off; only the intrinsic-value strategy does.
+        "regime_gate": True,
+        "option_flow_gate": True,
     }
     return evidence, calculations, session_info
 
@@ -447,7 +450,7 @@ def completed_candles(candles: list[Candle], now: datetime, minutes: int = CANDL
 
 
 
-def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST", daily_candles: list[Candle] | None = None, expiry_day: bool = False) -> dict:
+def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST", daily_candles: list[Candle] | None = None, expiry_day: bool = False, context: dict | None = None, now: datetime | None = None) -> dict:
     if len(candles) < 21:
         return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "At least 21 candles are required", "confidence": 0, "setup": None}
     if strategy == "ORB_RETEST":
@@ -506,6 +509,10 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         }}
     if strategy == "VWAP_REVERSAL":
         return _vwap_reversal(symbol, candles, risk_per_trade)
+    if strategy == intrinsic_value.STRATEGY_ID:
+        now = now or datetime.now(MARKET_TIMEZONE)
+        daily_atr = _daily_atr(_daily_bars(candles, daily_candles, now.date()), StrategyConfiguration().atr_period)
+        return intrinsic_value.analyze_intrinsic(symbol, candles, context or {}, now, daily_atr)
     return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Range Defined Risk is analysis-only until the multi-leg builder is enabled", "confidence": 0, "setup": None}
 
 
@@ -575,6 +582,36 @@ def _candles_from(items: object) -> list[Candle]:
     return [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
 
 
+def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option_evidence: dict | None, expiry_day: bool) -> None:
+    """Swap the trend-following ORB evidence for the intrinsic-value strategy's own.
+
+    Every operational gate (data quality, session, VIX, gap, liquidity, 2R, broker, risk,
+    SAFE_MODE, kill switch) still applies. The breakout/retest gates become "key value and
+    strike selected" / "premium pullback and continuation confirmed", the score is the
+    strategy's own 10-point card, and option flow is scored rather than a hard gate. A
+    contrarian trade fades the prevailing trend by design, so the regime gate is applied
+    only when the mapping follows the sentiment.
+    """
+    config = intrinsic_value.IntrinsicConfig()
+    calc = result.get("intrinsic") or {}
+    card = intrinsic_value.score(result, option_evidence, config)
+    if expiry_day:
+        card["minimum"] = card["minimum"] + float(StrategyConfiguration().expiry_day_adjustments["minimum_score_increase"])
+    selected = calc.get("selected") or {}
+    evidence.update({
+        "setup_side": (result.get("setup") or {}).get("side") or result.get("side"),
+        "breakout_valid": bool(calc.get("key_value") and selected),
+        "retest_confirmed": (calc.get("premium") or {}).get("status") == "CONFIRMED",
+        "score": card["total"],
+        "minimum_score": card["minimum"],
+        "liquidity_score": selected.get("liquidity_score"),
+        "regime_gate": calc.get("mapping") == "FOLLOW",
+        "option_flow_gate": False,
+    })
+    calculations["score"] = {**calculations["score"], **card, "card": "INTRINSIC_VALUE"}
+    calculations["intrinsic"] = calc
+
+
 def analyze_payload(payload: dict) -> dict:
     candles = _candles_from(payload.get("candles", []))
     daily_candles = _candles_from(payload.get("daily_candles")) or None
@@ -583,13 +620,24 @@ def analyze_payload(payload: dict) -> dict:
     now = datetime.now(MARKET_TIMEZONE)
     candles = completed_candles(candles, now)
     option_evidence = payload.get("option_evidence")
-    result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy, daily_candles, _expiry_today(option_evidence, now))
+    context = None
+    if strategy == intrinsic_value.STRATEGY_ID:
+        premium = payload.get("premium_candles") if isinstance(payload.get("premium_candles"), dict) else {}
+        context = {
+            "index_sentiment": payload.get("index_sentiment"),
+            "option_chain": payload.get("option_chain"),
+            "sentiment_mapping": payload.get("sentiment_mapping"),
+            "premium_candles": {"symbol": premium.get("symbol"), "candles": completed_candles(_candles_from(premium.get("candles")), now)} if premium else None,
+        }
+    result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy, daily_candles, _expiry_today(option_evidence, now), context, now)
     # Evidence the engine can observe directly from candles and the IST clock is computed
     # first; the caller (Node API boundary) may only *add* independently-verified evidence
     # such as broker health, SAFE_MODE, and kill-switch state. A caller can never overwrite
     # observed data-quality, session, regime, gap, breakout, or retest evidence with this merge.
     volume_source = payload.get("volume_source") if isinstance(payload.get("volume_source"), str) else None
     evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, option_evidence, daily_candles, volume_source)
+    if strategy == intrinsic_value.STRATEGY_ID:
+        _intrinsic_evidence(result, evidence, calculations, option_evidence, bool(session_info.get("expiry_day")))
     result["calculations"] = calculations
     result["session"] = session_info
     caller_evidence = payload.get("pipeline") or {}

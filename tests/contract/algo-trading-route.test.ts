@@ -78,4 +78,14 @@ describe("algo trading execution boundary", () => {
     });
     expect(firestoreFake.documents("orders")).toEqual([expect.objectContaining({ symbol: "NIFTY2691523300PE", status: "OPEN" })]);
   });
+
+  it("stores the intrinsic-value premium trail on a manual paper order", async () => {
+    const response = await POST(requestFor({
+      mode: "PAPER", orderSource: "MANUAL", strategy: "INTRINSIC_VALUE", strategyName: "Intrinsic Value OTM", underlying: "NIFTY",
+      symbol: "NIFTY2691523300PE", growwSymbol: "NIFTY2691523300PE", side: "BUY", quantity: 65, price: 52.5, target: 76.25, stopLoss: 48, trailingDistance: 4.5,
+      lotSize: 65, expiry: "2026-09-15", optionType: "PE", strike: 23300, tickSize: 0.05, freezeQuantity: 1801, contractActive: true, sentimentMapping: "CONTRARIAN",
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ order: expect.objectContaining({ strategy: "INTRINSIC_VALUE", trailingDistance: 4.5, initialStopLoss: 48, highWaterMark: 52.5 }) });
+  });
 });

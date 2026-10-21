@@ -452,7 +452,7 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-message { margin: 0; padding: 8px 12px; border: 1px solid #1f4a58; border-radius: 6px; color: #b5cdd2; background: #0a1f29; }
 .exec-content > .mi-desk { margin: 0; }
 .exec-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 12px; }
-.exec-strategy-controls { display: flex; gap: 6px; }
+.exec-strategy-controls { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .exec-strategy-controls select, .exec-search input, .exec-fields input, .exec-fields select, .exec-pin input { padding: 7px 9px; color: var(--text); border: 1px solid #25505f; border-radius: 5px; background: #0d2a37; font: 12px "Manrope", sans-serif; }
 .exec-strategy-controls button, .exec-search button { padding: 7px 12px; color: white; border: 0; border-radius: 5px; background: #1560c4; font: 600 12px "Manrope", sans-serif; cursor: pointer; }
 .exec-setup { display: grid; gap: 2px; margin: 8px 0; padding: 8px; border-radius: 6px; background: #0b2330; }
@@ -473,7 +473,7 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-results { display: grid; gap: 4px; margin: 6px 0; }
 .exec-results button { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; color: var(--text); border: 1px solid #1f4a58; border-radius: 5px; background: #0b2330; text-align: left; font: 12px "Manrope", sans-serif; cursor: pointer; }
 .exec-results small { color: var(--muted); }
-.exec-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 8px 0; }
+.exec-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 8px 0; }
 .exec-fields label, .exec-pin { display: grid; gap: 3px; color: var(--muted); font-size: 10px; }
 .exec-fields input, .exec-fields select { width: 100%; box-sizing: border-box; }
 .exec-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }

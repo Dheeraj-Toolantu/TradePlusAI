@@ -54,6 +54,10 @@ class PipelineEvidence:
     kill_switch: bool = False
     execution_ready: bool | None = None
     broker_forced_exit: bool = False
+    # Only an explicit False switches these off (missing evidence keeps them on). The engine sets
+    # them from the strategy, never from caller-supplied evidence.
+    regime_gate: bool | None = True
+    option_flow_gate: bool | None = True
 
 
 class NoTradeEngine:
@@ -89,8 +93,9 @@ class NoTradeEngine:
 
         require("BREAKOUT_INVALID", evidence.breakout_valid, "a valid completed-candle breakout is required")
         require("RETEST_NOT_CONFIRMED", evidence.retest_confirmed, "a confirmed retest is required")
-        require("ORS_NOT_CONFIRMED", evidence.ors_confirmed, "option relative strength must confirm direction")
-        require("OI_PCR_NOT_SUPPORTIVE", evidence.oi_pcr_supportive, "OI/PCR evidence must support direction")
+        if evidence.option_flow_gate is not False:
+            require("ORS_NOT_CONFIRMED", evidence.ors_confirmed, "option relative strength must confirm direction")
+            require("OI_PCR_NOT_SUPPORTIVE", evidence.oi_pcr_supportive, "OI/PCR evidence must support direction")
 
         valid_vix = evidence.vix_regime in {"LOW", "NORMAL", "HIGH"}
         gates.append(GateEvidence("VIX_BLOCKED", valid_vix, "extreme or missing VIX regime blocks entry"))
@@ -99,18 +104,19 @@ class NoTradeEngine:
         elif not valid_vix:
             reasons.append("VIX_BLOCKED")
 
-        valid_regime = evidence.regime in {"TRENDING_BULL", "TRENDING_BEAR"}
-        # A BUY setup in a bearish trend (or SELL in a bullish one) is a conflicting regime.
-        if valid_regime and evidence.setup_side in {"BUY", "SELL"}:
-            conflict = (evidence.setup_side == "BUY" and evidence.regime == "TRENDING_BEAR") or (evidence.setup_side == "SELL" and evidence.regime == "TRENDING_BULL")
-            if conflict:
-                gates.append(GateEvidence("REGIME_CONFLICT", False, f"{evidence.setup_side} setup against a {evidence.regime} regime"))
-                reasons.append("REGIME_CONFLICT")
-        gates.append(GateEvidence("REGIME_BLOCKED", valid_regime, "CHOP, RANGE, UNKNOWN, and conflicting regimes cannot enter"))
-        if evidence.regime is None:
-            reasons.append("MISSING_REGIME")
-        elif not valid_regime:
-            reasons.append("REGIME_BLOCKED")
+        if evidence.regime_gate is not False:
+            valid_regime = evidence.regime in {"TRENDING_BULL", "TRENDING_BEAR"}
+            # A BUY setup in a bearish trend (or SELL in a bullish one) is a conflicting regime.
+            if valid_regime and evidence.setup_side in {"BUY", "SELL"}:
+                conflict = (evidence.setup_side == "BUY" and evidence.regime == "TRENDING_BEAR") or (evidence.setup_side == "SELL" and evidence.regime == "TRENDING_BULL")
+                if conflict:
+                    gates.append(GateEvidence("REGIME_CONFLICT", False, f"{evidence.setup_side} setup against a {evidence.regime} regime"))
+                    reasons.append("REGIME_CONFLICT")
+            gates.append(GateEvidence("REGIME_BLOCKED", valid_regime, "CHOP, RANGE, UNKNOWN, and conflicting regimes cannot enter"))
+            if evidence.regime is None:
+                reasons.append("MISSING_REGIME")
+            elif not valid_regime:
+                reasons.append("REGIME_BLOCKED")
 
         valid_gap = evidence.gap_state in {"NORMAL_DAY", "GAP_HOLD_CONFIRMED", "GAP_FILL_CONFIRMED"}
         gates.append(GateEvidence("GAP_UNRESOLVED", valid_gap, "gap state must be normal or confirmed hold/fill"))

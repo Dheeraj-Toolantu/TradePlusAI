@@ -17,10 +17,23 @@ const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-d
 const ScalperDesk = dynamic(() => import("../../components/scalper/scalper-desk").then((module) => module.ScalperDesk), { ssr: false, loading: () => <div className="algo-empty">Loading scalper…</div> });
 
 type PipelineGate = { code: string; passed: boolean; detail: string };
+type IntrinsicContract = { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string; lot_size?: number | null; tick_size?: number | null; freeze_quantity?: number | null };
+type IntrinsicCandidate = { symbol: string; strike: number; premium: number; delta?: number; market_odds: number; itm_chance: number; intrinsic_at_key: number; premium_at_key: number; value_gain: number; liquidity_score: number; eligible: boolean };
+type IntrinsicCalc = {
+  mapping: "CONTRARIAN" | "FOLLOW"; spot?: number | null; reach?: number | null;
+  sentiment: { score: number | null; label?: string | null; zone?: string | null; option_type: "CE" | "PE" | null; ok: boolean; reason: string; age_minutes?: number | null; threshold: number };
+  key_value: { price: number; distance: number; sources: string[]; strength: number } | null;
+  levels: Array<{ name: string; price: number; distance: number }>;
+  candidates: IntrinsicCandidate[];
+  selected: IntrinsicCandidate | null;
+  premium: { status: string; reason: string; impulse_low?: number; impulse_high?: number; pullback_low?: number; retrace?: number } | null;
+  plan: { entry: number; stop_loss: number; target: number; risk_reward: number; trailing_distance: number; breakeven_at: number; trailing_rule: string } | null;
+};
+type StrategySetup = { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: IntrinsicContract; trailing_distance?: number; breakeven_at?: number; key_value?: number };
 type Analysis = {
   decision: string; reason?: string;
-  setup?: { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean };
-  calculations?: { underlying?: Record<string, number | string | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string };
+  setup?: StrategySetup;
+  calculations?: { underlying?: Record<string, number | string | null>; orb?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string; intrinsic?: IntrinsicCalc };
   session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean };
   pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
   strategy_decision?: string;
@@ -29,7 +42,7 @@ type Analysis = {
 };
 type Order = {
   id: string; symbol: string; strategy?: string; strategyName?: string; side: string; quantity: number; lotSize?: number; price: number; status: string; mode?: string;
-  target?: number; stopLoss?: number; trailingStop?: number; trailingActivatedAt?: string; currentPrice?: number; pnl?: number; pnlPercent?: number; quoteSource?: string;
+  target?: number; stopLoss?: number; trailingStop?: number; trailingDistance?: number; highWaterMark?: number; trailingActivatedAt?: string; currentPrice?: number; pnl?: number; pnlPercent?: number; quoteSource?: string;
   createdAt: string; exitPrice?: number; exitReason?: string; realizedPnl?: number; realizedPnlPercent?: number; exitError?: string; reconcileWarning?: string;
 };
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
@@ -37,7 +50,8 @@ type QuoteUpdate = { symbol: string; price: number | null; timestamp: string; so
 type OptionCandidate = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; score: number; riskReward: number; lotSize?: number; tickSize?: number; freezeQuantity?: number };
 type Contract = { symbol: string; growwSymbol: string; type: "CE" | "PE"; expiry?: string; strike?: number; lotSize: number; tickSize?: number; freezeQuantity?: number; active?: boolean };
 type SearchResult = Contract & { exchange?: string };
-type StrategyId = "ORB_RETEST" | "VWAP_REVERSAL" | "RANGE_DEFINED_RISK";
+type StrategyId = "ORB_RETEST" | "VWAP_REVERSAL" | "RANGE_DEFINED_RISK" | "INTRINSIC_VALUE";
+type SentimentMapping = "CONTRARIAN" | "FOLLOW";
 type LiveStatus = { enabled: boolean; disabledReasons: string[]; limits?: { maxDailyLoss: number; maxTradesPerDay: number; maxLotsPerOrder: number; maxOrderValue: number; maxOpenPositions: number; minRewardRisk: number }; today?: { tradesToday: number; realizedPnl: number; openRisk: number; lossBudgetLeft: number }; positions: Order[]; monitor?: { running: boolean; lastTickAt: string | null; lastError: string | null } };
 type Tab = "LIVE" | "PAPER" | "HISTORY" | "LOGS";
 type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
@@ -49,6 +63,11 @@ const STRATEGIES: Array<{ id: StrategyId; name: string; description: string }> =
   { id: "ORB_RETEST", name: "ORB + Retest", description: "15-minute opening range breakout; retest within 3 candles or a later orderly pullback to the level, failed breaks re-armed, structural stop, 2R target." },
   { id: "VWAP_REVERSAL", name: "VWAP Reversal", description: "Rejection at support/resistance with a higher low / lower high, then a confirmed VWAP reclaim." },
   { id: "RANGE_DEFINED_RISK", name: "Range (analysis only)", description: "Defined-risk range regime detection. Multi-leg execution is not enabled; no naked selling." },
+  { id: "INTRINSIC_VALUE", name: "Intrinsic Value OTM", description: "Extreme index sentiment sets the side; the nearest key value sets where price is heading; the OTM strike with the best chance of turning ITM is bought after its premium pulls back and resumes. Stop under the premium pullback, target = premium at the key value, stop trails by the initial risk." },
+];
+const MAPPINGS: Array<{ id: SentimentMapping; name: string; note: string }> = [
+  { id: "CONTRARIAN", name: "Contrarian: +ve → PE, −ve → CE", note: "Fades the crowd at sentiment extremes, so it trades against the prevailing trend; the regime gate is not applied." },
+  { id: "FOLLOW", name: "Follow: +ve → CE, −ve → PE", note: "Trades with the sentiment; the regime gate still applies." },
 ];
 const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
 const calc = (value: unknown, percent = false) => formatMarketCalculationValue(value as number | string | null | undefined, { percent });
@@ -59,6 +78,7 @@ const nowLabel = () => new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/
 export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");
   const [strategyId, setStrategyId] = useState<StrategyId>("ORB_RETEST");
+  const [sentimentMapping, setSentimentMapping] = useState<SentimentMapping>("CONTRARIAN");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [paperOrders, setPaperOrders] = useState<Order[]>([]);
   const [history, setHistory] = useState<Order[]>([]);
@@ -80,6 +100,7 @@ export default function ExecutionPage() {
   const [lots, setLots] = useState(1);
   const [stopLoss, setStopLoss] = useState("");
   const [target, setTarget] = useState("");
+  const [trailing, setTrailing] = useState("");
   const [ticketSource, setTicketSource] = useState("MANUAL");
   // ALGO_ORB orders are re-validated by the server's V5 pipeline; MANUAL orders are user-authorised.
   const [ticketOrigin, setTicketOrigin] = useState<"MANUAL" | "ALGO">("MANUAL");
@@ -108,7 +129,7 @@ export default function ExecutionPage() {
     if (!quiet) setBusy(true);
     const version = mutationVersion.current;
     try {
-      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategyId}`, { cache: "no-store" }).then((response) => response.json());
+      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategyId}${strategyId === "INTRINSIC_VALUE" ? `&mapping=${sentimentMapping}` : ""}`, { cache: "no-store" }).then((response) => response.json());
       setAnalysis(data.analysis ?? null);
       setAccount(data.account ?? null);
       setSafety({ safeMode: Boolean(data.safeMode), killSwitch: Boolean(data.killSwitch), reason: data.killSwitchReason ?? data.safeModeReason ?? "" });
@@ -120,7 +141,7 @@ export default function ExecutionPage() {
       if (data.error) setMessage(data.error);
     } catch { setMessage("Strategy engine unavailable; retrying on the next refresh."); }
     finally { if (!quiet) setBusy(false); }
-  }, [strategyId, symbol]);
+  }, [sentimentMapping, strategyId, symbol]);
 
   const refreshLive = useCallback(async () => {
     try { setLive(await fetch("/api/live-orders", { cache: "no-store" }).then((response) => response.json())); } catch { /* status is advisory */ }
@@ -293,7 +314,8 @@ export default function ExecutionPage() {
               const price = prices.get(norm(order.symbol));
               if (!price || price === order.currentPrice) return order;
               const pnl = (price - order.price) * order.quantity;
-              return { ...order, currentPrice: price, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
+              const highWaterMark = order.trailingDistance ? Math.max(order.highWaterMark ?? order.price, price) : order.highWaterMark;
+              return { ...order, currentPrice: price, highWaterMark, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
             }));
           }
         }
@@ -369,7 +391,7 @@ export default function ExecutionPage() {
       const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
         mode: "PAPER", orderSource: ticketOrigin, strategy: strategyId, strategyName: `${strategy.name}${ticketSource !== "MANUAL" ? ` · ${ticketSource}` : ""}`, underlying: symbol,
         symbol: enriched.symbol, growwSymbol: enriched.growwSymbol, side: "BUY", quantity: lots * enriched.lotSize, lotSize: enriched.lotSize, price: premium,
-        target: Number(target), stopLoss: Number(stopLoss), expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
+        target: Number(target), stopLoss: Number(stopLoss), ...(Number(trailing) > 0 ? { trailingDistance: Number(trailing) } : {}), sentimentMapping, expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
         tickSize: enriched.tickSize, freezeQuantity: enriched.freezeQuantity, contractActive: enriched.active, analysisDecision: analysis?.decision,
       }) });
       const data = await response.json().catch(() => ({}));
@@ -422,6 +444,7 @@ export default function ExecutionPage() {
     setLots(Math.max(1, plan.lots ?? 1));
     setStopLoss(String(plan.premium.stop));
     setTarget(String(plan.premium.target1));
+    setTrailing("");
     setTicketSource(`Desk ${plan.status}`);
     setTicketOrigin("MANUAL");
     setMessage(`Plan loaded: BUY ${plan.contract.trading_symbol} · SL ₹${plan.premium.stop} · T1 ₹${plan.premium.target1}. Status ${plan.status}${plan.status === "READY" ? "" : " (practise in paper mode)"}.`);
@@ -445,6 +468,7 @@ export default function ExecutionPage() {
     setLots(1);
     setStopLoss(String(advice.premium.stop));
     setTarget(String(advice.premium.target1));
+    setTrailing("");
     setTicketSource(`AI ${advice.source === "AI" ? "advisor" : "rule-based"}`);
     setTicketOrigin("MANUAL");
     setMessage(`AI suggestion loaded: BUY ${advice.contract.trading_symbol} · SL ₹${advice.premium.stop} · T1 ₹${advice.premium.target1}. Review before placing.`);
@@ -461,6 +485,21 @@ export default function ExecutionPage() {
   const loadStrategySetup = useCallback(() => {
     const setup = analysis?.setup;
     if (!setup || analysis?.pipeline?.decision !== "CONFIRMED") return;
+    if (setup.instrument === "OPTION_PREMIUM" && setup.contract) {
+      // Intrinsic value: the engine already chose the strike and the premium levels.
+      const picked = setup.contract;
+      const row = chainRef.current.find((item) => norm(item.symbol) === norm(picked.symbol));
+      setContract({ symbol: picked.symbol, growwSymbol: picked.symbol, type: picked.type, expiry: picked.expiry ?? row?.expiry, strike: picked.strike, lotSize: Number(picked.lot_size) > 0 ? Number(picked.lot_size) : row?.lotSize || FALLBACK_LOT[symbol] || 1, tickSize: picked.tick_size ?? row?.tickSize, freezeQuantity: picked.freeze_quantity ?? row?.freezeQuantity });
+      setLots(1);
+      setStopLoss(String(setup.stop_loss));
+      setTarget(String(setup.target));
+      setTrailing(String(setup.trailing_distance ?? ""));
+      setTicketSource(`${strategy.name} V5`);
+      setTicketOrigin("ALGO");
+      setMessage(`${strategy.name} setup loaded: BUY ${picked.symbol} near ₹${setup.entry} · SL ₹${setup.stop_loss} · trail ₹${setup.trailing_distance} (breakeven at ₹${setup.breakeven_at}) · target ₹${setup.target} at key value ${money(setup.key_value)}. The server re-checks every V5 gate when you place it.`);
+      document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
     const wanted = setup.side === "SELL" ? "PUT" : "CALL";
     const pick = chainRef.current
       .filter((item) => item.contract === wanted && item.premium > 0)
@@ -474,6 +513,7 @@ export default function ExecutionPage() {
     setLots(1);
     setStopLoss(String(round(premiumStop)));
     setTarget(String(round(premiumTarget)));
+    setTrailing("");
     setTicketSource(`${strategy.name} V5`);
     setTicketOrigin("ALGO");
     setMessage(`${strategy.name} setup loaded: BUY ${pick.symbol} (delta ${delta.toFixed(2)}) · SL ₹${round(premiumStop)} · target ₹${round(premiumTarget)}${setup.gap_day ? " · gap day: half size, keep 1 lot" : ""}. The server re-checks every V5 gate when you place it.`);
@@ -494,6 +534,11 @@ export default function ExecutionPage() {
   const underlying = analysis?.calculations?.underlying ?? {};
   const regime = analysis?.calculations?.regime;
   const { vwap, ema20, ema50 } = underlying;
+  const intrinsic = strategyId === "INTRINSIC_VALUE" ? analysis?.calculations?.intrinsic : undefined;
+  const mappingInfo = MAPPINGS.find((item) => item.id === sentimentMapping) ?? MAPPINGS[0];
+  const scoreTiles: Array<[string, unknown, number]> = score.card === "INTRINSIC_VALUE"
+    ? [["Sentiment extreme", score.sentiment_extreme, 3], ["Key value", score.key_value, 2], ["ITM chance", score.itm_chance, 2], ["Premium structure", score.premium_structure, 2], ["Option flow", score.option_flow, 1]]
+    : [["Trend cluster", score.trend_cluster, 3], ["Structure", score.structure_cluster, 3], ["Volume", score.volume_evidence, 2], ["Option strength", score.option_relative_strength, 1], ["OI writers", score.oi_direction, 1]];
   const strategyTrend = useMemo(() => ({ regime: regime ?? null, vwap: Number(vwap) || null, ema20: Number(ema20) || null, ema50: Number(ema50) || null }), [regime, vwap, ema20, ema50]);
   const ticketPremium = premiumFor(contract);
   const ticketRisk = ticketPremium && Number(stopLoss) > 0 ? (ticketPremium - Number(stopLoss)) * lots * lotSize : null;
@@ -529,11 +574,14 @@ export default function ExecutionPage() {
               <div><span className="algo-kicker">V5 RULE ENGINE · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
               <div className="exec-strategy-controls">
                 <select aria-label="Strategy" value={strategyId} onChange={(event) => setStrategyId(event.target.value as StrategyId)}>{STRATEGIES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+                {strategyId === "INTRINSIC_VALUE" && <select aria-label="Sentiment mapping" value={sentimentMapping} onChange={(event) => setSentimentMapping(event.target.value as SentimentMapping)} title={mappingInfo.note}>{MAPPINGS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>}
                 <button type="button" onClick={() => void refresh()} disabled={busy}>{busy ? "…" : "Refresh"}</button>
               </div>
             </div>
-            <p className="mi-note">{strategy.description}</p>
-            {analysis?.setup ? (
+            <p className="mi-note">{strategy.description}{strategyId === "INTRINSIC_VALUE" ? ` ${mappingInfo.note}` : ""}</p>
+            {analysis?.setup?.instrument === "OPTION_PREMIUM" && analysis.setup.contract ? (
+              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · trail ₹{money(analysis.setup.trailing_distance)} (breakeven at ₹{money(analysis.setup.breakeven_at)}) · target ₹{money(analysis.setup.target)} · {analysis.setup.risk_reward}R</span></div>
+            ) : analysis?.setup ? (
               <div className="exec-setup"><b className={analysis.setup.side === "SELL" ? "loss" : "gain"}>{analysis.setup.side === "SELL" ? "BEARISH → buy PE" : "BULLISH → buy CE"}</b><span>Spot entry {money(analysis.setup.entry)} · SL {money(analysis.setup.stop_loss)} · target {money(analysis.setup.target)} · {analysis.setup.risk_reward ?? 2}R</span></div>
             ) : null}
             {analysis?.setup && analysis.pipeline?.decision === "CONFIRMED" && <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load {strategy.name} setup into the order ticket</button>}
@@ -546,9 +594,20 @@ export default function ExecutionPage() {
                 <small>{String(analysis?.strategy_reason ?? orb.reason ?? "")}</small>
               </div>
             )}
+            {intrinsic && (
+              <div className="exec-orb" aria-label="Intrinsic value plan">
+                <span>Sentiment <b className={(intrinsic.sentiment.score ?? 0) >= 0 ? "gain" : "loss"}>{intrinsic.sentiment.score === null ? "--" : `${intrinsic.sentiment.score > 0 ? "+" : ""}${calc(intrinsic.sentiment.score)}`}</b>{intrinsic.sentiment.label ? ` ${String(intrinsic.sentiment.label).replaceAll("_", " ").toLowerCase()}` : ""} → <b>{intrinsic.sentiment.option_type ? `buy ${intrinsic.sentiment.option_type}` : "no side"}</b></span>
+                <span>Key value <b>{intrinsic.key_value ? money(intrinsic.key_value.price) : "--"}</b>{intrinsic.key_value ? ` (${intrinsic.key_value.sources.join(" + ")}, ${money(intrinsic.key_value.distance)} pts)` : ""}</span>
+                <span>Strike <b>{intrinsic.selected ? `${money(intrinsic.selected.strike)} ${intrinsic.sentiment.option_type}` : "--"}</b>{intrinsic.selected ? ` · ITM chance ${Math.round(intrinsic.selected.itm_chance * 100)}% (market ${Math.round(intrinsic.selected.market_odds * 100)}%) · ₹${money(intrinsic.selected.premium)} → ₹${money(intrinsic.selected.premium_at_key)} at key` : ""}</span>
+                <span>Premium <b className={intrinsic.premium?.status === "CONFIRMED" ? "gain" : "warning"}>{intrinsic.premium ? intrinsic.premium.status.replaceAll("_", " ") : "--"}</b>{intrinsic.premium?.retrace !== undefined ? ` · pullback ${Math.round(intrinsic.premium.retrace * 100)}% to ₹${money(intrinsic.premium.pullback_low)}` : ""}</span>
+                {intrinsic.plan && <span>Trailing <b>{intrinsic.plan.trailing_rule}</b></span>}
+                <small>{String(analysis?.strategy_reason ?? intrinsic.sentiment.reason ?? "")}</small>
+                {intrinsic.candidates.length > 1 && <small>Other OTM strikes: {intrinsic.candidates.filter((item) => item.symbol !== intrinsic.selected?.symbol).slice(0, 3).map((item) => `${money(item.strike)} (${Math.round(item.itm_chance * 100)}%, ₹${money(item.premium)}${item.eligible ? "" : ", too little intrinsic gain"})`).join(" · ")}</small>}
+              </div>
+            )}
             {!analysis?.setup && <p className="mi-note">{analysis?.pipeline ? `${analysis.pipeline.gates.filter((gate) => gate.passed).length}/${analysis.pipeline.gates.length} gates passing. No setup until every gate is green.` : analysis?.reason ?? "Waiting for the engine…"}</p>}
             <div className="exec-score">
-              {[["Trend cluster", score.trend_cluster, 3], ["Structure", score.structure_cluster, 3], ["Volume", score.volume_evidence, 2], ["Option strength", score.option_relative_strength, 1], ["OI writers", score.oi_direction, 1]].map(([name, value, max]) => (
+              {scoreTiles.map(([name, value, max]) => (
                 <span key={String(name)}><small>{name}</small><b>{calc(value)} / {String(max)}</b></span>
               ))}
               <span className="exec-score-total"><small>Total</small><b className={Number(score.total) >= Number(score.minimum ?? 8) ? "gain" : "warning"}>{calc(score.total)} / 10</b><em>min {calc(score.minimum ?? 8)}</em></span>
@@ -577,6 +636,7 @@ export default function ExecutionPage() {
               <label>Lots<input type="number" min={1} step={1} value={lots} onChange={(event) => setLots(Math.max(1, Math.floor(Number(event.target.value) || 1)))} /><small>{lots * lotSize} qty</small></label>
               <label>Stop-loss (premium ₹)<input type="number" min={0} step={0.05} value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} /></label>
               <label>Target (premium ₹)<input type="number" min={0} step={0.05} value={target} onChange={(event) => setTarget(event.target.value)} /></label>
+              <label>Trailing SL (₹ below high)<input type="number" min={0} step={0.05} value={trailing} onChange={(event) => setTrailing(event.target.value)} placeholder="off" /><small>{Number(trailing) > 0 ? "paper stop follows the highest premium" : "optional"}</small></label>
             </div>
             <div className="mi-risk-row"><span>Risk <b className="loss">{ticketRisk !== null ? `₹${money(ticketRisk)}` : "--"}</b></span><span>Reward <b className="gain">{ticketReward !== null ? `₹${money(ticketReward)}` : "--"}</b></span><span>R:R <b>{ticketRisk && ticketReward ? (ticketReward / ticketRisk).toFixed(2) : "--"}</b></span></div>
             <div className="exec-actions">
@@ -620,7 +680,7 @@ export default function ExecutionPage() {
             <table className="exec-table"><thead><tr><th>Contract</th><th>Strategy</th><th>Qty</th><th>Entry</th><th>LTP</th><th>SL / Target</th><th>P&amp;L</th><th /></tr></thead><tbody>
               {openPaper.map((order) => <tr key={order.id}>
                 <td><b>{order.symbol}</b></td><td><small>{order.strategyName ?? order.strategy}</small></td><td>{order.quantity}</td><td>₹{money(order.price)}</td><td>₹{money(order.currentPrice ?? order.price)}</td>
-                <td>₹{money(order.stopLoss)} / ₹{money(order.target)}{order.trailingActivatedAt ? <small> trail ₹{money(order.trailingStop)}</small> : null}</td>
+                <td>₹{money(order.stopLoss)} / ₹{money(order.target)}{order.trailingActivatedAt ? <small> trail ₹{money(order.trailingStop)}</small> : order.trailingDistance && (order.highWaterMark ?? order.price) > order.price ? <small> trail ₹{money(getOrderExitState(order, order.currentPrice).effectiveStop)}</small> : null}</td>
                 <td className={(order.pnl ?? 0) >= 0 ? "gain" : "loss"}>{order.pnl !== undefined ? `₹${money(order.pnl)}` : "awaiting quote"}</td>
                 <td><button type="button" className="algo-exit" onClick={() => void exitPaper(order)} disabled={busy}>Exit</button></td>
               </tr>)}
