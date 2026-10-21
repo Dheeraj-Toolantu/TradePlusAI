@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EventChips, IndexCorporatePanel, StockEvents } from "../../components/corporate-events";
 import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
 import { TelegramLiveFeed } from "../../components/telegram-live-feed";
@@ -10,6 +10,7 @@ import { CommoditySentimentDesk } from "../../components/commodity-sentiment";
 import { SentimentHistoryPanel } from "../../components/sentiment-history";
 import { AlertCenter, AlertToasts, useSentimentAlerts } from "../../components/sentiment-alerts";
 import { useLiveFeeds } from "../../components/use-live-feeds";
+import { JOINED, useTabSync } from "../../components/use-tab-sync";
 import { mergeTelegram } from "../../lib/telegram-merge";
 import type { TelegramLive } from "../../lib/telegram-live";
 import type { ConstituentSentiment, IndexId, IndexSentiment, IndexSentimentReading, Lens } from "../../lib/index-sentiment";
@@ -271,13 +272,59 @@ const IndexDetail = memo(function IndexDetail({ reading }: { reading: IndexSenti
   );
 });
 
+const AUTO_REFRESH_MS = 5 * 60_000;
+
+/** "Auto-refresh every 5 min · next in 3:41 · live in this tab": ticks only while the tab is visible. */
+const RefreshStatus = memo(function RefreshStatus({ nextAt, leader, tabs }: { nextAt: number; leader: boolean; tabs: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 1_000);
+    return () => clearInterval(timer);
+  }, []);
+  const left = Math.max(0, Math.round((nextAt - now) / 1000));
+  return (
+    <small className="isa-auto" title="One open tab fetches and shares the data with the others; alerts are delivered once, by the tab you are looking at or, when none is in front, as a system notification.">
+      Auto-refresh every 5 min · next in {Math.floor(left / 60)}:{String(left % 60).padStart(2, "0")}
+      {tabs > 1 ? ` · ${tabs} tabs open, ${leader ? "this tab fetches for all" : "synced from another tab"}` : ""}
+    </small>
+  );
+});
+
 export default function OperationsPage() {
   const [scan, setScan] = useState<IndexSentiment | null>(null);
   const [telegram, setTelegram] = useState<TelegramLive | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<IndexId | null>("NIFTY");
+  const [nextAt, setNextAt] = useState(() => Date.now() + AUTO_REFRESH_MS);
   const scanTime = useRef<string | null>(null);
+  const telegramRef = useRef<TelegramLive | null>(null);
+
+  // Every open tab of this page shares one leader's data (see useTabSync).
+  const applyScan = useCallback((body: IndexSentiment) => {
+    if (body.generated_at === scanTime.current) return false;
+    scanTime.current = body.generated_at;
+    startTransition(() => setScan(body)); // a big re-render never blocks input
+    return true;
+  }, []);
+  const applyTelegram = useCallback((live: TelegramLive) => { telegramRef.current = live; startTransition(() => setTelegram(live)); }, []);
+  const share = useRef<(topic: string, payload: unknown) => void>(() => undefined);
+  const sync = useTabSync((topic, payload) => {
+    if (topic === "scan") applyScan(payload as IndexSentiment);
+    else if (topic === "telegram") applyTelegram(payload as TelegramLive);
+    else if (topic === "next") setNextAt(payload as number);
+    else if (topic === JOINED && sync.leader) {
+      // A tab just opened: hand it what this one already has.
+      if (scanRef.current) share.current("scan", scanRef.current);
+      if (telegramRef.current) share.current("telegram", telegramRef.current);
+      share.current("next", nextAtRef.current);
+    }
+  });
+  share.current = sync.share;
+  const scanRef = useRef<IndexSentiment | null>(null);
+  scanRef.current = scan;
+  const nextAtRef = useRef(nextAt);
+  nextAtRef.current = nextAt;
 
   const load = useCallback(async (force = false) => {
     setLoading(true);
@@ -286,29 +333,46 @@ export default function OperationsPage() {
       const response = await fetch(`/api/index-sentiment${force ? "?refresh=1" : ""}`, { cache: force ? "no-store" : "no-cache" });
       const body = await response.json();
       if (!response.ok || body.error) throw new Error(body.error ?? "Index sentiment unavailable");
-      if (body.generated_at !== scanTime.current) { scanTime.current = body.generated_at; setScan(body as IndexSentiment); }
+      if (applyScan(body as IndexSentiment)) share.current("scan", body);
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Index sentiment unavailable");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyScan]);
 
   useEffect(() => { void load(); }, [load]);
-  const alerts = useSentimentAlerts(scan, telegram);
+  const alerts = useSentimentAlerts(scan, telegram, { leader: sync.leader, otherTabActive: sync.otherTabActive });
+  const monitoringRef = useRef(alerts.monitoring);
+  monitoringRef.current = alerts.monitoring;
+
+  // Every 5 minutes the leader re-checks the scan (a 304 when unchanged; the server re-scans every
+  // 5 minutes) and shares it. Runs in a background tab while alert monitoring is on.
+  useEffect(() => {
+    if (!sync.leader) return;
+    const schedule = () => { const at = Date.now() + AUTO_REFRESH_MS; setNextAt(at); share.current("next", at); };
+    schedule();
+    const timer = setInterval(() => {
+      schedule();
+      if (document.hidden && !monitoringRef.current) return;
+      void load();
+    }, AUTO_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [sync.leader, load]);
   // Pushes over WebSocket (or HTTP polling as a fallback): Telegram every ~minute, and a notice
   // when a new full scan exists, which is then fetched once. With alert monitoring on, this keeps
   // running in a background tab; with it off, nothing runs while the tab is hidden.
   const { connection, telegramError } = useLiveFeeds({
-    onTelegram: setTelegram,
+    onTelegram: (live) => { applyTelegram(live); share.current("telegram", live); },
     onNewScan: (generatedAt) => { if (generatedAt !== scanTime.current) void load(); },
     background: alerts.monitoring,
+    enabled: sync.leader,
   });
   const refresh = useCallback(() => {
     void load(true);
-    void fetch("/api/telegram-live?refresh=1", { cache: "no-store" }).then((response) => response.json()).then((body) => { if (!body.error) setTelegram(body as TelegramLive); }).catch(() => undefined);
-  }, [load]);
+    void fetch("/api/telegram-live?refresh=1", { cache: "no-store" }).then((response) => response.json()).then((body) => { if (!body.error) { applyTelegram(body as TelegramLive); share.current("telegram", body); } }).catch(() => undefined);
+  }, [load, applyTelegram]);
   const toggle = useCallback((id: IndexId) => setSelected((current) => (current === id ? null : id)), []);
   const data = useMemo(() => mergeTelegram(scan, telegram), [scan, telegram]);
 
@@ -324,6 +388,7 @@ export default function OperationsPage() {
         <div className="isa-actions">
           <button type="button" onClick={refresh} disabled={loading}>{loading ? "Scanning…" : "Refresh"}</button>
           {data ? <small>Updated {new Date(data.generated_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST</small> : null}
+          <RefreshStatus nextAt={nextAt} leader={sync.leader} tabs={sync.tabs} />
           <a href="/">Back to dashboard</a>
         </div>
       </header>

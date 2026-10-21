@@ -114,9 +114,9 @@ export type IndexSentiment = {
   method: string;
 };
 
-// ~150 feeds, 60+ charts and order books per scan. News older than 8 h is ignored, so re-scan
-// every 10 minutes (stale-while-revalidate) to keep the window filled with the latest items.
-const TTL_MS = 10 * 60_000;
+// ~150 feeds, 60+ charts and order books per scan. Re-scan every 5 minutes (stale-while-revalidate):
+// one scan per server, shared by every tab and the history recorder, however many pages are open.
+const TTL_MS = 5 * 60_000;
 export const INDEX_REFRESH_MIN_MS = 2 * 60_000;
 const store = globalThis as typeof globalThis & { __tradepulseIndexSentiment?: { at: number; value: IndexSentiment } | null; __tradepulseIndexSentimentJob?: Promise<IndexSentiment> | null };
 

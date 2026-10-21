@@ -49,12 +49,32 @@ function chime(tone: AlertTone) {
   });
 }
 
-function desktop(alert: SentimentAlert) {
-  try {
-    const notice = new Notification(alert.title, { body: alert.body, tag: alert.id, silent: false });
-    notice.onclick = () => { window.focus(); notice.close(); };
-  } catch { /* e.g. Android Chrome only allows notifications from a service worker */ }
+// A tiny service worker shows the notifications: they reach you in other apps, stay in the
+// system's notification centre, work on Android, and a click brings this page back to the front.
+let worker: Promise<ServiceWorkerRegistration | null> | null = null;
+function notificationWorker(): Promise<ServiceWorkerRegistration | null> {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return Promise.resolve(null);
+  worker ??= navigator.serviceWorker.register("/sentiment-sw.js").then(() => navigator.serviceWorker.ready).catch(() => null);
+  return worker;
 }
+
+function desktop(alert: SentimentAlert) {
+  const options = { body: alert.body, tag: alert.id, silent: false, data: { url: window.location.href, link: alert.link ?? null } };
+  const direct = () => {
+    try {
+      const notice = new Notification(alert.title, options);
+      notice.onclick = () => { window.focus(); notice.close(); };
+    } catch { /* no notification support in this context */ }
+  };
+  void notificationWorker().then((registration) => (registration ? registration.showNotification(alert.title, options) : direct())).catch(direct);
+}
+
+/**
+ * Who delivers an alert when several tabs of the page are open: the tab you are looking at plays
+ * the chime; when none is in front (another site, another app), only the leader tab chimes and
+ * raises one system notification. Each tab still logs the alert and shows its toast.
+ */
+export type AlertDelivery = { leader: boolean; otherTabActive: () => boolean };
 
 /**
  * Watches the Telegram feed and the full sentiment scan for new events: fresh Telegram posts, a
@@ -63,7 +83,7 @@ function desktop(alert: SentimentAlert) {
  * browser notification and an unread count in the tab title. The first reading of each feed only
  * sets the baseline, so opening the page doesn't replay old posts.
  */
-export function useSentimentAlerts(scan: IndexSentiment | null, telegram: TelegramLive | null) {
+export function useSentimentAlerts(scan: IndexSentiment | null, telegram: TelegramLive | null, delivery: AlertDelivery = { leader: true, otherTabActive: () => false }) {
   const [prefs, setPrefs] = useState<AlertPrefs>(DEFAULT_PREFS);
   const [monitoring, setMonitoring] = useState(true);
   const [log, setLog] = useState<SentimentAlert[]>([]);
@@ -71,8 +91,8 @@ export function useSentimentAlerts(scan: IndexSentiment | null, telegram: Telegr
   const [permission, setPermission] = useState<Permission>("default");
   const [loaded, setLoaded] = useState(false);
   const baseline = useRef(emptyBaseline());
-  const state = useRef({ prefs, monitoring, permission });
-  state.current = { prefs, monitoring, permission };
+  const state = useRef({ prefs, monitoring, permission, delivery });
+  state.current = { prefs, monitoring, permission, delivery };
   const unread = useRef(0);
   const title = useRef<string | null>(null);
 
@@ -82,6 +102,7 @@ export function useSentimentAlerts(scan: IndexSentiment | null, telegram: Telegr
     if (typeof saved.monitoring === "boolean") setMonitoring(saved.monitoring);
     if (Array.isArray(saved.log)) setLog(saved.log.slice(0, LOG_LIMIT));
     setPermission(permissionNow());
+    if (permissionNow() === "granted") void notificationWorker();
     setLoaded(true);
   }, []);
   useEffect(() => { if (loaded) write({ prefs, monitoring, log }); }, [loaded, prefs, monitoring, log]);
@@ -106,14 +127,16 @@ export function useSentimentAlerts(scan: IndexSentiment | null, telegram: Telegr
   }, []);
 
   const emit = useCallback((alerts: SentimentAlert[], force = false) => {
-    const { prefs: current, monitoring: on, permission: allowed } = state.current;
+    const { prefs: current, monitoring: on, permission: allowed, delivery: tabs } = state.current;
     if (!alerts.length || (!on && !force)) return;
     setLog((rows) => [...alerts, ...rows].slice(0, LOG_LIMIT));
     setToasts((rows) => [...alerts, ...rows].slice(0, TOAST_LIMIT));
     alerts.forEach((alert) => setTimeout(() => setToasts((rows) => rows.filter((row) => row.id !== alert.id)), TOAST_MS));
-    if (current.sound) chime(alerts[0].tone);
-    const away = document.hidden || !document.hasFocus();
-    if (current.desktop && allowed === "granted" && (away || force)) alerts.slice(0, DESKTOP_LIMIT).forEach(desktop);
+    const here = !document.hidden && document.hasFocus();
+    // Exactly one tab delivers: this one if you are looking at it, else the leader if no tab is in front.
+    const deliver = force || here || (tabs.leader && !tabs.otherTabActive());
+    if (current.sound && deliver) chime(alerts[0].tone);
+    if (current.desktop && allowed === "granted" && deliver && (!here || force)) alerts.slice(0, DESKTOP_LIMIT).forEach(desktop);
     if (document.hidden) {
       title.current ??= document.title;
       unread.current += alerts.length;
@@ -128,7 +151,11 @@ export function useSentimentAlerts(scan: IndexSentiment | null, telegram: Telegr
   const requestPermission = useCallback(async () => {
     unlockAudio();
     if (typeof Notification === "undefined") { setPermission("unsupported"); return; }
-    try { setPermission(await Notification.requestPermission()); } catch { setPermission(permissionNow()); }
+    try {
+      const result = await Notification.requestPermission();
+      setPermission(result);
+      if (result === "granted") void notificationWorker();
+    } catch { setPermission(permissionNow()); }
   }, []);
   const test = useCallback(() => {
     unlockAudio();

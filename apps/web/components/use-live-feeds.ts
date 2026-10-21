@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { TelegramLive } from "../lib/telegram-live";
 
-export type Connection = "connecting" | "live" | "polling" | "paused";
+export type Connection = "connecting" | "live" | "polling" | "paused" | "synced";
 
 const FALLBACK_AFTER_MS = 8_000;
 const TELEGRAM_POLL_MS = 60_000;
@@ -14,8 +14,9 @@ const SENTIMENT_POLL_MS = 120_000;
  * notices); if it can't connect, polls the same endpoints over HTTP. With `background` off nothing
  * is fetched while the tab is hidden (both catch up once it is visible); with it on, the feeds keep
  * running in a hidden tab so alerts can fire (browsers throttle background timers to ~1/minute).
+ * With `enabled` off (another tab is the leader and shares its data) nothing connects at all.
  */
-export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void; onNewScan: (generatedAt: string) => void; background?: boolean }): { connection: Connection; telegramError: string | null } {
+export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void; onNewScan: (generatedAt: string) => void; background?: boolean; enabled?: boolean }): { connection: Connection; telegramError: string | null } {
   const [connection, setConnection] = useState<Connection>("connecting");
   const [telegramError, setTelegramError] = useState<string | null>(null);
   const handlers = useRef(options);
@@ -23,7 +24,11 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
   const background = useRef(Boolean(options.background));
   background.current = Boolean(options.background);
 
+  const enabled = options.enabled ?? true;
+
   useEffect(() => {
+    if (!enabled) { setConnection("synced"); setTelegramError(null); return; }
+    setConnection("connecting");
     let socket: WebSocket | null = null;
     let retry = 1_000;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -115,7 +120,7 @@ export function useLiveFeeds(options: { onTelegram: (live: TelegramLive) => void
       stopPolling();
       socket?.close();
     };
-  }, []);
+  }, [enabled]);
 
   return { connection, telegramError };
 }
