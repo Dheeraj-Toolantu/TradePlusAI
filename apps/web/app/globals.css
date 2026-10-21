@@ -1176,3 +1176,33 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 @media (max-width: 560px) { .sal-log li { grid-template-columns: auto 1fr; } .sal-log li > div { grid-column: 1 / -1; } }
 @keyframes sal-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .sal-toast { animation: none; } }
+
+/* Commodity sentiment and Firestore sentiment history. */
+.cms .isa-cards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-bottom: 10px; }
+.cms-card { cursor: default; }
+.cms-card:hover { transform: none; }
+.cms-card .isa-card-score small { display: block; margin-top: 2px; text-transform: none; }
+.cms-lenses { display: flex; flex-wrap: wrap; gap: 4px 10px; color: #7f9ba3; font-size: 11px; }
+.cms-headline { overflow: hidden; color: #8cc8ff; font-size: 12px; text-decoration: none; white-space: nowrap; text-overflow: ellipsis; }
+.smh-list { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 6px; }
+.smh-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 7px 10px; border: 1px solid #1d3442; border-radius: 7px; font-size: 13px; }
+.smh-list li small { color: #7f9ba3; font-size: 11px; }
+.smh-list i { font-style: normal; font-weight: 700; }
+.smh-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.smh-tools label { display: inline-flex; align-items: center; gap: 6px; color: #a2bcc2; font-size: 12px; }
+.smh-tools input, .smh-tools select, .smh-tools button, .smh-expand { padding: 5px 10px; color: #a2bcc2; border: 1px solid #234654; border-radius: 6px; background: #0e2330; font: 12px "Manrope", sans-serif; color-scheme: dark; }
+.smh-tools button, .smh-expand { cursor: pointer; }
+.smh-tools button.active { color: #06141c; background: #30d4ca; border-color: #30d4ca; }
+.smh-tools button:disabled { opacity: .5; cursor: default; }
+.smh-wrap { max-height: 560px; overflow: auto; margin-bottom: 12px; }
+.smh-table th { position: sticky; top: 0; z-index: 1; background: #0a1c27; white-space: nowrap; }
+.smh-table th small, .smh-table td small { display: block; color: #6a8790; font-size: 11px; font-weight: 400; white-space: nowrap; }
+.smh-table td { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.smh-table tr.smh-flip td { background: rgba(240, 191, 102, .06); }
+.smh-detail td { padding: 0 0 10px 24px; background: #08161f; white-space: normal; }
+.smh-stocks td small { display: block; color: #6a8790; font-size: 11px; }
+.smh-reason { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.smh-tag { padding: 1px 6px; border: 1px solid #234654; border-radius: 10px; color: #a2bcc2; font-size: 11px; font-style: normal; white-space: nowrap; }
+.smh-tag.smh-up { border-color: #1f6b52; color: #25d69c; }
+.smh-tag.smh-down { border-color: #7a2f36; color: #f07a84; }
+.smh-sub { margin: 4px 0 8px; font-size: 14px; }

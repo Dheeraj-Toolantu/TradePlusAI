@@ -6,6 +6,8 @@ import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
 import { TelegramLiveFeed } from "../../components/telegram-live-feed";
 import { TelegramOptionsDesk } from "../../components/telegram-options";
 import { TelegramChannelAnalysis } from "../../components/telegram-channel-analysis";
+import { CommoditySentimentDesk } from "../../components/commodity-sentiment";
+import { SentimentHistoryPanel } from "../../components/sentiment-history";
 import { AlertCenter, AlertToasts, useSentimentAlerts } from "../../components/sentiment-alerts";
 import { useLiveFeeds } from "../../components/use-live-feeds";
 import { mergeTelegram } from "../../lib/telegram-merge";
@@ -337,6 +339,8 @@ export default function OperationsPage() {
           <section className="isa-cards">
             {data.indices.map((index) => <IndexCard key={index.id} reading={index} active={index.id === selected} onSelect={toggle} />)}
           </section>
+          {data.commodities ? <CommoditySentimentDesk data={data.commodities} /> : null}
+          <SentimentHistoryPanel />
           {data.retail_desk ? <RetailCrowdDesk desk={data.retail_desk} /> : null}
           {data.telegram_options ? <TelegramOptionsDesk options={data.telegram_options} /> : null}
           <TelegramChannelAnalysis />

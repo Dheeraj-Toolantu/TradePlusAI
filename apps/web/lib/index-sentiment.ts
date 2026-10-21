@@ -1,5 +1,6 @@
 import { runPythonModule } from "./python";
 import { getSentiment } from "./sentiment";
+import type { CommoditySentiment } from "./commodity-sentiment";
 
 export type IndexId = "NIFTY" | "BANKNIFTY" | "SENSEX";
 export type Lens = "price" | "volume" | "orderflow" | "news" | "social" | "events";
@@ -104,6 +105,8 @@ export type IndexSentiment = {
   indices: IndexSentimentReading[];
   retail_desk?: RetailDesk;
   telegram_options?: TelegramOptions;
+  /** Crude oil, natural gas, gold, silver, copper; null when that scan failed. */
+  commodities?: CommoditySentiment | null;
   market_context: Record<string, number | string | null> | null;
   feeds: Array<{ id: string; name: string; ok: boolean; items: number; fresh: number; cached?: boolean }>;
   freshness: { max_age_hours: number; fresh_window_hours: number };
@@ -130,8 +133,12 @@ async function marketContext() {
 }
 
 function refresh(): Promise<IndexSentiment> {
-  store.__tradepulseIndexSentimentJob ??= marketContext()
+  if (store.__tradepulseIndexSentimentJob) return store.__tradepulseIndexSentimentJob;
+  // Commodities run alongside; their failure never fails the index scan.
+  const commodities = runPythonModule<CommoditySentiment>("tradepulse_quant.sentiment.commodity_engine", {}, 40_000).catch(() => null);
+  store.__tradepulseIndexSentimentJob = marketContext()
     .then((market_context) => runPythonModule<IndexSentiment>("tradepulse_quant.sentiment.index_engine", { market_context }, 90_000))
+    .then(async (scan) => ({ ...scan, commodities: await commodities }))
     .then((value) => { store.__tradepulseIndexSentiment = { at: Date.now(), value }; return value; })
     .finally(() => { store.__tradepulseIndexSentimentJob = null; });
   return store.__tradepulseIndexSentimentJob;
