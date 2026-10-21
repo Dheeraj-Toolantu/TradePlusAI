@@ -13,11 +13,14 @@ export async function POST() {
   }
 }
 
-// GET ?limit=20: the latest snapshots and reversals.
+// GET ?limit=20: the latest snapshots and reversals. ?date=2026-10-21: every one from that IST day.
 export async function GET(request?: Request) {
-  const count = Number(request ? new URL(request.url).searchParams.get("limit") : null) || 20;
+  const params = request ? new URL(request.url).searchParams : new URLSearchParams();
+  const count = Number(params.get("limit")) || 20;
+  const date = params.get("date") ?? undefined;
+  if (date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return NextResponse.json({ error: "date must be YYYY-MM-DD" }, { status: 400 });
   try {
-    return NextResponse.json(await recentHistory(count), { headers: { "cache-control": "no-store" } });
+    return NextResponse.json(await recentHistory(count, date), { headers: { "cache-control": "no-store" } });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Sentiment history unavailable" }, { status: 503 });
   }

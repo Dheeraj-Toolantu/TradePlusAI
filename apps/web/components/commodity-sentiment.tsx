@@ -4,7 +4,11 @@ import { memo } from "react";
 import type { CommodityReading, CommoditySentiment } from "../lib/commodity-sentiment";
 
 const tone = (score: number | null | undefined) => (score === null || score === undefined ? "isa-muted" : score >= 12 ? "isa-up" : score <= -12 ? "isa-down" : "isa-flat");
-const signed = (value: number | null | undefined, digits = 0) => (value === null || value === undefined ? "--" : `${value > 0 ? "+" : ""}${value.toFixed(digits)}`);
+const signed = (value: number | null | undefined, digits = 0) => {
+  if (value === null || value === undefined) return "--";
+  const text = Math.abs(value).toFixed(digits);
+  return Number(text) === 0 ? text : `${value > 0 ? "+" : "-"}${text}`; // never "-0"
+};
 const words = (value: string) => value.replaceAll("_", " ").toLowerCase();
 const LENS_LABEL = { price: "Today", trend: "Trend", news: "News" } as const;
 

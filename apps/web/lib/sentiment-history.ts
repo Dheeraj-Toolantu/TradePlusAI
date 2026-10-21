@@ -1,4 +1,4 @@
-import { collection, doc, getDoc, getDocs, limit, orderBy, query, setDoc } from "firebase/firestore";
+import { collection, doc, getDoc, getDocs, limit, orderBy, query, setDoc, where } from "firebase/firestore";
 import { db } from "./firebase";
 import type { IndexSentiment } from "./index-sentiment";
 
@@ -45,6 +45,10 @@ export function slotId(at: Date, step = SLOT_MINUTES): string {
   return `${ist.getUTCFullYear()}${pad(ist.getUTCMonth() + 1)}${pad(ist.getUTCDate())}-${pad(ist.getUTCHours())}${pad(minutes)}`;
 }
 
+/** "2026-10-21" and "09:26" in IST: stored on every document so the history can be read by day. */
+export const istDate = (at: Date) => new Date(at.getTime() + 330 * 60_000).toISOString().slice(0, 10);
+export const istTime = (at: Date) => new Date(at.getTime() + 330 * 60_000).toISOString().slice(11, 16);
+
 export function sentimentDirection(score: number | null, previous: Direction = "NEUTRAL"): Direction {
   if (score === null) return previous;
   return score >= SENTIMENT_BAND ? "BULLISH" : score <= -SENTIMENT_BAND ? "BEARISH" : previous;
@@ -60,7 +64,10 @@ export function instrumentsOf(scan: IndexSentiment): Instrument[] {
   const indices: Instrument[] = scan.indices.map((index) => ({
     id: index.id, kind: "INDEX", name: index.name, score: round(index.score, 1), label: index.label, price: round(index.quote?.price), change_pct: round(index.quote?.change_pct),
     extra: { zone: index.zone, bias: index.bias, bullish_pct: round(index.breadth.bullish_pct, 1), bearish_pct: round(index.breadth.bearish_pct, 1),
-      advances: index.breadth.advances, declines: index.breadth.declines, stocks_scored: index.coverage.stocks_scored, stocks_total: index.coverage.stocks_total },
+      advances: index.breadth.advances, declines: index.breadth.declines, stocks_scored: index.coverage.stocks_scored, stocks_total: index.coverage.stocks_total,
+      // Every constituent's price and score at this time (~50 rows, a few KB per snapshot).
+      constituents: (index.constituents ?? []).map((stock) => ({ symbol: stock.symbol, name: stock.name, weight: round(stock.weight), score: round(stock.score, 1), label: stock.label,
+        price: round(stock.price), change_pct: round(stock.change_pct) })) },
   }));
   const commodities: Instrument[] = (scan.commodities?.commodities ?? []).map((item) => ({
     id: item.id, kind: "COMMODITY", name: item.name, score: round(item.score, 1), label: item.label, price: round(item.price, 3), change_pct: round(item.change_pct),
@@ -116,12 +123,12 @@ async function record(scan: IndexSentiment, now: Date): Promise<RecordResult> {
   const snapshotId = reasons.includes("SCHEDULED") ? slot : `${slotId(now, 1)}-reversal`;
   const recordedAt = now.toISOString();
   await setDoc(doc(db, SNAPSHOTS, snapshotId), {
-    id: snapshotId, slot, recordedAt, scanAt, reasons,
+    id: snapshotId, slot, date: istDate(now), time: istTime(now), recordedAt, scanAt, reasons,
     reversals: reversals.map((item) => ({ instrument: item.instrument, type: item.type, from: item.from, to: item.to })),
     indices: Object.fromEntries(instruments.filter((item) => item.kind === "INDEX").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra }])),
     commodities: Object.fromEntries(instruments.filter((item) => item.kind === "COMMODITY").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra }])),
   }, { merge: true });
-  for (const reversal of reversals) await setDoc(doc(db, REVERSALS, firestoreId(reversal.id)), { ...reversal, recordedAt, snapshotId });
+  for (const reversal of reversals) await setDoc(doc(db, REVERSALS, firestoreId(reversal.id)), { ...reversal, date: istDate(now), time: istTime(now), recordedAt, snapshotId });
   await setDoc(doc(db, STATE, "latest"), { ...nextState, updatedAt: recordedAt });
   store.__tradepulseSentimentHistory = nextState;
   return { recorded: true, snapshotId, reasons, reversals, scanAt };
@@ -142,11 +149,29 @@ export function resetSentimentHistoryCache(): void {
   store.__tradepulseSentimentRecording = null;
 }
 
-export async function recentHistory(count = 20): Promise<{ snapshots: Array<Record<string, unknown>>; reversals: Array<Record<string, unknown>> }> {
+export type HistoryReading = { name: string; score: number | null; label: string; price: number | null; change_pct: number | null; [key: string]: unknown };
+export type StoredConstituent = { symbol: string; name: string; weight: number | null; score: number | null; label: string; price: number | null; change_pct: number | null };
+export type StoredSnapshot = {
+  id: string; slot: string; date?: string; time?: string; recordedAt: string; scanAt: string; reasons: Array<"SCHEDULED" | "REVERSAL">;
+  reversals: Array<{ instrument: string; type: Reversal["type"]; from: string; to: string }>;
+  indices: Record<string, HistoryReading & { zone?: string; bullish_pct?: number | null; bearish_pct?: number | null; advances?: number; declines?: number; constituents?: StoredConstituent[] }>;
+  commodities: Record<string, HistoryReading & { unit?: string; india_impact?: number | null; india_label?: string }>;
+};
+export type StoredReversal = Reversal & { date?: string; time?: string; recordedAt: string; snapshotId: string };
+
+const newestFirst = <T extends { recordedAt?: unknown }>(rows: T[]) => rows.sort((a, b) => String(b.recordedAt ?? "").localeCompare(String(a.recordedAt ?? "")));
+
+/**
+ * Latest snapshots and reversals, newest first. With `date` ("2026-10-21", IST) only that day's,
+ * read by an equality filter and sorted here, so Firestore needs no composite index.
+ */
+export async function recentHistory(count = 20, date?: string): Promise<{ snapshots: StoredSnapshot[]; reversals: StoredReversal[] }> {
   const size = Math.max(1, Math.min(200, count));
-  const [snapshots, reversals] = await Promise.all([
-    getDocs(query(collection(db, SNAPSHOTS), orderBy("recordedAt", "desc"), limit(size))),
-    getDocs(query(collection(db, REVERSALS), orderBy("recordedAt", "desc"), limit(size))),
-  ]);
-  return { snapshots: snapshots.docs.map((item) => ({ id: item.id, ...item.data() })), reversals: reversals.docs.map((item) => ({ id: item.id, ...item.data() })) };
+  const read = async <T,>(name: string) => {
+    const result = await getDocs(date ? query(collection(db, name), where("date", "==", date)) : query(collection(db, name), orderBy("recordedAt", "desc"), limit(size)));
+    const rows = result.docs.map((item) => ({ ...item.data(), id: item.id }) as { id: string; recordedAt?: unknown });
+    return newestFirst(rows).slice(0, date ? 200 : size) as unknown as T[];
+  };
+  const [snapshots, reversals] = await Promise.all([read<StoredSnapshot>(SNAPSHOTS), read<StoredReversal>(REVERSALS)]);
+  return { snapshots, reversals };
 }

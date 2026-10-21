@@ -70,3 +70,25 @@ describe("sentiment history", () => {
     expect(result.reversals.map((item) => `${item.instrument}:${item.from}->${item.to}`)).toEqual(["CRUDEOIL:BULLISH->BEARISH"]);
   });
 });
+
+describe("sentiment history reads", () => {
+  beforeEach(() => resetSentimentHistoryCache());
+
+  it("stores date, time and share prices, and reads one IST day newest first", async () => {
+    const { recentHistory } = await import("../../apps/web/lib/sentiment-history");
+    const withStocks = (at: string, score: number, change: number) => {
+      const value = scan(at, score, change) as unknown as { indices: Array<Record<string, unknown>> };
+      value.indices[0].constituents = [{ symbol: "RELIANCE", name: "Reliance Industries", weight: 9.1, score: 22, label: "BULLISH", price: 2950.5, change_pct: 0.8 }];
+      return value as unknown as IndexSentiment;
+    };
+    await recordSentiment(withStocks("2026-10-20T09:00:00Z", 15, 0.3), new Date("2026-10-20T09:01:00Z")); // 20 Oct 14:31 IST
+    await recordSentiment(withStocks("2026-10-21T03:45:00Z", 15, 0.3), new Date("2026-10-21T03:46:00Z")); // 21 Oct 09:16 IST
+    await recordSentiment(withStocks("2026-10-21T04:00:00Z", 18, 0.4), new Date("2026-10-21T04:01:00Z")); // 21 Oct 09:31 IST
+
+    const day = await recentHistory(20, "2026-10-21");
+    expect(day.snapshots.map((item) => `${item.date} ${item.time}`)).toEqual(["2026-10-21 09:31", "2026-10-21 09:16"]);
+    expect(day.snapshots[0].indices.NIFTY).toMatchObject({ score: 18, price: 24000, change_pct: 0.4 });
+    expect(day.snapshots[0].indices.NIFTY.constituents?.[0]).toEqual({ symbol: "RELIANCE", name: "Reliance Industries", weight: 9.1, score: 22, label: "BULLISH", price: 2950.5, change_pct: 0.8 });
+    expect((await recentHistory(2)).snapshots).toHaveLength(2);
+  });
+});
