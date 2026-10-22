@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { OpenPremiumEstimator, type EstimatorPreset } from "./open-premium-estimator";
 import { PremiumCalculator, type PremiumCheck } from "./premium-calculator";
 
 type Factor = { id: string; name: string; value: number; weight: number; contribution: number; note: string };
@@ -47,6 +48,12 @@ export function NextDayPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: st
   const setup = setups.find((item) => item.symbol === active);
   const prediction = setup?.prediction;
   const record = setup?.track_record;
+  // Contracts and key levels from the plans prefill the opening-premium estimator.
+  const presets: EstimatorPreset[] = (setup?.plans ?? []).flatMap((plan) => plan.contract ? [{ label: `${plan.contract.strike} ${plan.contract.type} → ${Math.round(plan.index.target)}`, option_type: plan.contract.type, strike: plan.contract.strike, expiry: plan.contract.expiry, key_level: plan.index.target }] : []);
+  const levels = [
+    ...(prediction ? [{ label: "Expected open", value: prediction.expected_open }, { label: "Open range low", value: prediction.expected_range[0] }, { label: "Open range high", value: prediction.expected_range[1] }] : []),
+    ...(setup?.plans ?? []).flatMap((plan) => [{ label: `${plan.option_type} trigger`, value: plan.index.trigger }, { label: `${plan.option_type} target`, value: plan.index.target }]),
+  ];
 
   return (
     <article className="mi-card exec-next-day" aria-label="Next-day setup">
@@ -89,6 +96,7 @@ export function NextDayPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: st
               </div>
             ))}
           </div>
+          <OpenPremiumEstimator symbol={active} presets={presets} levels={levels} />
           <details className="mi-management">
             <summary>Why this prediction</summary>
             <div className="exec-calcs">
