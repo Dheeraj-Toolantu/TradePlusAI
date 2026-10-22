@@ -579,7 +579,7 @@ export default function ExecutionPage() {
             </div>
             <p className="mi-note">{strategy.description} {mappingInfo.note}</p>
             {analysis?.setup?.contract ? (
-              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · trail ₹{money(analysis.setup.trailing_distance)} (breakeven at ₹{money(analysis.setup.breakeven_at)}) · target ₹{money(analysis.setup.target)} · {analysis.setup.risk_reward}R</span></div>
+              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · trail ₹{money(analysis.setup.trailing_distance)} (breakeven at ₹{money(analysis.setup.breakeven_at)}) · target ₹{money(analysis.setup.target)} · {analysis.setup.risk_reward}R net of costs</span></div>
             ) : null}
             {analysis?.setup?.contract && analysis.pipeline?.decision === "CONFIRMED" && <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load {strategy.name} setup into the order ticket</button>}
             {intrinsic && (
@@ -590,7 +590,7 @@ export default function ExecutionPage() {
                 <span>Premium <b className={intrinsic.premium?.status === "CONFIRMED" ? "gain" : "warning"}>{intrinsic.premium ? intrinsic.premium.status.replaceAll("_", " ") : "--"}</b>{intrinsic.premium?.retrace !== undefined ? ` · pullback ${Math.round(intrinsic.premium.retrace * 100)}% to ₹${money(intrinsic.premium.pullback_low)}` : ""}</span>
                 {intrinsic.plan && <span>Trailing <b>{intrinsic.plan.trailing_rule}</b></span>}
                 <small>{String(analysis?.strategy_reason ?? intrinsic.sentiment.reason ?? "")}</small>
-                {intrinsic.candidates.length > 1 && <small>Other OTM strikes: {intrinsic.candidates.filter((item) => item.symbol !== intrinsic.selected?.symbol).slice(0, 3).map((item) => `${money(item.strike)} (${Math.round(item.itm_chance * 100)}%, ₹${money(item.premium)}${item.eligible ? "" : item.target_reachable === false ? ", key level too close for +50%" : ", too little intrinsic gain"})`).join(" · ")}</small>}
+                {intrinsic.candidates.length > 1 && <small>Other OTM strikes: {intrinsic.candidates.filter((item) => item.symbol !== intrinsic.selected?.symbol).slice(0, 3).map((item) => `${money(item.strike)} (${Math.round(item.itm_chance * 100)}%, ₹${money(item.premium)}${item.eligible ? "" : item.target_reachable === false ? ", key level too close for +50%" : ", under a 50% premium gain at the key value"})`).join(" · ")}</small>}
               </div>
             )}
             {(() => {
@@ -598,12 +598,18 @@ export default function ExecutionPage() {
               const side = intrinsic?.sentiment.option_type ?? intrinsic?.sentiment.lean_option_type;
               return check && side ? <PremiumCalculator check={check} optionType={side} title={intrinsic?.premium_check ? "Premium target check at entry" : `Premium target check · ${intrinsic?.selected?.symbol ?? intrinsic?.candidates[0]?.symbol ?? ""}`} /> : null;
             })()}
-            {!analysis?.setup && <p className="mi-note">{analysis?.pipeline ? `${analysis.pipeline.gates.filter((gate) => gate.passed).length}/${analysis.pipeline.gates.length} gates passing. No setup until every gate is green.` : analysis?.reason ?? "Waiting for the engine…"}</p>}
+            {analysis?.pipeline ? (
+              <p className="mi-note">
+                <b>Rule gates {analysis.pipeline.gates.filter((gate) => gate.passed).length}/{analysis.pipeline.gates.length} passing</b>: every gate must pass; one red gate blocks the trade.{" "}
+                <b>Strategy score {calc(score.total)}/10 (minimum {calc(score.minimum ?? 8)})</b>: the score is itself one of the gates ("score"), so a score below the minimum blocks the trade, and a high score never overrides a red gate.
+                {!analysis.setup ? " No setup until every gate is green." : ""}
+              </p>
+            ) : !analysis?.setup && <p className="mi-note">{analysis?.reason ?? "Waiting for the engine…"}</p>}
             <div className="exec-score">
               {scoreTiles.map(([name, value, max]) => (
                 <span key={String(name)}><small>{name}</small><b>{calc(value)} / {String(max)}</b></span>
               ))}
-              <span className="exec-score-total"><small>Total</small><b className={Number(score.total) >= Number(score.minimum ?? 8) ? "gain" : "warning"}>{calc(score.total)} / 10</b><em>min {calc(score.minimum ?? 8)}</em></span>
+              <span className="exec-score-total"><small>Strategy score</small><b className={Number(score.total) >= Number(score.minimum ?? 8) ? "gain" : "warning"}>{calc(score.total)} / 10</b><em>min {calc(score.minimum ?? 8)}</em></span>
             </div>
             <div className="exec-gates">{(analysis?.pipeline?.gates ?? []).map((gate) => <span key={gate.code} className={gate.passed ? "pass" : "fail"} title={gate.detail}>{gate.passed ? "✓" : "✗"} {GATE_LABELS[gate.code] ?? gate.code.replace(/_(BLOCKED|NOT_CONFIRMED|NOT_SUPPORTIVE|BELOW_MINIMUM|UNRESOLVED|MISSING|REQUIRED|UNHEALTHY|STALE|INVALID|NOT_READY)$/, "").replaceAll("_", " ").toLowerCase()}</span>)}</div>
             <details className="mi-management">

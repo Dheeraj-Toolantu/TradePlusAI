@@ -132,13 +132,14 @@ class StrikeSelectionTest(unittest.TestCase):
         self.assertEqual(result["decision"], "WAIT_FOR_CONFIRMATION")
         self.assertEqual(result["needs_premium_candles"], "NIFTY26OCT24950PE")
 
-    def test_strike_must_offer_a_meaningful_intrinsic_gain(self):
+    def test_strike_must_offer_a_50_percent_option_premium_gain(self):
         ctx = context()
         for row in ctx["option_chain"]["contracts"]:
-            row["premium"] *= 4  # an expensive chain: 50 points of intrinsic no longer pays
+            row["premium"] *= 8  # an expensive chain: repriced at any key value, no strike gains 50%
         result = run(ctx)
         self.assertEqual(result["decision"], "NO_TRADE")
-        self.assertIn("intrinsic gain", result["reason"])
+        self.assertIn("50% option premium gain", result["reason"])
+        self.assertNotIn("intrinsic gain", result["reason"])
 
     def test_bearish_sentiment_buys_a_call_under_contrarian(self):
         result = run(context(score=-58))
@@ -155,8 +156,11 @@ class PremiumTargetTest(unittest.TestCase):
         self.assertEqual(check["move_points"], 100)  # spot 25000 to the 24900 key value
         self.assertEqual(check["target_premium"], 67.5)  # 45 x 1.5
         self.assertEqual(check["move_needed_delta"], 53.6)  # 22.5 / 0.42
-        self.assertLessEqual(check["move_needed_greeks"], check["move_points"])
-        self.assertTrue(check["valid"])
+        self.assertLessEqual(check["move_needed_model"], check["move_points"])
+        self.assertTrue(check["target_possible"])
+        # The candidate's premium at the key value is the full reprice, not intrinsic + time value.
+        selected = run(context())["intrinsic"]["selected"]
+        self.assertEqual(selected["premium_at_key"], check["premium_at_key_model"])
 
     def test_key_value_too_close_for_a_50_percent_premium_is_rejected(self):
         ctx = context()
@@ -198,8 +202,15 @@ class PremiumTriggerTest(unittest.TestCase):
         self.assertEqual(setup["contract"]["symbol"], "NIFTY26OCT24950PE")
         self.assertEqual(setup["entry"], 52.5)
         self.assertLess(setup["stop_loss"], 49)  # under the pullback low
-        self.assertEqual(setup["target"], 76.25)  # 50 intrinsic at 24900 + half of today's premium
+        check = result["intrinsic"]["premium_check"]
+        # Target = this contract repriced at the 24900 key value; it must clear 1.5 x entry.
+        self.assertAlmostEqual(setup["target"], check["premium_at_key_model"], delta=0.05)
+        self.assertGreaterEqual(setup["target"], 52.5 * 1.5)
+        self.assertEqual(setup["target_method"], "KEY_VALUE_REPRICE")
+        # Reward-to-risk is net of costs, so it is below the gross figure.
         self.assertGreaterEqual(setup["risk_reward"], 2)
+        self.assertEqual(setup["risk_reward"], check["net_risk_reward"])
+        self.assertLess(setup["risk_reward"], result["intrinsic"]["plan"]["gross_risk_reward"])
         self.assertAlmostEqual(setup["trailing_distance"], round(52.5 - setup["stop_loss"], 2), places=2)
         self.assertAlmostEqual(setup["breakeven_at"], 52.5 + setup["trailing_distance"], places=2)
 

@@ -20,7 +20,7 @@ each prediction carries its own track record.
 The plan follows the live Intrinsic Value strategy: an OTM option between the entry trigger and
 the next key value, entered on an index trigger after the first 15 minutes plus a premium
 pullback and continuation, stop from the index invalidation translated by delta (capped at 35%
-of the premium), target = intrinsic value at the key value plus half the entry premium, stop
+of the premium), target = the contract repriced at the key value (``premium_math``), stop
 trailed by the initial risk with breakeven at +1R. The primary plan trades the predicted open;
 the alternate plan trades its failure. On a FLAT prediction both are breakout plans.
 
@@ -246,14 +246,15 @@ def pick_strike(chain: list[dict], option_type: str, trigger: float, target: flo
             continue
         estimate = max(premium + odds * (trigger - close) * direction, 0.3 * premium, 0.5)
         intrinsic_at_key = abs(target - strike)
-        premium_at_key = intrinsic_at_key + intrinsic.residual_time_value * estimate
-        gain = premium_at_key / estimate - 1.0
         liquid = liquidity_score(row, intrinsic)
         # The premium calculator at the trigger: does the key value pay +50% on the estimated entry?
         scale = estimate / premium
         bid, ask = premium_math.number(row.get("bid")), premium_math.number(row.get("ask"))
         check = premium_math.evaluate(trigger, target, option_type, strike, estimate, row.get("expiry"), entry_time or now, iv=premium_math.number(row.get("iv")), delta=odds,
-                                      bid=bid * scale if bid is not None else None, ask=ask * scale if ask is not None else None, liquidity=liquid)
+                                      bid=bid * scale if bid is not None else None, ask=ask * scale if ask is not None else None, liquidity=liquid, lot_size=row.get("lotSize"))
+        # The contract repriced at the key value (same model as the check); intrinsic + time value only without one.
+        premium_at_key = check["premium_at_key_model"] if check["premium_at_key_model"] is not None else intrinsic_at_key + intrinsic.residual_time_value * estimate
+        gain = premium_at_key / estimate - 1.0
         reachable = all(item["passed"] for item in check["checks"] if item["id"] in {"KEY_LEVEL_PAYS_TARGET", "SPREAD"})
         rows.append({"symbol": row.get("symbol"), "strike": strike, "type": option_type, "expiry": row.get("expiry"), "premium_close": premium,
                      "delta": _r(odds, 3), "estimated_entry": round(estimate, 2), "intrinsic_at_key": round(intrinsic_at_key, 2),
@@ -287,7 +288,7 @@ def build_plan(role: str, direction: int, symbol: str, summary: dict, levels: li
     if pick is None:
         plan["entry_rule"] = condition
         blocked = next((row for row in candidates if not row["target_reachable"]), None)
-        plan["note"] = (f"No liquid OTM {option_type} between {trigger:.0f} and the key value {target:.0f} offers a {intrinsic.min_value_gain:.0%} intrinsic gain and a reachable +50% premium"
+        plan["note"] = (f"No liquid OTM {option_type} between {trigger:.0f} and the key value {target:.0f} offers a {intrinsic.min_value_gain:.0%} option premium gain at the key value"
                         + (f" ({blocked['symbol']}: {blocked['premium_check']['reason']})" if blocked else "") + "; trade only if the chain reprices at the open.")
         return plan
     tick = float(pick.get("tick_size") or 0.05) or 0.05
@@ -297,12 +298,13 @@ def build_plan(role: str, direction: int, symbol: str, summary: dict, levels: li
     target_premium = _tick(pick["premium_at_key"], tick)
     plan["contract"] = {key_: pick[key_] for key_ in ("symbol", "strike", "type", "expiry", "lot_size", "premium_close", "delta")}
     plan["contract"]["expiry_day"] = str(pick.get("expiry") or "")[:10] == next_day.isoformat()
-    plan["premium"] = {"entry": entry, "stop_loss": _tick(entry - risk, tick), "target": target_premium,
-                       "risk_reward": round((target_premium - entry) / risk, 2) if risk > 0 else None, "trailing_distance": risk,
-                       "breakeven_at": _tick(entry + risk, tick), "stop_capped": raw_risk > risk + tick}
     spread = pick.get("spread")
-    plan["premium"]["check"] = premium_math.evaluate(trigger, target, option_type, pick["strike"], entry, pick["expiry"], entry_time, iv=pick.get("iv"), delta=pick["delta"],
-                                                     bid=spread[0] if spread else None, ask=spread[1] if spread else None, liquidity=pick["liquidity_score"], stop=entry - risk)
+    check = premium_math.evaluate(trigger, target, option_type, pick["strike"], entry, pick["expiry"], entry_time, iv=pick.get("iv"), delta=pick["delta"],
+                                  bid=spread[0] if spread else None, ask=spread[1] if spread else None, liquidity=pick["liquidity_score"],
+                                  stop=entry - risk, target=target_premium, lot_size=pick.get("lot_size"))
+    plan["premium"] = {"entry": entry, "stop_loss": _tick(entry - risk, tick), "target": target_premium,
+                       "risk_reward": check["net_risk_reward"], "gross_risk_reward": round((target_premium - entry) / risk, 2) if risk > 0 else None,
+                       "trailing_distance": risk, "breakeven_at": _tick(entry + risk, tick), "stop_capped": raw_risk > risk + tick, "check": check}
     plan["entry_rule"] = condition + f" Buy {pick['symbol']} near ₹{entry:.2f} (estimated from yesterday's ₹{pick['premium_close']:.2f} and delta {pick['delta']:.2f})."
     plan["trailing_rule"] = (f"Trail the premium stop ₹{risk:.2f} under the highest premium (breakeven at ₹{entry + risk:.2f}, +1R). "
                              f"On the index: once {symbol} is {abs(trigger - stop):.0f} pts in favour, move the index stop to {trigger:.0f}.")
