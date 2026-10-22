@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { PremiumCalculator, type PremiumCheck } from "./premium-calculator";
 
 type Factor = { id: string; name: string; value: number; weight: number; contribution: number; note: string };
 type Plan = {
   role: "PRIMARY" | "ALTERNATE" | "BREAKOUT_UP" | "BREAKOUT_DOWN"; option_type: "CE" | "PE"; direction: string;
   index: { trigger: number; stop_loss: number; target: number; key_value_sources: string[]; risk_points: number; reward_points: number; risk_reward: number; skip_if_open_beyond: number };
   contract: { symbol: string; strike: number; type: "CE" | "PE"; expiry?: string; lot_size?: number | null; premium_close: number; delta: number | null; expiry_day: boolean } | null;
-  premium: { entry: number; stop_loss: number; target: number; risk_reward: number | null; trailing_distance: number; breakeven_at: number; stop_capped: boolean } | null;
+  premium: { entry: number; stop_loss: number; target: number; risk_reward: number | null; trailing_distance: number; breakeven_at: number; stop_capped: boolean; check?: PremiumCheck } | null;
   entry_rule?: string; trailing_rule?: string; exit_rule?: string; note?: string;
 };
 export type NextDaySetup = {
@@ -83,6 +84,7 @@ export function NextDayPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: st
                 {plan.trailing_rule && <small>{plan.trailing_rule}</small>}
                 {plan.exit_rule && <small>{plan.exit_rule}</small>}
                 {plan.note && <small className="warning">{plan.note}</small>}
+                {plan.premium?.check && <PremiumCalculator check={plan.premium.check} optionType={plan.option_type} title="Premium target check at the trigger" />}
                 {plan.contract && plan.premium && onUsePlan && <button type="button" className="mi-use-plan" onClick={() => onUsePlan(plan, setup)}>Load into the order ticket</button>}
               </div>
             ))}

@@ -21,6 +21,10 @@ The trade is read in four steps, each one fail-closed:
    the continuation close, the stop sits under the pullback low, the target is the premium
    expected at the key value (intrinsic + residual time value), and the stop trails by the
    initial risk (breakeven at +1R).
+5. Premium math (``premium_math``). Every candidate strike is checked against its key value: the
+   index move needed for a +50% premium (delta-only and with gamma, vega and theta) must not
+   exceed the distance to the key level, the bid-ask spread must be tight and the strike liquid.
+   At entry the same check runs on the traded premium and the structural stop.
 """
 from __future__ import annotations
 
@@ -28,6 +32,8 @@ import math
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
+
+from . import premium_math
 
 STRATEGY_ID = "INTRINSIC_VALUE"
 
@@ -259,14 +265,18 @@ def rank_strikes(chain: list[dict], spot: float, key: dict, option_type: str, co
         premium_at_key = intrinsic_at_key + config.residual_time_value * premium
         value_gain = premium_at_key / premium - 1.0
         chance = odds + (1.0 - odds) * config.sentiment_lift * conviction
+        liquid = liquidity_score(row, config)
+        check = premium_math.evaluate(spot, key["price"], option_type, strike, premium, row.get("expiry"), now, iv=premium_math.number(row.get("iv")), delta=premium_math.number(row.get("delta")),
+                                      bid=premium_math.number(row.get("bid")), ask=premium_math.number(row.get("ask")), liquidity=liquid)
+        reachable = all(item["passed"] for item in check["checks"] if item["id"] in {"KEY_LEVEL_PAYS_TARGET", "SPREAD"})
         rows.append({
             "symbol": row.get("symbol"), "strike": strike, "type": option_type, "expiry": row.get("expiry"), "premium": premium,
-            "delta": row.get("delta"), "iv": row.get("iv"), "open_interest": row.get("openInterest"), "volume": row.get("volume"),
+            "delta": row.get("delta"), "iv": row.get("iv"), "bid": row.get("bid"), "ask": row.get("ask"), "open_interest": row.get("openInterest"), "volume": row.get("volume"),
             "lot_size": row.get("lotSize"), "tick_size": row.get("tickSize"), "freeze_quantity": row.get("freezeQuantity"),
             "distance": round(abs(strike - spot), 2), "market_odds": round(odds, 3), "itm_chance": round(chance, 3),
             "intrinsic_at_key": round(intrinsic_at_key, 2), "premium_at_key": round(premium_at_key, 2), "value_gain": round(value_gain, 3),
-            "liquidity_score": liquidity_score(row, config),
-            "eligible": value_gain >= config.min_value_gain and liquidity_score(row, config) >= 2,
+            "liquidity_score": liquid, "premium_check": check, "target_reachable": reachable,
+            "eligible": value_gain >= config.min_value_gain and liquid >= 2 and reachable,
         })
     return sorted(rows, key=lambda item: (not item["eligible"], -item["itm_chance"], -item["value_gain"]))
 
@@ -342,7 +352,10 @@ def select_strike(symbol: str, spot: float, candles: list[CandleLike], chain: li
     calc["key_value"] = key
     calc["candidates"] = candidates[:5]
     if pick is None:
-        return f"No liquid OTM {option_type} between spot {spot:.0f} and a key value (nearest {key['price']:.0f}) offers a {config.min_value_gain:.0%} intrinsic gain on its premium"
+        unreachable = next((row for row in candidates if not row["target_reachable"]), None)
+        if unreachable is not None and all(row["value_gain"] >= config.min_value_gain and row["liquidity_score"] >= 2 for row in candidates if not row["target_reachable"]):
+            return f"Key value {key['price']:.0f} is too close for a +50% premium: {unreachable['symbol']} {unreachable['premium_check']['reason']}"
+        return f"No liquid OTM {option_type} between spot {spot:.0f} and a key value (nearest {key['price']:.0f}) offers a {config.min_value_gain:.0%} intrinsic gain on its premium and a reachable +50% premium target"
     calc["selected"] = pick
     return None
 
@@ -393,7 +406,15 @@ def analyze_intrinsic(symbol: str, candles: list[CandleLike], context: dict, now
         "trailing_distance": _tick(risk, tick), "breakeven_at": _tick(entry + risk, tick),
         "trailing_rule": f"Trail the stop {risk:.2f} under the highest premium; it reaches breakeven at {entry + risk:.2f} (+1R)",
     }
+    # The user's calculator on the traded premium: structural stop, +50% target, Greeks move.
+    check = premium_math.evaluate(spot, key["price"], option_type, pick["strike"], entry, pick["expiry"], now, iv=premium_math.number(pick.get("iv")), delta=premium_math.number(pick.get("delta")),
+                                  bid=premium_math.number(pick.get("bid")), ask=premium_math.number(pick.get("ask")), liquidity=pick["liquidity_score"], stop=stop)
+    calc["premium_check"] = check
+    plan["percent_target"] = check["percent_target"]
+    plan["premium_at_key_model"] = check["premium_at_key_model"]
     calc["plan"] = plan
+    if not check["valid"]:
+        return {**base, "decision": "NO_TRADE", "reason": f"{pick['symbol']} at ₹{entry:.2f}: {check['reason']}"}
     if rr < config.min_rr:
         return {**base, "decision": "NO_TRADE", "reason": f"Only {rr:.2f}R from entry {entry:.2f} to the key-value premium {target:.2f}; minimum {config.min_rr:.0f}R"}
     return {**base, "decision": "CONFIRMED", "confidence": 100,

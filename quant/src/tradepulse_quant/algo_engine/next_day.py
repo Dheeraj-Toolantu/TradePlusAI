@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from .engine import MARKET_TIMEZONE, Candle, _candles_from, _daily_atr, _daily_bars, _parse_timestamp
+from . import premium_math
 from .intrinsic_value import ROUND_STEP, IntrinsicConfig, liquidity_score, market_itm_odds
 
 SESSION_CLOSE = time(15, 30)
@@ -229,7 +230,8 @@ def key_value(levels: list[tuple[str, float]], trigger: float, direction: int, a
     return {"price": round(price, 2), "sources": sources}
 
 
-def pick_strike(chain: list[dict], option_type: str, trigger: float, target: float, close: float, now: datetime, session_day: date, intrinsic: IntrinsicConfig) -> tuple[dict | None, list[dict]]:
+def pick_strike(chain: list[dict], option_type: str, trigger: float, target: float, close: float, now: datetime, session_day: date, intrinsic: IntrinsicConfig,
+                entry_time: datetime | None = None) -> tuple[dict | None, list[dict]]:
     wanted = "CALL" if option_type == "CE" else "PUT"
     direction = 1 if option_type == "CE" else -1
     rows = []
@@ -247,11 +249,19 @@ def pick_strike(chain: list[dict], option_type: str, trigger: float, target: flo
         premium_at_key = intrinsic_at_key + intrinsic.residual_time_value * estimate
         gain = premium_at_key / estimate - 1.0
         liquid = liquidity_score(row, intrinsic)
+        # The premium calculator at the trigger: does the key value pay +50% on the estimated entry?
+        scale = estimate / premium
+        bid, ask = premium_math.number(row.get("bid")), premium_math.number(row.get("ask"))
+        check = premium_math.evaluate(trigger, target, option_type, strike, estimate, row.get("expiry"), entry_time or now, iv=premium_math.number(row.get("iv")), delta=odds,
+                                      bid=bid * scale if bid is not None else None, ask=ask * scale if ask is not None else None, liquidity=liquid)
+        reachable = all(item["passed"] for item in check["checks"] if item["id"] in {"KEY_LEVEL_PAYS_TARGET", "SPREAD"})
         rows.append({"symbol": row.get("symbol"), "strike": strike, "type": option_type, "expiry": row.get("expiry"), "premium_close": premium,
                      "delta": _r(odds, 3), "estimated_entry": round(estimate, 2), "intrinsic_at_key": round(intrinsic_at_key, 2),
                      "premium_at_key": round(premium_at_key, 2), "value_gain": round(gain, 3), "liquidity_score": liquid,
-                     "lot_size": row.get("lotSize"), "tick_size": row.get("tickSize"),
-                     "eligible": gain >= intrinsic.min_value_gain and liquid >= 2})
+                     "lot_size": row.get("lotSize"), "tick_size": row.get("tickSize"), "iv": premium_math.number(row.get("iv")),
+                     "spread": (bid * scale, ask * scale) if bid is not None and ask is not None else None,
+                     "premium_check": check, "target_reachable": reachable,
+                     "eligible": gain >= intrinsic.min_value_gain and liquid >= 2 and reachable})
     rows.sort(key=lambda item: (not item["eligible"], -(item["delta"] or 0)))
     return next((row for row in rows if row["eligible"]), None), rows[:4]
 
@@ -269,13 +279,16 @@ def build_plan(role: str, direction: int, symbol: str, summary: dict, levels: li
              "risk_points": round(abs(trigger - stop), 1), "reward_points": round(abs(target - trigger), 1), "risk_reward": round(abs(target - trigger) / abs(trigger - stop), 2),
              "skip_if_open_beyond": round(trigger + direction * 0.5 * abs(target - trigger), 1)}
     plan = {"role": role, "option_type": option_type, "direction": "BULLISH" if direction > 0 else "BEARISH", "index": index, "contract": None, "premium": None, "candidates": []}
-    pick, candidates = pick_strike(chain, option_type, trigger, target, summary["close"], now, session_day, intrinsic)
+    entry_time = datetime.combine(next_day, time(10, 0), tzinfo=MARKET_TIMEZONE)
+    pick, candidates = pick_strike(chain, option_type, trigger, target, summary["close"], now, session_day, intrinsic, entry_time)
     plan["candidates"] = candidates
     condition = (f"After 9:30 (once the first 15-minute candle is done), {symbol} trades {word} {trigger:.0f} and the option premium pulls back and resumes. "
                  f"Skip if {symbol} opens {word} {index['skip_if_open_beyond']:.0f} (the move is already half done).")
     if pick is None:
         plan["entry_rule"] = condition
-        plan["note"] = f"No liquid OTM {option_type} between {trigger:.0f} and the key value {target:.0f} offers a {intrinsic.min_value_gain:.0%} intrinsic gain; trade only if the chain reprices at the open."
+        blocked = next((row for row in candidates if not row["target_reachable"]), None)
+        plan["note"] = (f"No liquid OTM {option_type} between {trigger:.0f} and the key value {target:.0f} offers a {intrinsic.min_value_gain:.0%} intrinsic gain and a reachable +50% premium"
+                        + (f" ({blocked['symbol']}: {blocked['premium_check']['reason']})" if blocked else "") + "; trade only if the chain reprices at the open.")
         return plan
     tick = float(pick.get("tick_size") or 0.05) or 0.05
     entry = _tick(pick["estimated_entry"], tick)
@@ -287,6 +300,9 @@ def build_plan(role: str, direction: int, symbol: str, summary: dict, levels: li
     plan["premium"] = {"entry": entry, "stop_loss": _tick(entry - risk, tick), "target": target_premium,
                        "risk_reward": round((target_premium - entry) / risk, 2) if risk > 0 else None, "trailing_distance": risk,
                        "breakeven_at": _tick(entry + risk, tick), "stop_capped": raw_risk > risk + tick}
+    spread = pick.get("spread")
+    plan["premium"]["check"] = premium_math.evaluate(trigger, target, option_type, pick["strike"], entry, pick["expiry"], entry_time, iv=pick.get("iv"), delta=pick["delta"],
+                                                     bid=spread[0] if spread else None, ask=spread[1] if spread else None, liquidity=pick["liquidity_score"], stop=entry - risk)
     plan["entry_rule"] = condition + f" Buy {pick['symbol']} near ₹{entry:.2f} (estimated from yesterday's ₹{pick['premium_close']:.2f} and delta {pick['delta']:.2f})."
     plan["trailing_rule"] = (f"Trail the premium stop ₹{risk:.2f} under the highest premium (breakeven at ₹{entry + risk:.2f}, +1R). "
                              f"On the index: once {symbol} is {abs(trigger - stop):.0f} pts in favour, move the index stop to {trigger:.0f}.")

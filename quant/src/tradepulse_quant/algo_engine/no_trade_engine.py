@@ -56,6 +56,9 @@ class PipelineEvidence:
     broker_forced_exit: bool = False
     # Only an explicit False switches these off (missing evidence keeps them on). The engine sets
     # them from the strategy, never from caller-supplied evidence.
+    # Strategies that size the index move to the premium target set this; None skips the gate.
+    premium_target_reachable: bool | None = None
+    premium_target_detail: str | None = None
     regime_gate: bool | None = True
     option_flow_gate: bool | None = True
 
@@ -145,6 +148,9 @@ class NoTradeEngine:
             reasons.append("MISSING_RISK_REWARD")
         elif not valid_rr:
             reasons.append("RR_BELOW_MINIMUM")
+
+        if evidence.premium_target_reachable is not None:
+            require("PREMIUM_TARGET_UNREACHABLE", evidence.premium_target_reachable, evidence.premium_target_detail or "the key level must be far enough for the premium target, with a tight spread and a liquid strike")
 
         if evidence.safe_mode:
             gates.append(GateEvidence("SAFE_MODE_ACTIVE", False, "SAFE_MODE blocks new entries"))

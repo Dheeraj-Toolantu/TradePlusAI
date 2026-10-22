@@ -572,6 +572,10 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-orb { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0; padding: 8px; border: 1px solid #173a47; border-radius: 6px; background: #0b2330; color: var(--muted); }
 .exec-orb b { color: var(--text); }
 .exec-orb small { flex-basis: 100%; }
+.exec-premium-check { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0; padding: 8px; border: 1px dashed #25505f; border-radius: 6px; color: var(--muted); }
+.exec-premium-check b { color: var(--text); }
+.exec-premium-check > span, .exec-premium-check > small, .exec-premium-check > div, .exec-premium-check > details { flex-basis: 100%; }
+.exec-premium-check .exec-gates { margin: 2px 0; }
 
 /* Options strategy panel (value, time, expiry, volatility, sentiment) */
 .ost-panel { display: grid; gap: 10px; }

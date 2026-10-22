@@ -599,6 +599,8 @@ def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option
         card["minimum"] = card["minimum"] + float(StrategyConfiguration().expiry_day_adjustments["minimum_score_increase"])
     # A watch-mode strike (sentiment not extreme yet) is shown, never counted as a passed gate.
     selected = {} if calc.get("watch") else calc.get("selected") or {}
+    # The entry check once the premium has triggered; before that, the selected strike's own.
+    check = calc.get("premium_check") or selected.get("premium_check")
     evidence.update({
         "setup_side": (result.get("setup") or {}).get("side") or result.get("side"),
         "breakout_valid": bool(not calc.get("watch") and calc.get("key_value") and selected),
@@ -607,6 +609,8 @@ def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option
         "minimum_score": card["minimum"],
         "liquidity_score": selected.get("liquidity_score"),
         "regime_gate": calc.get("mapping") == "FOLLOW",
+        "premium_target_reachable": bool(check and check.get("valid")),
+        "premium_target_detail": (check or {}).get("reason") or "No strike selected yet, so the premium target is unchecked",
         "option_flow_gate": False,
     })
     calculations["score"] = {**calculations["score"], **card, "card": "INTRINSIC_VALUE"}
