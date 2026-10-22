@@ -131,6 +131,16 @@ class PlanTest(unittest.TestCase):
         self.assertIn("After 9:30", primary["entry_rule"])
         self.assertIn("Trail", primary["trailing_rule"])
 
+    def test_plan_carries_the_premium_calculator(self):
+        primary = setup(STRONG_CLOSE)["plans"][0]
+        check = primary["premium"]["check"]
+        self.assertAlmostEqual(check["spot"], primary["index"]["trigger"], places=0)
+        self.assertAlmostEqual(check["key_level"], primary["index"]["target"], places=0)
+        self.assertEqual(check["entry"], primary["premium"]["entry"])
+        self.assertEqual(check["stop_premium"], primary["premium"]["stop_loss"])
+        self.assertIsNotNone(check["move_needed_delta"])
+        self.assertTrue(primary["candidates"][0]["target_reachable"])
+
     def test_gap_down_plan_buys_a_put_below_the_trigger(self):
         primary = setup(WEAK_CLOSE)["plans"][0]
         self.assertEqual(primary["option_type"], "PE")

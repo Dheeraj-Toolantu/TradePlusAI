@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
+import { PremiumCalculator, type PremiumCheck } from "../../components/execution/premium-calculator";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -20,11 +21,12 @@ const ScalperDesk = dynamic(() => import("../../components/scalper/scalper-desk"
 
 type PipelineGate = { code: string; passed: boolean; detail: string };
 type IntrinsicContract = { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string; lot_size?: number | null; tick_size?: number | null; freeze_quantity?: number | null };
-type IntrinsicCandidate = { symbol: string; strike: number; premium: number; delta?: number; market_odds: number; itm_chance: number; intrinsic_at_key: number; premium_at_key: number; value_gain: number; liquidity_score: number; eligible: boolean };
+type IntrinsicCandidate = { symbol: string; strike: number; premium: number; delta?: number; market_odds: number; itm_chance: number; intrinsic_at_key: number; premium_at_key: number; value_gain: number; liquidity_score: number; eligible: boolean; target_reachable?: boolean; premium_check?: PremiumCheck };
 type IntrinsicCalc = {
   mapping: "CONTRARIAN" | "FOLLOW"; spot?: number | null; reach?: number | null;
   sentiment: { score: number | null; label?: string | null; zone?: string | null; option_type: "CE" | "PE" | null; lean_option_type?: "CE" | "PE" | null; ok: boolean; reason: string; age_minutes?: number | null; threshold: number };
   watch?: boolean;
+  premium_check?: PremiumCheck | null;
   key_value: { price: number; distance: number; sources: string[]; strength: number } | null;
   levels: Array<{ name: string; price: number; distance: number }>;
   candidates: IntrinsicCandidate[];
@@ -533,7 +535,7 @@ export default function ExecutionPage() {
   const mappingInfo = MAPPINGS.find((item) => item.id === sentimentMapping) ?? MAPPINGS[0];
   const scoreTiles: Array<[string, unknown, number]> = [["Sentiment extreme", score.sentiment_extreme, 3], ["Key value", score.key_value, 2], ["ITM chance", score.itm_chance, 2], ["Premium structure", score.premium_structure, 2], ["Option flow", score.option_flow, 1]];
   // Pipeline gate codes are shared with the other strategies; name them for this one.
-  const GATE_LABELS: Record<string, string> = { BREAKOUT_INVALID: "key value + strike", RETEST_NOT_CONFIRMED: "premium pullback", STRATEGY_NOT_CONFIRMED: "strategy" };
+  const GATE_LABELS: Record<string, string> = { BREAKOUT_INVALID: "key value + strike", RETEST_NOT_CONFIRMED: "premium pullback", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "premium target" };
   const strategyTrend = useMemo(() => ({ regime: regime ?? null, vwap: Number(vwap) || null, ema20: Number(ema20) || null, ema50: Number(ema50) || null }), [regime, vwap, ema20, ema50]);
   const ticketPremium = premiumFor(contract);
   const ticketRisk = ticketPremium && Number(stopLoss) > 0 ? (ticketPremium - Number(stopLoss)) * lots * lotSize : null;
@@ -588,9 +590,14 @@ export default function ExecutionPage() {
                 <span>Premium <b className={intrinsic.premium?.status === "CONFIRMED" ? "gain" : "warning"}>{intrinsic.premium ? intrinsic.premium.status.replaceAll("_", " ") : "--"}</b>{intrinsic.premium?.retrace !== undefined ? ` · pullback ${Math.round(intrinsic.premium.retrace * 100)}% to ₹${money(intrinsic.premium.pullback_low)}` : ""}</span>
                 {intrinsic.plan && <span>Trailing <b>{intrinsic.plan.trailing_rule}</b></span>}
                 <small>{String(analysis?.strategy_reason ?? intrinsic.sentiment.reason ?? "")}</small>
-                {intrinsic.candidates.length > 1 && <small>Other OTM strikes: {intrinsic.candidates.filter((item) => item.symbol !== intrinsic.selected?.symbol).slice(0, 3).map((item) => `${money(item.strike)} (${Math.round(item.itm_chance * 100)}%, ₹${money(item.premium)}${item.eligible ? "" : ", too little intrinsic gain"})`).join(" · ")}</small>}
+                {intrinsic.candidates.length > 1 && <small>Other OTM strikes: {intrinsic.candidates.filter((item) => item.symbol !== intrinsic.selected?.symbol).slice(0, 3).map((item) => `${money(item.strike)} (${Math.round(item.itm_chance * 100)}%, ₹${money(item.premium)}${item.eligible ? "" : item.target_reachable === false ? ", key level too close for +50%" : ", too little intrinsic gain"})`).join(" · ")}</small>}
               </div>
             )}
+            {(() => {
+              const check = intrinsic?.premium_check ?? intrinsic?.selected?.premium_check ?? intrinsic?.candidates[0]?.premium_check;
+              const side = intrinsic?.sentiment.option_type ?? intrinsic?.sentiment.lean_option_type;
+              return check && side ? <PremiumCalculator check={check} optionType={side} title={intrinsic?.premium_check ? "Premium target check at entry" : `Premium target check · ${intrinsic?.selected?.symbol ?? intrinsic?.candidates[0]?.symbol ?? ""}`} /> : null;
+            })()}
             {!analysis?.setup && <p className="mi-note">{analysis?.pipeline ? `${analysis.pipeline.gates.filter((gate) => gate.passed).length}/${analysis.pipeline.gates.length} gates passing. No setup until every gate is green.` : analysis?.reason ?? "Waiting for the engine…"}</p>}
             <div className="exec-score">
               {scoreTiles.map(([name, value, max]) => (

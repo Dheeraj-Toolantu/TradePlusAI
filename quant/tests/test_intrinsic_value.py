@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from tradepulse_quant.algo_engine.engine import Candle, _intrinsic_evidence, analyze
-from tradepulse_quant.algo_engine.intrinsic_value import IntrinsicConfig, config_for, premium_trigger, read_sentiment
+from tradepulse_quant.algo_engine.intrinsic_value import IntrinsicConfig, config_for, premium_trigger, rank_strikes, read_sentiment
 from tradepulse_quant.algo_engine.pipeline import evaluate_payload
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -147,6 +147,46 @@ class StrikeSelectionTest(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertTrue(selected["symbol"].endswith("CE"))
         self.assertGreater(selected["strike"], 25000)
+
+
+class PremiumTargetTest(unittest.TestCase):
+    def test_selected_strike_carries_the_premium_calculator(self):
+        check = run(context())["intrinsic"]["selected"]["premium_check"]
+        self.assertEqual(check["move_points"], 100)  # spot 25000 to the 24900 key value
+        self.assertEqual(check["target_premium"], 67.5)  # 45 x 1.5
+        self.assertEqual(check["move_needed_delta"], 53.6)  # 22.5 / 0.42
+        self.assertLessEqual(check["move_needed_greeks"], check["move_points"])
+        self.assertTrue(check["valid"])
+
+    def test_key_value_too_close_for_a_50_percent_premium_is_rejected(self):
+        ctx = context()
+        ctx["option_chain"]["spot"] = 24960  # the 24900 key value is now 60 pts away
+        for row in ctx["option_chain"]["contracts"]:
+            if row["symbol"] == "NIFTY26OCT24950PE":
+                row["premium"], row["delta"] = 60, -0.45  # needs ~67 pts for +50%
+        # 24900 cannot pay +50%, so the engine moves on to the next key value (PDL 24840).
+        result = run(ctx)
+        calc = result["intrinsic"]
+        self.assertEqual(calc["key_value"]["price"], 24840)
+        self.assertGreaterEqual(calc["selected"]["premium_check"]["move_points"], calc["selected"]["premium_check"]["move_needed_greeks"])
+        near = rank_strikes(ctx["option_chain"]["contracts"], 24960, {"price": 24900}, "PE", 0.2, NOW, IntrinsicConfig())
+        row = next(r for r in near if r["symbol"] == "NIFTY26OCT24950PE")
+        self.assertFalse(row["target_reachable"])
+        self.assertFalse(row["eligible"])
+        self.assertGreater(row["premium_check"]["move_needed_greeks"], 60)
+
+    def test_confirmed_trade_reports_the_entry_check_and_passes_the_gate(self):
+        result = run(context(premium=premium_candles(IMPULSE_PULLBACK_CONTINUATION)))
+        self.assertEqual(result["decision"], "CONFIRMED", result["reason"])
+        check = result["intrinsic"]["premium_check"]
+        self.assertEqual(check["entry"], 52.5)
+        self.assertEqual(check["percent_target"], 78.75)
+        self.assertTrue(check["valid"])
+        evidence = {"regime": "TRENDING_BULL", "regime_gate": True, "option_flow_gate": True, "score": 0, "minimum_score": 8}
+        _intrinsic_evidence(result, evidence, {"score": {}}, {}, expiry_day=False)
+        self.assertTrue(evidence["premium_target_reachable"])
+        gates = {gate["code"]: gate["passed"] for gate in evaluate_payload(evidence)["gates"]}
+        self.assertTrue(gates["PREMIUM_TARGET_UNREACHABLE"])
 
 
 class PremiumTriggerTest(unittest.TestCase):
