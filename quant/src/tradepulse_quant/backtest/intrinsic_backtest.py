@@ -13,7 +13,8 @@ volume only), India VIX, broker and risk-manager gates. Sentiment is a single re
 day, normally the point-in-time 09:00 IST score from ``sentiment.backtest_index``.
 
 stdin JSON: ``symbol``, ``day`` (YYYY-MM-DD), ``candles_5m`` and ``daily_candles`` (index,
-including prior sessions), ``sentiment`` ({score, label}), ``mapping`` (CONTRARIAN|FOLLOW),
+including prior sessions), ``sentiment`` ({score, label}), ``mapping`` (CONTRARIAN|FOLLOW), ``extreme`` (ACTIVE|BALANCED|STRICT
+or a number; default ACTIVE),
 ``options``: [{symbol, type: CE|PE, strike, expiry, lot_size, candles}].
 """
 from __future__ import annotations
@@ -128,7 +129,7 @@ def replay(payload: dict) -> dict:
             contracts.append({"symbol": option["symbol"], "contract": "CALL" if option["type"] == "CE" else "PUT", "strike": option["strike"], "premium": done[-1].close,
                               "delta": delta, "iv": iv, "openInterest": None, "volume": sum(c.volume for c in done if _start(c).date() == day),
                               "expiry": option.get("expiry"), "lotSize": option.get("lot_size"), "tickSize": 0.05, "freezeQuantity": None, "_bars": done})
-        context = {"index_sentiment": sentiment, "sentiment_mapping": mapping, "option_chain": {"spot": spot, "contracts": [{k: v for k, v in c.items() if k != "_bars"} for c in contracts]}}
+        context = {"index_sentiment": sentiment, "sentiment_mapping": mapping, "sentiment_extreme": payload.get("extreme"), "option_chain": {"spot": spot, "contracts": [{k: v for k, v in c.items() if k != "_bars"} for c in contracts]}}
         result = analyze(symbol, history, strategy="INTRINSIC_VALUE", daily_candles=daily, context=context, now=now)
         wanted = result.get("needs_premium_candles")
         if wanted:

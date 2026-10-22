@@ -2,8 +2,10 @@
 
 The trade is read in four steps, each one fail-closed:
 
-1. Sentiment. The Index Sentiment Analyser score (-100..+100) must be extreme (at or beyond
-   the STRONG_BULLISH / STRONG_BEARISH cut-off). The direction is then taken from
+1. Sentiment. The Index Sentiment Analyser score (-100..+100) must be extreme. The index score
+   is a weight-averaged blend of ~50 constituents, so it rarely leaves -40..+40; the default
+   cut-off is the analyser's own Greed/Fear zone edge (15), and ``EXTREME_PRESETS`` offers
+   stricter ones. The direction is then taken from
    ``SENTIMENT_MAPPINGS``. The default mapping is CONTRARIAN, exactly as specified: a very
    positive index sentiment buys a PE, a very negative one buys a CE. Pass ``FOLLOW`` to
    trade with the sentiment instead.
@@ -37,6 +39,11 @@ SENTIMENT_MAPPINGS: dict[str, dict[str, str]] = {
 }
 DEFAULT_MAPPING = "CONTRARIAN"
 
+# Sentiment cut-offs the user can pick. ACTIVE is the analyser's Greed/Fear zone edge; STRICT is
+# its STRONG_* label, which a constituent-weighted index score reaches only a few days a year.
+EXTREME_PRESETS: dict[str, float] = {"ACTIVE": 15.0, "BALANCED": 25.0, "STRICT": 40.0}
+DEFAULT_EXTREME = "ACTIVE"
+
 STRIKE_STEP = {"NIFTY": 50.0, "BANKNIFTY": 100.0, "SENSEX": 100.0}
 ROUND_STEP = {"NIFTY": 100.0, "BANKNIFTY": 500.0, "SENSEX": 500.0}
 
@@ -52,7 +59,7 @@ class CandleLike(Protocol):
 
 @dataclass(frozen=True)
 class IntrinsicConfig:
-    extreme_score: float = 40.0  # Index Sentiment Analyser STRONG_* cut-off
+    extreme_score: float = EXTREME_PRESETS[DEFAULT_EXTREME]
     sentiment_max_age_minutes: float = 45.0
     key_reach_daily_atr: float = 1.0  # a key value further than this many daily ATRs is out of reach
     key_cluster_pct: float = 0.0012  # levels within 0.12% of each other are one key value
@@ -70,13 +77,25 @@ class IntrinsicConfig:
     stop_buffer_pct: float = 0.02
     max_stop_pct: float = 0.35
     min_rr: float = 2.0
-    minimum_score: float = 6.0
+    minimum_score: float = 5.0
     maximum_score: float = 10.0
 
 
 def normalize_mapping(value: object) -> str:
     text = str(value or "").upper()
     return text if text in SENTIMENT_MAPPINGS else DEFAULT_MAPPING
+
+
+def config_for(extreme: object) -> IntrinsicConfig:
+    """A preset name (ACTIVE/BALANCED/STRICT) or a number 10..60 sets the sentiment cut-off."""
+    text = str(extreme or "").upper()
+    if text in EXTREME_PRESETS:
+        return IntrinsicConfig(extreme_score=EXTREME_PRESETS[text])
+    try:
+        value = float(text)
+    except ValueError:
+        return IntrinsicConfig()
+    return IntrinsicConfig(extreme_score=min(60.0, max(10.0, value))) if math.isfinite(value) else IntrinsicConfig()
 
 
 def _parse(value: str) -> datetime | None:
@@ -126,10 +145,13 @@ def read_sentiment(reading: dict | None, mapping: str, config: IntrinsicConfig, 
         out["age_minutes"] = round(age, 1)
         if age > config.sentiment_max_age_minutes:
             return {**out, "reason": f"Index sentiment is {age:.0f} min old (max {config.sentiment_max_age_minutes:.0f}); waiting for a fresh scan"}
-    if abs(score) < config.extreme_score:
-        return {**out, "reason": f"Sentiment {score:+.0f} is not extreme (needs {config.extreme_score:+.0f} or {-config.extreme_score:+.0f}); no intrinsic-value trade"}
     bias = "BULLISH" if score > 0 else "BEARISH"
     option_type = SENTIMENT_MAPPINGS[mapping][bias]
+    if abs(score) < config.extreme_score:
+        # Not tradable yet, but the side it leans to is known: the strategy shows the strike it
+        # would buy so the setup is ready the moment sentiment crosses the cut-off.
+        lean = option_type if score != 0 else None
+        return {**out, "lean_option_type": lean, "reason": f"Sentiment {score:+.1f} is not extreme yet (needs {config.extreme_score:+.0f} or {-config.extreme_score:+.0f})" + (f"; watching the {lean} it leans to" if lean else "")}
     side = "BUY" if option_type == "CE" else "SELL"
     conviction = min(1.0, abs(score) / 100.0)
     rule = "contrarian: fade the crowd" if mapping == "CONTRARIAN" else "follow the sentiment"
@@ -294,20 +316,8 @@ def premium_trigger(candles: list[CandleLike], config: IntrinsicConfig) -> dict:
 
 # ---- strategy -------------------------------------------------------------------------
 
-def analyze_intrinsic(symbol: str, candles: list[CandleLike], context: dict, now: datetime, daily_atr: float | None, config: IntrinsicConfig | None = None) -> dict:
-    config = config or IntrinsicConfig()
-    mapping = normalize_mapping(context.get("sentiment_mapping"))
-    chain = [row for row in (context.get("option_chain") or {}).get("contracts", []) if isinstance(row, dict) and row.get("strike") is not None]
-    spot = float((context.get("option_chain") or {}).get("spot") or 0) or (candles[-1].close if candles else 0.0)
-    sentiment = read_sentiment(context.get("index_sentiment"), mapping, config, now)
-    calc: dict = {"mapping": mapping, "sentiment": sentiment, "spot": _round(spot), "key_value": None, "levels": [], "candidates": [], "selected": None, "premium": None, "plan": None}
-    base = {"symbol": symbol, "strategy": STRATEGY_ID, "confidence": 0, "setup": None, "side": sentiment.get("side"), "intrinsic": calc}
-    if not sentiment["ok"]:
-        return {**base, "decision": "NO_TRADE", "reason": sentiment["reason"]}
-    option_type = sentiment["option_type"]
-    if spot <= 0 or not chain:
-        return {**base, "decision": "NO_TRADE", "reason": "Option chain is unavailable; cannot pick an OTM strike"}
-
+def select_strike(symbol: str, spot: float, candles: list[CandleLike], chain: list[dict], option_type: str, conviction: float, now: datetime, daily_atr: float | None, config: IntrinsicConfig, calc: dict) -> str | None:
+    """Fill ``calc`` with the key value and the OTM strike; returns the reason when none qualifies."""
     strikes = sorted({float(row["strike"]) for row in chain})
     otm = [s for s in strikes if s > spot] if option_type == "CE" else sorted([s for s in strikes if s < spot], reverse=True)
     first_otm = otm[0] if otm else None
@@ -318,11 +328,11 @@ def analyze_intrinsic(symbol: str, candles: list[CandleLike], context: dict, now
     calc["reach"] = _round(reach)
     if not keys:
         why = f"within {reach:.0f} pts (1 daily ATR)" if reach else "on the chart"
-        return {**base, "decision": "NO_TRADE", "reason": f"No key value {why} {'above' if option_type == 'CE' else 'below'} the first OTM strike {first_otm:g}; an OTM premium has no level to gain intrinsic value towards" if first_otm else "No OTM strike in the chain"}
+        return f"No key value {why} {'above' if option_type == 'CE' else 'below'} the first OTM strike {first_otm:g}; an OTM premium has no level to gain intrinsic value towards" if first_otm else "No OTM strike in the chain"
     # The nearest key value that leaves room for a meaningful intrinsic gain on a liquid strike.
     key, candidates, pick = keys[0], [], None
     for level in keys:
-        ranked = rank_strikes(chain, spot, level, option_type, sentiment["conviction"], now, config)
+        ranked = rank_strikes(chain, spot, level, option_type, conviction, now, config)
         best = next((row for row in ranked if row["eligible"]), None)
         if best is not None:
             key, candidates, pick = level, ranked, best
@@ -332,8 +342,33 @@ def analyze_intrinsic(symbol: str, candles: list[CandleLike], context: dict, now
     calc["key_value"] = key
     calc["candidates"] = candidates[:5]
     if pick is None:
-        return {**base, "decision": "NO_TRADE", "reason": f"No liquid OTM {option_type} between spot {spot:.0f} and a key value (nearest {key['price']:.0f}) offers a {config.min_value_gain:.0%} intrinsic gain on its premium"}
+        return f"No liquid OTM {option_type} between spot {spot:.0f} and a key value (nearest {key['price']:.0f}) offers a {config.min_value_gain:.0%} intrinsic gain on its premium"
     calc["selected"] = pick
+    return None
+
+
+def analyze_intrinsic(symbol: str, candles: list[CandleLike], context: dict, now: datetime, daily_atr: float | None, config: IntrinsicConfig | None = None) -> dict:
+    config = config or IntrinsicConfig()
+    mapping = normalize_mapping(context.get("sentiment_mapping"))
+    chain = [row for row in (context.get("option_chain") or {}).get("contracts", []) if isinstance(row, dict) and row.get("strike") is not None]
+    spot = float((context.get("option_chain") or {}).get("spot") or 0) or (candles[-1].close if candles else 0.0)
+    sentiment = read_sentiment(context.get("index_sentiment"), mapping, config, now)
+    calc: dict = {"mapping": mapping, "sentiment": sentiment, "spot": _round(spot), "key_value": None, "levels": [], "candidates": [], "selected": None, "premium": None, "plan": None, "watch": False}
+    base = {"symbol": symbol, "strategy": STRATEGY_ID, "confidence": 0, "setup": None, "side": sentiment.get("side"), "intrinsic": calc}
+    if not sentiment["ok"]:
+        lean = sentiment.get("lean_option_type")
+        if lean and spot > 0 and chain:
+            # Watch mode: the strike is shown, but nothing downstream (premium, gates) is armed.
+            calc["watch"] = True
+            select_strike(symbol, spot, candles, chain, lean, min(1.0, abs(float(sentiment["score"])) / 100.0), now, daily_atr, config, calc)
+        return {**base, "decision": "NO_TRADE", "reason": sentiment["reason"]}
+    option_type = sentiment["option_type"]
+    if spot <= 0 or not chain:
+        return {**base, "decision": "NO_TRADE", "reason": "Option chain is unavailable; cannot pick an OTM strike"}
+    why_not = select_strike(symbol, spot, candles, chain, option_type, sentiment["conviction"], now, daily_atr, config, calc)
+    if why_not:
+        return {**base, "decision": "NO_TRADE", "reason": why_not}
+    pick, key = calc["selected"], calc["key_value"]
 
     premium_rows = context.get("premium_candles") or {}
     if premium_rows.get("symbol") != pick["symbol"]:
@@ -376,11 +411,13 @@ def score(result: dict, option_evidence: dict | None, config: IntrinsicConfig) -
     calc = result.get("intrinsic") or {}
     sentiment = calc.get("sentiment") or {}
     magnitude = abs(float(sentiment.get("score") or 0)) if sentiment.get("ok") else 0.0
-    sentiment_points = 3 if magnitude >= 60 else 2 if magnitude >= 50 else 1 if magnitude >= config.extreme_score else 0
-    key = calc.get("key_value") or {}
-    key_points = 2 if key.get("strength", 0) >= 3 else 1 if key.get("strength", 0) >= 2 else 0
-    chance = float((calc.get("selected") or {}).get("itm_chance") or 0)
-    chance_points = 2 if chance >= 0.40 else 1 if chance >= 0.30 else 0
+    # Points are relative to the chosen cut-off, so a stricter preset is not double-counted.
+    threshold = config.extreme_score
+    sentiment_points = 3 if magnitude >= threshold + 25 else 2 if magnitude >= threshold + 10 else 1 if magnitude >= threshold else 0
+    key = (calc.get("key_value") or {}) if sentiment.get("ok") else {}
+    key_points = 2 if key.get("strength", 0) >= 2 else 1 if key.get("strength", 0) >= 1 else 0
+    chance = float((calc.get("selected") or {}).get("itm_chance") or 0) if sentiment.get("ok") else 0.0
+    chance_points = 2 if chance >= 0.40 else 1 if chance >= 0.25 else 0
     structure_points = 2 if (calc.get("premium") or {}).get("status") == "CONFIRMED" else 0
     evidence = option_evidence or {}
     option_type = sentiment.get("option_type")

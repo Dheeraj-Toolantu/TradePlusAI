@@ -512,7 +512,7 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
     if strategy == intrinsic_value.STRATEGY_ID:
         now = now or datetime.now(MARKET_TIMEZONE)
         daily_atr = _daily_atr(_daily_bars(candles, daily_candles, now.date()), StrategyConfiguration().atr_period)
-        return intrinsic_value.analyze_intrinsic(symbol, candles, context or {}, now, daily_atr)
+        return intrinsic_value.analyze_intrinsic(symbol, candles, context or {}, now, daily_atr, intrinsic_value.config_for((context or {}).get("sentiment_extreme")))
     return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Range Defined Risk is analysis-only until the multi-leg builder is enabled", "confidence": 0, "setup": None}
 
 
@@ -582,7 +582,7 @@ def _candles_from(items: object) -> list[Candle]:
     return [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
 
 
-def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option_evidence: dict | None, expiry_day: bool) -> None:
+def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option_evidence: dict | None, expiry_day: bool, extreme: object = None) -> None:
     """Swap the trend-following ORB evidence for the intrinsic-value strategy's own.
 
     Every operational gate (data quality, session, VIX, gap, liquidity, 2R, broker, risk,
@@ -592,15 +592,16 @@ def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option
     contrarian trade fades the prevailing trend by design, so the regime gate is applied
     only when the mapping follows the sentiment.
     """
-    config = intrinsic_value.IntrinsicConfig()
+    config = intrinsic_value.config_for(extreme)
     calc = result.get("intrinsic") or {}
     card = intrinsic_value.score(result, option_evidence, config)
     if expiry_day:
         card["minimum"] = card["minimum"] + float(StrategyConfiguration().expiry_day_adjustments["minimum_score_increase"])
-    selected = calc.get("selected") or {}
+    # A watch-mode strike (sentiment not extreme yet) is shown, never counted as a passed gate.
+    selected = {} if calc.get("watch") else calc.get("selected") or {}
     evidence.update({
         "setup_side": (result.get("setup") or {}).get("side") or result.get("side"),
-        "breakout_valid": bool(calc.get("key_value") and selected),
+        "breakout_valid": bool(not calc.get("watch") and calc.get("key_value") and selected),
         "retest_confirmed": (calc.get("premium") or {}).get("status") == "CONFIRMED",
         "score": card["total"],
         "minimum_score": card["minimum"],
@@ -627,6 +628,7 @@ def analyze_payload(payload: dict) -> dict:
             "index_sentiment": payload.get("index_sentiment"),
             "option_chain": payload.get("option_chain"),
             "sentiment_mapping": payload.get("sentiment_mapping"),
+            "sentiment_extreme": payload.get("sentiment_extreme"),
             "premium_candles": {"symbol": premium.get("symbol"), "candles": completed_candles(_candles_from(premium.get("candles")), now)} if premium else None,
         }
     result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy, daily_candles, _expiry_today(option_evidence, now), context, now)
@@ -637,7 +639,7 @@ def analyze_payload(payload: dict) -> dict:
     volume_source = payload.get("volume_source") if isinstance(payload.get("volume_source"), str) else None
     evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, option_evidence, daily_candles, volume_source)
     if strategy == intrinsic_value.STRATEGY_ID:
-        _intrinsic_evidence(result, evidence, calculations, option_evidence, bool(session_info.get("expiry_day")))
+        _intrinsic_evidence(result, evidence, calculations, option_evidence, bool(session_info.get("expiry_day")), payload.get("sentiment_extreme"))
     result["calculations"] = calculations
     result["session"] = session_info
     caller_evidence = payload.get("pipeline") or {}

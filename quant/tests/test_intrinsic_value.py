@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from tradepulse_quant.algo_engine.engine import Candle, _intrinsic_evidence, analyze
-from tradepulse_quant.algo_engine.intrinsic_value import IntrinsicConfig, premium_trigger, read_sentiment
+from tradepulse_quant.algo_engine.intrinsic_value import IntrinsicConfig, config_for, premium_trigger, read_sentiment
 from tradepulse_quant.algo_engine.pipeline import evaluate_payload
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -79,10 +79,36 @@ class SentimentMappingTest(unittest.TestCase):
         self.assertEqual(read_sentiment({"score": 55}, "FOLLOW", config, NOW)["option_type"], "CE")
         self.assertEqual(read_sentiment({"score": -62}, "FOLLOW", config, NOW)["option_type"], "PE")
 
-    def test_moderate_sentiment_is_no_trade(self):
-        result = run(context(score=25))
+    def test_moderate_sentiment_is_no_trade_but_shows_the_strike_it_leans_to(self):
+        result = run(context(score=10))
         self.assertEqual(result["decision"], "NO_TRADE")
         self.assertIn("not extreme", result["reason"])
+        calc = result["intrinsic"]
+        self.assertTrue(calc["watch"])
+        self.assertEqual(calc["sentiment"]["lean_option_type"], "PE")
+        self.assertEqual(calc["selected"]["symbol"], "NIFTY26OCT24950PE")
+        # A watched strike is never a passed gate.
+        evidence = {"regime": "TRENDING_BULL", "regime_gate": True, "option_flow_gate": True, "score": 0, "minimum_score": 8}
+        _intrinsic_evidence(result, evidence, {"score": {}}, {}, expiry_day=False)
+        self.assertFalse(evidence["breakout_valid"])
+        self.assertIsNone(evidence["liquidity_score"])
+        self.assertEqual(evidence["score"], 0)
+
+    def test_screenshot_reading_minus_19_trades_a_call_on_the_default_cut_off(self):
+        # -19.1 sat in the analyser's Fear zone but under the old +/-40 cut-off, so the strategy never traded.
+        sentiment = read_sentiment({"score": -19.1}, "CONTRARIAN", IntrinsicConfig(), NOW)
+        self.assertTrue(sentiment["ok"])
+        self.assertEqual(sentiment["option_type"], "CE")
+
+    def test_strict_preset_keeps_the_old_cut_off(self):
+        self.assertEqual(config_for("STRICT").extreme_score, 40)
+        self.assertEqual(config_for("25").extreme_score, 25)
+        self.assertEqual(config_for("999").extreme_score, 60)
+        self.assertEqual(config_for(None).extreme_score, 15)
+        ctx = context(score=25)
+        ctx["sentiment_extreme"] = "STRICT"
+        self.assertEqual(run(ctx)["decision"], "NO_TRADE")
+        self.assertEqual(run(context(score=25))["decision"], "WAIT_FOR_CONFIRMATION")
 
     def test_missing_or_stale_sentiment_fails_closed(self):
         ctx = context()
@@ -171,6 +197,14 @@ class PipelineTest(unittest.TestCase):
         self.assertNotIn("REGIME_BLOCKED", gates)
         self.assertNotIn("ORS_NOT_CONFIRMED", gates)
         self.assertIn("SESSION_BLOCKED", gates)  # operational gates still apply
+
+    def test_confirmed_trade_at_a_moderate_score_clears_the_scorecard(self):
+        # The old card (6/10, sentiment points from 40) could not be met by a typical setup.
+        result = run(context(score=22, premium=premium_candles(IMPULSE_PULLBACK_CONTINUATION)))
+        self.assertEqual(result["decision"], "CONFIRMED", result["reason"])
+        evidence = {"regime": "TRENDING_BULL", "regime_gate": True, "option_flow_gate": True, "score": 0, "minimum_score": 8}
+        _intrinsic_evidence(result, evidence, {"score": {}}, {}, expiry_day=False)
+        self.assertGreaterEqual(evidence["score"], evidence["minimum_score"])
 
     def test_follow_mapping_keeps_the_regime_gate(self):
         evidence = self._evidence("FOLLOW")
