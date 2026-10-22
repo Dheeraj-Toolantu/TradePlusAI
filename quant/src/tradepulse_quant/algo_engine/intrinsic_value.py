@@ -14,7 +14,7 @@ The trade is read in four steps, each one fail-closed:
    round number), clustered so coinciding levels count as one stronger level.
 3. Strike. Among OTM strikes that lie between spot and the key value, pick the one with the
    highest chance of turning ITM: the market's own odds (|delta|) lifted by sentiment
-   conviction, keeping only strikes whose intrinsic value at the key value is a meaningful
+   conviction, keeping only strikes whose repriced premium at the key value is a meaningful
    gain on today's premium.
 4. Premium trigger. On the selected premium's own 5-minute candles: an impulse up, an orderly
    pullback (20-70% retrace that holds the impulse low), then a continuation candle. Entry is
@@ -72,7 +72,7 @@ class IntrinsicConfig:
     min_premium: float = 5.0
     min_delta: float = 0.12  # far-OTM lottery strikes are never selected
     sentiment_lift: float = 0.30  # sentiment conviction can add up to 30% of the remaining odds
-    min_value_gain: float = 0.5  # premium expected at the key value must be >= 1.5x today's
+    min_value_gain: float = 0.5  # option premium gain at the key value: premium there must be >= 1.5x today's
     residual_time_value: float = 0.5  # share of today's premium assumed left at the key value
     impulse_lookback: int = 12
     impulse_min_pct: float = 8.0
@@ -262,12 +262,14 @@ def rank_strikes(chain: list[dict], spot: float, key: dict, option_type: str, co
         if odds is None or odds < config.min_delta:
             continue
         intrinsic_at_key = abs(key["price"] - strike)
-        premium_at_key = intrinsic_at_key + config.residual_time_value * premium
-        value_gain = premium_at_key / premium - 1.0
         chance = odds + (1.0 - odds) * config.sentiment_lift * conviction
         liquid = liquidity_score(row, config)
         check = premium_math.evaluate(spot, key["price"], option_type, strike, premium, row.get("expiry"), now, iv=premium_math.number(row.get("iv")), delta=premium_math.number(row.get("delta")),
-                                      bid=premium_math.number(row.get("bid")), ask=premium_math.number(row.get("ask")), liquidity=liquid)
+                                      bid=premium_math.number(row.get("bid")), ask=premium_math.number(row.get("ask")), liquidity=liquid, lot_size=row.get("lotSize"))
+        # Premium at the key value: the full reprice of this contract (same strike, expiry, rate and
+        # implied vol); intrinsic + residual time value only when the model has no volatility.
+        premium_at_key = check["premium_at_key_model"] if check["premium_at_key_model"] is not None else intrinsic_at_key + config.residual_time_value * premium
+        value_gain = premium_at_key / premium - 1.0
         reachable = all(item["passed"] for item in check["checks"] if item["id"] in {"KEY_LEVEL_PAYS_TARGET", "SPREAD"})
         rows.append({
             "symbol": row.get("symbol"), "strike": strike, "type": option_type, "expiry": row.get("expiry"), "premium": premium,
@@ -339,7 +341,7 @@ def select_strike(symbol: str, spot: float, candles: list[CandleLike], chain: li
     if not keys:
         why = f"within {reach:.0f} pts (1 daily ATR)" if reach else "on the chart"
         return f"No key value {why} {'above' if option_type == 'CE' else 'below'} the first OTM strike {first_otm:g}; an OTM premium has no level to gain intrinsic value towards" if first_otm else "No OTM strike in the chain"
-    # The nearest key value that leaves room for a meaningful intrinsic gain on a liquid strike.
+    # The nearest key value that leaves room for a meaningful option premium gain on a liquid strike.
     key, candidates, pick = keys[0], [], None
     for level in keys:
         ranked = rank_strikes(chain, spot, level, option_type, conviction, now, config)
@@ -355,7 +357,7 @@ def select_strike(symbol: str, spot: float, candles: list[CandleLike], chain: li
         unreachable = next((row for row in candidates if not row["target_reachable"]), None)
         if unreachable is not None and all(row["value_gain"] >= config.min_value_gain and row["liquidity_score"] >= 2 for row in candidates if not row["target_reachable"]):
             return f"Key value {key['price']:.0f} is too close for a +50% premium: {unreachable['symbol']} {unreachable['premium_check']['reason']}"
-        return f"No liquid OTM {option_type} between spot {spot:.0f} and a key value (nearest {key['price']:.0f}) offers a {config.min_value_gain:.0%} intrinsic gain on its premium and a reachable +50% premium target"
+        return f"No liquid OTM {option_type} between spot {spot:.0f} and a key value (nearest {key['price']:.0f}) offers a {config.min_value_gain:.0%} option premium gain at the key value"
     calc["selected"] = pick
     return None
 
@@ -398,32 +400,35 @@ def analyze_intrinsic(symbol: str, candles: list[CandleLike], context: dict, now
         return {**base, "decision": "NO_TRADE", "reason": "Stop is not below the entry premium"}
     if risk / entry > config.max_stop_pct:
         return {**base, "decision": "NO_TRADE", "reason": f"Pullback stop is {risk / entry:.0%} of the premium (max {config.max_stop_pct:.0%}); too wide for an option buy"}
-    target = pick["intrinsic_at_key"] + config.residual_time_value * entry
-    rr = (target - entry) / risk
+    # The calculator on the traded premium: the model reprices this contract at the key value
+    # (target), and reward-to-risk is taken net of costs against the structural stop.
+    inputs = dict(iv=premium_math.number(pick.get("iv")), delta=premium_math.number(pick.get("delta")), bid=premium_math.number(pick.get("bid")),
+                  ask=premium_math.number(pick.get("ask")), liquidity=pick["liquidity_score"], lot_size=pick.get("lot_size"), stop=stop)
+    first = premium_math.evaluate(spot, key["price"], option_type, pick["strike"], entry, pick["expiry"], now, **inputs)
+    target = first["premium_at_key_model"] if first["premium_at_key_model"] is not None else pick["intrinsic_at_key"] + config.residual_time_value * entry
+    check = premium_math.evaluate(spot, key["price"], option_type, pick["strike"], entry, pick["expiry"], now, target=target, **inputs)
+    rr = check["net_risk_reward"] if check["net_risk_reward"] is not None else (target - entry) / risk
     tick = float(pick.get("tick_size") or 0.05) or 0.05
     plan = {
         "entry": _tick(entry, tick), "stop_loss": _tick(stop, tick), "target": _tick(target, tick), "risk_reward": round(rr, 2),
+        "gross_risk_reward": round((target - entry) / risk, 2), "costs_per_unit": check["costs"]["at_target"]["per_unit"],
         "trailing_distance": _tick(risk, tick), "breakeven_at": _tick(entry + risk, tick),
         "trailing_rule": f"Trail the stop {risk:.2f} under the highest premium; it reaches breakeven at {entry + risk:.2f} (+1R)",
+        "percent_target": check["percent_target"], "premium_at_key_model": check["premium_at_key_model"],
     }
-    # The user's calculator on the traded premium: structural stop, +50% target, Greeks move.
-    check = premium_math.evaluate(spot, key["price"], option_type, pick["strike"], entry, pick["expiry"], now, iv=premium_math.number(pick.get("iv")), delta=premium_math.number(pick.get("delta")),
-                                  bid=premium_math.number(pick.get("bid")), ask=premium_math.number(pick.get("ask")), liquidity=pick["liquidity_score"], stop=stop)
     calc["premium_check"] = check
-    plan["percent_target"] = check["percent_target"]
-    plan["premium_at_key_model"] = check["premium_at_key_model"]
     calc["plan"] = plan
     if not check["valid"]:
         return {**base, "decision": "NO_TRADE", "reason": f"{pick['symbol']} at ₹{entry:.2f}: {check['reason']}"}
     if rr < config.min_rr:
-        return {**base, "decision": "NO_TRADE", "reason": f"Only {rr:.2f}R from entry {entry:.2f} to the key-value premium {target:.2f}; minimum {config.min_rr:.0f}R"}
+        return {**base, "decision": "NO_TRADE", "reason": f"Only {rr:.2f}R net from entry {entry:.2f} to the key-value premium {target:.2f}; minimum {config.min_rr:.0f}R"}
     return {**base, "decision": "CONFIRMED", "confidence": 100,
             "reason": f"{sentiment['reason']}; key value {key['price']:.0f} ({', '.join(key['sources'])}); {pick['symbol']} {pick['itm_chance']:.0%} ITM chance; {trigger['reason']}",
             "setup": {
                 "side": sentiment["side"], "instrument": "OPTION_PREMIUM", "entry": plan["entry"], "stop_loss": plan["stop_loss"], "target": plan["target"],
                 "risk_reward": plan["risk_reward"], "trailing_distance": plan["trailing_distance"], "breakeven_at": plan["breakeven_at"],
                 "contract": {"symbol": pick["symbol"], "type": option_type, "strike": pick["strike"], "expiry": pick["expiry"], "lot_size": pick["lot_size"], "tick_size": pick["tick_size"], "freeze_quantity": pick["freeze_quantity"]},
-                "spot": _round(spot), "key_value": key["price"], "target_method": "KEY_VALUE_INTRINSIC", "stop_method": "PREMIUM_PULLBACK_LOW",
+                "spot": _round(spot), "key_value": key["price"], "target_method": "KEY_VALUE_REPRICE", "stop_method": "PREMIUM_PULLBACK_LOW",
             }}
 
 

@@ -8,7 +8,7 @@ type Plan = {
   role: "PRIMARY" | "ALTERNATE" | "BREAKOUT_UP" | "BREAKOUT_DOWN"; option_type: "CE" | "PE"; direction: string;
   index: { trigger: number; stop_loss: number; target: number; key_value_sources: string[]; risk_points: number; reward_points: number; risk_reward: number; skip_if_open_beyond: number };
   contract: { symbol: string; strike: number; type: "CE" | "PE"; expiry?: string; lot_size?: number | null; premium_close: number; delta: number | null; expiry_day: boolean } | null;
-  premium: { entry: number; stop_loss: number; target: number; risk_reward: number | null; trailing_distance: number; breakeven_at: number; stop_capped: boolean; check?: PremiumCheck } | null;
+  premium: { entry: number; stop_loss: number; target: number; risk_reward: number | null; gross_risk_reward?: number | null; trailing_distance: number; breakeven_at: number; stop_capped: boolean; check?: PremiumCheck } | null;
   entry_rule?: string; trailing_rule?: string; exit_rule?: string; note?: string;
 };
 export type NextDaySetup = {
@@ -79,7 +79,7 @@ export function NextDayPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: st
                 <span><small>{ROLE[plan.role]}</small></span>
                 <span><b className={plan.option_type === "CE" ? "gain" : "loss"}>{plan.contract ? `BUY ${plan.contract.symbol}` : `BUY ${plan.option_type} (no strike qualifies)`}</b>{plan.contract?.expiry_day ? <em className="warning"> expiry day</em> : null}</span>
                 <span>Index trigger <b>{num(plan.index.trigger, 0)}</b> · SL <b>{num(plan.index.stop_loss, 0)}</b> · target <b>{num(plan.index.target, 0)}</b> <small>({plan.index.key_value_sources.join(" + ")})</small></span>
-                {plan.premium && <span>Premium entry <b>₹{num(plan.premium.entry)}</b> · SL <b>₹{num(plan.premium.stop_loss)}</b> · trail <b>₹{num(plan.premium.trailing_distance)}</b> (breakeven ₹{num(plan.premium.breakeven_at)}) · target <b>₹{num(plan.premium.target)}</b> · {num(plan.premium.risk_reward)}R</span>}
+                {plan.premium && <span>Premium entry <b>₹{num(plan.premium.entry)}</b> · SL <b>₹{num(plan.premium.stop_loss)}</b> · trail <b>₹{num(plan.premium.trailing_distance)}</b> (breakeven ₹{num(plan.premium.breakeven_at)}) · target <b>₹{num(plan.premium.target)}</b> · {num(plan.premium.risk_reward)}R net of costs{plan.premium.gross_risk_reward !== undefined && plan.premium.gross_risk_reward !== null ? ` (${num(plan.premium.gross_risk_reward)}R gross)` : ""}</span>}
                 {plan.entry_rule && <small>{plan.entry_rule}</small>}
                 {plan.trailing_rule && <small>{plan.trailing_rule}</small>}
                 {plan.exit_rule && <small>{plan.exit_rule}</small>}
