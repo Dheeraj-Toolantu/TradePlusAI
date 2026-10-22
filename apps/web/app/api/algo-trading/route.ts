@@ -27,6 +27,10 @@ const sentimentIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
 // CE on very negative index sentiment; FOLLOW trades with the sentiment.
 const sentimentMappings = new Set(["CONTRARIAN", "FOLLOW"]);
 const mappingOf = (value: unknown) => { const text = String(value ?? "").toUpperCase(); return sentimentMappings.has(text) ? text : "CONTRARIAN"; };
+// How extreme the sentiment must be: ACTIVE (15, the analyser's Greed/Fear edge, the default),
+// BALANCED (25) or STRICT (40, the old cut-off a constituent-weighted index score rarely reaches).
+const extremePresets = new Set(["ACTIVE", "BALANCED", "STRICT"]);
+const extremeOf = (value: unknown) => { const text = String(value ?? "").toUpperCase(); return extremePresets.has(text) ? text : "ACTIVE"; };
 
 type RecordValue = Record<string, unknown>;
 
@@ -135,7 +139,7 @@ async function intrinsicInputs(symbol: string, origin: string) {
   return { index_sentiment: sentiment, option_chain: chain && Array.isArray(chain.contracts) ? { spot: chain.spot ?? null, expiry: chain.expiry ?? null, contracts: chain.contracts } : null };
 }
 
-async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, sentimentMapping = "CONTRARIAN") {
+async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, sentimentMapping = "CONTRARIAN", sentimentExtreme = "ACTIVE") {
   // 5m index candles carry near-month futures volume (index volume is always zero); daily
   // candles give the true ATR14 used by the gap-day rule.
   const [historyResponse, daily] = await Promise.all([
@@ -161,7 +165,7 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
   if (strategy !== "INTRINSIC_VALUE") return runPythonEngine(payload);
   // Pass 1 picks the key value and the OTM strike; pass 2 reads that premium's own 5m candles
   // for the pullback-and-continuation entry.
-  Object.assign(payload, await intrinsicInputs(symbol, origin), { sentiment_mapping: sentimentMapping });
+  Object.assign(payload, await intrinsicInputs(symbol, origin), { sentiment_mapping: sentimentMapping, sentiment_extreme: sentimentExtreme });
   const first = await runPythonEngine(payload);
   const contract = typeof first.needs_premium_candles === "string" ? first.needs_premium_candles : null;
   if (!contract) return first;
@@ -220,6 +224,7 @@ export async function GET(request: Request) {
   const strategy = url.searchParams.get("strategy") ?? "ORB_RETEST";
   const historyOnly = url.searchParams.get("history") === "true";
   const sentimentMapping = mappingOf(url.searchParams.get("mapping"));
+  const sentimentExtreme = extremeOf(url.searchParams.get("extreme"));
   const config = readGrowwConfig();
 
   if (historyOnly) {
@@ -239,7 +244,7 @@ export async function GET(request: Request) {
     const brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
     const evidence = await operationalEvidence(symbol, brokerHealthy, safeModeState);
     const [analysis, account, liveOrders, history] = await Promise.all([
-      runEngine(symbol, provider, url.origin, strategy, evidence, sentimentMapping),
+      runEngine(symbol, provider, url.origin, strategy, evidence, sentimentMapping, sentimentExtreme),
       provider === "groww" ? growwAccountSummary().catch(() => null) : Promise.resolve(null),
       markedPaperOrders(),
       getAllOrdersFromFirestore(30),
@@ -354,7 +359,7 @@ export async function POST(request: Request) {
     // Manual paper entries are explicitly user-authorized and skip this gate only; the
     // kill-switch, SAFE_MODE, broker-health, contract-master, lot/freeze, and minimum-2R
     // checks still apply to every order.
-    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState), mappingOf(body.sentimentMapping));
+    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState), mappingOf(body.sentimentMapping), extremeOf(body.sentimentExtreme));
     const pipeline = serverAnalysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
     if (pipeline?.decision !== "CONFIRMED") {
       return NextResponse.json({ error: "V5 no-trade gate rejected the paper entry.", reasons: pipeline?.reasons ?? ["SERVER_PIPELINE_UNAVAILABLE"] }, { status: 403 });

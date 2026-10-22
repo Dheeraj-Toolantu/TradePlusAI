@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
+import type { NextDaySetup } from "../../components/execution/next-day-panel";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -14,6 +15,7 @@ const SentimentPanel = dynamic(() => import("../../components/market-intel/senti
 const OptionStrategyPanel = dynamic(() => import("../../components/market-intel/option-strategy-panel").then((module) => module.OptionStrategyPanel), { ssr: false });
 const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitoring-panel").then((module) => module.AIMonitoringPanel), { ssr: false });
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
+const NextDayPanel = dynamic(() => import("../../components/execution/next-day-panel").then((module) => module.NextDayPanel), { ssr: false });
 const ScalperDesk = dynamic(() => import("../../components/scalper/scalper-desk").then((module) => module.ScalperDesk), { ssr: false, loading: () => <div className="algo-empty">Loading scalper…</div> });
 
 type PipelineGate = { code: string; passed: boolean; detail: string };
@@ -21,7 +23,8 @@ type IntrinsicContract = { symbol: string; type: "CE" | "PE"; strike: number; ex
 type IntrinsicCandidate = { symbol: string; strike: number; premium: number; delta?: number; market_odds: number; itm_chance: number; intrinsic_at_key: number; premium_at_key: number; value_gain: number; liquidity_score: number; eligible: boolean };
 type IntrinsicCalc = {
   mapping: "CONTRARIAN" | "FOLLOW"; spot?: number | null; reach?: number | null;
-  sentiment: { score: number | null; label?: string | null; zone?: string | null; option_type: "CE" | "PE" | null; ok: boolean; reason: string; age_minutes?: number | null; threshold: number };
+  sentiment: { score: number | null; label?: string | null; zone?: string | null; option_type: "CE" | "PE" | null; lean_option_type?: "CE" | "PE" | null; ok: boolean; reason: string; age_minutes?: number | null; threshold: number };
+  watch?: boolean;
   key_value: { price: number; distance: number; sources: string[]; strength: number } | null;
   levels: Array<{ name: string; price: number; distance: number }>;
   candidates: IntrinsicCandidate[];
@@ -51,6 +54,8 @@ type OptionCandidate = { symbol: string; contract: "CALL" | "PUT"; expiry: strin
 type Contract = { symbol: string; growwSymbol: string; type: "CE" | "PE"; expiry?: string; strike?: number; lotSize: number; tickSize?: number; freezeQuantity?: number; active?: boolean };
 type SearchResult = Contract & { exchange?: string };
 type SentimentMapping = "CONTRARIAN" | "FOLLOW";
+type SentimentExtreme = "ACTIVE" | "BALANCED" | "STRICT";
+type NextDayPlan = NonNullable<NextDaySetup["plans"]>[number];
 type LiveStatus = { enabled: boolean; disabledReasons: string[]; limits?: { maxDailyLoss: number; maxTradesPerDay: number; maxLotsPerOrder: number; maxOrderValue: number; maxOpenPositions: number; minRewardRisk: number }; today?: { tradesToday: number; realizedPnl: number; openRisk: number; lossBudgetLeft: number }; positions: Order[]; monitor?: { running: boolean; lastTickAt: string | null; lastError: string | null } };
 type Tab = "LIVE" | "PAPER" | "HISTORY" | "LOGS";
 type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
@@ -64,6 +69,11 @@ const MAPPINGS: Array<{ id: SentimentMapping; name: string; note: string }> = [
   { id: "CONTRARIAN", name: "Contrarian: +ve → PE, −ve → CE", note: "Fades the crowd at sentiment extremes, so it trades against the prevailing trend; the regime gate is not applied." },
   { id: "FOLLOW", name: "Follow: +ve → CE, −ve → PE", note: "Trades with the sentiment; the regime gate still applies." },
 ];
+const EXTREMES: Array<{ id: SentimentExtreme; name: string }> = [
+  { id: "ACTIVE", name: "Trade at ±15 (Greed/Fear)" },
+  { id: "BALANCED", name: "Trade at ±25" },
+  { id: "STRICT", name: "Trade at ±40 (rare)" },
+];
 const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
 const calc = (value: unknown, percent = false) => formatMarketCalculationValue(value as number | string | null | undefined, { percent });
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -73,6 +83,7 @@ const nowLabel = () => new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/
 export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");
   const [sentimentMapping, setSentimentMapping] = useState<SentimentMapping>("CONTRARIAN");
+  const [sentimentExtreme, setSentimentExtreme] = useState<SentimentExtreme>("ACTIVE");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [paperOrders, setPaperOrders] = useState<Order[]>([]);
   const [history, setHistory] = useState<Order[]>([]);
@@ -122,7 +133,7 @@ export default function ExecutionPage() {
     if (!quiet) setBusy(true);
     const version = mutationVersion.current;
     try {
-      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&mapping=${sentimentMapping}`, { cache: "no-store" }).then((response) => response.json());
+      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&mapping=${sentimentMapping}&extreme=${sentimentExtreme}`, { cache: "no-store" }).then((response) => response.json());
       setAnalysis(data.analysis ?? null);
       setAccount(data.account ?? null);
       setSafety({ safeMode: Boolean(data.safeMode), killSwitch: Boolean(data.killSwitch), reason: data.killSwitchReason ?? data.safeModeReason ?? "" });
@@ -134,7 +145,7 @@ export default function ExecutionPage() {
       if (data.error) setMessage(data.error);
     } catch { setMessage("Strategy engine unavailable; retrying on the next refresh."); }
     finally { if (!quiet) setBusy(false); }
-  }, [sentimentMapping, symbol]);
+  }, [sentimentExtreme, sentimentMapping, symbol]);
 
   const refreshLive = useCallback(async () => {
     try { setLive(await fetch("/api/live-orders", { cache: "no-store" }).then((response) => response.json())); } catch { /* status is advisory */ }
@@ -383,7 +394,7 @@ export default function ExecutionPage() {
       const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
         mode: "PAPER", orderSource: ticketOrigin, strategy: strategy.id, strategyName: `${strategy.name}${ticketSource !== "MANUAL" ? ` · ${ticketSource}` : ""}`, underlying: symbol,
         symbol: enriched.symbol, growwSymbol: enriched.growwSymbol, side: "BUY", quantity: lots * enriched.lotSize, lotSize: enriched.lotSize, price: premium,
-        target: Number(target), stopLoss: Number(stopLoss), ...(Number(trailing) > 0 ? { trailingDistance: Number(trailing) } : {}), sentimentMapping, expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
+        target: Number(target), stopLoss: Number(stopLoss), ...(Number(trailing) > 0 ? { trailingDistance: Number(trailing) } : {}), sentimentMapping, sentimentExtreme, expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
         tickSize: enriched.tickSize, freezeQuantity: enriched.freezeQuantity, contractActive: enriched.active, analysisDecision: analysis?.decision,
       }) });
       const data = await response.json().catch(() => ({}));
@@ -473,6 +484,22 @@ export default function ExecutionPage() {
   const sessionLabelRef = useRef("--");
 
   // The engine has already chosen the strike and the premium entry, stop, trail and target.
+  // A next-day plan is a manual ticket: its premium is an estimate until the market opens.
+  const loadNextDayPlan = useCallback((plan: NextDayPlan, setup: NextDaySetup) => {
+    if (!plan.contract || !plan.premium) return;
+    const picked = plan.contract;
+    const row = chainRef.current.find((item) => norm(item.symbol) === norm(picked.symbol));
+    setContract({ symbol: picked.symbol, growwSymbol: picked.symbol, type: picked.type, expiry: picked.expiry ?? row?.expiry, strike: picked.strike, lotSize: Number(picked.lot_size) > 0 ? Number(picked.lot_size) : row?.lotSize || FALLBACK_LOT[setup.symbol] || 1, tickSize: row?.tickSize, freezeQuantity: row?.freezeQuantity });
+    setLots(1);
+    setStopLoss(String(plan.premium.stop_loss));
+    setTarget(String(plan.premium.target));
+    setTrailing(String(plan.premium.trailing_distance));
+    setTicketSource(`Next-day ${plan.role.toLowerCase()}`);
+    setTicketOrigin("MANUAL");
+    setMessage(`Next-day plan loaded: BUY ${picked.symbol} only after ${setup.symbol} trades ${plan.option_type === "CE" ? "above" : "below"} ${money(plan.index.trigger)} after 9:30 · est. entry ₹${plan.premium.entry} · SL ₹${plan.premium.stop_loss} · trail ₹${plan.premium.trailing_distance} · target ₹${plan.premium.target}. Re-check the stop and target against the live premium.`);
+    document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
+
   const loadStrategySetup = useCallback(() => {
     const setup = analysis?.setup;
     if (!setup?.contract || analysis?.pipeline?.decision !== "CONFIRMED") return;
@@ -536,11 +563,14 @@ export default function ExecutionPage() {
         <OptionStrategyPanel symbol={symbol} onSymbolChange={switchIndex} vix={quotes["INDIA VIX"] ?? null} trend={strategyTrend} />
         <AIMonitoringPanel symbol={symbol} strategyId={strategy.id} buildContext={aiContext} onLoadAdvice={loadAdvice} />
 
+        <NextDayPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadNextDayPlan} />
+
         <div className="exec-grid">
           <article className="mi-card exec-strategy">
             <div className="algo-panel-head">
               <div><span className="algo-kicker">V5 RULE ENGINE · INTRINSIC VALUE · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
               <div className="exec-strategy-controls">
+                <select aria-label="Sentiment cut-off" value={sentimentExtreme} onChange={(event) => setSentimentExtreme(event.target.value as SentimentExtreme)} title="How far from zero the index sentiment must be before the strategy trades">{EXTREMES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
                 <select aria-label="Sentiment mapping" value={sentimentMapping} onChange={(event) => setSentimentMapping(event.target.value as SentimentMapping)} title={mappingInfo.note}>{MAPPINGS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
                 <button type="button" onClick={() => void refresh()} disabled={busy}>{busy ? "…" : "Refresh"}</button>
               </div>
@@ -552,9 +582,9 @@ export default function ExecutionPage() {
             {analysis?.setup?.contract && analysis.pipeline?.decision === "CONFIRMED" && <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load {strategy.name} setup into the order ticket</button>}
             {intrinsic && (
               <div className="exec-orb" aria-label="Intrinsic value plan">
-                <span>Sentiment <b className={(intrinsic.sentiment.score ?? 0) >= 0 ? "gain" : "loss"}>{intrinsic.sentiment.score === null ? "--" : `${intrinsic.sentiment.score > 0 ? "+" : ""}${calc(intrinsic.sentiment.score)}`}</b>{intrinsic.sentiment.label ? ` ${String(intrinsic.sentiment.label).replaceAll("_", " ").toLowerCase()}` : ""} → <b>{intrinsic.sentiment.option_type ? `buy ${intrinsic.sentiment.option_type}` : "no side"}</b></span>
+                <span>Sentiment <b className={(intrinsic.sentiment.score ?? 0) >= 0 ? "gain" : "loss"}>{intrinsic.sentiment.score === null ? "--" : `${intrinsic.sentiment.score > 0 ? "+" : ""}${calc(intrinsic.sentiment.score)}`}</b>{intrinsic.sentiment.label ? ` ${String(intrinsic.sentiment.label).replaceAll("_", " ").toLowerCase()}` : ""} → <b>{intrinsic.sentiment.option_type ? `buy ${intrinsic.sentiment.option_type}` : intrinsic.watch && intrinsic.sentiment.lean_option_type ? `watching ${intrinsic.sentiment.lean_option_type} (trades at ${(intrinsic.sentiment.score ?? 0) < 0 ? "−" : "+"}${calc(intrinsic.sentiment.threshold)})` : "no side"}</b></span>
                 <span>Key value <b>{intrinsic.key_value ? money(intrinsic.key_value.price) : "--"}</b>{intrinsic.key_value ? ` (${intrinsic.key_value.sources.join(" + ")}, ${money(intrinsic.key_value.distance)} pts)` : ""}</span>
-                <span>Strike <b>{intrinsic.selected ? `${money(intrinsic.selected.strike)} ${intrinsic.sentiment.option_type}` : "--"}</b>{intrinsic.selected ? ` · ITM chance ${Math.round(intrinsic.selected.itm_chance * 100)}% (market ${Math.round(intrinsic.selected.market_odds * 100)}%) · ₹${money(intrinsic.selected.premium)} → ₹${money(intrinsic.selected.premium_at_key)} at key` : ""}</span>
+                <span>Strike <b>{intrinsic.selected ? `${money(intrinsic.selected.strike)} ${intrinsic.sentiment.option_type ?? intrinsic.sentiment.lean_option_type ?? ""}` : "--"}</b>{intrinsic.selected ? ` · ITM chance ${Math.round(intrinsic.selected.itm_chance * 100)}% (market ${Math.round(intrinsic.selected.market_odds * 100)}%) · ₹${money(intrinsic.selected.premium)} → ₹${money(intrinsic.selected.premium_at_key)} at key` : ""}</span>
                 <span>Premium <b className={intrinsic.premium?.status === "CONFIRMED" ? "gain" : "warning"}>{intrinsic.premium ? intrinsic.premium.status.replaceAll("_", " ") : "--"}</b>{intrinsic.premium?.retrace !== undefined ? ` · pullback ${Math.round(intrinsic.premium.retrace * 100)}% to ₹${money(intrinsic.premium.pullback_low)}` : ""}</span>
                 {intrinsic.plan && <span>Trailing <b>{intrinsic.plan.trailing_rule}</b></span>}
                 <small>{String(analysis?.strategy_reason ?? intrinsic.sentiment.reason ?? "")}</small>
