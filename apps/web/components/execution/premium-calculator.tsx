@@ -23,7 +23,7 @@ export type PremiumCheck = {
   checks: Array<{ id: string; passed: boolean; blocking: boolean; detail: string }>; valid: boolean; reason: string;
 };
 
-const LABELS: Record<string, string> = { KEY_LEVEL_PAYS_TARGET: "Key level pays target", REWARD_RISK: "Net reward-to-risk", SPREAD: "Bid-ask spread", LIQUIDITY: "Liquidity", TARGET_LIKELY: "Key level likely today" };
+const LABELS: Record<string, string> = { KEY_LEVEL_PAYS_TARGET: "Key level pays target", REWARD_RISK: "Net reward-to-risk", SPREAD: "Bid-ask spread", LIQUIDITY: "Liquidity", TARGET_LIKELY: "Target likely (info)" };
 const pct = (value: number | null | undefined) => (value === null || value === undefined ? "--" : `${Math.round(value * 100)}%`);
 const n = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: digits }));
 
