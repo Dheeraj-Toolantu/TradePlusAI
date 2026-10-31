@@ -99,12 +99,17 @@ def _key(h):
     return re.sub(r"\s+", " ", (h or "").replace("﻿", "")).strip().lower()
 
 
+def _is_side(k):
+    """'buy/sell', 'buy / sell' (the nseindia.com report download) or 'side'."""
+    return k.replace(" ", "").startswith("buy/sell") or k == "side"
+
+
 COLUMNS = (
     ("date", lambda k: k == "date" or k.startswith("deal date")),
     ("symbol", lambda k: k == "symbol"),
     ("security", lambda k: k.startswith("security name") or k == "security"),
     ("client", lambda k: k.startswith("client name") or k == "client"),
-    ("side", lambda k: k.startswith("buy/sell") or k in ("buy / sell", "side")),
+    ("side", lambda k: _is_side(k)),
     ("qty", lambda k: k.startswith("quantity")),
     ("price", lambda k: k.startswith("trade price") or k.startswith("wght") or k == "price"),
     ("remarks", lambda k: k.startswith("remarks")),
@@ -153,7 +158,7 @@ def parse_deals(text, kind="bulk"):
     head_at = None
     for i, r in enumerate(rows):
         keys = [_key(c) for c in r]
-        if "symbol" in keys and any(k.startswith("buy/sell") or k == "side" for k in keys):
+        if "symbol" in keys and any(_is_side(k) for k in keys):
             head_at = i
             break
     if head_at is None:
@@ -193,6 +198,74 @@ def parse_deals(text, kind="bulk"):
     return out
 
 
+# The nseindia.com website API answers in JSON. Field names below are written from memory
+# and NOT verified live (see SKILL.md):
+#   /api/historical/bulk-deals (and block-deals): {"data": [{"BD_DT_DATE", "BD_SYMBOL",
+#       "BD_SCRIP_NAME", "BD_CLIENT_NAME", "BD_BUY_SELL", "BD_QTY_TRD", "BD_TP_WATP",
+#       "BD_REMARKS"}]}
+#   /api/snapshot-capital-market-largedeal: {"BULK_DEALS_DATA": [...], "BLOCK_DEALS_DATA": [...]}
+#       with "date", "symbol", "name", "clientName", "buySell", "qty", "watp", "remarks"
+JSON_FIELDS = {
+    "date": ("BD_DT_DATE", "date"),
+    "symbol": ("BD_SYMBOL", "symbol"),
+    "security": ("BD_SCRIP_NAME", "name"),
+    "client": ("BD_CLIENT_NAME", "clientName"),
+    "side": ("BD_BUY_SELL", "buySell"),
+    "qty": ("BD_QTY_TRD", "qty"),
+    "price": ("BD_TP_WATP", "watp"),
+    "remarks": ("BD_REMARKS", "remarks"),
+}
+JSON_LISTS = {"bulk": "BULK_DEALS_DATA", "block": "BLOCK_DEALS_DATA"}
+
+
+def looks_like_json(text):
+    return (text or "").lstrip("﻿").lstrip()[:1] in ("{", "[")
+
+
+def is_snapshot_json(text):
+    if not looks_like_json(text):
+        return False
+    try:
+        doc = json.loads(text.lstrip("\ufeff"))
+    except ValueError:
+        return False
+    return isinstance(doc, dict) and any(k in doc for k in JSON_LISTS.values())
+
+
+def parse_deals_json(text, kind="bulk"):
+    """Rows from the nseindia.com JSON (historical {"data": [...]} or the snapshot with
+    BULK_DEALS_DATA / BLOCK_DEALS_DATA); same row shape as parse_deals()."""
+    try:
+        doc = json.loads((text or "").lstrip("﻿"))
+    except ValueError as exc:
+        raise DealsError("deals JSON is not valid: %s" % exc)
+    if isinstance(doc, dict) and any(k in doc for k in JSON_LISTS.values()):
+        rows = doc.get(JSON_LISTS[kind]) or []
+    elif isinstance(doc, dict):
+        rows = doc.get("data")
+        if rows is None:
+            raise DealsError("deals JSON has no \"data\", BULK_DEALS_DATA or BLOCK_DEALS_DATA list")
+    else:
+        rows = doc
+    names = [n for n, _ in COLUMNS]
+    csv_rows = [names]
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        cells = []
+        for n in names:
+            v = next((r[k] for k in JSON_FIELDS[n] if r.get(k) is not None), "")
+            cells.append(str(v))
+        csv_rows.append(cells)
+    buf = io.StringIO()
+    csv.writer(buf).writerows(csv_rows)
+    return parse_deals(buf.getvalue(), kind)
+
+
+def parse_any(text, kind="bulk"):
+    return parse_deals_json(text, kind) if looks_like_json(text) else parse_deals(text, kind)
+
+
 # ---------------------------------------------------------------- fetching
 
 def download(url, timeout=30):
@@ -222,22 +295,26 @@ def load_deals(kind="all", files=None, bulk_file=None, block_file=None):
     kinds = ["bulk", "block"] if kind == "all" else [kind]
     sources = {}
     if bulk_file:
-        sources["bulk"] = bulk_file
+        sources.setdefault("bulk", []).append(bulk_file)
     if block_file:
-        sources["block"] = block_file
+        sources.setdefault("block", []).append(block_file)
     for f in files or []:
-        sources[_kind_of_file(f, "bulk" if kind == "all" else kind)] = f
+        sources.setdefault(_kind_of_file(f, "bulk" if kind == "all" else kind), []).append(f)
     out = []
     use_files = bool(sources)
     for k in kinds:
         if use_files:
-            path = sources.get(k)
-            if not path:
-                continue
-            with open(path, encoding="utf-8-sig", errors="replace") as fh:
-                out.extend(parse_deals(fh.read(), k))
+            for path in sources.get(k, []):
+                with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                    text = fh.read()
+                if path in (files or []) and is_snapshot_json(text):
+                    # the website snapshot holds both lists: read each kind asked for
+                    for kk in kinds:
+                        out.extend(parse_deals_json(text, kk))
+                else:
+                    out.extend(parse_any(text, k))
         else:
-            out.extend(parse_deals(download(URLS[k]), k))
+            out.extend(parse_any(download(URLS[k]), k))
     return out
 
 
@@ -389,7 +466,7 @@ def _parser():
         p.add_argument("--client", help="client name contains this text (any case)")
         p.add_argument("--side", choices=("buy", "sell"))
         p.add_argument("--min-value-cr", type=float, help="only deals worth at least this many crore")
-        p.add_argument("--file", action="append", help="a saved bulk.csv / block.csv (repeatable)")
+        p.add_argument("--file", action="append", help="a saved bulk.csv / block.csv or nseindia.com JSON (repeatable; all are read)")
         p.add_argument("--bulk-file")
         p.add_argument("--block-file")
         p.add_argument("--portfolio", default="trader/portfolio.json")

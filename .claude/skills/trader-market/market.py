@@ -28,6 +28,13 @@ Facts, and where they come from (check them again when they matter, they change)
   NSE tick sizes            from 15 Apr 2025 (NSE/CMTR/67133): below Rs 250: 0.01;
                             250 to 1,000: 0.05; 1,000 to 5,000: 0.10; 5,000 to 10,000: 0.50;
                             10,000 to 20,000: 1.00; above 20,000: 5.00.
+                            NSE assigns the tick by band and reviews the band periodically
+                            from closing prices, so a stock trading just across a boundary can
+                            still carry its old tick. tick(price, ref=...) and the round_*
+                            helpers take the coarser of the two bands' ticks (the coarser tick
+                            is a multiple of the finer one, so the price is valid in either),
+                            which covers the common case of a stop or target on the other side
+                            of a boundary from the entry.
   Intraday equity charges   STT 0.025% of the sell value; NSE transaction charge 0.00297% and
                             SEBI fee 0.0001% and IPFT 0.0001% of both sides; stamp duty 0.003%
                             of the buy value; GST 18% on brokerage, transaction charge and SEBI
@@ -247,29 +254,39 @@ class Market(object):
             out["next_open"] = "%s %s" % (d.isoformat(), self.open.strftime("%H:%M"))
         elif not out["open"]:
             out["next_open"] = self.next_open(d)
+        if out.get("next_open") and self.code == "IN":
+            out["next_open_calendar_known"] = self.calendar_known(datetime.date.fromisoformat(out["next_open"][:10]))
         return out
 
     # ------------------------------------------------ prices
-    def tick(self, price):
+    def _band_tick(self, price):
         for upto, t in self.tick_bands:
             if upto is None or price < upto:
                 return t
         return self.tick_bands[-1][1]
 
-    def _round(self, price, how):
-        t = self.tick(price)
+    def tick(self, price, ref=None):
+        """The tick at price; with ref (say the entry, or the previous close), the coarser of the
+        ticks at price and at ref, which is valid in either band."""
+        t = self._band_tick(price)
+        if ref is not None:
+            t = max(t, self._band_tick(ref))
+        return t
+
+    def _round(self, price, how, ref=None):
+        t = self.tick(price, ref)
         n = price / t
         n = math.floor(n + 1e-9) if how == "down" else math.ceil(n - 1e-9) if how == "up" else round(n)
         return round(n * t, 2)
 
-    def round_down(self, price):
-        return self._round(price, "down")
+    def round_down(self, price, ref=None):
+        return self._round(price, "down", ref)
 
-    def round_up(self, price):
-        return self._round(price, "up")
+    def round_up(self, price, ref=None):
+        return self._round(price, "up", ref)
 
-    def round_tick(self, price):
-        return self._round(price, "near")
+    def round_tick(self, price, ref=None):
+        return self._round(price, "near", ref)
 
     def money(self, x, decimals=2):
         if x is None:
@@ -470,6 +487,9 @@ def main(argv=None):
                 print("Note: " + res["special_session"])
             if not res["calendar_known"]:
                 print("Holiday list covers %s only: check %s for this date."
+                      % (", ".join(map(str, mk.calendar_years)), mk.calendar_source))
+            elif mk.code == "IN" and res.get("next_open_calendar_known") is False:
+                print("Holiday list covers %s only: check %s for the next open."
                       % (", ".join(map(str, mk.calendar_years)), mk.calendar_source))
         elif cmd == "holidays":
             year = a.year or mk.now_local().year

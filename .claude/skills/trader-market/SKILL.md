@@ -51,7 +51,7 @@ The first one set wins:
 | Hours | 9:15 to 15:30 IST, pre-open 9:00 to 9:08. IST is UTC+05:30 all year, with no daylight time |
 | Holidays | the 16 weekday NSE holidays of 2026. NSE publishes the 2027 list in December; until it is added, 2027 dates are checked for weekends only and the tools say so |
 | Muhurat | Diwali Muhurat trading on Sunday 8 November 2026 is a short special evening session. The tools treat that day as closed and mention the session |
-| Tick size | below Rs 250: 0.01; 250 to 1,000: 0.05; 1,000 to 5,000: 0.10; 5,000 to 10,000: 0.50; 10,000 to 20,000: 1.00; above 20,000: 5.00 (from 15 Apr 2025) |
+| Tick size | below Rs 250: 0.01; 250 to 1,000: 0.05; 1,000 to 5,000: 0.10; 5,000 to 10,000: 0.50; 10,000 to 20,000: 1.00; above 20,000: 5.00 (from 15 Apr 2025). NSE reviews each stock's band periodically from its closing price, so a stock trading just across a boundary can still carry its old tick; the tools round a stop or target with the coarser of the tick at that price and at the entry, which is valid in either band and covers the common case |
 | Day-trade window | entries from 09:30 (after a 15-minute opening range) to 14:45, flat by 15:10, ahead of the broker's intraday auto square-off (about 15:10 to 15:20, charged per position) |
 | Money | rupees, grouped in lakh and crore: Rs 12,34,567.50 prints as `₹12,34,567.50` |
 
