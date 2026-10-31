@@ -1,8 +1,9 @@
 ---
 name: trader-pelosi
 description: >-
-  The Pelosi Tracker. Watches the stock trades members of Congress must
-  disclose under the STOCK Act: reads the House Clerk's public Periodic
+  The Pelosi Tracker (US markets only; for Indian markets the counterpart is
+  /trader-deals, NSE bulk and block deals). Watches the stock trades members
+  of the US Congress must disclose under the STOCK Act: reads the House Clerk's public Periodic
   Transaction Reports (PTRs) as soon as they are posted, alerts once per new
   filing, and turns each PDF into clean rows (who, owner, stock, ticker,
   buy or sell, options strike and expiry, trade date, amount range, how many
@@ -15,6 +16,11 @@ argument-hint: "[member name] [--read]"
 ---
 
 # trader-pelosi
+
+US only. This skill reads US House filings about US-listed stocks. For
+Indian markets (NSE) the counterpart is `/trader-deals`, which tracks NSE's
+bulk and block deals and gives the manual route for SEBI insider-trading
+and takeover disclosures.
 
 Members of Congress have to report their trades, their spouse's and their
 dependent children's. The House Clerk posts every report as a PDF and lists

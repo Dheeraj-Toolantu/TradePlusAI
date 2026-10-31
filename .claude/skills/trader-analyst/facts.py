@@ -36,19 +36,63 @@ How the quarters are built:
 company_tickers.json, companyfacts-CIK##########.json,
 submissions-CIK##########.json and <accession>/index.json from DIR.
 
+India (the default market, --market IN): SEC EDGAR has no Indian companies, so the
+quarters come from Yahoo's fundamentals-timeseries endpoint (the one yfinance uses, no
+crumb needed), and the latest result filing is looked up in NSE's Financial Results RSS:
+
+    python3 facts.py RELIANCE TCS INFY            # NSE symbols, with or without .NS
+    python3 facts.py HDFCBANK --quarters 5 --json
+    python3 facts.py RELIANCE --offline DIR       # DIR/timeseries-RELIANCE.NS.json
+    python3 facts.py TCS --rss-file Financial_Results.xml --name "Tata Consultancy Services"
+
+  https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/<SYM>.NS
+  https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml
+
+  Amounts are in rupees crore (1 crore = 1e7), quarters carry Indian fiscal labels
+  (Q1 FY27 = April to June 2026, Q4 FY27 = January to March 2027). Free Yahoo data often holds
+  only the last 5 or so quarters, and some fields are missing for some companies (banks have
+  no gross profit): those cells are blank, never zero. --market US keeps the SEC path.
+
 Numbers only: this tool never says whether a stock is a buy.
 """
 
 import argparse
 import datetime as _dt
 import gzip
+import importlib.util
 import json
 import os
 import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+
+
+def _market_module():
+    name = "trader_market_shared"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-market", "market.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+market = _market_module()
+MK = None
+
+
+def apply_market(mk):
+    """Make mk the active market (the SEC path is US-only; IN reads Yahoo and NSE)."""
+    global MK
+    MK = mk
+    return mk
+
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK%s.json"
@@ -74,6 +118,9 @@ FLOWS = ("revenue", "cost_of_revenue", "gross_profit", "operating_income", "net_
 
 class FactsError(Exception):
     pass
+
+
+apply_market(market.resolve())
 
 
 def user_agent(cli=None, config="trader/config.json"):
@@ -467,9 +514,397 @@ def ticker_ciks(fetcher):
     return out
 
 
+# ---------------------------------------------------------------- India (Yahoo + NSE)
+
+YF_TS_URL = ("https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/"
+             "%s?symbol=%s&type=%s&period1=%d&period2=%d")
+NSE_RESULTS_RSS = "https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml"
+NSE_RESULTS_HELP = ("nseindia.com > Companies > Corporate Filings > Financial Results "
+                    "(search the company; the XBRL and PDF of each result are linked there)")
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+CRORE = 1e7
+YF_TYPES = {
+    "revenue": ["quarterlyTotalRevenue"],
+    "gross_profit": ["quarterlyGrossProfit"],
+    "operating_income": ["quarterlyOperatingIncome"],
+    "net_income": ["quarterlyNetIncome"],
+    "eps_diluted": ["quarterlyDilutedEPS", "quarterlyBasicEPS"],
+}
+YF_ANNUAL = {"revenue": "annualTotalRevenue", "net_income": "annualNetIncome",
+             "eps_diluted": "annualDilutedEPS"}
+YF_ALL_TYPES = ["quarterlyTotalRevenue", "quarterlyGrossProfit", "quarterlyOperatingIncome",
+                "quarterlyNetIncome", "quarterlyDilutedEPS", "quarterlyBasicEPS",
+                "annualTotalRevenue", "annualNetIncome", "annualDilutedEPS"]
+YF_NOTE = ("Free Yahoo data often holds only the last 5 or so quarters, and some fields are "
+           "missing (banks report no gross profit): blank means not reported, not zero.")
+
+
+def indian_fiscal(end):
+    """'2026-06-30' -> 'Q1 FY27' (India's fiscal year runs April to March)."""
+    d = _date(end)
+    q = {4: 1, 5: 1, 6: 1, 7: 2, 8: 2, 9: 2, 10: 3, 11: 3, 12: 3, 1: 4, 2: 4, 3: 4}[d.month]
+    fy = d.year + 1 if d.month >= 4 else d.year
+    return "Q%d FY%02d" % (q, fy % 100)
+
+
+def yahoo_timeseries_url(symbol, now=None):
+    """The fundamentals-timeseries URL for an NSE symbol (RELIANCE -> RELIANCE.NS)."""
+    ysym = MK.yahoo_symbol(symbol) if MK.code == "IN" else market.get("IN").yahoo_symbol(symbol)
+    q = urllib.parse.quote(ysym, safe="^.-")
+    now = int(now if now is not None else time.time())
+    return YF_TS_URL % (q, q, ",".join(YF_ALL_TYPES), now - 6 * 366 * 86400, now)
+
+
+def parse_timeseries(doc):
+    """{type: {asOfDate: value}} from a fundamentals-timeseries response. Null entries,
+    entries without a reportedValue and empty results are skipped."""
+    out = {}
+    res = ((doc or {}).get("timeseries") or {}).get("result") or []
+    for item in res:
+        if not isinstance(item, dict):
+            continue
+        types = ((item.get("meta") or {}).get("type") or [])
+        for t in types:
+            for e in item.get(t) or []:
+                if not isinstance(e, dict):
+                    continue
+                rv = e.get("reportedValue")
+                raw = rv.get("raw") if isinstance(rv, dict) else rv
+                if raw is None or not e.get("asOfDate"):
+                    continue
+                try:
+                    out.setdefault(t, {})[e["asOfDate"]] = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if e.get("currencyCode"):
+                    out.setdefault("_currency", {})[t] = e["currencyCode"]
+    return out
+
+
+def analyse_india(ts, quarters=6, name=None, symbol=None):
+    """The same report dict as analyse(), from parse_timeseries() output. Amounts in rupees."""
+    s, used = {}, {}
+    for key, types in YF_TYPES.items():
+        merged, u = {}, []
+        for t in types:
+            vals = ts.get(t) or {}
+            added = False
+            for end, v in vals.items():
+                if end not in merged:
+                    merged[end] = {"value": v, "end": end, "derived": False}
+                    added = True
+            if added:
+                u.append(t)
+        s[key], used[key] = merged, u
+    # a missing March quarter = the fiscal year minus the three quarters inside it
+    for key, akey in YF_ANNUAL.items():
+        for end, total in (ts.get(akey) or {}).items():
+            if end in s[key]:
+                continue
+            start = _date(end) - _dt.timedelta(days=365)
+            inside = [v for e, v in s[key].items() if start < _date(e) < _date(end)]
+            if len(inside) == 3:
+                s[key][end] = {"value": total - sum(v["value"] for v in inside), "end": end,
+                               "derived": True}
+    rev, ni = s["revenue"], s["net_income"]
+    if not any(k for k in ts if not k.startswith("_")):
+        raise FactsError("Yahoo has no fundamentals for %s.NS (is it an NSE symbol?)" % (symbol or "?"))
+    if not rev and not ni:
+        raise FactsError("no quarterly revenue or net income in the Yahoo timeseries")
+    ends = sorted(set(rev) | set(ni), reverse=True)[:quarters]
+    rows = []
+    for end in ends:
+        r = rev.get(end, {}).get("value")
+        gp = s["gross_profit"].get(end, {}).get("value")
+        oi = s["operating_income"].get(end, {}).get("value")
+        n = ni.get(end, {}).get("value")
+        eps = s["eps_diluted"].get(end, {}).get("value")
+        prior = {k: _yoy_match(s[k], end) for k in ("revenue", "net_income", "eps_diluted")}
+        rows.append({
+            "end": end, "start": None, "fiscal": indian_fiscal(end),
+            "derived": any(s[k].get(end, {}).get("derived") for k in ("revenue", "net_income")),
+            "revenue": r, "gross_profit": gp, "operating_income": oi, "net_income": n,
+            "eps_diluted": round(eps, 2) if eps is not None else None,
+            "gross_margin": margin(gp, r), "operating_margin": margin(oi, r),
+            "net_margin": margin(n, r),
+            "revenue_yoy": pct(r, (prior["revenue"] or {}).get("value")),
+            "net_income_yoy": pct(n, (prior["net_income"] or {}).get("value")),
+            "eps_yoy": pct(eps, (prior["eps_diluted"] or {}).get("value")),
+            "filed": None, "form": "Yahoo",
+        })
+    ttm = {}
+    for key in ("revenue", "net_income", "eps_diluted"):
+        last4 = sorted(s[key])[-4:]
+        if len(last4) == 4 and (_date(last4[-1]) - _date(last4[0])).days < 300:
+            ttm[key] = sum(s[key][e]["value"] for e in last4)
+    if "eps_diluted" in ttm:
+        ttm["eps_diluted"] = round(ttm["eps_diluted"], 2)
+    cur = sorted(set((ts.get("_currency") or {}).values()))
+    return {"entity": name or symbol, "cik": None, "symbol": symbol, "market": "IN",
+            "currency": cur[0] if len(cur) == 1 else ("INR" if not cur else "/".join(cur)),
+            "rows": rows, "ttm": ttm, "concepts": used, "source": "Yahoo fundamentals-timeseries"}
+
+
+def crore(v, decimals=1):
+    """1.234e11 -> '₹12,340.0 Cr'."""
+    if v is None:
+        return "n/a"
+    neg = v < 0
+    x = abs(v) / CRORE
+    whole = int(round(x, decimals) // 1)
+    frac = ("%.*f" % (decimals, x)).split(".")[1] if decimals else ""
+    body = market.indian_grouping(whole) + ("." + frac if decimals else "")
+    return ("-" if neg else "") + "₹" + body + " Cr"
+
+
+def _cr_cell(v):
+    if v is None:
+        return "-"
+    neg = v < 0
+    return ("-" if neg else "") + market.indian_grouping(int(round(abs(v) / CRORE)))
+
+
+def changes_india(result):
+    """Plain sentences for the latest quarter, in rupees crore."""
+    rows = result["rows"]
+    if not rows:
+        return []
+    cur = rows[0]
+    prev = rows[1] if len(rows) > 1 else None
+    out = []
+    label = "Quarter ending %s (%s)%s" % (cur["end"], cur["fiscal"],
+                                          " (derived from the annual numbers)" if cur["derived"] else "")
+    line = "%s: revenue %s" % (label, crore(cur["revenue"]))
+    if cur["revenue_yoy"] is not None:
+        line += " (%+.1f%% vs a year earlier)" % cur["revenue_yoy"]
+    line += ", net profit %s" % crore(cur["net_income"])
+    if cur["net_income_yoy"] is not None:
+        line += " (%+.1f%%)" % cur["net_income_yoy"]
+    if cur["eps_diluted"] is not None:
+        line += ", diluted EPS ₹%.2f" % cur["eps_diluted"]
+        if cur["eps_yoy"] is not None:
+            line += " (%+.1f%%)" % cur["eps_yoy"]
+    out.append(line + ".")
+    for key, nm in (("gross_margin", "Gross margin"), ("operating_margin", "Operating margin"),
+                    ("net_margin", "Net margin")):
+        if cur[key] is None:
+            continue
+        t = "%s %.1f%%" % (nm, cur[key])
+        if prev and prev[key] is not None:
+            t += " (%+.1f points vs the quarter before)" % (cur[key] - prev[key])
+        out.append(t + ".")
+    if cur["gross_margin"] is None and cur["revenue"] is not None:
+        out.append("No gross profit in the data (normal for banks and NBFCs): margins below "
+                   "the top line only.")
+    if cur["net_income"] is not None and cur["operating_income"] is not None \
+            and cur["net_income"] > cur["operating_income"]:
+        out.append("Net profit is above operating profit: it includes other income or "
+                   "exceptional items. Check the result filing before reading it as growth.")
+    if prev and cur["revenue"] is not None and prev["revenue"]:
+        out.append("Revenue %+.1f%% vs the quarter before (many businesses are seasonal: "
+                   "compare with a year earlier first)." % pct(cur["revenue"], prev["revenue"]))
+    return out
+
+
+_NAME_DROP = {"LIMITED", "LTD", "THE", "AND", "CO", "COMPANY", "OF", "INDIA"}
+
+
+def _name_words(text):
+    words = re.sub(r"[^A-Z0-9 ]", " ", (text or "").upper().replace("&", " AND ")).split()
+    return [w for w in words if w not in ("LIMITED", "LTD")]
+
+
+def name_matches(title, symbol=None, name=None):
+    """Is this RSS title the company? By the name given, or by the NSE symbol:
+    RELIANCE ~ Reliance Industries Limited, TCS ~ Tata Consultancy Services Limited."""
+    words = _name_words(title)
+    if not words:
+        return False
+    joined = "".join(words)
+    if name:
+        want = "".join(_name_words(name))
+        if want and (joined.startswith(want) or want.startswith(joined)):
+            return True
+    if symbol:
+        sym = re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
+        if not sym:
+            return False
+        if words[0] == sym or (len(sym) >= 5 and joined.startswith(sym)):
+            return True
+        initials = "".join(w[0] for w in words if w not in _NAME_DROP)
+        if len(sym) >= 2 and initials == sym:
+            return True
+    return False
+
+
+def parse_results_rss(xml_bytes):
+    """[{title, link, description, published}] from NSE's Financial_Results.xml."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as exc:
+        raise FactsError("NSE results RSS is not valid XML: %s" % exc)
+    out = []
+    for it in root.iter("item"):
+        def txt(tag):
+            el = it.find(tag)
+            return (el.text or "").strip() if el is not None and el.text else ""
+        out.append({"title": txt("title"), "link": txt("link"), "description": txt("description"),
+                    "published": txt("pubDate")})
+    return out
+
+
+def latest_result_filing(items, symbol, name=None):
+    """The newest feed item for the company, with "also_matched": other company names that
+    matched the symbol too (RELIANCE could be Reliance Infrastructure: pass --name)."""
+    hits = [it for it in items if name and name_matches(it["title"], None, name)]
+    if not hits:
+        hits = [it for it in items if name_matches(it["title"], symbol)]
+    if not hits:
+        return None
+    pick = dict(hits[0])
+    others = []
+    for it in hits[1:]:
+        if it["title"].upper() != pick["title"].upper() and it["title"] not in others:
+            others.append(it["title"])
+    pick["also_matched"] = others
+    return pick
+
+
+def _http_get(url, headers, timeout=30):
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+            return data
+    except urllib.error.HTTPError as exc:
+        raise FactsError("HTTP %s for %s" % (exc.code, url))
+    except urllib.error.URLError as exc:
+        raise FactsError("could not reach %s: %s" % (url, exc.reason))
+
+
+def fetch_timeseries(symbol, offline=None):
+    ysym = market.get("IN").yahoo_symbol(symbol)
+    if offline:
+        path = os.path.join(offline, "timeseries-%s.json" % ysym)
+        if not os.path.isfile(path):
+            raise FactsError("offline: no file %s" % path)
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    data = _http_get(yahoo_timeseries_url(symbol), {"User-Agent": BROWSER_UA,
+                                                     "Accept": "application/json"})
+    try:
+        return json.loads(data.decode("utf-8"))
+    except ValueError:
+        raise FactsError("Yahoo did not return JSON for %s" % ysym)
+
+
+def load_results_rss(rss_file=None, offline=None):
+    """The NSE results RSS items, or (None, why) when it cannot be read."""
+    path = rss_file or (os.path.join(offline, "Financial_Results.xml") if offline else None)
+    try:
+        if path:
+            if not os.path.isfile(path):
+                return None, "no file %s" % path
+            with open(path, "rb") as fh:
+                return parse_results_rss(fh.read()), None
+        data = _http_get(NSE_RESULTS_RSS, {"User-Agent": BROWSER_UA, "Accept": "application/xml",
+                                           "Referer": "https://www.nseindia.com/"})
+        return parse_results_rss(data), None
+    except FactsError as exc:
+        return None, str(exc)
+
+
+def render_india(symbol, result, filing=None, rss_error=None, filings=True):
+    out = ["%s (%s, NSE). Rupees crore except EPS (₹). Source: Yahoo fundamentals-timeseries, "
+           "currency %s." % (result["entity"] or symbol, symbol, result.get("currency") or "INR"), ""]
+    out.append("%-11s %-9s %10s %8s %7s %7s %7s %10s %8s %7s" % (
+        "quarter end", "fiscal", "revenue", "rev yoy", "gross", "oper", "net",
+        "net prof", "EPS dil", "EPS yoy"))
+    for r in result["rows"]:
+        out.append("%-11s %-9s %10s %8s %7s %7s %7s %10s %8s %7s%s" % (
+            r["end"], r["fiscal"], _cr_cell(r["revenue"]), _p(r["revenue_yoy"]),
+            _pm(r["gross_margin"]), _pm(r["operating_margin"]), _pm(r["net_margin"]),
+            _cr_cell(r["net_income"]), "-" if r["eps_diluted"] is None else "%.2f" % r["eps_diluted"],
+            _p(r["eps_yoy"]), "  derived" if r["derived"] else ""))
+    t = result["ttm"]
+    if t:
+        out.append("")
+        out.append("Last 4 quarters: revenue %s, net profit %s, diluted EPS %s." % (
+            crore(t.get("revenue")) if t.get("revenue") is not None else "-",
+            crore(t.get("net_income")) if t.get("net_income") is not None else "-",
+            "₹%.2f" % t["eps_diluted"] if t.get("eps_diluted") is not None else "-"))
+    out.append("")
+    out.append("What changed:")
+    for line in changes_india(result):
+        out.append("  - " + line)
+    out.append("")
+    if result["concepts"].get("eps_diluted") == ["quarterlyBasicEPS"]:
+        out.append("EPS is basic EPS: Yahoo has no diluted EPS for this company.")
+    if not filings:
+        pass
+    elif filing:
+        out.append("Latest result filing on NSE: %s, %s  %s" % (
+            filing["title"], filing["published"] or "date not given", filing["link"]))
+        if filing.get("also_matched"):
+            out.append("  also matched %s: pass --name \"Company Name\" if that is the wrong one."
+                       % "; ".join(filing["also_matched"]))
+    elif rss_error:
+        out.append("NSE results feed not read (%s). Latest result filing: %s." % (rss_error, NSE_RESULTS_HELP))
+    else:
+        out.append("No recent result for %s in NSE's results feed (it holds the latest few days). "
+                   "Older results: %s." % (symbol, NSE_RESULTS_HELP))
+    if result["rows"] and result["rows"][0]["end"] < (_dt.date.today() - _dt.timedelta(days=150)).isoformat():
+        out.append("NOTE: the newest quarter here ends %s; a newer result may be filed. Check NSE."
+                   % result["rows"][0]["end"])
+    if any(r["derived"] for r in result["rows"]):
+        out.append("Derived quarters are the fiscal year minus the three quarters inside it; "
+                   "derived EPS is approximate.")
+    out.append(YF_NOTE)
+    return "\n".join(out) + "\n"
+
+
+def metrics_row_india(symbol, result):
+    row = metrics_row(symbol, result)
+    row.update(cik=None, market="IN", currency=result.get("currency") or "INR",
+               source="Yahoo fundamentals-timeseries",
+               revenue_ttm_cr=round(result["ttm"]["revenue"] / CRORE, 2) if result["ttm"].get("revenue") is not None else None,
+               net_income_ttm_cr=round(result["ttm"]["net_income"] / CRORE, 2) if result["ttm"].get("net_income") is not None else None)
+    return row
+
+
+def run_india(args):
+    results, rows, failed = [], [], 0
+    items, rss_error = (None, None)
+    if not args.no_filings:
+        items, rss_error = load_results_rss(args.rss_file, args.offline)
+    for t in args.tickers:
+        sym = market.get("IN").plain_symbol(t)
+        try:
+            ts = parse_timeseries(fetch_timeseries(sym, args.offline))
+            result = analyse_india(ts, quarters=args.quarters, name=args.name, symbol=sym)
+        except FactsError as exc:
+            print("facts: %s: %s" % (sym, exc), file=sys.stderr)
+            failed += 1
+            continue
+        filing = latest_result_filing(items, sym, args.name) if items else None
+        if filing and not args.name and not filing.get("also_matched"):
+            result["entity"] = filing["title"]
+        results.append({"ticker": sym, "result": result, "filing": filing,
+                        "changes": changes_india(result), "note": YF_NOTE,
+                        "filings_help": NSE_RESULTS_HELP})
+        rows.append(metrics_row_india(sym, result))
+        if not args.json:
+            sys.stdout.write(render_india(sym, result, filing, rss_error, not args.no_filings))
+            sys.stdout.write("\n")
+    return results, rows, failed
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("tickers", nargs="*", help="tickers, e.g. AAPL KO")
+    ap.add_argument("tickers", nargs="*",
+                    help="NSE symbols, e.g. RELIANCE TCS (US tickers like AAPL with --market US)")
     ap.add_argument("--cik", help="use this CIK instead of a ticker lookup (one company)")
     ap.add_argument("--quarters", type=int, default=6)
     ap.add_argument("--no-filings", action="store_true", help="skip the 8-K and 10-Q links")
@@ -478,10 +913,25 @@ def main(argv=None):
     ap.add_argument("--config", default="trader/config.json")
     ap.add_argument("--offline", metavar="DIR")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--market", help="IN (NSE via Yahoo, the default) or US (SEC EDGAR)")
+    ap.add_argument("--name", help="India: company name to match in NSE's results feed")
+    ap.add_argument("--rss-file", metavar="FILE",
+                    help="India: a saved Financial_Results.xml instead of fetching it")
     args = ap.parse_args(argv)
+    try:
+        apply_market(market.resolve(args.market, market.read_config(args.config)))
+    except market.MarketError as exc:
+        print("facts: %s" % exc, file=sys.stderr)
+        return 2
     if not args.tickers and not args.cik:
         ap.print_help()
         return 2
+    if MK.code == "IN":
+        if args.cik:
+            print("facts: --cik is for SEC filers (--market US); give an NSE symbol", file=sys.stderr)
+            return 2
+        results, rows, failed = run_india(args)
+        return _finish(args, results, rows, failed)
     ua = user_agent(args.user_agent, args.config)
     if not ua and not args.offline:
         print("facts: " + UA_HELP, file=sys.stderr)
@@ -522,6 +972,10 @@ def main(argv=None):
         if not args.json:
             sys.stdout.write(render(tick, result, filings))
             sys.stdout.write("\n")
+    return _finish(args, results, rows, failed)
+
+
+def _finish(args, results, rows, failed):
     if args.json:
         print(json.dumps(results, indent=2))
     if args.metrics and rows:
