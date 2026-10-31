@@ -38,7 +38,7 @@ from datetime import date, datetime, time, timedelta
 
 from .engine import MARKET_TIMEZONE, Candle, _candles_from, _daily_atr, _daily_bars, _parse_timestamp
 from . import premium_math
-from .intrinsic_value import ROUND_STEP, IntrinsicConfig, liquidity_score, market_itm_odds
+from .option_selection import ROUND_STEP, OptionSelectionConfig, liquidity_score, market_itm_odds
 
 SESSION_CLOSE = time(15, 30)
 OPENING_RANGE_END = time(9, 30)
@@ -230,7 +230,7 @@ def key_value(levels: list[tuple[str, float]], trigger: float, direction: int, a
     return {"price": round(price, 2), "sources": sources}
 
 
-def pick_strike(chain: list[dict], option_type: str, trigger: float, target: float, close: float, now: datetime, session_day: date, intrinsic: IntrinsicConfig,
+def pick_strike(chain: list[dict], option_type: str, trigger: float, target: float, close: float, now: datetime, session_day: date, intrinsic: OptionSelectionConfig,
                 entry_time: datetime | None = None) -> tuple[dict | None, list[dict]]:
     wanted = "CALL" if option_type == "CE" else "PUT"
     direction = 1 if option_type == "CE" else -1
@@ -268,7 +268,7 @@ def pick_strike(chain: list[dict], option_type: str, trigger: float, target: flo
 
 
 def build_plan(role: str, direction: int, symbol: str, summary: dict, levels: list[tuple[str, float]], expected_open: float, atr: float, chain: list[dict],
-               now: datetime, session_day: date, next_day: date, config: NextDayConfig, intrinsic: IntrinsicConfig) -> dict:
+               now: datetime, session_day: date, next_day: date, config: NextDayConfig, intrinsic: OptionSelectionConfig) -> dict:
     option_type = "CE" if direction > 0 else "PE"
     word = "above" if direction > 0 else "below"
     edge = summary["last_hour"]["high"] if direction > 0 else summary["last_hour"]["low"]
@@ -328,7 +328,7 @@ def next_day_setup(symbol: str, candles: list[Candle], daily: list[Candle] | Non
     prediction = predict(summary, atr, typical_gap(sessions, daily), config)
     chain = [row for row in (chain_payload or {}).get("contracts", []) if isinstance(row, dict) and row.get("strike") is not None]
     levels = levels_for(symbol, summary, older, chain, summary["close"])
-    intrinsic = IntrinsicConfig()
+    intrinsic = OptionSelectionConfig()
     expected = prediction["expected_open"]
     if prediction["opening"] == "FLAT":
         plans = [build_plan("BREAKOUT_UP", 1, symbol, summary, levels, expected, atr, chain, now, session_day, next_day, config, intrinsic),
