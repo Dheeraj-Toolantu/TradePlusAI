@@ -248,7 +248,8 @@ def parse_deals_json(text, kind="bulk"):
     else:
         rows = doc
     names = [n for n, _ in COLUMNS]
-    csv_rows = [names]
+    csv_rows = [["Date", "Symbol", "Security Name", "Client Name", "Buy/Sell", "Quantity Traded",
+                 "Trade Price / Wght. Avg. Price", "Remarks"]]
     for r in rows or []:
         if not isinstance(r, dict):
             continue

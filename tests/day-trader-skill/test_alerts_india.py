@@ -313,5 +313,53 @@ class Cli(unittest.TestCase):
         self.assertEqual(alerts.MK.code, "IN")
 
 
+class IndiaWordingAndMissedFlatBy(unittest.TestCase):
+    """The plan's flat-by checked only after the close, and the India post-alert line."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.args = ["--rules", os.path.join(d, "alerts.json"), "--state", os.path.join(d, "state.json")]
+        self.plan = os.path.join(FIX, "trader-alerts-in", "plan-RELIANCE.json")
+        code, out, err = run(["add", "--from-plan", "--plan", self.plan, "--config", "/nonexistent.json"]
+                             + self.args)
+        self.assertEqual(code, 0, err)
+        self.check = ["check", "--offline", os.path.join(FIX, "trader-alerts-in"),
+                      "--prices-out", os.path.join(d, "prices.json")] + self.args
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_flat_by_after_the_close_says_missed_once(self):
+        code, out, err = run(self.check + ["--now", "2026-10-30 15:45"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("MISSED Flat by close was missed: set for 15:10 IST", out)
+        self.assertIn("after the 15:30 close", out)
+        self.assertNotIn("trader-broker flatten", out)
+        self.assertNotIn("ALERT", out)
+        code, out, err = run(self.check + ["--now", "2026-10-30 15:50"])
+        self.assertNotIn("MISSED", out)
+
+    def test_flat_by_in_the_session_still_rings(self):
+        code, out, err = run(self.check + ["--now", "2026-10-30 15:12"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("ALERT Flat by close: it is 15:12 IST (set for 15:10), the market closes at 15:30", out)
+
+    def test_post_alert_line_is_groww_not_bracket(self):
+        code, out, err = run(self.check + ["--now", "2026-10-30 15:12"])
+        self.assertIn("the SL-M stop sits at Groww", out)
+        self.assertIn("ticket.py fill", out)
+        for us in ("bracket's", "get_open_position"):
+            self.assertNotIn(us, out)
+
+    def test_before_close_help_in_india(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            alerts.main(["--market", "IN", "add", "--help"])
+        text = " ".join(out.getvalue().split())
+        self.assertIn("NSE has no early-close days", text)
+        self.assertNotIn("NYSE 1:00 p.m.", text)
+
+
 if __name__ == "__main__":
     unittest.main()

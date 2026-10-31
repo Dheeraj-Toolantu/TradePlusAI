@@ -152,11 +152,17 @@ KEYWORDS = KEYWORDS_US
 # India: the exchange-filing tags first, then upstream's generic ones with Indian
 # regulators and macro words added.
 KEYWORDS_IN_FILINGS = [
-    ("results", r"\bresults?\b|\bQ[1-4]\s*(?:FY)?\s*'?\d{0,4}\b|\bquarterly\b|\bnet profit\b|\bPAT\b|\bEBITDA\b"),
+    # "results" / "financial result", "earnings", "quarterly", Q2 FY27 / Q2FY27, net profit and
+    # EBITDA; PAT only in upper case (not "Pat Cummins"); a bare "result" ("as a result") is not.
+    ("results", r"\bresults\b|\bfinancial results?\b|\bearnings\b|\bquarterly\b|"
+                r"\bQ[1-4]\s*FY\s*'?\d{2,4}\b|\bQ[1-4]\b(?=\s+(?:numbers|profit|net|earnings|results|show))|"
+                r"\bnet profit\b|\bEBITDA\b|(?-i:\bPAT\b)"),
     ("board meeting", r"\bboard meeting\b|\bmeeting of the board\b|\boutcome of (?:the )?board\b"),
     ("dividend", r"\bdividends?\b"),
-    ("bonus", r"\bbonus\b"),
-    ("split", r"\bstock split\b|\bsplit\b|\bsub-?division\b"),
+    # a bonus issue, not an employee or festive "bonus"; a stock split, not a "split screen"
+    ("bonus", r"\bbonus\s+(?:issue|shares?|equity|ratio)\b|\bissue of bonus\b|\b\d+\s*:\s*\d+\s+bonus\b"),
+    ("split", r"\b(?:stock|share|equity)\s+split\b|\bsplit of (?:the )?(?:equity )?shares\b|"
+              r"\bsub-?division\b|\bface value split\b"),
     ("buyback", r"\bbuy-?backs?\b"),
     ("rights issue", r"\brights issue\b|\brights entitlement\b"),
     ("sebi order", r"\bSEBI\b[^.]{0,60}\b(?:order|penalty|penalises|penalizes|bans?|show[- ]cause|settlement|"
@@ -166,10 +172,15 @@ KEYWORDS_IN_FILINGS = [
     ("promoter", r"\bpromoters?\b"),
     ("credit rating", r"\bcredit rating\b|\b(?:CRISIL|ICRA|CARE Ratings|India Ratings|Brickwork|Acuite)\b|"
                       r"\brating (?:upgrade|downgrade|reaffirm\w*|revision)"),
-    ("insider/pit", r"\binsiders?\b|\bSAST\b|\bPIT\b|\binsider trading\b|\btrading window\b"),
+    # PIT and SAST only in upper case (not a "pit stop")
+    ("insider/pit", r"\binsiders?\b|(?-i:\bSAST\b)|(?-i:\bPIT\b)|\binsider trading\b|\btrading window\b"),
 ]
 KEYWORDS_IN = KEYWORDS_IN_FILINGS + [
-    (lab, rx) for lab, rx in KEYWORDS_US if lab not in ("legal", "regulatory", "macro")] + [
+    (lab, rx) for lab, rx in KEYWORDS_US if lab not in ("legal", "regulatory", "macro", "risk")] + [
+    # a real cyber incident (not a "hackathon"), a payment or loan default (not "default to growth")
+    ("risk", r"\brecall\b|\bbankrupt|\b(?:payment|loan|debt|interest|bond|NCD|repayment)s?\s+defaults?\b|"
+             r"\bdefault(?:ed|s)?\s+on\b|\bwilful defaulter|\bdefaulter\b|\bhacked\b|\bcyber[- ]?attack|"
+             r"\bdata breach\b|\bsecurity breach\b|\bransomware\b|\bdelist|\boutage\b"),
     ("legal", r"\blawsuit\b|\bsued\b|\bprobe\b|\binvestigation\b|\bNCLT\b|\bNCLAT\b|\binsolvency\b|"
               r"\bED raid|\bIncome Tax (?:raid|search)|\bCCI\b|\bjudge\b|\bcourt\b"),
     ("regulatory", r"\bSEBI\b|\bRBI\b|\bIRDAI\b|\bTRAI\b|\bUSFDA\b|\bFDA\b|\bDCGI\b|\bapproval\b|\bapproves\b|"
@@ -485,6 +496,12 @@ def dedupe(items):
                 "%s|%s" % (re.sub(r"\W+", " ", it["title"].lower()).strip(),
                            it["time"].date() if it["time"] else "")]
         hit = next((seen[k] for k in keys if k and k in seen), None)
+        if hit is not None and not is_us():
+            # India: remember the folded copy too, so it does not come back as new later
+            fps = hit.setdefault("_dupes", [])
+            for fp in [fingerprint(it)] + it.get("_dupes", []):
+                if fp not in fps and fp != fingerprint(hit):
+                    fps.append(fp)
         if hit is not None:
             for t in it.get("touches", []):
                 if t not in hit["touches"]:
@@ -659,12 +676,24 @@ def parse_nse_time(value):
     if not v:
         return None
     ist = market.get("IN")
-    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%b-%Y", "%d-%m-%Y %H:%M:%S"):
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%b-%Y",
+                "%d-%b-%Y %I:%M:%S %p", "%d-%b-%Y %I:%M %p",
+                "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
+                "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+                "%d/%m/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M %p",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M:%S %p"):
         try:
             local = _dt.datetime.strptime(v, fmt)
         except ValueError:
             continue
         return ist.local_to_utc(local).replace(tzinfo=_dt.timezone.utc)
+    try:  # ISO 8601: with an offset as given, without one in IST
+        d = _dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            return ist.local_to_utc(d).replace(tzinfo=_dt.timezone.utc)
+        return d.astimezone(_dt.timezone.utc)
+    except ValueError:
+        pass
     try:
         d = email.utils.parsedate_to_datetime(v)
     except (TypeError, ValueError, IndexError):
@@ -678,10 +707,17 @@ def parse_nse_time(value):
 
 def parse_nse_rss(data, label):
     """One NSE RSS 2.0 feed -> raw entries {title, description, link, guid, time, form}."""
+    head = (data[:2000].decode("utf-8", "replace") if isinstance(data, bytes) else str(data)[:2000]).lower()
+    if "access denied" in head or re.search(r"<\s*(?:!doctype\s+)?html\b", head):
+        raise NewsError("NSE %s feed came back as an HTML page (Access Denied?), not RSS: NSE "
+                        "blocked the request. Try again later, or check nseindia.com > Companies > "
+                        "Corporate Filings in a browser" % label)
     try:
         root = ET.fromstring(data)
     except ET.ParseError as exc:
         raise NewsError("NSE %s feed is not valid XML: %s" % (label, exc))
+    if _local(root.tag).lower() not in ("rss", "feed", "rdf"):
+        raise NewsError("NSE %s feed is not RSS (root <%s>)" % (label, _local(root.tag)))
     out = []
     for it in root.iter("item"):
         title = _text(it, "title")
@@ -706,6 +742,24 @@ def name_regex(sym, name):
     return re.compile(r"^\W*(?:%s)" % "|".join(alts), re.I)
 
 
+_INFORMED = re.compile(r"^(?:has\s+)?(?:informed|intimated)\s+(?:to\s+)?(?:the\s+)?exchanges?\s*"
+                       r"(?:about|regarding|that|of|on)?\s*[:-]?\s*", re.I)
+
+
+def _without_company(text, rx):
+    """'Reliance Industries Limited has informed the Exchange about Buyback' -> 'Buyback'
+    (the company is already the start of the item title)."""
+    text = (text or "").strip()
+    m = rx.match(text)
+    if not m:
+        return text
+    rest = text[m.end():].strip(" -:|,–")
+    rest = _INFORMED.sub("", rest).strip()
+    if not rest:
+        return text
+    return rest[0].upper() + rest[1:]
+
+
 def match_filings(raw, watch):
     """NSE feed entries -> filing items for the watched companies (longest name match wins)."""
     rxs = dict((t, name_regex(t, n)) for t, n in watch.items())
@@ -722,7 +776,7 @@ def match_filings(raw, watch):
         company = r["title"][:n].strip(" -:|,–")
         if not company or company.upper() == t:
             company = watch.get(t) or t
-        subject = r["title"][n:].strip(" -:|,–") or r["description"]
+        subject = r["title"][n:].strip(" -:|,–") or _without_company(r["description"], rxs[t])
         if len(subject) > 160:
             subject = subject[:157].rstrip() + "..."
         title = "%s, %s%s" % (company, r["form"], (": " + subject) if subject else "")
@@ -816,7 +870,7 @@ def select(items, state, now, hours=48, show_all=False):
         if it["time"] is not None and (it["time"] < cutoff or it["time"] > ahead):
             continue
         fp = fingerprint(it)
-        it["new"] = fp not in seen
+        it["new"] = fp not in seen and not any(d in seen for d in it.get("_dupes", ()))
         if it["new"] or show_all:
             out.append(it)
     out.sort(key=lambda i: (i["time"] or now), reverse=True)
@@ -828,6 +882,8 @@ def remember(items, state, now):
     stamp = now.isoformat()
     for it in items:
         seen.setdefault(fingerprint(it), stamp)
+        for fp in it.get("_dupes", ()):
+            seen.setdefault(fp, stamp)
     cutoff = (now - _dt.timedelta(days=KEEP_DAYS)).isoformat()
     state["seen"] = {k: v for k, v in seen.items() if v >= cutoff}
     state["last_check"] = stamp
@@ -876,6 +932,7 @@ def _json_ready(items):
     out = []
     for it in items:
         d = dict(it)
+        d.pop("_dupes", None)
         d["time"] = it["time"].isoformat() if it["time"] else None
         if not is_us():
             d["local_time"] = (to_eastern(it["time"]).strftime("%Y-%m-%d %H:%M ") + TZ) if it["time"] else None
@@ -927,6 +984,10 @@ def main(argv=None):
         print("news: %s" % exc, file=sys.stderr)
         return 2
 
+    if args.tickers and not is_us() and any(not plain(t) for t in args.tickers):
+        print("news: an empty ticker was given (--tickers \"\"): pass NSE symbols like RELIANCE TCS",
+              file=sys.stderr)
+        return 2
     if args.tickers:
         watch = {plain(t): None for t in args.tickers}
         known = watch_from_files(args.portfolio, args.watchlist, args.plan)

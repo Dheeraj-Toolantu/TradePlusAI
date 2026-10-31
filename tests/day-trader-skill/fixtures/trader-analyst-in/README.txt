@@ -14,3 +14,10 @@ timeseries-<SYM>.NS.json  Yahoo fundamentals-timeseries
 Financial_Results.xml     NSE's results RSS, https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml
     (item title = company name, link, description, pubDate). Shape written from memory, not
     checked live. Includes Reliance Infrastructure as a decoy for the RELIANCE symbol.
+Financial_Results-lookalikes.xml  look-alike companies (Mahindra & Mahindra Financial Services listed
+    before Mahindra & Mahindra, ITC Hotels next to ITC), mixed pubDate formats (NSE's 31-Oct-2026
+    18:05:12 and RFC 822) and items out of date order (an older ITC result first).
+timeseries-NOGP.NS.json   a non-financial company with no gross profit; the March 2026 quarter derived.
+timeseries-USDCO.NS.json  the same shape with currencyCode "USD" (Yahoo reports some companies in USD).
+timeseries-CRUMB.NS.json  Yahoo's {"finance": {"error": {"code": "Unauthorized", "description":
+    "Invalid Crumb"}}} refusal.

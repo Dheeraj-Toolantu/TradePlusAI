@@ -228,5 +228,71 @@ class CompanyName(unittest.TestCase):
             self.assertIsNone(facts.company_name("INFY", names, os.path.join(d, "x.csv")))
 
 
+class RealWorldVariants(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(DIR, "Financial_Results-lookalikes.xml"), "rb") as fh:
+            self.items = facts.parse_results_rss(fh.read())
+
+    def test_known_name_is_matched_exactly(self):
+        pick = facts.latest_result_filing(self.items, "M&M", "Mahindra & Mahindra Limited")
+        self.assertIn("SYNTHETIC_MM.xml", pick["link"])   # not M&M Financial Services
+        self.assertEqual(pick["also_matched"], [])
+        self.assertFalse(facts.name_matches("Mahindra & Mahindra Financial Services Limited", None,
+                                            "Mahindra & Mahindra Limited"))
+        self.assertTrue(facts.name_matches("MAHINDRA AND MAHINDRA LTD.", None, "Mahindra & Mahindra Limited"))
+        self.assertFalse(facts.name_matches("ITC Hotels Limited", None, "ITC Limited"))
+
+    def test_newest_by_pubdate_not_feed_order(self):
+        pick = facts.latest_result_filing(self.items, "ITC", "ITC Limited")
+        self.assertIn("SYNTHETIC_ITC_NEW", pick["link"])
+
+    def test_symbol_fallback_is_strict_and_lists_others(self):
+        pick = facts.latest_result_filing(self.items, "ITC")
+        self.assertEqual(pick["title"], "ITC Hotels Limited")    # newest whose first word is ITC
+        self.assertEqual(pick["also_matched"], ["ITC Limited"])
+        self.assertIsNone(facts.latest_result_filing(self.items, "M&MFIN"))
+        self.assertFalse(facts.name_matches("Tata Consumer Products Limited", "TCS"))
+        self.assertFalse(facts.name_matches("Reliance Industries Limited", "RELI"))
+
+    def test_known_name_absent_does_not_fall_back_to_a_lookalike(self):
+        only_fin = [it for it in self.items if "Financial" in it["title"]]
+        self.assertIsNone(facts.latest_result_filing(only_fin, "M&M", "Mahindra & Mahindra Limited"))
+
+    def test_feed_times(self):
+        self.assertEqual(facts.feed_time("31-Oct-2026 18:05:12").isoformat(), "2026-10-31T18:05:12+05:30")
+        self.assertEqual(facts.feed_time("Sat, 31 Oct 2026 16:00:00 +0530").utcoffset().total_seconds(), 19800)
+        self.assertIsNone(facts.feed_time(""))
+
+    def test_currency_label_and_warning(self):
+        code, out, err = run(["USDCO", "--offline", DIR, "--no-filings"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("WARNING: Yahoo reports this company in USD", out)
+        self.assertNotIn("Rupees crore", out)
+        self.assertIn("revenue US$1,25,000.0 Cr", out)
+        self.assertNotIn("₹", out)
+
+    def test_gross_profit_note_depends_on_the_business(self):
+        r = facts.analyse_india(timeseries("NOGP"), symbol="NOGP")
+        lines = " ".join(facts.changes_india(r))
+        self.assertIn("Gross profit not reported", lines)
+        self.assertNotIn("banks", lines)
+        self.assertTrue(facts.looks_financial("Bajaj Finance Limited", "BAJFINANCE"))
+        self.assertTrue(facts.looks_financial(None, "M&MFIN"))
+        self.assertFalse(facts.looks_financial("Reliance Industries Limited", "RELIANCE"))
+
+    def test_crumb_error_is_reported_as_such(self):
+        code, out, err = run(["CRUMB", "--offline", DIR, "--no-filings"])
+        self.assertEqual(code, 2)
+        self.assertIn("Yahoo refused the request", err)
+        self.assertNotIn("is it an NSE symbol", err)
+
+    def test_india_help_has_no_sec_wording(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            facts.main(["--help", "--market", "IN"])
+        self.assertNotIn("8-K", out.getvalue())
+        self.assertIn("US only", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

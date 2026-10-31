@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Time Machine for trader-timemachine. Standard library only.
 
-Replays a planned day trade before you risk a dollar: 10,000 simulated runs of
+Replays a planned day trade before you risk a rupee (or a dollar): 10,000 simulated runs of
 the rest of the session from your entry, plus the same rule on every past
 session in the data.
 
@@ -29,18 +29,20 @@ trader-exit, else the whole shares in Rs 1 lakh.
 
 How the replays work (the reel's sim.py, same algorithm, same random draws):
   1. Fetch 60 days of 5-minute bars (Yahoo v8 chart, range=60d interval=5m;
-     one request). Keep only FULL sessions before the plan's date: 78 bars,
-     9:30 to 4:00 New York time. Half days, gaps and today are left out.
-  2. The pool: for every bar slot 1..77 of the day, each past session's bar as
+     one request). Keep only FULL sessions before the plan's date: 75 bars,
+     9:15 to 15:30 IST on NSE (78 bars, 9:30 to 4:00 New York time, in the
+     US). Half days, gaps, holidays and today are left out.
+  2. The pool: for every bar slot 1..74 of the day (1..77 in the US), each past session's bar as
      ratios to the previous bar's close: (open, high, low, close) / prev close.
   3. One replay starts at the entry price and walks the rest of the session.
      For each bar i it picks a slot j = i + randint(-window, window), kept in
-     1..77, then one past bar from pool[j] (random.choice), and scales it to
+     1..74 (1..77), then one past bar from pool[j] (random.choice), and scales it to
      the current price. The stop is checked before the target in every bar,
      so a bar that touches both counts as the stop (the conservative call).
   4. Outcomes: "target" or "stop" (whichever was touched first), or "neither"
-     when the trade is still open at --until (default 16:00, the close, or
-     13:00 on an NYSE early-close day).
+     when the trade is still open at --until (India: the plan's flat_by,
+     default 15:10 IST, the bar closing then included; US: 16:00, the close,
+     or 13:00 on an NYSE early-close day).
      "green" = target first, or above the entry at --until (below for a sell).
      R = the target's R at the target, -1 at the stop, otherwise
      (price at --until - entry) / risk. A gap through the stop still counts
@@ -52,6 +54,12 @@ How the replays work (the reel's sim.py, same algorithm, same random draws):
   6. History: the plan's own rule (an opening-range breakout with the same
      opening range, stop rule and target R) re-run on every one of those past
      full sessions, first close beyond the range = entry, same stop-first rule.
+     On NSE an entry bar must close inside the entry window (no_entries_before
+     and no_entries_after: 09:30 to 14:45 IST by default, from the plan or
+     trader/config.json), as in trader-entry and trader-risk, and the stop and
+     target are rounded the way trader-exit rounds them (one tick, the coarsest
+     band of the entry, stop and target). The US run keeps upstream's rule:
+     any bar up to --until.
 
 The verdict line looks at the replays that hit one side (target or stop) and
 compares the target's share of them, target / (target + stop), with the share
@@ -511,11 +519,12 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
 
 # ---------------------------------------------------------------- stop rules and the history replay
 
-def cents_away(x, long):
+def cents_away(x, long, ref=None):
     """Round a stop to the cent, away from the entry: down for a buy, up for a sell.
-    On NSE: to the tick for the price, the same way."""
+    On NSE: to the tick for the price, the same way; with ref (the entry), to the coarser of
+    the ticks at x and at ref, valid whichever band the stock carries."""
     if not is_us():
-        return MK.round_down(x) if long else MK.round_up(x)
+        return MK.round_down(x, ref) if long else MK.round_up(x, ref)
     c = round(x * 100, 4)
     return (math.floor(c) if long else math.ceil(c)) / 100.0
 
@@ -529,38 +538,89 @@ def opening_range(D, n):
 def rule_stop(rule, oh, ol, entry, long):
     r = rule["stop_rule"]
     if r == "or_mid":
-        return cents_away((oh + ol) / 2, long)
-    if r in ("or_low", "or_high"):
-        return cents_away(ol if long else oh, long)
-    frac = rule["stop_pct"] / 100.0
-    return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
+        raw = (oh + ol) / 2
+    elif r in ("or_low", "or_high"):
+        raw = ol if long else oh
+    else:
+        frac = rule["stop_pct"] / 100.0
+        raw = entry * (1 - frac) if long else entry * (1 + frac)
+    if is_us():
+        return cents_away(raw, long)
+    return in_stop_target(entry, raw, rule["target_r"], long)[0]
 
 
-def _px(x, how="near"):
-    """History prices: to the cent (US, upstream) or the NSE tick (target rounds up for a buy)."""
+def in_stop_target(entry, stop_raw, target_r, long):
+    """India: (stop, target, tick) the way trader-exit rounds them: one tick for both, the
+    coarsest of the bands of the entry, the stop and the target, the stop away from the
+    entry and the target beyond it."""
+    tick = MK.tick(stop_raw, entry)
+    for _ in range(3):
+        n = stop_raw / tick
+        stop = round((math.floor(n + 1e-9) if long else math.ceil(n - 1e-9)) * tick, 2)
+        risk = (entry - stop) if long else (stop - entry)
+        t_raw = entry + target_r * risk if long else entry - target_r * risk
+        t2 = max(tick, MK.tick(t_raw)) if t_raw > 0 else tick
+        if t2 == tick:
+            break
+        tick = t2
+    n = t_raw / tick
+    target = round((math.ceil(n - 1e-9) if long else math.floor(n + 1e-9)) * tick, 2)
+    return stop, target, tick
+
+
+def _px(x, how="near", ref=None):
+    """History prices: to the cent (US, upstream) or the NSE tick (target rounds up for a buy);
+    with ref, to the coarser of the ticks at x and at ref."""
     if is_us():
         return round(x, 2)
-    return MK.round_up(x) if how == "up" else MK.round_down(x) if how == "down" else MK.round_tick(x)
+    return MK.round_up(x, ref) if how == "up" else MK.round_down(x, ref) if how == "down" else MK.round_tick(x, ref)
 
 
-def history_replay(sessions, rule, last, side="buy", charges_fn=None):
+def entry_window(plan=None):
+    """India: (first, last) entry-bar close times in minutes after midnight, from the plan,
+    trader/config.json or the market defaults (09:30 and 14:45 IST), as trader-entry and
+    trader-risk use them. None in the US."""
+    if is_us():
+        return None
+    out = []
+    for k in ("no_entries_before", "no_entries_after"):
+        v = (plan or {}).get(k) or CFG.get(k) or MK.defaults[k]
+        out.append(parse_clock(v, k))
+    return tuple(out)
+
+
+def history_replay(sessions, rule, last, side="buy", charges_fn=None, window=None):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
-    target, bar by bar, else the close at --until."""
+    target, bar by bar, else the close at --until.
+    window (India) = (first, last) entry-bar close times in minutes: a bar closing outside it is
+    not an entry, as in trader-entry and trader-risk (no_entries_before / no_entries_after).
+    Upstream (US) has no window here: it allows entries up to the --until bar, kept as is."""
     long = side == "buy"
     n = rule["or_minutes"] // 5
     trades = []
     for d, D in sessions:
         oh, ol = opening_range(D, n)
-        kk = next((i for i in range(n, last + 1) if (D[i]["c"] > oh if long else D[i]["c"] < ol)), None)
+        kk = next((i for i in range(n, last + 1) if (D[i]["c"] > oh if long else D[i]["c"] < ol)
+                   and (window is None or window[0] <= OPEN_MIN + 5 * (i + 1) <= window[1])), None)
         if kk is None:
             continue
-        e = _px(D[kk]["c"])
-        s = rule_stop(rule, oh, ol, e, long)
+        if is_us():
+            e = _px(D[kk]["c"])
+            s = rule_stop(rule, oh, ol, e, long)
+        else:
+            e = _px(D[kk]["c"], ref=oh if long else ol)
+            s = rule_stop(rule, oh, ol, e, long)
         risk = (e - s) if long else (s - e)
         if risk <= 0:
             continue
-        t = _px(e + rule["target_r"] * risk, "up") if long else _px(e - rule["target_r"] * risk, "down")
+        if is_us():
+            t = _px(e + rule["target_r"] * risk, "up") if long else _px(e - rule["target_r"] * risk, "down")
+        else:
+            raw = (oh + ol) / 2 if rule["stop_rule"] == "or_mid" else (ol if long else oh) \
+                if rule["stop_rule"] in ("or_low", "or_high") else \
+                (e * (1 - rule["stop_pct"] / 100.0) if long else e * (1 + rule["stop_pct"] / 100.0))
+            t = in_stop_target(e, raw, rule["target_r"], long)[1]
         oc = None
         for b in D[kk + 1:last + 1]:
             if (b["l"] <= s) if long else (b["h"] >= s):
@@ -685,7 +745,13 @@ def normalize_plan(raw, src="flags"):
     if or_min < 5 or or_min % 5 or or_min >= CLOSE_MIN - OPEN_MIN:
         raise TMError("opening_range.minutes must be a multiple of 5 (got %s)" % or_min)
     risk = (entry - stop) if long else (stop - entry)
-    return {
+    window = {}
+    if not is_us():
+        for kw in ("no_entries_before", "no_entries_after"):
+            if raw.get(kw):
+                parse_clock(raw[kw], kw)
+                window[kw] = str(raw[kw])
+    return dict({
         "symbol": sym, "side": side, "date": date, "setup": str(raw.get("setup") or "orb"),
         "entry": entry, "entry_time": clock12(OPEN_MIN + 5 * (k + 1)), "entry_bar": k,
         "stop": stop, "target": target, "risk_per_share": round(risk, 2),
@@ -694,7 +760,7 @@ def normalize_plan(raw, src="flags"):
         "stop_rule": str(raw.get("stop_rule") or "auto"), "interval": "5m",
         "flat_by": raw.get("flat_by"), "from": src,
         "qty": raw.get("qty"), "charges_ref": raw.get("charges_ref") if isinstance(raw.get("charges_ref"), dict) else None,
-    }
+    }, **window)
 
 
 def resolve_rule(plan, entry_day):
@@ -714,9 +780,14 @@ def resolve_rule(plan, entry_day):
         rule["stop_rule"] = "pct"
         if all(i in entry_day for i in range(n)):
             oh, ol = opening_range(entry_day, n)
-            if abs(cents_away((oh + ol) / 2, long) - plan["stop"]) < 0.005:
+            if is_us():
+                mid, edge = cents_away((oh + ol) / 2, long), cents_away(ol if long else oh, long)
+            else:
+                mid = in_stop_target(plan["entry"], (oh + ol) / 2, plan["target_r"], long)[0]
+                edge = in_stop_target(plan["entry"], ol if long else oh, plan["target_r"], long)[0]
+            if abs(mid - plan["stop"]) < 0.005:
                 rule["stop_rule"] = "or_mid"
-            elif abs(cents_away(ol if long else oh, long) - plan["stop"]) < 0.005:
+            elif abs(edge - plan["stop"]) < 0.005:
                 rule["stop_rule"] = far
     elif rule["stop_rule"] in ("or_low", "or_high") and rule["stop_rule"] != far:
         rule["stop_rule"] = "pct"
@@ -843,6 +914,9 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                       % (clock24(OPEN_MIN + 5 * k), plan["entry_time"], plan["date"], sym, reason))
     eb = entry_day[k]
     warn = []
+    if not is_us() and not MK.calendar_known(datetime.date.fromisoformat(plan["date"])):
+        warn.append("Holiday list covers %s only: check %s for this date"
+                    % (" and ".join(map(str, MK.calendar_years)), MK.calendar_source))
     if not eb["l"] - 0.01 <= plan["entry"] <= eb["h"] + 0.01:
         warn.append("the plan's entry %.2f is outside that bar's range %.2f to %.2f"
                     % (plan["entry"], eb["l"], eb["h"]))
@@ -870,7 +944,11 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     if rule:
         plan_out["stop_rule"] = rule["stop_rule"]
         history = history_replay(sessions, rule, last, plan["side"],
-                                 charges_fn=charges_in_r(charges["qty"], 0, CFG) if charges else None)
+                                 charges_fn=charges_in_r(charges["qty"], 0, CFG) if charges else None,
+                                 window=entry_window(plan))
+        if not is_us():
+            w = entry_window(plan)
+            history["entry_window"] = [clock24(w[0]), clock24(w[1])]
     else:
         history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
@@ -948,15 +1026,27 @@ def report(doc):
                             (", %+.3f after charges" % h["avg_R_net"]) if h.get("avg_R_net") is not None else ""))
         else:
             lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
+        if h.get("entry_window"):
+            lines[-1] = lines[-1][:-1] + " (entries only on bars closing %s to %s %s, as trader-entry)." % (
+                h["entry_window"][0], h["entry_window"][1], MK.tz_label)
     else:
         lines.append("History: " + h.get("note", "skipped."))
     lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
     for w in doc.get("warnings") or []:
         lines.append("Note: " + w + ".")
-    if doc["data"]["short_sessions_left_out"]:
+    left = doc["data"]["short_sessions_left_out"]
+    if left and is_us():
         lines.append("Left out %d short session(s) (half days or gaps): %s."
-                     % (len(doc["data"]["short_sessions_left_out"]),
-                        ", ".join(x["date"] for x in doc["data"]["short_sessions_left_out"])))
+                     % (len(left), ", ".join(x["date"] for x in left)))
+    elif left:
+        closed = [x for x in left if x.get("reason")]
+        short = [x for x in left if not x.get("reason")]
+        if short:
+            lines.append("Left out %d short session(s) (gaps or missing bars): %s."
+                         % (len(short), ", ".join(x["date"] for x in short)))
+        if closed:
+            lines.append("Left out %d day(s) that are not regular NSE sessions: %s."
+                         % (len(closed), ", ".join("%s (%s)" % (x["date"], x["reason"]) for x in closed)))
     lines.append(doc["note"] + " Repeat this run with --seed %d." % m["seed"])
     return lines
 

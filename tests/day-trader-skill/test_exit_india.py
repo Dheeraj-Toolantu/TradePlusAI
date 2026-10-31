@@ -77,6 +77,32 @@ class Ticks(unittest.TestCase):
         self.assertEqual(c(98.37, "price:98.32", "2R", None, None)["risk"], Decimal("0.05"))
         self.assertEqual(exitp.MIN_TICKS, 5)
 
+    def test_stop_and_target_use_the_coarser_tick_across_a_band(self):
+        # entry Rs 1,000.20 (tick 0.10), stop asked at Rs 999.27 (band tick 0.05): 999.20, not 999.25
+        p = c(1000.20, "price:999.27", "2R", None, None)
+        self.assertEqual((p["stop"], p["tick"]), (Decimal("999.20"), Decimal("0.1")))
+        self.assertEqual(p["target"] % Decimal("0.1"), 0)
+        # entry Rs 250.10 (tick 0.05), stop asked at Rs 249.73 (band tick 0.01): 249.70
+        p = c(250.10, "price:249.73", "2R", None, None)
+        self.assertEqual((p["stop"], p["tick"]), (Decimal("249.70"), Decimal("0.05")))
+        self.assertEqual(p["target"] % Decimal("0.05"), 0)
+        # entry Rs 999.97 (0.05) with a 2R target over Rs 1,000 (0.10): one tick, 0.10, for both
+        p = c(999.97, "price:998", "2R", None, None)
+        self.assertEqual(p["tick"], Decimal("0.1"))
+        self.assertEqual(p["stop"] % Decimal("0.1"), 0)
+        self.assertEqual(p["target"] % Decimal("0.1"), 0)
+
+    def test_too_tight_names_the_rule_that_binds(self):
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(185, "price:184.91", "2R", None, None)
+        msg = str(cm.exception)
+        self.assertIn("risk ₹0.09 is under the ₹0.10 minimum", msg)
+        self.assertIn("5 ticks = ₹0.05", msg)
+        self.assertIn("the 0.05% rule binds", msg)
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(28000, "price:27980", "2R", None, None)
+        self.assertIn("the 5-tick rule binds", str(cm.exception))
+
     def test_rupee_prices_in_flags(self):
         self.assertEqual(exitp.parse_stop("price:₹1,405")[1], Decimal("1405"))
         self.assertEqual(exitp.parse_target("price:Rs 1,436")[1], Decimal("1436"))
@@ -99,6 +125,28 @@ class Cli(unittest.TestCase):
 
     def plan(self, *args):
         return run(exitp, ["plan", "--market", "IN", "--now", "2026-10-30 09:51"] + list(args))
+
+    def test_plan_tick_agrees_with_the_rounding(self):
+        code, out, err = self.plan("--symbol", "ABC", "--entry", "1000.20", "--stop", "price:999.27",
+                                   "--date", "2026-10-30", "--json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertEqual((doc["stop"], doc["tick"]), (999.2, 0.1))
+        self.assertIn("rounded down to the 0.1 tick", doc["stop_detail"])
+
+    def test_holiday_weekend_and_unknown_calendar_notes(self):
+        base = ["--symbol", "RELIANCE", "--entry", "1415.30", "--or-high", "1412", "--or-low", "1398"]
+        code, out, err = self.plan(*(base + ["--date", "2026-11-10"]))
+        self.assertEqual(code, 0, err)
+        self.assertIn("not a regular NSE trading day (NSE holiday: Diwali Balipratipada)", out)
+        self.assertIn("next regular open 2026-11-11 09:15 IST", out)
+        code, out, err = self.plan(*(base + ["--date", "2026-11-08"]))
+        self.assertIn("(weekend): Muhurat trading", out)
+        code, out, err = self.plan(*(base + ["--date", "2027-01-26"]))
+        self.assertIn("Holiday list covers 2026 only", out)
+        code, out, err = self.plan(*(base + ["--date", "2026-10-30"]))
+        self.assertNotIn("regular NSE trading day", out)
+        self.assertNotIn("Holiday list covers", out)
 
     def test_entry_to_plan_with_charges(self):
         code, _, err = run(entry, ["check", "RELIANCE", "--market", "IN", "--offline", FILE,

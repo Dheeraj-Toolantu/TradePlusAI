@@ -555,9 +555,32 @@ def yahoo_timeseries_url(symbol, now=None):
     return YF_TS_URL % (q, q, ",".join(YF_ALL_TYPES), now - 6 * 366 * 86400, now)
 
 
+_AUTH_WORDS = re.compile(r"crumb|unauthori[sz]ed|forbidden|cookie|consent|too many requests", re.I)
+
+
+def yahoo_refusal(doc):
+    """Yahoo's own error text when it refused the request (an Invalid Crumb or Unauthorized
+    answer, as {"finance": {"error": ...}} or {"timeseries": {"error": ...}}), else None."""
+    if not isinstance(doc, dict):
+        return None
+    for top in ("finance", "timeseries"):
+        err = (doc.get(top) or {}).get("error") if isinstance(doc.get(top), dict) else None
+        if isinstance(err, dict):
+            text = "%s %s" % (err.get("code") or "", err.get("description") or "")
+            if _AUTH_WORDS.search(text):
+                return text.strip()
+    return None
+
+
 def parse_timeseries(doc):
     """{type: {asOfDate: value}} from a fundamentals-timeseries response. Null entries,
-    entries without a reportedValue and empty results are skipped."""
+    entries without a reportedValue and empty results are skipped. A refusal (Invalid
+    Crumb, Unauthorized) is a FactsError that says so."""
+    why = yahoo_refusal(doc)
+    if why:
+        raise FactsError("Yahoo refused the request (%s): an authorisation / crumb error, not an "
+                         "unknown symbol. Try again later, or read the result on NSE: %s"
+                         % (why, NSE_RESULTS_HELP))
     out = {}
     res = ((doc or {}).get("timeseries") or {}).get("result") or []
     for item in res:
@@ -645,8 +668,17 @@ def analyse_india(ts, quarters=6, name=None, symbol=None):
             "rows": rows, "ttm": ttm, "concepts": used, "source": "Yahoo fundamentals-timeseries"}
 
 
-def crore(v, decimals=1):
-    """1.234e11 -> '₹12,340.0 Cr'."""
+CURRENCY_SIGN = {"INR": "₹", "USD": "US$", "EUR": "€", "GBP": "£"}
+
+
+def money_sign(currency=None):
+    """'₹' for INR (the default), 'US$' for USD, else the code and a space."""
+    cur = (currency or "INR").upper()
+    return CURRENCY_SIGN.get(cur, cur + " ")
+
+
+def crore(v, decimals=1, currency=None):
+    """1.234e11 -> '₹12,340.0 Cr' (another currencyCode: 'US$12,340.0 Cr')."""
     if v is None:
         return "n/a"
     neg = v < 0
@@ -654,7 +686,7 @@ def crore(v, decimals=1):
     whole = int(round(x, decimals) // 1)
     frac = ("%.*f" % (decimals, x)).split(".")[1] if decimals else ""
     body = market.indian_grouping(whole) + ("." + frac if decimals else "")
-    return ("-" if neg else "") + "₹" + body + " Cr"
+    return ("-" if neg else "") + money_sign(currency) + body + " Cr"
 
 
 def _cr_cell(v):
@@ -671,17 +703,19 @@ def changes_india(result):
         return []
     cur = rows[0]
     prev = rows[1] if len(rows) > 1 else None
+    ccy = result.get("currency") or "INR"
+    sign = money_sign(ccy)
     out = []
     label = "Quarter ending %s (%s)%s" % (cur["end"], cur["fiscal"],
                                           " (derived from the annual numbers)" if cur["derived"] else "")
-    line = "%s: revenue %s" % (label, crore(cur["revenue"]))
+    line = "%s: revenue %s" % (label, crore(cur["revenue"], currency=ccy))
     if cur["revenue_yoy"] is not None:
         line += " (%+.1f%% vs a year earlier)" % cur["revenue_yoy"]
-    line += ", net profit %s" % crore(cur["net_income"])
+    line += ", net profit %s" % crore(cur["net_income"], currency=ccy)
     if cur["net_income_yoy"] is not None:
         line += " (%+.1f%%)" % cur["net_income_yoy"]
     if cur["eps_diluted"] is not None:
-        line += ", diluted EPS ₹%.2f" % cur["eps_diluted"]
+        line += ", diluted EPS %s%.2f" % (sign, cur["eps_diluted"])
         if cur["eps_yoy"] is not None:
             line += " (%+.1f%%)" % cur["eps_yoy"]
     out.append(line + ".")
@@ -694,8 +728,12 @@ def changes_india(result):
             t += " (%+.1f points vs the quarter before)" % (cur[key] - prev[key])
         out.append(t + ".")
     if cur["gross_margin"] is None and cur["revenue"] is not None:
-        out.append("No gross profit in the data (normal for banks and NBFCs): margins below "
-                   "the top line only.")
+        if looks_financial(result.get("entity"), result.get("symbol")):
+            out.append("No gross profit in the data (normal for banks and NBFCs): margins below "
+                       "the top line only.")
+        else:
+            out.append("Gross profit not reported in the data for this quarter: margins below "
+                       "the top line only.")
     if cur["net_income"] is not None and cur["operating_income"] is not None \
             and cur["net_income"] > cur["operating_income"]:
         out.append("Net profit is above operating profit: it includes other income or "
@@ -706,6 +744,16 @@ def changes_india(result):
     return out
 
 
+_FINANCIAL = re.compile(r"BANK|FINANCE|FINANCIAL|FINSERV|FINCORP|CAPITAL|INSURANCE|ASSURANCE|"
+                        r"HOUSING|CREDIT|LEASING|INVESTMENT|NBFC|\bAMC\b|\bLIFE\b", re.I)
+
+
+def looks_financial(name=None, symbol=None):
+    """A bank, NBFC or insurer by its name or NSE symbol (HDFCBANK, BAJFINANCE, M&MFIN)."""
+    text = " ".join(str(x) for x in (name, symbol) if x)
+    return bool(_FINANCIAL.search(text)) or bool(re.search(r"FIN$|FINSV$", str(symbol or ""), re.I))
+
+
 _NAME_DROP = {"LIMITED", "LTD", "THE", "AND", "CO", "COMPANY", "OF", "INDIA"}
 
 
@@ -714,22 +762,33 @@ def _name_words(text):
     return [w for w in words if w not in ("LIMITED", "LTD")]
 
 
+def name_key(text):
+    """'Mahindra & Mahindra Ltd.' and 'MAHINDRA AND MAHINDRA LIMITED' -> 'MAHINDRAANDMAHINDRA'.
+    Case, punctuation, & / and and a trailing LIMITED / LTD do not count."""
+    words = re.sub(r"[^A-Z0-9 ]", " ", (text or "").upper().replace("&", " AND ")).split()
+    while words and words[-1] in ("LIMITED", "LTD"):
+        words.pop()
+    return "".join(words)
+
+
 def name_matches(title, symbol=None, name=None):
-    """Is this RSS title the company? By the name given, or by the NSE symbol:
-    RELIANCE ~ Reliance Industries Limited, TCS ~ Tata Consultancy Services Limited."""
+    """Is this RSS title the company? A known name must match EXACTLY once normalised
+    (Mahindra & Mahindra is not Mahindra & Mahindra Financial Services, ITC is not ITC
+    Hotels). With no name, the NSE symbol: the first word (RELIANCE, ITC), the whole name
+    (HDFCBANK ~ HDFC Bank) or the initials (TCS ~ Tata Consultancy Services)."""
     words = _name_words(title)
     if not words:
         return False
     joined = "".join(words)
     if name:
-        want = "".join(_name_words(name))
-        if want and (joined.startswith(want) or want.startswith(joined)):
+        want = name_key(name)
+        if want and name_key(title) == want:
             return True
     if symbol:
         sym = re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
         if not sym:
             return False
-        if words[0] == sym or (len(sym) >= 5 and joined.startswith(sym)):
+        if words[0] == sym or joined == sym:
             return True
         initials = "".join(w[0] for w in words if w not in _NAME_DROP)
         if len(sym) >= 2 and initials == sym:
@@ -780,11 +839,44 @@ def company_name(symbol, names_file=NAMES_FILE, equity_csv=EQUITY_CACHE):
     return None
 
 
+def feed_time(text):
+    """An NSE feed pubDate (RFC 822, or '31-Oct-2026 18:05:12' in IST) -> aware UTC, or None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    ist = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%b-%Y", "%d-%m-%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M:%S", "%d-%b-%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return _dt.datetime.strptime(t, fmt).replace(tzinfo=ist)
+        except ValueError:
+            continue
+    try:
+        import email.utils
+        d = email.utils.parsedate_to_datetime(t)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if d is None:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=ist)
+
+
+def _newest_first(items):
+    """Feed items by pubDate, newest first; items without a readable date go last, in feed order."""
+    floor = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    keyed = [(feed_time(it.get("published")), i, it) for i, it in enumerate(items)]
+    keyed.sort(key=lambda x: (x[0] is not None, x[0] or floor, -x[1]), reverse=True)
+    return [it for _, _, it in keyed]
+
+
 def latest_result_filing(items, symbol, name=None):
-    """The newest feed item for the company, with "also_matched": other company names that
-    matched the symbol too (RELIANCE could be Reliance Infrastructure: pass --name)."""
-    hits = [it for it in items if name and name_matches(it["title"], None, name)]
-    if not hits:
+    """The newest feed item (by pubDate) for the company. A known name is matched exactly and
+    nothing else is tried; with no name the symbol is matched, with "also_matched": other
+    company names that matched it too (RELIANCE could be Reliance Infrastructure: pass --name)."""
+    items = _newest_first(items or [])
+    if name:
+        hits = [it for it in items if name_matches(it["title"], None, name)]
+    else:
         hits = [it for it in items if name_matches(it["title"], symbol)]
     if not hits:
         return None
@@ -806,6 +898,9 @@ def _http_get(url, headers, timeout=30):
                 data = gzip.decompress(data)
             return data
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise FactsError("HTTP %s for %s: Yahoo refused the request (an authorisation / crumb "
+                             "error, not an unknown symbol)" % (exc.code, url))
         raise FactsError("HTTP %s for %s" % (exc.code, url))
     except urllib.error.URLError as exc:
         raise FactsError("could not reach %s: %s" % (url, exc.reason))
@@ -844,8 +939,16 @@ def load_results_rss(rss_file=None, offline=None):
 
 
 def render_india(symbol, result, filing=None, rss_error=None, filings=True):
-    out = ["%s (%s, NSE). Rupees crore except EPS (₹). Source: Yahoo fundamentals-timeseries, "
-           "currency %s." % (result["entity"] or symbol, symbol, result.get("currency") or "INR"), ""]
+    ccy = result.get("currency") or "INR"
+    if ccy == "INR":
+        out = ["%s (%s, NSE). Rupees crore except EPS (₹). Source: Yahoo fundamentals-timeseries, "
+               "currency %s." % (result["entity"] or symbol, symbol, ccy), ""]
+    else:
+        out = ["%s (%s, NSE). %s crore (units of 10 million) except EPS (%s). Source: Yahoo "
+               "fundamentals-timeseries, currency %s." % (result["entity"] or symbol, symbol, ccy,
+                                                          money_sign(ccy).strip(), ccy),
+               "WARNING: Yahoo reports this company in %s, not INR: the amounts are NOT rupees. "
+               "Check the result filing on NSE for the rupee figures." % ccy, ""]
     out.append("%-11s %-9s %10s %8s %7s %7s %7s %10s %8s %7s" % (
         "quarter end", "fiscal", "revenue", "rev yoy", "gross", "oper", "net",
         "net prof", "EPS dil", "EPS yoy"))
@@ -859,9 +962,9 @@ def render_india(symbol, result, filing=None, rss_error=None, filings=True):
     if t:
         out.append("")
         out.append("Last 4 quarters: revenue %s, net profit %s, diluted EPS %s." % (
-            crore(t.get("revenue")) if t.get("revenue") is not None else "-",
-            crore(t.get("net_income")) if t.get("net_income") is not None else "-",
-            "₹%.2f" % t["eps_diluted"] if t.get("eps_diluted") is not None else "-"))
+            crore(t.get("revenue"), currency=ccy) if t.get("revenue") is not None else "-",
+            crore(t.get("net_income"), currency=ccy) if t.get("net_income") is not None else "-",
+            "%s%.2f" % (money_sign(ccy), t["eps_diluted"]) if t.get("eps_diluted") is not None else "-"))
     out.append("")
     out.append("What changed:")
     for line in changes_india(result):
@@ -931,13 +1034,32 @@ def run_india(args):
     return results, rows, failed
 
 
+def _help_market(argv):
+    """The market the help text is for: --market in argv, else TRADER_MARKET / the default."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    flag = None
+    for i, a in enumerate(args):
+        if a == "--market" and i + 1 < len(args):
+            flag = args[i + 1]
+        elif a.startswith("--market="):
+            flag = a.split("=", 1)[1]
+    try:
+        return market.resolve(flag).code
+    except Exception:
+        return "IN"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    india_help = _help_market(argv) == "IN"
     ap.add_argument("tickers", nargs="*",
                     help="NSE symbols, e.g. RELIANCE TCS (US tickers like AAPL with --market US)")
-    ap.add_argument("--cik", help="use this CIK instead of a ticker lookup (one company)")
+    ap.add_argument("--cik", help=("US only (--market US): an SEC CIK instead of a ticker lookup"
+                                   if india_help else
+                                   "use this CIK instead of a ticker lookup (one company)"))
     ap.add_argument("--quarters", type=int, default=6)
-    ap.add_argument("--no-filings", action="store_true", help="skip the 8-K and 10-Q links")
+    ap.add_argument("--no-filings", action="store_true",
+                    help=("skip the NSE results-feed link" if india_help else "skip the 8-K and 10-Q links"))
     ap.add_argument("--metrics", metavar="FILE", help="merge a row per ticker into this JSON")
     ap.add_argument("--user-agent")
     ap.add_argument("--config", default="trader/config.json")

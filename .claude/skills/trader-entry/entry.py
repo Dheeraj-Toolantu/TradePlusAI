@@ -23,18 +23,20 @@ Setups (v2 plans longs only):
   level  the first completed bar that closes above --level (for example a
          20-day high from trader-scanner).
   --min-volume-x X  the trigger bar also needs at least X times the average
-         volume of the opening-range bars (the 9:30 bar carries the opening
-         auction, so 1.0 is already a high bar).
+         volume of the opening-range bars (the first bar, 9:15 IST or 9:30
+         ET, carries the opening auction, so 1.0 is already a high bar).
 
-A trigger's time is the trigger bar's CLOSE time (the 10:10 bar closes at
-10:15 AM) and its price is that close, to the cent. Only bars on the interval
+A trigger's time is the trigger bar's CLOSE time (the 9:30 bar closes at
+9:35 AM IST; on NYSE the 10:10 bar closes at 10:15 AM) and its price is that
+close, to the NSE tick in India or to the cent in the US. Only bars on the interval
 grid count (Yahoo's live tick, e.g. 10:49:45, is dropped) and a bar counts only
 once it has closed: now >= its start + the interval.
 
 Statuses: triggered; waiting (not open yet, range still forming, or no close
-above the level yet); expired (no trigger by no_entries_after, default 15:30;
-on a 1:00 p.m. early close the cutoff moves up three hours with the close);
-no-data (the market is closed today or Yahoo sent no bars).
+above the level yet); expired (no trigger by no_entries_after, default 14:45
+IST on NSE or 15:30 ET on NYSE; on an NYSE 1:00 p.m. early close the cutoff
+moves up three hours with the close, NSE has none); no-data (the market is
+closed today, with a note on a Muhurat day, or Yahoo sent no bars).
 
 trader/config.json (optional): "no_entries_before" and "no_entries_after",
 exchange-local time. NSE defaults 09:30 and 14:45 IST (the window ahead of the
@@ -54,7 +56,8 @@ on expiry, at the close or at --until (exit 1). With --now or --offline it runs
 on a simulated clock and replays the day without sleeping.
 
 Data: Yahoo's free chart JSON (unofficial, can lag, bars not single trades)
-  https://query2.finance.yahoo.com/v8/finance/chart/TSLA?range=1d&interval=5m
+  https://query2.finance.yahoo.com/v8/finance/chart/RELIANCE.NS?range=1d&interval=5m
+  (TSLA in the US)
   falls back to query1 on HTTP 429 or 5xx; a 429 gets one retry after a pause.
   --offline PATH reads a saved chart JSON (.json or .json.gz) instead, or
   PATH/<TICKER>.json when PATH is a folder. Without --now, an offline file is
@@ -518,6 +521,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if not ok:
         res.update(status="no-data", phase="closed", reason="the %s is closed today (%s)" % (MK.exchange, why),
                    next_open=next_open(day))
+        special = (MK.special_sessions or {}).get(day.isoformat()) if not is_us() else None
+        if special:
+            res["special_session"] = special
         return res
     o, c = session(day)
     open_dt = datetime.datetime.combine(day, o)
@@ -728,6 +734,8 @@ def describe(res):
                 f["bar_start"].lstrip("0"), px(f["price"]), f["closes"]))
         if res["status"] == "expired":
             out.append("No entry on this setup today. Nothing was placed.")
+        if res.get("special_session"):
+            out.append("Note: %s; the entry timer does not watch it." % res["special_session"])
         if res.get("next_open"):
             out.append("Next open: %s %s." % (res["next_open"], tz_city()))
     if res.get("early_close"):

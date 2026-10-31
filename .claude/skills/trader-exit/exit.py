@@ -15,7 +15,8 @@ trader/config.json, or TRADER_MARKET=US) gives the original NYSE behaviour, unch
     python3 exit.py plan --symbol NVDA --entry 190.25 --setup level --stop pct:1
     python3 exit.py show                                    # the current trader/plan.json
 
-Stops (a long's stop rounds DOWN to the cent, away from the entry):
+Stops (a long's stop rounds DOWN, away from the entry: to the cent in the US, to the
+NSE tick in India):
   or-mid     the opening-range midpoint (the default for an orb entry)
   or-low     the opening-range low
   price:X    your price
@@ -25,7 +26,7 @@ Stops (a long's stop rounds DOWN to the cent, away from the entry):
              bars by then it averages all of them and says so.
   A level setup has no opening-range default: give a stop.
 
-Targets (round half up to the cent):
+Targets (US: round half up to the cent; India: UP to the NSE tick):
   2R (default), 1R, 1.5R ...   entry + R x risk, where risk = entry - stop
   price:X                      your price
 
@@ -34,12 +35,19 @@ it, a risk under 0.05% of the price (too tight to survive the spread), an
 entry.json that has not triggered (unless you give --entry), a short (v2
 plans longs only).
 
-flat_by (default 15:55, or "flat_by" in trader/config.json): out by then, win
-or lose. On a 1:00 p.m. early close it moves up with the close (12:55).
+flat_by (default 15:10 IST in India, 15:55 ET in the US, or "flat_by" in
+trader/config.json): out by then, win or lose. On an NYSE 1:00 p.m. early close
+it moves up with the close (12:55); NSE has no early closes.
 
 India (the default): the stop rounds DOWN and the target rounds UP to the NSE
-tick for the price (0.05 from Rs 250, 0.10 from Rs 1,000 ...), the entry to the
-nearest tick. flat_by defaults to 15:10 IST, ahead of the broker's intraday
+tick (0.05 from Rs 250, 0.10 from Rs 1,000 ...), the entry to the nearest tick.
+The stop and the target share one tick: the coarsest of the bands of the entry,
+the stop and the target (plan.json's "tick"). NSE reviews a stock's band
+periodically from its close, so a stock just across a boundary can still carry
+its old tick; the coarser tick is a multiple of the finer one and is valid in
+either band (entry Rs 1,000.20, stop Rs 999.27 -> Rs 999.20, not 999.25). A plan
+dated on an NSE holiday or weekend, or outside the holiday list's years, gets a
+note. flat_by defaults to 15:10 IST, ahead of the broker's intraday
 (MIS) auto square-off. "Too tight to survive the spread" is a risk under
 MIN_TICKS (5) ticks of the entry's tick size, or under 0.05% of the price,
 whichever is larger: RELIANCE at Rs 1,415.30 (tick 0.10) needs a stop at least
@@ -291,31 +299,34 @@ def amt(x):
     return MK.symbol + num(d)
 
 
-def tick_of(x):
-    """The price step at x: 0.01 in the US; the NSE tick band in India."""
+def tick_of(x, ref=None):
+    """The price step at x: 0.01 in the US; the NSE tick band in India. With ref (the entry),
+    the coarser of the ticks at x and at ref: NSE sets a stock's tick from its band, reviewed
+    periodically from the close, so a stop or target across a band boundary from the entry
+    stays valid whichever band the stock carries."""
     if is_us():
         return CENT
-    return D(MK.tick(float(D(x))))
+    return D(MK.tick(float(D(x)), None if ref is None else float(D(ref))))
 
 
-def to_tick(x, rounding):
-    t = tick_of(x)
+def to_tick(x, rounding, ref=None, tick=None):
+    t = tick if tick is not None else tick_of(x, ref)
     return ((D(x) / t).to_integral_value(rounding=rounding) * t).quantize(CENT)
 
 
-def entry_px(x):
-    """The entry: to the cent (US) or the nearest NSE tick (India)."""
-    return cents(x) if is_us() else to_tick(x, ROUND_HALF_UP)
+def entry_px(x, ref=None):
+    """The entry: to the cent (US) or the nearest NSE tick (India; with ref, the opening-range high)."""
+    return cents(x) if is_us() else to_tick(x, ROUND_HALF_UP, ref)
 
 
-def stop_px(x):
+def stop_px(x, ref=None, tick=None):
     """A long's stop: down, away from the entry, to the cent or the NSE tick."""
-    return floor_cents(x) if is_us() else to_tick(x, ROUND_FLOOR)
+    return floor_cents(x) if is_us() else to_tick(x, ROUND_FLOOR, ref, tick)
 
 
-def target_px(x):
+def target_px(x, ref=None, tick=None):
     """A long's target: half up to the cent (US, upstream) or UP to the NSE tick (India)."""
-    return cents(x) if is_us() else to_tick(x, ROUND_CEILING)
+    return cents(x) if is_us() else to_tick(x, ROUND_CEILING, ref, tick)
 
 
 def level_px(x):
@@ -378,7 +389,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
             atr=None, atr_bars=None):
     """The stop, the target and the risk, in exact cents (on the NSE tick in India).
     Raises PlanError with the reason."""
-    e = entry_px(entry)
+    e = entry_px(entry) if is_us() else entry_px(entry, or_high)
     if e <= 0:
         raise PlanError("the entry price must be above %s" % money(0).split(".")[0])
     detail = ""
@@ -410,9 +421,22 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
             "$" if is_us() else MK.symbol, num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
-    stop = stop_px(raw)
+    if is_us():
+        stop = stop_px(raw)
+        tick = CENT
+    else:
+        # one tick for the stop and the target: the coarsest of the bands of the entry, the
+        # stop and the target (each coarser tick is a multiple of the finer ones)
+        tick = tick_of(raw, e)
+        for _ in range(3):
+            stop = stop_px(raw, tick=tick)
+            t_raw = (e + target_param * (e - stop)) if target_rule == "r" else target_param
+            t2 = max(tick, tick_of(t_raw)) if t_raw > 0 else tick
+            if t2 == tick:
+                break
+            tick = t2
     if stop != D(raw):
-        how = "rounded down" if is_us() else "rounded down to the %s tick" % num(tick_of(raw))
+        how = "rounded down" if is_us() else "rounded down to the %s tick" % num(tick)
         detail = (detail + ", " + how if detail else "%s %s" % (amt(raw), how))
     if stop >= e:
         raise PlanError("the stop %s (%s) is at or above the entry %s: a long's stop goes under the entry"
@@ -425,19 +449,23 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         tk = tick_of(e)
         need = max(floor_risk, tk * MIN_TICKS)
         if risk < need:
-            raise PlanError("the stop is %s under the entry, %s tick(s) of %s: under the minimum of %d ticks and 0.05%% "
-                            "of the price (%s on %s): too tight to survive the spread, normal wiggle would stop you "
-                            "out. Widen it." % (money(risk), num(risk / tk), num(tk), MIN_TICKS,
-                                                money(need.quantize(CENT, rounding=ROUND_CEILING)), money(e)))
+            by_ticks = tk * MIN_TICKS >= floor_risk
+            raise PlanError("the stop is %s under the entry (%s tick(s) of %s): risk %s is under the %s minimum "
+                            "(the larger of %d ticks = %s and 0.05%% of the price = %s on %s; the %s rule binds): "
+                            "too tight to survive the spread, normal wiggle would stop you out. Widen it."
+                            % (money(risk), num(risk / tk), num(tk), money(risk),
+                               money(need.quantize(CENT, rounding=ROUND_CEILING)),
+                               MIN_TICKS, money(tk * MIN_TICKS), amt(floor_risk.normalize()), money(e),
+                               "%d-tick" % MIN_TICKS if by_ticks else "0.05%"))
     if risk < floor_risk:
         raise PlanError("the stop is %s under the entry, less than 0.05%% of the price (%s on %s): too tight to "
                         "survive the spread, normal wiggle would stop you out. Widen it."
                         % (money(risk), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP)), money(e)))
     if target_rule == "r":
-        target = target_px(e + target_param * risk)
+        target = target_px(e + target_param * risk) if is_us() else target_px(e + target_param * risk, tick=tick)
         t_label = r_label(target_param)
     else:
-        target = target_px(target_param)
+        target = target_px(target_param) if is_us() else target_px(target_param, tick=tick)
         t_label = None
     if target <= e:
         raise PlanError("the target %s is at or below the entry %s: a long's target goes above it"
@@ -445,9 +473,12 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     rr = ((target - e) / risk).quantize(CENT, rounding=ROUND_HALF_UP)
     if t_label is None:
         t_label = "your price (%sR)" % ratio(rr)
-    return {"entry": e, "stop": stop, "stop_label": label, "stop_detail": detail, "target": target,
-            "target_r": target_param if target_rule == "r" else rr, "target_label": t_label,
-            "risk": risk, "reward_risk": rr}
+    out = {"entry": e, "stop": stop, "stop_label": label, "stop_detail": detail, "target": target,
+           "target_r": target_param if target_rule == "r" else rr, "target_label": t_label,
+           "risk": risk, "reward_risk": rr}
+    if not is_us():
+        out["tick"] = tick      # the tick the stop and the target were rounded to (plan.json's "tick")
+    return out
 
 
 # ---------------------------------------------------------------- bars for ATR (same reader as trader-entry)
@@ -740,7 +771,7 @@ def build_plan(a, now_utc):
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
     if not is_us():
-        plan.update(market=MK.code, currency=MK.currency, tick=float(tick_of(c["entry"])),
+        plan.update(market=MK.code, currency=MK.currency, tick=float(c["tick"]),
                     charges_ref=charges_ref(c, getattr(a, "ref_qty", None), cfg))
     warnings = []
     if flat_note:
@@ -759,6 +790,19 @@ def build_plan(a, now_utc):
     today = to_eastern(now_utc).date()
     if day != today:
         warnings.append("This plan is for %s, not today (%s)." % (day.isoformat(), today.isoformat()))
+    if not is_us():
+        ok, why = MK.trading_day(day)
+        if not ok:
+            nxt = MK.next_open(day)
+            special = MK.special_sessions.get(day.isoformat())
+            warnings.append("%s is not a regular NSE trading day (%s)%s%s."
+                            % (day.isoformat(), why,
+                               (": %s, which this plan does not cover" % special) if special else
+                               ": there is no session to trade this plan in",
+                               ("; next regular open %s %s" % (nxt, MK.tz_label)) if nxt else ""))
+        if not MK.calendar_known(day):
+            warnings.append("Holiday list covers %s only: check %s for this date."
+                            % (" and ".join(map(str, MK.calendar_years)), MK.calendar_source))
     return plan, warnings
 
 

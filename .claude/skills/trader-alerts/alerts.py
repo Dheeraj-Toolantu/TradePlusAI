@@ -572,6 +572,21 @@ def evaluate(rules, quotes, status, state, now_utc):
             at = ring_time(r, status)
             if status.get("opens") and local.time() >= at and not _rang_today(rung.get(rid), today):
                 label = r.get("label") or "time alert"
+                sym = plain(r.get("symbol") or "")
+                closes = _hhmm(status["closes"]) if status.get("closes") else None
+                if (not is_us() and not status["open"] and closes and at < closes
+                        and local.time() >= closes and (sym or r.get("before_close"))):
+                    # India: a square-off reminder checked only after the close is not rung as
+                    # if there were still time; it says the reminder was missed.
+                    msg = "%s%s was missed: set for %s %s, but the first check after it ran at %s %s, after " \
+                          "the %s close." % (label[:1].upper(), label[1:], at.strftime("%H:%M"), CLOCK,
+                                             local.strftime("%H:%M"), CLOCK, status["closes"])
+                    if sym:
+                        msg += (" Groww squares off open intraday (MIS) positions near the close: check "
+                                "the Groww app for %s and record any fill with ticket.py fill." % sym)
+                    rings.append({"id": rid, "symbol": sym, "message": msg, "missed": True})
+                    rung[rid] = stamp
+                    continue
                 msg = "%s%s: it is %s %s (set for %s)" % (label[:1].upper(), label[1:],
                                                            local.strftime("%H:%M"), CLOCK, at.strftime("%H:%M"))
                 msg += (", the market closes at %s." % status["closes"]) if status["open"] else \
@@ -756,18 +771,25 @@ def cmd_check(a):
         if status.get("special_session"):
             print("Special session: %s." % status["special_session"])
         for r in rings:
-            print("ALERT " + r["message"])
+            print(("MISSED " if r.get("missed") else "ALERT ") + r["message"])
         if not rings:
             print("Nothing hit. %d rule(s) watched today%s." % (
                 len(watched), (", " + ", ".join("%s %s" % (s, px(quotes[s]["price"])) for s in syms if s in quotes))
                 if quotes else ""))
         for e in errors:
             print("error: " + e)
-        if rings:
+        if rings and is_us():
             print("An alert is information, not an order. A bracket's stop-loss and take-profit already sit at "
                   "the broker: check get_open_position and record any fill (ticket.py fill). To close a "
                   "position yourself: ticket.py flatten, then trader-risk and your yes.")
-    return 0 if rings else 1
+        elif any(not r.get("missed") for r in rings):
+            print("An alert is information, not an order. Once you place it, the SL-M stop sits at Groww "
+                  "(Groww has no bracket order, and the target is only this alert): check the Groww app "
+                  "for fills and record any fill with ticket.py fill. To close a position yourself: "
+                  "ticket.py flatten, then trader-risk and your yes.")
+    if is_us():
+        return 0 if rings else 1
+    return 0 if any(not r.get("missed") for r in rings) else 1
 
 
 def cmd_add(a):
@@ -866,7 +888,23 @@ def cmd_reset(a):
     return 0
 
 
+def _help_market(argv):
+    """The market the --help text is written for: --market in argv, else the default."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    flag = None
+    for i, a in enumerate(args):
+        if a == "--market" and i + 1 < len(args):
+            flag = args[i + 1]
+        elif a.startswith("--market="):
+            flag = a.split("=", 1)[1]
+    try:
+        return market.resolve(flag).code
+    except Exception:
+        return "IN"
+
+
 def main(argv=None):
+    india_help = _help_market(argv) == "IN"
     ap = argparse.ArgumentParser(description="Price alerts and the exchange clock (trader-alerts). "
                                              "India (NSE, IST, rupees) by default; --market US for the NYSE.")
     ap.add_argument("--market", help="IN (NSE, the default) or US (NYSE)")
@@ -919,7 +957,9 @@ def main(argv=None):
     p.add_argument("--config", default="trader/config.json", help="flat_by when the plan has none")
     p.add_argument("--label", help="what a time alert says, e.g. \"flat by close\"")
     p.add_argument("--before-close", action="store_true",
-                   help="a time alert that moves earlier on an early close (NYSE 1:00 p.m. days)")
+                   help=("a time alert that moves earlier on an early close (NSE has no early-close "
+                         "days, so in India it never moves)" if india_help else
+                         "a time alert that moves earlier on an early close (NYSE 1:00 p.m. days)"))
     p.add_argument("--date", help="watch this rule on this exchange-local date only (YYYY-MM-DD)")
     p.add_argument("--direction", choices=["up", "down"])
     p.add_argument("--rearm", action="store_true")

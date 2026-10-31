@@ -256,6 +256,14 @@ class Orb(Base):
             scan.orb_window(scan.parse_now("2026-11-10 10:00"), None, 15, None)
         self.assertIn("NSE holiday: Diwali Balipratipada", str(cm.exception))
         with self.assertRaises(scan.ScanError) as cm:
+            scan.orb_window(scan.parse_now("2026-11-08 18:00"), None, 15, None)
+        self.assertIn("Muhurat trading", str(cm.exception))
+        with self.assertRaises(scan.ScanError) as cm:          # after 14:45 on the day before a holiday
+            scan.orb_window(scan.parse_now("2026-11-09 14:50"), None, 15, scan.parse_hhmm("14:45"))
+        self.assertIn("Run orb on Wed 2026-11-11 after 9:35 AM", str(cm.exception))
+        self.assertIsNone(scan.calendar_note(D(2026, 11, 2)))
+        self.assertIn("Holiday list covers 2026 only", scan.calendar_note(D(2027, 1, 26)))
+        with self.assertRaises(scan.ScanError) as cm:
             scan.orb_window(scan.parse_now("2026-10-29 15:31"), None, 15, None)
         self.assertIn("closed at 3:30 PM IST", str(cm.exception))
         self.assertIn("--at 10:00", str(cm.exception))

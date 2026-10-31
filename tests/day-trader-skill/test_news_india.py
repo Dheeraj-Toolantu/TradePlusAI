@@ -275,5 +275,119 @@ class Check(unittest.TestCase):
             news.apply_market(news.market.get("IN"))
 
 
+RW = os.path.join(DIR, "realworld")
+
+
+class RealWorldVariants(unittest.TestCase):
+    """Probe inputs shaped like the live Google News and NSE feeds (fixtures/trader-news-in/realworld)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "news.json")
+        none = os.path.join(self.tmp.name, "none.json")
+        self.base = ["--offline", RW, "--state", self.state, "--now", "2026-10-31T19:00:00+05:30",
+                     "--hours", "72", "--no-moves", "--portfolio", none, "--watchlist", none,
+                     "--plan", none, "--names", none, "--equity-list", os.path.join(RW, "EQUITY_L.csv")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def item(self, title):
+        return {"id": title, "source": "Google News", "kind": "headline", "ticker": "RELIANCE",
+                "title": title, "summary": "", "link": "", "time": None}
+
+    def tags(self, title):
+        return news.tag([self.item(title)], {"RELIANCE": "Reliance Industries Limited"})[0]["tags"]
+
+    def test_common_words_are_not_tags(self):
+        cases = {
+            "As a result of the rally, Sensex hits record": "results",
+            "Pat Cummins joins Jio ad campaign": "results",
+            "Ambani says the deal pit stop is over": "insider/pit",
+            "Reliance sets up hackathon for startups": "risk",
+            "Ambani will default to growth": "risk",
+            "Jio offers Diwali bonus data pack": "bonus",
+            "New split screen feature on JioTV": "split",
+        }
+        for title, tag in cases.items():
+            self.assertNotIn(tag, self.tags(title), title)
+
+    def test_true_positives_stay(self):
+        cases = {
+            "Q2FY27 PAT up 9%; board recommends 1:1 bonus issue and stock split": ["results", "bonus", "split"],
+            "Q2 FY27 earnings beat estimates": ["results"],
+            "Quarterly results on Friday": ["results"],
+            "Unit hacked in cyber attack": ["risk"],
+            "Group firm defaults on loan; payment default flagged": ["risk"],
+            "Data breach at the telecom arm": ["risk"],
+            "Bonus shares in the ratio 1:1": ["bonus"],
+            "Sub-division of equity shares approved": ["split"],
+            "Disclosure under SEBI (PIT) Regulations": ["insider/pit"],
+            "Insider trading probe": ["insider/pit"],
+        }
+        for title, want in cases.items():
+            got = self.tags(title)
+            for t in want:
+                self.assertIn(t, got, title)
+
+    def test_nse_times(self):
+        ist = lambda s: news.parse_nse_time(s).isoformat()
+        self.assertEqual(ist("2026-10-31 18:05:12"), "2026-10-31T12:35:12+00:00")
+        self.assertEqual(ist("2026-10-31T18:05:12"), "2026-10-31T12:35:12+00:00")
+        self.assertEqual(ist("31-Oct-2026 06:05:12 PM"), "2026-10-31T12:35:12+00:00")
+        self.assertEqual(ist("31/10/2026 18:05:12"), "2026-10-31T12:35:12+00:00")
+        self.assertEqual(ist("31-OCT-2026 18:05:12"), "2026-10-31T12:35:12+00:00")
+        self.assertEqual(ist("Sat, 31 Oct 2026 12:35:12 GMT"), "2026-10-31T12:35:12+00:00")
+        self.assertEqual(ist("2026-10-31T18:05:12+05:30"), "2026-10-31T12:35:12+00:00")
+
+    def test_html_page_is_a_note_not_an_empty_feed(self):
+        page = b"<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>You don't have permission</BODY></HTML>"
+        with self.assertRaises(news.NewsError) as cm:
+            news.parse_nse_rss(page, "announcement")
+        self.assertIn("HTML page", str(cm.exception))
+        self.assertEqual(news.parse_nse_rss(b'<rss version="2.0"><channel></channel></rss>', "x"), [])
+
+    def test_lookalike_companies_and_no_repeated_name(self):
+        code, out, err = run(["--tickers", "RELIANCE", "BAJAJ-AUTO", "M&M", "TCS", "--json", "--dry-run"]
+                             + self.base)
+        self.assertEqual(code, 0, err)
+        filings = [i for i in json.loads(out)["items"] if i["source"] == "NSE"]
+        self.assertEqual(sorted(i["ticker"] for i in filings), ["BAJAJ-AUTO", "M&M", "RELIANCE", "TCS"])
+        titles = [i["title"] for i in filings]
+        self.assertIn("Reliance Industries Limited, announcement: Analysts/Institutional Investor Meet/Con. "
+                      "Call Updates", titles)
+        self.assertIn("Tata Consultancy Services Limited, announcement: Buyback", titles)
+        for t in titles:
+            self.assertFalse(any(w in t for w in ("Infrastructure", "Power", "Finance", "Financial",
+                                                  "Consumer", "Communications")), t)
+            self.assertNotIn("has informed", t)
+
+    def test_suppressed_duplicate_is_remembered_across_runs(self):
+        args = ["--tickers", "RELIANCE", "--no-filings"] + self.base
+        code, out, err = run(args)
+        self.assertEqual(code, 0, err)
+        self.assertIn("via The Economic Times", out)
+        self.assertNotIn("articles/A6", out)        # the Mint copy of the same story is folded
+        # next run: the ET copy has left the feed; the Mint copy must not come back as new
+        alt = os.path.join(self.tmp.name, "feeds")
+        os.makedirs(alt)
+        for f in os.listdir(RW):
+            with open(os.path.join(RW, f), encoding="utf-8") as fh:
+                text = fh.read()
+            if f == "gnews-RELIANCE.xml":
+                text = "\n".join(l for l in text.splitlines() if "The Economic Times</title>" not in l)
+            with open(os.path.join(alt, f), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        args[args.index("--offline") + 1] = alt
+        code, out, err = run(args)
+        self.assertEqual(code, 1, out)
+        self.assertIn("Nothing new", out)
+
+    def test_empty_ticker_is_refused(self):
+        code, out, err = run(["--tickers", ""] + self.base)
+        self.assertEqual(code, 2)
+        self.assertIn("empty ticker", err)
+
+
 if __name__ == "__main__":
     unittest.main()

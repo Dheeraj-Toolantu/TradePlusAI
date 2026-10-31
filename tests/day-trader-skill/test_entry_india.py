@@ -149,6 +149,10 @@ class Phases(unittest.TestCase):
         self.assertEqual(r["next_open"], "2026-11-02 09:15")
         r = at("2026-11-09 09:50", shift_to(doc(), datetime.date(2026, 11, 9)))
         self.assertEqual(r["trigger"]["time"], "9:50 AM")
+        r = at("2026-11-08 18:00", shift_to(doc(), datetime.date(2026, 11, 8)))
+        self.assertEqual(r["phase"], "closed")
+        self.assertIn("Muhurat trading", "\n".join(entry.describe(r)))
+        self.assertNotIn("Muhurat", "\n".join(entry.describe(at("2026-11-07 10:00"))))
         self.assertFalse(at("2027-02-01 10:00")["calendar_known"])
         self.assertIn("nseindia.com", "\n".join(entry.describe(at("2027-02-01 10:00"))))
 

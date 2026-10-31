@@ -58,7 +58,18 @@ python3 "${CLAUDE_SKILL_DIR}/deals.py" --help
 NSE sometimes refuses scripted downloads. If a fetch fails, the user opens
 nseindia.com > Market Data > Bulk / Block Deals in a browser, downloads the
 CSV and you pass it with `--file` (the kind is read from the file name, or
-use `--bulk-file` / `--block-file`).
+use `--bulk-file` / `--block-file`). `--file` can be repeated: every file is
+read. The website's report download (header `"Buy / Sell "`, quoted, with
+trailing spaces) is read as well as the archive CSV.
+
+`--file` also reads the JSON the nseindia.com website API returns:
+`{"data": [{"BD_DT_DATE", "BD_SYMBOL", "BD_SCRIP_NAME", "BD_CLIENT_NAME",
+"BD_BUY_SELL", "BD_QTY_TRD", "BD_TP_WATP", "BD_REMARKS"}]}` (historical bulk
+or block deals) or the snapshot `{"BULK_DEALS_DATA": [...],
+"BLOCK_DEALS_DATA": [...]}` with `date`, `symbol`, `name`, `clientName`,
+`buySell`, `qty`, `watp`, `remarks` (one file, both kinds). These field names
+were written from memory and are NOT verified against the live site: if a
+saved JSON does not parse, check its keys and use the CSV instead.
 
 ## The rules
 

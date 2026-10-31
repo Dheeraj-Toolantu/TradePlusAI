@@ -62,6 +62,20 @@ class Prices(unittest.TestCase):
         self.assertEqual(IN.round_down(5003.2), 5003.0)
         self.assertEqual(US.round_down(358.326), 358.32)
 
+    def test_coarser_tick_across_a_band_boundary(self):
+        # NSE sets the tick from the band, reviewed from the close: with a ref (the entry) the
+        # coarser of the two ticks is used, a multiple of the finer one, valid in either band
+        self.assertEqual(IN.tick(999.27), 0.05)
+        self.assertEqual(IN.tick(999.27, ref=1000.20), 0.10)
+        self.assertEqual(IN.tick(1000.20, ref=999.27), 0.10)
+        self.assertEqual(IN.round_down(999.27, ref=1000.20), 999.2)
+        self.assertEqual(IN.round_down(999.27), 999.25)
+        self.assertEqual(IN.tick(249.73, ref=250.10), 0.05)
+        self.assertEqual(IN.round_down(249.73, ref=250.10), 249.7)
+        self.assertEqual(IN.round_up(250.02, ref=249.99), 250.05)
+        self.assertEqual(IN.round_tick(999.97, ref=1000.2), 1000.0)
+        self.assertEqual(US.round_down(358.326, ref=1000), 358.32)
+
     def test_rupees_use_lakh_and_crore_grouping(self):
         self.assertEqual(IN.money(1234567.5), "₹12,34,567.50")
         self.assertEqual(IN.money(999), "₹999.00")
@@ -134,6 +148,15 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 0)
         res = json.loads(out)
         self.assertEqual(res["next_open"], "2026-11-11 09:15")
+
+    def test_next_open_outside_the_holiday_list_is_flagged(self):
+        rc, out = self.run_cli("status", "--at", "2026-12-31 16:00")
+        self.assertIn("Next open: 2027-01-01 09:15 IST", out)
+        self.assertIn("Holiday list covers 2026 only", out)
+        rc, out = self.run_cli("--json", "status", "--at", "2026-12-31 16:00")
+        self.assertIs(json.loads(out)["next_open_calendar_known"], False)
+        rc, out = self.run_cli("status", "--at", "2026-11-10 10:00")
+        self.assertNotIn("Holiday list covers", out)
 
     def test_charges_text(self):
         rc, out = self.run_cli("charges", "--qty", "40", "--buy", "1250", "--sell", "1262.5")

@@ -76,7 +76,65 @@ class Session(unittest.TestCase):
         self.assertIn("Dussehra", [x for x in short if x["date"] == "2026-10-20"][0]["reason"])
 
 
+def late_breakout_chart():
+    """SYNTHETIC: 40 flat NSE sessions whose only close above the opening range is the 15:00 bar
+    (closing 15:05), after the 14:45 no-entries cutoff; the plan day breaks out at 9:30."""
+    import calendar
+    import datetime as dtm
+    stamps, o, h, l, c = [], [], [], [], []
+    d, end = dtm.date(2026, 9, 1), dtm.date(2026, 10, 30)
+    while d <= end:
+        if d.weekday() < 5:
+            for i in range(75 if d < end else 6):
+                mins = 9 * 60 + 15 + 5 * i
+                bar = (100, 100.5, 99.5, 100) if i < 3 else (100, 101.2, 99.9, 101.0) if mins == 15 * 60 \
+                    else (100, 100.4, 99.8, 100)
+                if d == end and i == 3:
+                    bar = (100, 100.8, 100, 100.6)
+                utc = dtm.datetime.combine(d, dtm.time(mins // 60, mins % 60)) - dtm.timedelta(hours=5, minutes=30)
+                stamps.append(calendar.timegm(utc.timetuple()))
+                for col, v in zip((o, h, l, c), bar):
+                    col.append(v)
+        d += dtm.timedelta(days=1)
+    return json.dumps({"chart": {"result": [{
+        "meta": {"symbol": "LATE.NS", "gmtoffset": 19800, "exchangeTimezoneName": "Asia/Kolkata",
+                 "dataGranularity": "5m", "regularMarketTime": stamps[-1] + 300},
+        "timestamp": stamps,
+        "indicators": {"quote": [{"open": o, "high": h, "low": l, "close": c, "volume": [1] * len(c)}]}}],
+        "error": None}})
+
+
 class Run(unittest.TestCase):
+    def test_history_entries_respect_the_entry_window(self):
+        """India: the history replay takes no entry after no_entries_after (14:45), as trader-entry."""
+        raw = {"symbol": "LATE", "side": "buy", "date": "2026-10-30", "setup": "orb", "entry": 100.6,
+               "stop": 100.0, "target": 101.8, "entry_time": "9:35 AM", "stop_rule": "or_mid",
+               "opening_range": {"minutes": 15}, "interval": "5m", "flat_by": "15:10"}
+        text = late_breakout_chart()
+        now = tm.parse_now("2026-10-30 09:45")
+        doc = machine(raw, text=text, now=now)
+        self.assertEqual(doc["history"]["sessions"], 40)
+        self.assertEqual(doc["history"]["triggered"], 0)
+        self.assertEqual(doc["history"]["entry_window"], ["09:30", "14:45"])
+        self.assertEqual(doc["mc"]["until"], "15:10")                  # replays still run to flat_by
+        raw["no_entries_after"] = "15:05"                              # a later window lets them in
+        doc = machine(raw, text=text, now=now)
+        self.assertEqual(doc["history"]["triggered"], 40)
+        self.assertEqual({t["time"] for t in doc["history"]["trades"]}, {"3:05 PM"})
+        self.assertIn("2026-10-02 (NSE holiday: Mahatma Gandhi Jayanti)", "\n".join(tm.report(doc)))
+        self.assertNotIn("half days or gaps", "\n".join(tm.report(doc)))
+
+    def test_unknown_calendar_year_is_flagged(self):
+        doc = machine()
+        self.assertFalse(any("Holiday list covers" in w for w in doc["warnings"]))
+        years = tm.MK.calendar_years
+        tm.MK.calendar_years = (2025,)                 # as if the plan's year had no holiday list yet
+        try:
+            doc = machine()
+        finally:
+            tm.MK.calendar_years = years
+        self.assertTrue(any("Holiday list covers 2025 only" in w for w in doc["warnings"]))
+
     def test_replays_to_flat_by_and_reports_in_rupees(self):
         doc = machine()
         m = doc["mc"]

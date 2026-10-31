@@ -40,9 +40,10 @@ universe (US)  Downloads Nasdaq Trader's symbol directories (nasdaqlisted.txt an
             6. in: everything else (plain names like "AMETEK, Inc.")
 
 daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
-          3 months of 1-day bars, closes only). Liquidity from the spark meta:
-          regularMarketPrice >= --min-price (5) and regularMarketVolume >=
-          --min-volume (1,000,000). Setups, from closes only:
+          3 months of 1-day bars, closes only). Liquidity: US, from the spark
+          meta, regularMarketPrice >= --min-price ($5) and regularMarketVolume
+          >= --min-volume (1,000,000); India, price >= Rs 50 and an average
+          daily traded value >= --min-value-cr (10 crore). Setups, from closes only:
             breakout_20d     the last close is above every close of the 20 before it
             bull_flag        up more than 10 % over the 10 sessions before the
                              last 5, then the last 5 closes inside a 5 % range
@@ -61,22 +62,27 @@ orb       Opening-range breakouts, 5-minute bars. The range is the first
           bar's close time. Stage 2 fetches at most --max-confirm (200) charts,
           the most traded candidates first (price x volume so far), and says
           so when it stops short. A chart is usable only when every 5-minute
-          bar from 9:30 to the cutoff is there (a missing bar is a halt or no
-          trades). Floors: --min-price 5 (last close), --min-volume 0.
+          bar from the open (9:15 IST, 9:30 ET) to the cutoff is there (a
+          missing bar is a halt or no trades). Floors: US --min-price 5 (last
+          close), --min-volume 0; India Rs 50 and Rs 1 crore traded so far.
 
 Bars: null closes are dropped, a bar off the 5-minute grid (the live tick,
 like 10:49:45) is dropped, and a bar counts only once it is complete
-(start + 5 minutes <= the clock). Times are New York (ET). --now pins the
-clock ("2026-10-19 10:15", New York time; ...Z for UTC).
+(start + 5 minutes <= the clock). Times are exchange-local: IST in India,
+New York (ET) in the US. --now pins the clock ("2026-10-30 10:00" IST, or
+"2026-10-19 10:15" New York time with --market US; ...Z for UTC). A date past
+the NSE holiday list's years is flagged; on a closed day the error names the
+holiday (and the Muhurat session on Diwali).
 
 Yahoo's endpoints are free, unofficial and can lag. query2 first, query1 on
 a 429 or 5xx, one retry after a pause on a 429. A polite pause between
 requests (--pause). Partial results are reported as partial.
 
 --offline PATH reads files instead of the network: universe wants a folder
-with nasdaqlisted.txt and otherlisted.txt; daily and orb take a folder of
-<T>.json v8 chart files or spark responses, or one file that is a spark
-response, a v8 chart, or a bundle {"TSLA": <v8 json>, ...}. .json.gz is fine.
+with EQUITY_L.csv and ind_<index>list.csv (India) or nasdaqlisted.txt and
+otherlisted.txt (US); daily and orb take a folder of
+<T>.json v8 chart files or spark responses (RELIANCE.NS.json in India), or one
+file that is a spark response, a v8 chart, or a bundle {"TSLA": <v8 json>, ...}. .json.gz is fine.
 
 India: Yahoo symbols get .NS (URL-quoted, so M&M works), the session is
 9:15 to 15:30 IST, the 15-minute opening range is the 9:15, 9:20 and 9:25 bars,
@@ -255,6 +261,22 @@ def clock_label(t):
 
 def day_label(d):
     return "%s %s" % (d.strftime("%a"), d.isoformat())
+
+
+def calendar_note(d):
+    """India: the holiday list's caveat for a date outside its years (as trader-entry says it), else None."""
+    if MK.code == "US" or MK.calendar_known(d):
+        return None
+    return "Holiday list covers %s only: check %s for this date." % (
+        " and ".join(map(str, CALENDAR_YEARS)), MK.calendar_source)
+
+
+def next_session_label(d):
+    """India: the next trading day after d as 'Wed 2026-11-11' (from the market's calendar)."""
+    nxt = MK.next_open(d)
+    if not nxt:
+        return "the next trading day"
+    return day_label(datetime.date.fromisoformat(nxt[:10]))
 
 
 # ---------------------------------------------------------------- network
@@ -799,7 +821,7 @@ def session_bars(series, day, cutoff):
         if et.date() != day or et.second or et.minute % BAR_MIN:
             continue  # another day, or the live tick off the grid
         if et.time() < OPEN or et.time() >= close_t:
-            continue  # pre-market, after hours, the 4:00 PM closing print
+            continue  # pre-open / pre-market, after hours, the closing print (15:30 IST, 4:00 PM ET)
         if et + datetime.timedelta(minutes=BAR_MIN) > cutoff:
             continue  # still in progress at the cutoff
         v = series.get("v")
@@ -855,8 +877,11 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
         raise ScanError("--or-minutes wants a multiple of 5 from 5 to 120 (15 is the classic)")
     ok, why = trading_day(day)
     if not ok:
-        raise ScanError("No session on %s (%s): the market is closed. Run orb on a trading day "
-                        "after the opening range, or replay a past day with --offline." % (day_label(day), why))
+        special = MK.special_sessions.get(day.isoformat()) if MK.code != "US" else None
+        raise ScanError("No session on %s (%s): the market is closed.%s Run orb on a trading day "
+                        "after the opening range, or replay a past day with --offline." % (
+                            day_label(day), why,
+                            (" Note: %s; the scanner does not scan it." % special) if special else ""))
     s = session(day)
     range_end = slot(day, or_minutes // BAR_MIN)
     first_close = range_end + datetime.timedelta(minutes=BAR_MIN)
@@ -880,8 +905,9 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
                            clock_label(first_close), clock_label(first_close)))
     if until is not None and cutoff.time() > until:
         raise ScanError("It is %s %s, after %s, your last time for new entries (no_entries_after): an "
-                        "opening-range breakout found now is expired. Run orb tomorrow after %s, or replay "
+                        "opening-range breakout found now is expired. Run orb %s after %s, or replay "
                         "today with --at %s." % (clock_label(cutoff), TZ, until.strftime("%H:%M"),
+                                                   "tomorrow" if MK.code == "US" else "on " + next_session_label(day),
                                                    clock_label(first_close), EXAMPLE_AT))
     return day, cutoff
 
@@ -1199,6 +1225,8 @@ def cmd_daily(a):
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": "yahoo", "filters": _filters(a), "note": NOTE, "hits": hits}
     _mark(doc)
+    if calendar_note(to_eastern(now).date()):
+        doc["calendar_known"] = False
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -1209,6 +1237,8 @@ def cmd_daily(a):
     local = to_eastern(now)
     print("Daily scan, %s %s, closes through %s (Yahoo spark, daily closes only)." % (
         local.strftime("%a %Y-%m-%d %H:%M"), TZ, last_date.isoformat() if last_date else "nothing"))
+    if calendar_note(local.date()):
+        print(calendar_note(local.date()))
     if MK.code == "US":
         floor = "$%s+ and %s+ shares" % (_n(a.min_price), "{:,}".format(a.min_volume))
     else:
@@ -1302,6 +1332,8 @@ def cmd_orb(a):
            "interval": "%dm" % BAR_MIN,
            "filters": _filters(a), "note": NOTE, "hits": hits}
     _mark(doc)
+    if calendar_note(day):
+        doc["calendar_known"] = False
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -1320,6 +1352,8 @@ def cmd_orb(a):
                                                     "volume" if MK.code == "US" else "traded-value"))
              if counts["illiquid"] else "",
              "{:,}".format(counts["candidates"]), "{:,}".format(counts["confirmed"])))
+    if calendar_note(day):
+        print(calendar_note(day))
     if counts["unconfirmed"]:
         print("PARTIAL: %s more candidates were not checked (only the %s most traded are; --max-confirm 0 "
               "checks all)." % ("{:,}".format(counts["unconfirmed"]), "{:,}".format(a.max_confirm)))

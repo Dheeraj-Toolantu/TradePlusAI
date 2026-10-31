@@ -189,5 +189,56 @@ class Cli(unittest.TestCase):
         self.assertIn("deals:", err)
 
 
+class RealWorldVariants(unittest.TestCase):
+    """Layouts the NSE website gives besides the archive CSV."""
+
+    def test_website_report_download_header(self):
+        rows = deals.parse_deals(read(os.path.join(DIR, "Bulk-Deals-31-10-2026-to-31-10-2026-synthetic.csv")))
+        self.assertEqual(len(rows), 2)
+        buy = rows[0]
+        self.assertEqual((buy["date"], buy["symbol"], buy["side"], buy["qty"], buy["price"]),
+                         ("2026-10-31", "INFY", "buy", 1000000, 1502.25))
+        self.assertEqual(buy["client"], "EXAMPLE FUND, ODI")
+        self.assertEqual(buy["value_cr"], 150.22)
+        self.assertEqual(buy["remarks"], "")
+        self.assertEqual(rows[1]["side"], "sell")
+
+    def test_bom_and_comma_price(self):
+        rows = deals.parse_deals(read(os.path.join(DIR, "deals-a-synthetic.csv")))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["price"], 1234.5)
+        self.assertEqual(rows[0]["value_cr"], 15.24)   # 1,23,456 x 1,234.50 = Rs 15.24 crore
+
+    def test_several_files_are_all_read(self):
+        got = deals.load_deals("all", files=[os.path.join(DIR, "deals-a-synthetic.csv"),
+                                             os.path.join(DIR, "Bulk-Deals-31-10-2026-to-31-10-2026-synthetic.csv")])
+        self.assertEqual(sorted(d["symbol"] for d in got), ["INFY", "INFY", "TCS"])
+
+    def test_website_json(self):
+        got = deals.load_deals("all", files=[os.path.join(DIR, "bulk-api-synthetic.json")])
+        self.assertEqual(len(got), 1)
+        d = got[0]
+        self.assertEqual((d["kind"], d["date"], d["symbol"], d["security"], d["client"], d["side"]),
+                         ("bulk", "2026-10-31", "INFY", "Infosys Limited", "EXAMPLE FUND", "buy"))
+        self.assertEqual((d["qty"], d["price"], d["value_cr"], d["remarks"]), (1000000, 1502.25, 150.22, ""))
+
+    def test_snapshot_json_has_both_kinds(self):
+        path = os.path.join(DIR, "largedeal-snapshot-synthetic.json")
+        got = deals.load_deals("all", files=[path])
+        self.assertEqual(sorted((d["kind"], d["symbol"]) for d in got), [("block", "TCS"), ("bulk", "INFY")])
+        self.assertEqual([d["symbol"] for d in deals.load_deals("block", files=[path])], ["TCS"])
+
+    def test_json_without_a_list_is_an_error(self):
+        with self.assertRaises(deals.DealsError):
+            deals.parse_deals_json('{"x": 1}')
+        self.assertEqual(deals.parse_deals_json('{"data": []}'), [])
+
+    def test_cli_reads_website_download(self):
+        code, out, err = run(["fetch", "--file", os.path.join(DIR, "Bulk-Deals-31-10-2026-to-31-10-2026-synthetic.csv"),
+                              "--no-write", "--portfolio", "/nonexistent", "--watchlist", "/nonexistent"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("buys ₹150.22 Cr, sells ₹142.78 Cr", out)
+
+
 if __name__ == "__main__":
     unittest.main()
