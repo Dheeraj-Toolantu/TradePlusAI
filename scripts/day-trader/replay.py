@@ -9,7 +9,7 @@ S = REPO + "/.claude/skills"
 sys.path.insert(0, REPO + "/tests/day-trader-skill")
 from _load import load
 IN = load("trader-market", "market").get("IN")
-chart, sym, out = sys.argv[1], sys.argv[2], sys.argv[3]
+chart, sym, out = os.path.abspath(sys.argv[1]), sys.argv[2], os.path.abspath(sys.argv[3])
 ndays = int(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 0
 doc = json.load(gzip.open(chart, "rt") if chart.endswith(".gz") else open(chart))
 r = doc["chart"]["result"][0]; q = r["indicators"]["quote"][0]
