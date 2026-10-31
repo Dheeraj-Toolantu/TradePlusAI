@@ -15,6 +15,7 @@
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "test": "vitest run",
+    "test:trader-skills": "python3 -m unittest discover -s tests/day-trader-skill",
     "db:migrate": "powershell -ExecutionPolicy Bypass -File infra/local/migrate.ps1",
     "fixtures:load": "node infra/local/load-fixtures.mjs"
   },

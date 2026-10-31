@@ -16,3 +16,5 @@ venv/
 .vscode/
 Thumbs.db
 *.tmp
+# day-trader skill workspace (budget, positions, state, SEC contact): local only
+/trader/

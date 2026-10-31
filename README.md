@@ -11,5 +11,15 @@ repository contains the Spec Kit artifacts and the initial runnable monorepo fou
 4. Install JavaScript dependencies with `pnpm install`.
 5. Start the dashboard with `pnpm dev`.
 
+## Claude Code day-trader skills
+
+The 11 MIT-licensed skills from
+[day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill) are vendored in
+`.claude/skills/` (`/trader-scanner`, `/trader-news`, `/trader-entry`, `/trader-exit`,
+`/trader-timemachine`, `/trader-risk`, `/trader-budget`, `/trader-broker`, `/trader-alerts`,
+`/trader-analyst`, `/trader-pelosi`). They target US equities and are separate from the TradePulse
+execution path. See [docs/day-trader-skill/README.md](docs/day-trader-skill/README.md). Run their
+offline tests with `npm run test:trader-skills`.
+
 Live execution is intentionally disabled until the risk, paper-trading, broker, security, and
 regulatory release gates are implemented and verified.

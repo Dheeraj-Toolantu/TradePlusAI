@@ -13,3 +13,8 @@ __pycache__/
 venv/
 .vscode/
 .idea/
+
+# vendored day-trader skill pack and its real-data fixtures, kept as published
+.claude/skills/trader-*/
+tests/day-trader-skill/fixtures/
+docs/day-trader-skill/UPSTREAM-README.md
