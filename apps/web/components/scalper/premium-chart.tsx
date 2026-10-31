@@ -1,18 +1,47 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CandlestickSeries, ColorType, CrosshairMode, LineStyle, createChart, type IChartApi, type IPriceLine, type ISeriesApi, type UTCTimestamp } from "lightweight-charts";
 
 export type ChartBar = { time: number; open: number; high: number; low: number; close: number };
 export type ChartLevel = { price: number; color: string; title: string; dashed?: boolean };
+/** A long-premium risk-reward drawing: reward zone (entry→target) over risk zone (entry→stop). */
+export type RiskRewardBox = { entry: number; stop: number; target: number; fromTime?: number | null; quantity?: number; label?: string };
+type BoxLayout = { left: number; width: number; targetY: number; entryY: number; stopY: number };
+const RR_MIN_WIDTH = 190;
+const RR_RIGHT_OFFSET_BARS = 34; // room right of the last candle for the drawing (34 bars x 6 px > RR_MIN_WIDTH)
+
+/** Pixel layout of the risk-reward zones; null when a price is off-scale or the box would be empty. */
+export function riskRewardLayout(box: RiskRewardBox, toY: (price: number) => number | null, plotWidth: number, fromX: number | null): BoxLayout | null {
+  const targetY = toY(box.target);
+  const entryY = toY(box.entry);
+  const stopY = toY(box.stop);
+  if (targetY === null || entryY === null || stopY === null || !(plotWidth > 0)) return null;
+  // At least RR_MIN_WIDTH px wide (or the whole plot if narrower), so the labels stay inside the plot.
+  const minWidth = Math.min(RR_MIN_WIDTH, plotWidth);
+  const left = Math.min(Math.max(0, fromX ?? plotWidth * 0.55), plotWidth - minWidth);
+  return { left, width: Math.max(minWidth, plotWidth - left), targetY, entryY, stopY };
+}
 
 const IST_S = 330 * 60;
 /** lightweight-charts renders UTC; shift by +05:30 so the axis reads IST. */
 const chartTime = (epochS: number) => (epochS + IST_S) as UTCTimestamp;
 
 /** Candles plus horizontal levels (entry/SL/target, supports/resistances). Data is owned by the caller. */
-export function PremiumChart({ bars, levels, height = 300 }: { bars: ChartBar[]; levels: ChartLevel[]; height?: number }) {
+export function PremiumChart({ bars, levels, height = 300, riskReward = null }: { bars: ChartBar[]; levels: ChartLevel[]; height?: number; riskReward?: RiskRewardBox | null }) {
   const host = useRef<HTMLDivElement | null>(null);
+  const [layout, setLayout] = useState<BoxLayout | null>(null);
+  const boxRef = useRef<RiskRewardBox | null>(riskReward);
+  boxRef.current = riskReward;
+  const relayout = useCallback(() => {
+    const box = boxRef.current;
+    const target = series.current;
+    const instance = chart.current;
+    if (!box || !target || !instance || !host.current) { setLayout(null); return; }
+    const plotWidth = host.current.clientWidth - instance.priceScale("right").width();
+    const fromX = box.fromTime ? instance.timeScale().timeToCoordinate(chartTime(box.fromTime)) : null;
+    setLayout(riskRewardLayout(box, (price) => target.priceToCoordinate(price), plotWidth, fromX));
+  }, []);
   const chart = useRef<IChartApi | null>(null);
   const series = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const lines = useRef<IPriceLine[]>([]);
@@ -31,8 +60,13 @@ export function PremiumChart({ bars, levels, height = 300 }: { bars: ChartBar[];
     });
     series.current = instance.addSeries(CandlestickSeries, { upColor: "#22d59b", downColor: "#fa6b78", borderVisible: false, wickUpColor: "#22d59b", wickDownColor: "#fa6b78" });
     chart.current = instance;
-    return () => { instance.remove(); chart.current = null; series.current = null; lines.current = []; firstTime.current = null; length.current = 0; };
-  }, []);
+    // Keep the risk-reward zones glued to their prices while the chart scrolls, zooms or resizes.
+    const onRange = () => requestAnimationFrame(relayout);
+    instance.timeScale().subscribeVisibleLogicalRangeChange(onRange);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(onRange);
+    observer?.observe(host.current);
+    return () => { observer?.disconnect(); instance.timeScale().unsubscribeVisibleLogicalRangeChange(onRange); instance.remove(); chart.current = null; series.current = null; lines.current = []; firstTime.current = null; length.current = 0; };
+  }, [relayout]);
 
   useEffect(() => {
     const target = series.current;
@@ -46,7 +80,22 @@ export function PremiumChart({ bars, levels, height = 300 }: { bars: ChartBar[];
       firstTime.current = bars[0]?.time ?? null;
       if (data.length) chart.current?.timeScale().scrollToRealTime();
     } else target.update(data.at(-1)!);
-  }, [bars]);
+    requestAnimationFrame(relayout);
+  }, [bars, relayout]);
+
+  useEffect(() => {
+    const target = series.current;
+    if (!target) return;
+    // Like a position tool, the drawing extends into the future: leave room right of the last candle.
+    chart.current?.timeScale().applyOptions({ rightOffset: riskReward ? RR_RIGHT_OFFSET_BARS : 6 });
+    // The zones must stay on-screen: widen the autoscale to include the target and the stop.
+    target.applyOptions({ autoscaleInfoProvider: riskReward ? (original: () => { priceRange: { minValue: number; maxValue: number } } | null) => {
+      const base = original();
+      if (!base) return base;
+      return { ...base, priceRange: { minValue: Math.min(base.priceRange.minValue, riskReward.stop), maxValue: Math.max(base.priceRange.maxValue, riskReward.target) } };
+    } : undefined });
+    requestAnimationFrame(relayout);
+  }, [riskReward, relayout]);
 
   useEffect(() => {
     const target = series.current;
@@ -55,7 +104,29 @@ export function PremiumChart({ bars, levels, height = 300 }: { bars: ChartBar[];
     lines.current = levels.filter((level) => Number.isFinite(level.price) && level.price > 0).map((level) => target.createPriceLine({ price: level.price, color: level.color, lineWidth: 1, lineStyle: level.dashed ? LineStyle.Dashed : LineStyle.Solid, axisLabelVisible: true, title: level.title }));
   }, [levels]);
 
-  return <div ref={host} className="scalper-chart-canvas" style={{ height }} />;
+  const risk = riskReward ? riskReward.entry - riskReward.stop : 0;
+  const reward = riskReward ? riskReward.target - riskReward.entry : 0;
+  const ratio = risk > 0 ? reward / risk : 0;
+  const qty = riskReward?.quantity ?? 0;
+  const rupees = (value: number) => `₹${value.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+  return (
+    <div className="rr-chart-wrap" style={{ position: "relative", height }}>
+      <div ref={host} className="scalper-chart-canvas" style={{ height }} />
+      {riskReward && layout ? (
+        <div className="rr-overlay" aria-label={`Risk reward ${ratio.toFixed(2)} to 1`} style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 3 }}>
+          <div className="rr-zone rr-reward" style={{ position: "absolute", left: layout.left, width: layout.width, top: Math.min(layout.targetY, layout.entryY), height: Math.abs(layout.entryY - layout.targetY), background: "rgba(34,213,155,.16)", borderTop: "1px solid #22d59b" }}>
+            <span className="rr-label" style={{ position: "absolute", top: 2, left: 6, fontSize: 11, color: "#22d59b", whiteSpace: "nowrap" }}>Target {rupees(riskReward.target)} · +{rupees(reward)}{qty ? ` (${rupees(reward * qty)})` : ""} · {ratio.toFixed(2)}R</span>
+          </div>
+          <div className="rr-zone rr-risk" style={{ position: "absolute", left: layout.left, width: layout.width, top: Math.min(layout.entryY, layout.stopY), height: Math.abs(layout.stopY - layout.entryY), background: "rgba(250,107,120,.16)", borderBottom: "1px solid #fa6b78" }}>
+            <span className="rr-label" style={{ position: "absolute", bottom: 2, left: 6, fontSize: 11, color: "#fa6b78", whiteSpace: "nowrap" }}>Stop {rupees(riskReward.stop)} · −{rupees(risk)}{qty ? ` (${rupees(risk * qty)})` : ""}</span>
+          </div>
+          <div className="rr-entry" style={{ position: "absolute", left: layout.left, width: layout.width, top: layout.entryY, borderTop: "1px dashed #c9d3d6" }}>
+            <span className="rr-label" style={{ position: "absolute", top: 2, left: 6, fontSize: 11, color: "#c9d3d6", whiteSpace: "nowrap" }}>{riskReward.label ?? "Entry"} {rupees(riskReward.entry)}</span>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 /** Fold a live price into the current bucket (or start a new one). */

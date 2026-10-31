@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
-import { SmartScalper, type ScalperBar, type ScalperContract, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
+import type { ScalperBar, ScalperContract, ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
 import { getMarketIntel, isIntelSymbol, type MarketIntel } from "../../../lib/market-intel";
 
-// Paper-only smart scalper behind the execution page's scalper desk. One process-wide book so
-// scans and manual Buy/Sell/Exit act on the same positions. Fills include slippage.
-const globalScalper = globalThis as typeof globalThis & { __tradepulseScalper?: SmartScalper };
-const scalper = (globalScalper.__tradepulseScalper ??= new SmartScalper({ slippagePct: Number(process.env.SCALPER_SLIPPAGE_PCT ?? 0.3) / 100 }));
+import { getScalper } from "../../../lib/scalper-instance";
+
+// Paper-only smart scalper behind the execution page's scalper desk. One process-wide book (shared
+// with the algo page's "place on scalper") so scans and manual Buy/Sell/Exit act on the same
+// positions. Fills include slippage.
+const scalper = getScalper();
 
 type RecordValue = Record<string, unknown>;
 const numberOf = (value: unknown) => { const result = Number(value); return Number.isFinite(result) ? result : 0; };

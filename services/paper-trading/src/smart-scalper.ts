@@ -585,6 +585,33 @@ export class SmartScalper {
     });
   }
 
+  /**
+   * Place a scalp confirmed elsewhere (the VWAP-EMA scalper on the algo page) into this paper book.
+   * The book's own limits still decide: kill switch / safe mode, daily loss, loss streak and
+   * cool-down, trade cap, one engine position per index and the 15:15 square-off. The leg is
+   * re-priced at the live ask and the stop keeps its planned distance. A setup id is placed once.
+   */
+  place(underlying: string, plan: ScalperPlan, contracts: ScalperContract[], input: { setupId: string; settings?: Partial<ScalperSettings>; entryBlockedReason?: string }) {
+    return this.serial(async () => {
+      await this.hydrate();
+      this.rollDay();
+      const settings = SmartScalper.settings(input.settings);
+      if (!input.setupId) return { ...this.state(underlying), placed: false, error: "A setup id is required." };
+      if (this.consumedSetups.has(input.setupId)) return { ...this.state(underlying), placed: false, error: "This setup was already placed on the scalper." };
+      const now = this.clock();
+      const weekday = new Date(now.getTime() + 330 * 60_000).getUTCDay();
+      if (weekday === 0 || weekday === 6 || istMinutes(now) < MARKET_OPEN) return { ...this.state(underlying), placed: false, error: "Scalper entries are open 09:15-15:15 IST on trading days." };
+      const block = this.entryBlock(underlying, settings, input.entryBlockedReason);
+      if (block) return { ...this.state(underlying), placed: false, error: `Entry blocked: ${block}` };
+      if (!plan.legs.length || !(plan.quantity > 0) || !(plan.stop > 0) || !(plan.target > plan.entry) || !(plan.entry > plan.stop)) return { ...this.state(underlying), placed: false, error: "The scalp plan needs one leg, a quantity, and a stop below and a target above the entry." };
+      const prices = new Map(contracts.map((item) => [norm(item.symbol), item]));
+      const legs = plan.legs.map((leg) => { const live = prices.get(norm(leg.symbol)); return live ? { ...leg, price: live.ask || live.premium } : leg; });
+      this.consumedSetups.add(input.setupId);
+      const position = this.open(underlying, { ...plan, legs }, contracts);
+      return { ...this.state(underlying), placed: true, position: this.view(position), summary: `${position.kind} placed on the scalper: BUY ${position.legs[0].symbol} × ${position.legs[0].quantity} @ ${position.entry} · SL ${position.stop} · T ${position.target}` };
+    });
+  }
+
   private fill(price: number, side: "BUY" | "SELL", tick = 0.05) {
     const raw = side === "BUY" ? price * (1 + this.slippagePct) : price * (1 - this.slippagePct);
     return Math.max(round2(Math.round(raw / tick) * tick), tick);

@@ -41,7 +41,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange }: {
+export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0 }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -49,6 +49,8 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   spot: number;
   onLog?: (text: string, type?: "entry" | "exit" | "info") => void;
   onAutoChange?: (enabled: boolean) => void;
+  /** Bumped when another panel (the VWAP-EMA scalper) places a position in this book. */
+  refreshSignal?: number;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -136,7 +138,9 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
     return { ok: response.ok, data: await response.json().catch(() => ({ error: "Scalper unavailable" })) as ScalperState };
   }, [symbol]);
 
-  useEffect(() => { fetch(`/api/scalper?symbol=${symbol}`, { cache: "no-store" }).then((response) => response.json()).then((data) => apply(data, true)).catch(() => undefined); }, [apply, symbol]);
+  // Reload the book on index change and whenever another panel placed a position in it: an open
+  // position switches the 10-second scan on, which manages its stop, target and time stop.
+  useEffect(() => { fetch(`/api/scalper?symbol=${symbol}`, { cache: "no-store" }).then((response) => response.json()).then((data) => apply(data, true)).catch(() => undefined); }, [apply, symbol, refreshSignal]);
 
   const scan = useCallback(async () => {
     if (busy.current || !chain.length || !(spot > 0)) return;

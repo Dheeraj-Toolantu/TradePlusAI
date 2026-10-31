@@ -8,7 +8,8 @@ import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/grow
 import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
 import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-intel";
 import { DAILY_RISK_RULES, evaluateDailyRisk } from "../../../lib/daily-risk";
-import { getIndexSentiment } from "../../../lib/index-sentiment";
+import { getScalper } from "../../../lib/scalper-instance";
+import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -20,17 +21,16 @@ import {
 let paperOrders: Array<OrderRecord> = [];
 let firestoreHydrated = false;
 const supported = ["NIFTY", "BANKNIFTY", "SENSEX", "RELIANCE", "TCS", "INFY", "HDFCBANK"];
-const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "INTRINSIC_VALUE"]);
-const strategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK", "INTRINSIC_VALUE"]);
-const sentimentIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
-// INTRINSIC_VALUE sentiment direction. CONTRARIAN (the default) buys a PE on very positive and a
-// CE on very negative index sentiment; FOLLOW trades with the sentiment.
-const sentimentMappings = new Set(["CONTRARIAN", "FOLLOW"]);
-const mappingOf = (value: unknown) => { const text = String(value ?? "").toUpperCase(); return sentimentMappings.has(text) ? text : "CONTRARIAN"; };
-// How extreme the sentiment must be: ACTIVE (15, the analyser's Greed/Fear edge, the default),
-// BALANCED (25) or STRICT (40, the old cut-off a constituent-weighted index score rarely reaches).
-const extremePresets = new Set(["ACTIVE", "BALANCED", "STRICT"]);
-const extremeOf = (value: unknown) => { const text = String(value ?? "").toUpperCase(); return extremePresets.has(text) ? text : "ACTIVE"; };
+// VWAP_EMA_SCALP: the 1-minute VWAP / 5-9 EMA option scalper (quant/.../scalp_strategy.py).
+const SCALP = "VWAP_EMA_SCALP";
+const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", SCALP]);
+const strategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK", SCALP]);
+const scalpIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+// The trader's reward:risk for the scalp: 1:1 or 1:2 on the index move (2 is the default).
+const rrOf = (value: unknown) => (String(value ?? "").replace(/\s/g, "") === "1:1" ? "1:1" : "1:2");
+// Tick rounding may shave up to 3% off the chosen ratio on the premium (same as the engine).
+const scalpMinimumRr = (value: unknown) => (rrOf(value) === "1:1" ? 0.97 : 1.94);
+type ScalpOptions = { riskReward?: string; maxLossPerTrade?: number; maxLots?: number };
 
 type RecordValue = Record<string, unknown>;
 
@@ -126,50 +126,53 @@ function runPythonEngine(payload: Record<string, unknown>) {
   });
 }
 
-// Inputs only the intrinsic-value strategy reads: the index's sentiment reading (never waits on a
-// cold scan for long; missing sentiment makes the engine return NO_TRADE) and the strike ladder.
-async function intrinsicInputs(symbol: string, origin: string) {
-  const [sentiment, chain] = await Promise.all([
-    sentimentIndices.has(symbol) ? withTimeout(getIndexSentiment(), 10_000, "Index sentiment").then((value) => {
-      const reading = value.indices.find((item) => item.id === symbol);
-      return reading ? { score: reading.score, label: reading.label, zone: reading.zone, bias: reading.bias, generated_at: value.generated_at } : null;
-    }).catch(() => null) : Promise.resolve(null),
-    fetch(`${origin}/api/option-chain?symbol=${encodeURIComponent(symbol)}&full=1`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as Promise<{ spot?: number; expiry?: string; contracts?: unknown[] } | null>,
-  ]);
-  return { index_sentiment: sentiment, option_chain: chain && Array.isArray(chain.contracts) ? { spot: chain.spot ?? null, expiry: chain.expiry ?? null, contracts: chain.contracts } : null };
+// Inputs only the scalper reads: the strike ladder (Greeks, OI, volume), market-intel's options flow
+// (per-strike 5-minute OI change and build-up, PCR, OI walls) and India VIX. Missing inputs stay
+// null so the scalper's criteria fail closed.
+async function scalpInputs(origin: string, intel: Record<string, unknown> | null) {
+  const chain = await fetch(`${origin}/api/option-chain?symbol=${encodeURIComponent(String(intel?.symbol ?? ""))}&full=1`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as { spot?: number; expiry?: string; contracts?: unknown[] } | null;
+  const volatility = (intel?.available ? intel.volatility : null) as { value?: number; regime?: string | null } | null;
+  return {
+    option_chain: chain && Array.isArray(chain.contracts) ? { spot: chain.spot ?? null, expiry: chain.expiry ?? null, contracts: chain.contracts } : null,
+    options_flow: intel?.available ? intel.options_flow ?? null : null,
+    vix: volatility ? { value: volatility.value ?? null, regime: volatility.regime ?? null } : null,
+  };
 }
 
-async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, sentimentMapping = "CONTRARIAN", sentimentExtreme = "ACTIVE") {
-  // 5m index candles carry near-month futures volume (index volume is always zero); daily
-  // candles give the true ATR14 used by the gap-day rule.
+async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, scalp: ScalpOptions = {}) {
+  const scalping = strategy === SCALP;
+  // Index candles carry near-month futures volume (index volume is always zero); the scalper reads
+  // the 1-minute tape, the other strategies 5-minute candles. Daily candles give the true ATR14
+  // used by the gap-day rule.
   const [historyResponse, daily] = await Promise.all([
-    fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=5m&period=week&volume=futures&date=${istDate()}`, { cache: "no-store" }),
+    fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=${scalping ? "1m" : "5m"}&period=${scalping ? "day" : "week"}&volume=futures&date=${istDate()}`, { cache: "no-store" }),
     fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=1D&period=month&date=${istDate()}`, { cache: "no-store" }).then((response) => (response.ok ? response.json() : {})).catch(() => ({})) as Promise<{ candles?: unknown[] }>,
   ]);
   const history = await historyResponse.json();
   if (!historyResponse.ok) throw new Error(String(history.error ?? "Market history unavailable"));
   // A delayed (Yahoo fallback) chart is minutes behind the market: never let it confirm a setup.
-  if (history.delayed) throw new Error("Live 5-minute candles are unavailable (only delayed data); the strategy engine will not evaluate on stale prices.");
+  if (history.delayed) throw new Error(`Live ${scalping ? "1" : "5"}-minute candles are unavailable (only delayed data); the strategy engine will not evaluate on stale prices.`);
   // Option evidence comes from the market-intel engine: signed OI-flow direction score from
   // 5-minute OI change, delta-normalised option relative strength, India VIX regime and
   // strike liquidity. The V5 engine decides whether it supports the setup's direction.
   // Unavailable evidence stays absent so the no-trade gate fails closed.
   let optionEvidence: Record<string, unknown> = {};
+  let intel: Record<string, unknown> | null = null;
   if (isIntelSymbol(symbol)) {
     try {
-      const intel = await getMarketIntel(symbol, { origin });
+      intel = await getMarketIntel(symbol, { origin }) as Record<string, unknown>;
       optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>;
     } catch { optionEvidence = {}; }
   }
-  const payload: RecordValue = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence };
-  if (strategy !== "INTRINSIC_VALUE") return runPythonEngine(payload);
-  // Pass 1 picks the key value and the OTM strike; pass 2 reads that premium's own 5m candles
-  // for the pullback-and-continuation entry.
-  Object.assign(payload, await intrinsicInputs(symbol, origin), { sentiment_mapping: sentimentMapping, sentiment_extreme: sentimentExtreme });
+  const payload: RecordValue = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence, interval_minutes: scalping ? 1 : 5 };
+  if (!scalping) return runPythonEngine(payload);
+  // Pass 1 reads the tape and picks the strike from the OI data; pass 2 adds that premium's own
+  // 1-minute candles for its volume profile.
+  Object.assign(payload, await scalpInputs(origin, intel ?? { symbol }), { risk_reward: rrOf(scalp.riskReward), max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null });
   const first = await runPythonEngine(payload);
   const contract = typeof first.needs_premium_candles === "string" ? first.needs_premium_candles : null;
   if (!contract) return first;
-  const premium = await fetch(`${origin}/api/market-data/option-history?symbol=${encodeURIComponent(contract)}&timeframe=5m`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as { candles?: unknown[] } | null;
+  const premium = await fetch(`${origin}/api/market-data/option-history?symbol=${encodeURIComponent(contract)}&timeframe=1m`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as { candles?: unknown[] } | null;
   if (!premium || !Array.isArray(premium.candles) || !premium.candles.length) return first;
   return runPythonEngine({ ...payload, premium_candles: { symbol: contract, candles: premium.candles } });
 }
@@ -223,8 +226,7 @@ export async function GET(request: Request) {
   const provider = url.searchParams.get("provider") ?? "groww";
   const strategy = url.searchParams.get("strategy") ?? "ORB_RETEST";
   const historyOnly = url.searchParams.get("history") === "true";
-  const sentimentMapping = mappingOf(url.searchParams.get("mapping"));
-  const sentimentExtreme = extremeOf(url.searchParams.get("extreme"));
+  const scalp: ScalpOptions = { riskReward: rrOf(url.searchParams.get("rr")), maxLossPerTrade: Number(url.searchParams.get("maxLoss")) || undefined, maxLots: Number(url.searchParams.get("lots")) || undefined };
   const config = readGrowwConfig();
 
   if (historyOnly) {
@@ -234,6 +236,7 @@ export async function GET(request: Request) {
 
   if (!supported.includes(symbol)) return NextResponse.json({ error: "Unsupported symbol" }, { status: 400 });
   if (!strategies.has(strategy)) return NextResponse.json({ error: "Unsupported strategy" }, { status: 400 });
+  if (strategy === SCALP && !scalpIndices.has(symbol)) return NextResponse.json({ error: "The VWAP-EMA scalper trades index options (NIFTY, BANKNIFTY, SENSEX)." }, { status: 400 });
   if (provider !== "groww") return NextResponse.json({ error: "Groww is the only supported market-data and execution provider for the algo trading page." }, { status: 400 });
 
   const safeModeState = readSafeModeState();
@@ -244,7 +247,7 @@ export async function GET(request: Request) {
     const brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
     const evidence = await operationalEvidence(symbol, brokerHealthy, safeModeState);
     const [analysis, account, liveOrders, history] = await Promise.all([
-      runEngine(symbol, provider, url.origin, strategy, evidence, sentimentMapping, sentimentExtreme),
+      runEngine(symbol, provider, url.origin, strategy, evidence, scalp),
       provider === "groww" ? growwAccountSummary().catch(() => null) : Promise.resolve(null),
       markedPaperOrders(),
       getAllOrdersFromFirestore(30),
@@ -283,6 +286,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({})) as RecordValue;
+  if (String(body.action ?? "").toUpperCase() === "PLACE_ON_SCALPER") return placeOnScalper(body, new URL(request.url).origin);
   const config = readGrowwConfig();
   const requestedMode = String(body.mode ?? config.executionMode).toUpperCase();
 
@@ -359,7 +363,7 @@ export async function POST(request: Request) {
     // Manual paper entries are explicitly user-authorized and skip this gate only; the
     // kill-switch, SAFE_MODE, broker-health, contract-master, lot/freeze, and minimum-2R
     // checks still apply to every order.
-    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState), mappingOf(body.sentimentMapping), extremeOf(body.sentimentExtreme));
+    const serverAnalysis = await runEngine(underlying, provider, new URL(request.url).origin, strategy, await operationalEvidence(underlying, brokerHealthy, safeModeState), { riskReward: rrOf(body.riskReward), maxLossPerTrade: Number(body.maxLossPerTrade) || undefined, maxLots: Number(body.maxLots) || undefined });
     const pipeline = serverAnalysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
     if (pipeline?.decision !== "CONFIRMED") {
       return NextResponse.json({ error: "V5 no-trade gate rejected the paper entry.", reasons: pipeline?.reasons ?? ["SERVER_PIPELINE_UNAVAILABLE"] }, { status: 403 });
@@ -370,10 +374,10 @@ export async function POST(request: Request) {
     if ((setupSide === "BUY" && optionType !== "CE") || (setupSide === "SELL" && optionType !== "PE")) {
       return NextResponse.json({ error: `V5 setup is ${setupSide === "BUY" ? "bullish: buy a CE" : "bearish: buy a PE"}; ${optionType || "this contract"} does not match the signal direction.` }, { status: 409 });
     }
-    // The intrinsic-value strategy selects the strike itself; only that contract may be bought.
+    // The scalper selects the strike from the OI data itself; only that contract may be bought.
     const selected = (serverAnalysis.setup as { contract?: { symbol?: string } } | undefined)?.contract?.symbol;
-    if (strategy === "INTRINSIC_VALUE" && selected !== String(body.symbol ?? "")) {
-      return NextResponse.json({ error: `The intrinsic-value setup selected ${selected ?? "no contract"}; ${String(body.symbol ?? "this contract")} is not the confirmed strike.` }, { status: 409 });
+    if (strategy === SCALP && selected !== String(body.symbol ?? "")) {
+      return NextResponse.json({ error: `The scalper selected ${selected ?? "no contract"}; ${String(body.symbol ?? "this contract")} is not the confirmed strike.` }, { status: 409 });
     }
   }
 
@@ -385,8 +389,10 @@ export async function POST(request: Request) {
   const entryPrice = liveEntryPrice ?? price;
   const risk = Math.abs(entryPrice - stopLoss);
   const reward = Math.abs(target - entryPrice);
-  if (!risk || reward / risk < 2.0) {
-    return NextResponse.json({ error: "Paper entry requires the V5 minimum expected reward of 2.0R." }, { status: 400 });
+  // The scalper trades the 1:1 or 1:2 the trader chose; every other strategy keeps the 2R minimum.
+  const minimumRr = strategy === SCALP ? scalpMinimumRr(body.riskReward) : 2.0;
+  if (!risk || reward / risk < minimumRr) {
+    return NextResponse.json({ error: `Paper entry requires the V5 minimum expected reward of ${minimumRr}R.` }, { status: 400 });
   }
 
   const symbol = String(body.symbol);
@@ -419,6 +425,63 @@ export async function POST(request: Request) {
   void saveOrderToFirestore(order);
 
   return NextResponse.json({ order, mode: "PAPER", liveOrders: 0, firestoreSynced: true });
+}
+
+// ---- VWAP-EMA scalper → Smart Scalper paper book --------------------------------------------
+const numberOf = (value: unknown) => { const result = Number(value); return Number.isFinite(result) ? result : 0; };
+function toScalperContract(value: RecordValue): ScalperContract {
+  return {
+    symbol: String(value.symbol ?? ""), contract: String(value.contract ?? "").toUpperCase() === "PUT" ? "PUT" : "CALL", expiry: String(value.expiry ?? ""),
+    strike: numberOf(value.strike), premium: numberOf(value.premium), bid: numberOf(value.bid), ask: numberOf(value.ask), openInterest: numberOf(value.openInterest),
+    volume: numberOf(value.volume), iv: numberOf(value.iv), delta: numberOf(value.delta), theta: numberOf(value.theta), lotSize: numberOf(value.lotSize), tickSize: numberOf(value.tickSize),
+  };
+}
+
+type ScalpSetup = {
+  side: "BUY" | "SELL"; entry: number; stop_loss: number; target: number; risk_reward: number; rr_choice: string; lots: number; quantity: number; setup_id: string;
+  contract: { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string | null; lot_size?: number | null };
+  spot: { entry: number; stop: number; target: number };
+};
+
+/**
+ * Auto-place: the server re-runs the scalper and every V5 gate; only a CONFIRMED setup is placed,
+ * into the paper Smart Scalper book, whose own limits (trade cap, max loss, daily loss, loss streak,
+ * one position at a time, 15:15 square-off, kill switch, safe mode) still apply. Never a live order.
+ */
+async function placeOnScalper(body: RecordValue, origin: string) {
+  const underlying = String(body.underlying ?? body.symbol ?? "").toUpperCase();
+  if (!scalpIndices.has(underlying)) return NextResponse.json({ placed: false, error: "The VWAP-EMA scalper trades index options (NIFTY, BANKNIFTY, SENSEX)." }, { status: 400 });
+  const settings = (body.settings && typeof body.settings === "object" ? body.settings : {}) as Partial<ScalperSettings>;
+  const safety = readSafeModeState();
+  const entryBlockedReason = safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : safety.safeMode ? `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` : undefined;
+  if (entryBlockedReason) return NextResponse.json({ placed: false, error: entryBlockedReason }, { status: 403 });
+  let brokerHealthy = false;
+  try {
+    const health = await withTimeout(new GrowwAdapter(createGrowwTransport()).healthCheck(), 5000, "Groww health check");
+    brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
+  } catch { brokerHealthy = false; }
+  const analysis = await runEngine(underlying, "groww", origin, SCALP, await operationalEvidence(underlying, brokerHealthy, safety), {
+    riskReward: rrOf(body.riskReward), maxLossPerTrade: Number(settings.maxLossPerTrade) || undefined, maxLots: Number(settings.lots) || undefined,
+  }).catch((error: unknown) => ({ error: error instanceof Error ? error.message : "Strategy engine unavailable" }) as RecordValue);
+  const pipeline = analysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
+  const setup = analysis.setup as ScalpSetup | null | undefined;
+  if (pipeline?.decision !== "CONFIRMED" || !setup?.contract) {
+    return NextResponse.json({ placed: false, error: "V5 no-trade gate: the scalp is not confirmed on the server.", reasons: pipeline?.reasons ?? [String(analysis.error ?? "SERVER_PIPELINE_UNAVAILABLE")] }, { status: 403 });
+  }
+  const contracts = (Array.isArray(body.contracts) ? body.contracts : []).map((item: RecordValue) => toScalperContract(item)).filter((item) => item.symbol && item.strike > 0);
+  const live = contracts.find((item) => item.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase() === setup.contract.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase());
+  if (!live || !(live.premium > 0) || !(live.lotSize > 0)) return NextResponse.json({ placed: false, error: `${setup.contract.symbol} has no live premium and lot size in the chain yet.` }, { status: 409 });
+  const lot = live.lotSize;
+  const plan: ScalperPlan = {
+    kind: "SCALP", side: setup.contract.type,
+    legs: [{ symbol: live.symbol, contract: live.contract, strike: live.strike, side: "BUY", price: setup.entry, valuation: valueOption(live, setup.spot.entry) }],
+    lots: setup.lots, quantity: setup.lots * lot, entry: setup.entry, stop: setup.stop_loss, target: setup.target,
+    riskPerLot: Math.round((setup.entry - setup.stop_loss) * lot * 100) / 100, rewardPerLot: Math.round((setup.target - setup.entry) * lot * 100) / 100,
+    riskReward: setup.risk_reward, spot: setup.spot,
+    reason: `VWAP-EMA scalper ${setup.rr_choice}: ${setup.side === "BUY" ? "long" : "short"} ${underlying}, index stop ${setup.spot.stop} / target ${setup.spot.target}`,
+  };
+  const result = await getScalper().place(underlying, plan, contracts, { setupId: setup.setup_id, settings, entryBlockedReason });
+  return NextResponse.json({ ...result, setup }, { status: result.placed ? 200 : 409 });
 }
 
 export async function DELETE(request: Request) {

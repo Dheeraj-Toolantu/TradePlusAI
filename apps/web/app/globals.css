@@ -1245,3 +1245,16 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .smc-tip em { color: #7f9ba3; font-style: normal; font-variant-numeric: tabular-nums; }
 .smc-tip .smc-tip-flip { color: #f0bf66; }
 .isa-auto { display: block; max-width: 300px; color: #7f9ba3; font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* VWAP-EMA scalper panel */
+.exec-auto-place { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; color: var(--text); border: 1px solid #25505f; border-radius: 5px; background: #0d2a37; font: 600 12px "Manrope", sans-serif; cursor: pointer; }
+.exec-auto-place input { accent-color: #22d59b; }
+.exec-criteria { display: grid; gap: 3px; margin: 8px 0; padding: 0; list-style: none; font-size: 12px; color: var(--muted); }
+.exec-criteria li b { margin-right: 4px; }
+.exec-criteria li.gain b { color: #22d59b; }
+.exec-criteria li.warning b { color: #f0b35b; }
+.exec-score span.pass { border-color: #1d6b55; }
+.exec-score span.fail { border-color: #6b4a1d; }
+.exec-premium-chart { margin: 8px 0; padding: 6px 8px 8px; border: 1px solid #173a47; border-radius: 6px; background: #081c26; }
+.exec-premium-chart .mi-note { display: block; margin-bottom: 4px; }
+@media (max-width: 640px) { .exec-strategy-controls { justify-content: flex-start; } .exec-premium-chart { padding: 4px; } }
