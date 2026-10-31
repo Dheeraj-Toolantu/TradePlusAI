@@ -719,7 +719,9 @@ def match_filings(raw, watch):
         if not best:
             continue
         t, n = best
-        company = r["title"][:n].strip(" -:|,–") or watch.get(t) or t
+        company = r["title"][:n].strip(" -:|,–")
+        if not company or company.upper() == t:
+            company = watch.get(t) or t
         subject = r["title"][n:].strip(" -:|,–") or r["description"]
         if len(subject) > 160:
             subject = subject[:157].rstrip() + "..."
@@ -881,6 +883,17 @@ def _json_ready(items):
     return out
 
 
+def parse_local_now(text):
+    """India --now: ISO with an offset as given; without one it is IST ("2026-10-30 10:50")."""
+    try:
+        d = _dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return parse_time(text)
+    if d.tzinfo is None:
+        return MK.local_to_utc(d).replace(tzinfo=_dt.timezone.utc)
+    return d.astimezone(_dt.timezone.utc)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--market", help="IN (NSE, the default) or US (NYSE)")
@@ -924,9 +937,10 @@ def main(argv=None):
         print("news: no tickers. Pass --tickers, or run /trader-scanner first (it writes "
               "trader/watchlist.json).", file=sys.stderr)
         return 2
-    now = parse_time(args.now) if args.now else _dt.datetime.now(_dt.timezone.utc)
-    if args.now and now is None and not is_us():
-        now = parse_nse_time(args.now)  # "2026-10-30 10:50" with no zone: IST
+    if args.now and not is_us():
+        now = parse_local_now(args.now)
+    else:
+        now = parse_time(args.now) if args.now else _dt.datetime.now(_dt.timezone.utc)
     if now is None:
         print("news: --now wants an ISO time like 2026-10-30T10:50:00+05:30", file=sys.stderr)
         return 2
