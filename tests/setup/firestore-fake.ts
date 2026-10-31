@@ -21,12 +21,20 @@ const matches = (data: Data, constraint: Constraint) => {
   if (constraint.kind !== "where") return true;
   const actual = data[constraint.field];
   if (constraint.op === "==") return actual === constraint.value;
+  if (constraint.op === ">=") return String(actual ?? "") >= String(constraint.value) && actual !== undefined;
+  if (constraint.op === "<") return actual !== undefined && String(actual) < String(constraint.value);
   if (constraint.op === "in") return Array.isArray(constraint.value) && constraint.value.includes(actual);
   throw new Error(`firestore-fake: unsupported operator ${constraint.op}`);
 };
 
+// Fault injection: a test can make writes or reads to a collection hang or fail.
+type Fault = (path: string) => Promise<void> | void;
+const faults: { write?: Fault; read?: Fault } = {};
+
 export const firestoreFake = {
-  reset: () => collections.clear(),
+  reset: () => { collections.clear(); delete faults.write; delete faults.read; },
+  onWrite: (fault: Fault | undefined) => { faults.write = fault; },
+  onRead: (fault: Fault | undefined) => { faults.read = fault; },
   seed: (path: string, id: string, data: Data) => { bucket(path).set(id, structuredClone(data)); },
   documents: (path: string) => Array.from(bucket(path).entries()).map(([id, data]) => ({ id, ...structuredClone(data) })),
 };
@@ -41,6 +49,7 @@ vi.mock("firebase/firestore", () => ({
   orderBy: (): Constraint => ({ kind: "orderBy" }),
   serverTimestamp: () => ({ serverTimestamp: true }),
   setDoc: async (ref: DocRef, data: Data, options?: { merge?: boolean }) => {
+    await faults.write?.(ref.path);
     const store = bucket(ref.path);
     store.set(ref.id, options?.merge ? { ...(store.get(ref.id) ?? {}), ...structuredClone(data) } : structuredClone(data));
   },
@@ -51,8 +60,9 @@ vi.mock("firebase/firestore", () => ({
     store.set(ref.id, { ...existing, ...structuredClone(data) });
   },
   deleteDoc: async (ref: DocRef) => { bucket(ref.path).delete(ref.id); },
-  getDoc: async (ref: DocRef) => snapshotOf(ref.id, bucket(ref.path).get(ref.id)),
+  getDoc: async (ref: DocRef) => { await faults.read?.(ref.path); return snapshotOf(ref.id, bucket(ref.path).get(ref.id)); },
   getDocs: async (ref: CollectionRef | QueryRef) => {
+    await faults.read?.(ref.path);
     const constraints = ref.kind === "query" ? ref.constraints : [];
     const max = constraints.find((item): item is Extract<Constraint, { kind: "limit" }> => item.kind === "limit")?.count ?? Infinity;
     const docs = Array.from(bucket(ref.path).entries())

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { getAIMonitoring, updateAIMonitoring } from "../../lib/ai-monitoring-client";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -50,7 +50,7 @@ function readMonitoring(data: Record<string, unknown>, current: Monitoring): Mon
  * trades with automatic stop/target/trailing/square-off management. Real-money orders still go
  * only through the PIN-confirmed live flow.
  */
-export function AIMonitoringPanel({ symbol, strategyId, buildContext, onLoadAdvice }: { symbol: string; strategyId: string; buildContext: () => Record<string, unknown>; onLoadAdvice?: (advice: OptionAdvice) => void }) {
+function AIMonitoringPanelView({ symbol, strategyId, buildContext, onLoadAdvice }: { symbol: string; strategyId: string; buildContext: () => Record<string, unknown>; onLoadAdvice?: (advice: OptionAdvice) => void }) {
   const [monitoring, setMonitoring] = useState<Monitoring>({ state: "DISABLED", monitoringEnabled: false, automationEnabled: false, mode: "PAPER", blockers: [], log: [] });
   const [chat, setChat] = useState<ChatMessage[]>([{ role: "assistant", content: "Ask about trend, candles, levels, option-chain positioning, risk/reward or a paper-trade plan for NIFTY, BANKNIFTY or SENSEX." }]);
   const [input, setInput] = useState("");
@@ -274,3 +274,6 @@ function AutoTradeCard({ status }: { status: AutoTradeStatus | null }) {
     </div>
   );
 }
+
+/** Memoised: the algo page re-renders on every quote flush; this panel only when its own props change. */
+export const AIMonitoringPanel = memo(AIMonitoringPanelView);

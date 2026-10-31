@@ -1,10 +1,10 @@
 "use client";
 
-import { Fragment, memo, useCallback, useEffect, useMemo, useState } from "react";
-import type { HistoryReading, StoredReversal, StoredSnapshot } from "../lib/sentiment-history";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { HistoryReading, RecorderStatus, StoredReversal, StoredSnapshot } from "../lib/sentiment-history";
 import { SentimentChart, seriesColor } from "./sentiment-chart";
 
-type History = { snapshots: StoredSnapshot[]; reversals: StoredReversal[] };
+type History = { snapshots: StoredSnapshot[]; reversals: StoredReversal[]; warnings?: string[]; recorder?: RecorderStatus };
 type Row = { snapshot: StoredSnapshot; reading: HistoryReading & Record<string, unknown>; kind: "INDEX" | "COMMODITY" };
 
 const LATEST = "";
@@ -14,8 +14,29 @@ const IST_OFFSET_MS = 330 * 60_000;
 const today = () => new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
 const istDate = (iso: string) => new Date(new Date(iso).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
 const istTime = (iso: string) => new Date(new Date(iso).getTime() + IST_OFFSET_MS).toISOString().slice(11, 16);
-const dateOf = (snapshot: StoredSnapshot) => snapshot.date ?? istDate(snapshot.recordedAt);
-const timeOf = (snapshot: StoredSnapshot) => snapshot.time ?? istTime(snapshot.recordedAt);
+const validIso = (iso: unknown) => typeof iso === "string" && Number.isFinite(new Date(iso).getTime());
+const dateOf = (snapshot: { date?: string; recordedAt?: string }) => snapshot.date ?? (validIso(snapshot.recordedAt) ? istDate(snapshot.recordedAt!) : "--");
+const timeOf = (snapshot: { time?: string; recordedAt?: string }) => snapshot.time ?? (validIso(snapshot.recordedAt) ? istTime(snapshot.recordedAt!) : "--");
+const reasonsOf = (snapshot: StoredSnapshot) => (Array.isArray(snapshot.reasons) ? snapshot.reasons : []);
+const lower = (value: unknown) => (typeof value === "string" ? value.toLowerCase() : "--");
+const when = (iso: string | null | undefined) => (validIso(iso) ? `${istDate(iso!)} ${istTime(iso!)} IST` : "never");
+export const FETCH_TIMEOUT_MS = 30_000;
+
+/** Fetch one page of history; a non-JSON reply (an HTML error page, a proxy) or a hang becomes a readable error. */
+export async function fetchHistory(day: string, fetcher: typeof fetch = fetch): Promise<History> {
+  let response: Response;
+  try {
+    response = await fetcher(`/api/sentiment-history?${day ? `date=${day}` : "limit=48"}`, { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  } catch (failure) {
+    const name = (failure as { name?: string })?.name;
+    throw new Error(name === "TimeoutError" || name === "AbortError" ? "Sentiment history timed out. The server took longer than 30s." : "Couldn't reach the server for sentiment history.");
+  }
+  const text = await response.text();
+  let body: (Partial<History> & { error?: string }) | null = null;
+  try { body = JSON.parse(text); } catch { body = null; }
+  if (!response.ok || !body || body.error) throw new Error(body?.error ?? `Sentiment history unavailable (HTTP ${response.status}).`);
+  return { snapshots: Array.isArray(body.snapshots) ? body.snapshots : [], reversals: Array.isArray(body.reversals) ? body.reversals : [], warnings: body.warnings ?? [], recorder: body.recorder };
+}
 const tone = (score: number | null | undefined) => (score === null || score === undefined ? "isa-muted" : score >= 12 ? "isa-up" : score <= -12 ? "isa-down" : "isa-flat");
 const signed = (value: number | null | undefined, digits = 0) => {
   if (value === null || value === undefined) return "--";
@@ -45,9 +66,9 @@ function Reason({ snapshot, id }: { snapshot: StoredSnapshot; id?: string }) {
   const flips = (snapshot.reversals ?? []).filter((item) => !id || item.instrument === id);
   return (
     <span className="smh-reason">
-      {snapshot.reasons.includes("SCHEDULED") ? <i className="smh-tag">15 min</i> : null}
-      {flips.map((item) => <i key={item.instrument + item.type} className={`smh-tag ${up(item.to) ? "smh-up" : "smh-down"}`} title={`${item.instrument} ${item.type.toLowerCase()} ${item.from} → ${item.to}`}>{id ? "" : `${item.instrument} `}{item.type === "SENTIMENT" ? "sentiment" : "price"} → {item.to.toLowerCase()}</i>)}
-      {snapshot.reasons.includes("REVERSAL") && !flips.length && id ? <i className="smh-tag">reversal (other)</i> : null}
+      {reasonsOf(snapshot).includes("SCHEDULED") ? <i className="smh-tag">15 min</i> : null}
+      {flips.map((item) => <i key={item.instrument + item.type} className={`smh-tag ${up(item.to) ? "smh-up" : "smh-down"}`} title={`${item.instrument} ${lower(item.type)} ${item.from} → ${item.to}`}>{id ? "" : `${item.instrument} `}{item.type === "SENTIMENT" ? "sentiment" : "price"} → {lower(item.to)}</i>)}
+      {reasonsOf(snapshot).includes("REVERSAL") && !flips.length && id ? <i className="smh-tag">reversal (other)</i> : null}
     </span>
   );
 }
@@ -83,23 +104,24 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const [shown, setShown] = useState<string[]>(DEFAULT_SHOWN);
+  const dayRef = useRef<string>(LATEST);
 
   const load = useCallback(async (day: string) => {
     setLoading(true);
     try {
-      const response = await fetch(`/api/sentiment-history?${day ? `date=${day}` : "limit=48"}`, { cache: "no-store" });
-      const body = await response.json();
-      if (!response.ok || body.error) throw new Error(body.error ?? "History unavailable");
-      setHistory(body as History);
-      setError(null);
+      const next = await fetchHistory(day);
+      // A slow reply for a day no longer selected must not overwrite the current one.
+      if (day === dayRef.current) { setHistory(next); setError(null); }
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "History unavailable");
+      // Keep the last good history on screen; just say the refresh failed.
+      if (day === dayRef.current) setError(failure instanceof Error ? failure.message : "Sentiment history unavailable");
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    dayRef.current = date;
     void load(date);
     // A past day doesn't change; the latest view and today pick up new snapshots every minute.
     if (date && date !== today()) return;
@@ -124,11 +146,11 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
     const name = `sentiment-${instrument.toLowerCase()}-${date || "latest"}.csv`;
     if (instrument === "ALL") {
       download(name, csv([["date", "time_ist", "reasons", ...instruments.flatMap(({ id }) => [`${id}_score`, `${id}_price`, `${id}_change_pct`])],
-        ...snapshots.map((snapshot) => [dateOf(snapshot), timeOf(snapshot), snapshot.reasons.join("+"), ...instruments.flatMap(({ id }) => { const reading = readingOf(snapshot, id); return [reading?.score, reading?.price, reading?.change_pct]; })])]));
+        ...snapshots.map((snapshot) => [dateOf(snapshot), timeOf(snapshot), reasonsOf(snapshot).join("+"), ...instruments.flatMap(({ id }) => { const reading = readingOf(snapshot, id); return [reading?.score, reading?.price, reading?.change_pct]; })])]));
     } else {
       download(name, csv([["date", "time_ist", "score", "label", "price", "change_pct", "bullish_pct", "bearish_pct", "advances", "declines", "india_impact", "reasons"],
         ...rows.map(({ snapshot, reading }) => [dateOf(snapshot), timeOf(snapshot), reading.score, reading.label, reading.price, reading.change_pct, reading.bullish_pct as number, reading.bearish_pct as number,
-          reading.advances as number, reading.declines as number, reading.india_impact as number, snapshot.reasons.join("+")])]));
+          reading.advances as number, reading.declines as number, reading.india_impact as number, reasonsOf(snapshot).join("+")])]));
     }
   };
 
@@ -136,6 +158,12 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
   const toggle = (id: string) => setShown((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
 
   const latest = snapshots[0];
+  const recorder = history?.recorder;
+  // Explain an empty history, and say so whenever the recorder is failing.
+  const recorderNote = !recorder ? null
+    : recorder.lastError ? `Recorder is failing (${recorder.failures} of ${recorder.attempts} tries; last ${when(recorder.lastErrorAt)}): ${recorder.lastError}`
+    : !snapshots.length && !date ? (recorder.attempts ? `Recorder is running (last try ${when(recorder.lastAttemptAt)}, last save ${when(recorder.lastRecordedAt)}). The first snapshot appears within a minute.` : "The recorder starts about 10 seconds after the server boots. The first snapshot appears within a minute.")
+    : null;
   return (
     <section className="isa-panel smh">
       <div className="ce-head">
@@ -154,7 +182,9 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
         <button type="button" onClick={exportCsv} disabled={!snapshots.length}>Download CSV</button>
         {loading ? <small className="isa-muted">Loading…</small> : null}
       </div>
-      {error ? <p className="isa-alert">{error}</p> : null}
+      {error ? <p className="isa-alert">{history ? `Couldn't refresh: ${error} Showing the last history loaded.` : error}</p> : null}
+      {(history?.warnings ?? []).map((warning) => <p key={warning} className="isa-alert">{warning}</p>)}
+      {recorderNote ? <p className={history?.recorder?.lastError ? "isa-alert" : "isa-muted"}>{recorderNote}</p> : null}
 
       {history && !snapshots.length ? <p className="isa-muted">No snapshots {date ? `on ${date}` : "yet"}.</p> : null}
 
@@ -218,7 +248,7 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
                 const expanded = open === snapshot.id;
                 return (
                   <Fragment key={snapshot.id}>
-                    <tr className={snapshot.reasons.includes("REVERSAL") ? "smh-flip" : ""}>
+                    <tr className={reasonsOf(snapshot).includes("REVERSAL") ? "smh-flip" : ""}>
                       <td>{dateOf(snapshot)}</td>
                       <td>{timeOf(snapshot)}</td>
                       <td><b className={tone(reading.score)}>{signed(reading.score)}</b></td>
@@ -249,9 +279,9 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
         <ul className="smh-list">
           {reversals.map((item) => (
             <li key={item.id}>
-              <small>{item.date ?? istDate(item.recordedAt)} {item.time ?? istTime(item.recordedAt)}</small>
+              <small>{dateOf(item)} {timeOf(item)}</small>
               <b>{item.name}</b>
-              <span>{item.type === "SENTIMENT" ? "sentiment" : "price"} <i className={up(item.from) ? "isa-up" : "isa-down"}>{item.from.toLowerCase()}</i> → <i className={up(item.to) ? "isa-up" : "isa-down"}>{item.to.toLowerCase()}</i></span>
+              <span>{item.type === "SENTIMENT" ? "sentiment" : "price"} <i className={up(item.from) ? "isa-up" : "isa-down"}>{lower(item.from)}</i> → <i className={up(item.to) ? "isa-up" : "isa-down"}>{lower(item.to)}</i></span>
               <small>score {signed(item.previous_score)} → {signed(item.score)} · price {price(item.price)} ({signed(item.change_pct, 2)}%)</small>
             </li>
           ))}

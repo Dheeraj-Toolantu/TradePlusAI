@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, type RiskRewardBox } from "./premium-chart";
 import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 
@@ -58,7 +58,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -521,3 +521,6 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
     </section>
   );
 }
+
+/** Memoised: the algo page re-renders on every quote flush; this panel only when its own props change. */
+export const ScalperDesk = memo(ScalperDeskView);

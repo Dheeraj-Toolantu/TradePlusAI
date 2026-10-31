@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { OperatorFootprintPanel, type OperatorFootprint } from "./operator-footprint-panel";
 
 type Signal = "BULLISH" | "BEARISH" | "NEUTRAL";
@@ -88,7 +88,7 @@ function Learn({ children }: { children: string }) {
   return <details className="mi-learn"><summary>What is this?</summary><p>{children}</p></details>;
 }
 
-export function MarketIntelPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: string; onSymbolChange: (symbol: string) => void; onUsePlan?: (plan: TradePlan, intel: { symbol: string; expiry: string | null; lotSize: number | null }) => void }) {
+function MarketIntelPanelView({ symbol, onSymbolChange, onUsePlan }: { symbol: string; onSymbolChange: (symbol: string) => void; onUsePlan?: (plan: TradePlan, intel: { symbol: string; expiry: string | null; lotSize: number | null }) => void }) {
   const [intel, setIntel] = useState<Intel | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -330,3 +330,6 @@ export function MarketIntelPanel({ symbol, onSymbolChange, onUsePlan }: { symbol
     </section>
   );
 }
+
+/** Memoised: the algo page re-renders on every quote flush; this panel only when its own props change. */
+export const MarketIntelPanel = memo(MarketIntelPanelView);

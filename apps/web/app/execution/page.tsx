@@ -1,7 +1,8 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { fetchJsonShared } from "../../lib/shared-fetch";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
@@ -11,9 +12,9 @@ import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
 // Heavy, below-the-fold or on-demand panels load in their own chunks so the first paint only
-// needs the header and the trade desk shell.
+// needs the header and the trade desk shell. Every panel is memoised, so a quote tick re-renders
+// only the parts that read the moved price.
 const MarketIntelPanel = dynamic(() => import("../../components/market-intel/market-intel-panel").then((module) => module.MarketIntelPanel), { ssr: false, loading: () => <div className="algo-empty">Loading trade desk…</div> });
-const SentimentPanel = dynamic(() => import("../../components/market-intel/sentiment-panel").then((module) => module.SentimentPanel), { ssr: false });
 const OptionStrategyPanel = dynamic(() => import("../../components/market-intel/option-strategy-panel").then((module) => module.OptionStrategyPanel), { ssr: false });
 const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitoring-panel").then((module) => module.AIMonitoringPanel), { ssr: false });
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
@@ -94,6 +95,37 @@ const calc = (value: unknown, percent = false) => formatMarketCalculationValue(v
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
 const istDate = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
 const nowLabel = () => new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+// Socket ticks are folded into state at most this often, so a burst of quotes is one render.
+const TICK_FLUSH_MS = 250;
+
+/** The IST clock owns its 1-second timer, so the rest of the page doesn't re-render every second. */
+const IstClock = memo(function IstClock() {
+  const [clock, setClock] = useState("");
+  useEffect(() => {
+    const update = () => setClock(nowLabel());
+    update();
+    const timer = setInterval(update, 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return <span className="exec-badge">IST {clock || "--:--:--"}</span>;
+});
+
+/**
+ * Mounts a display-only panel when it comes near the viewport (its data loads only then) and
+ * keeps it mounted afterwards. Panels that trade or monitor on their own are never wrapped.
+ */
+function WhenVisible({ children, minHeight = 240 }: { children: ReactNode; minHeight?: number }) {
+  const [shown, setShown] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (shown || !ref.current) return;
+    if (typeof IntersectionObserver === "undefined") { setShown(true); return; }
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) setShown(true); }, { rootMargin: "600px 0px" });
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [shown]);
+  return shown ? <>{children}</> : <div ref={ref} className="algo-empty" style={{ minHeight }} aria-hidden="true" />;
+}
 
 export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");
@@ -111,7 +143,6 @@ export default function ExecutionPage() {
   const [safety, setSafety] = useState({ safeMode: false, killSwitch: false, reason: "" });
   const [message, setMessage] = useState("Paper mode is the default. Live orders need server enablement and a PIN-confirmed preview.");
   const [busy, setBusy] = useState(false);
-  const [clock, setClock] = useState("");
   const [quotes, setQuotes] = useState<Record<string, number>>({});
   const [streamStatus, setStreamStatus] = useState("connecting");
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -191,12 +222,6 @@ export default function ExecutionPage() {
     const timer = setInterval(() => { if (document.visibilityState === "visible") void refreshLive(); }, 10_000);
     return () => clearInterval(timer);
   }, [refreshLive]);
-  useEffect(() => {
-    const update = () => setClock(nowLabel());
-    update();
-    const timer = setInterval(update, 1000);
-    return () => clearInterval(timer);
-  }, []);
 
   // One history request (cached server-side) + one chain request. The old page also called
   // /api/options-engine, which always failed on Groww chains (no bid/ask) before falling back.
@@ -213,7 +238,8 @@ export default function ExecutionPage() {
       candlesRef.current = nextCandles;
       setCandles(nextCandles);
     });
-    const loadChain = () => fetch(`/api/option-chain?symbol=${symbol}&full=1`, { cache: "no-store" }).then((response) => response.json()).catch(() => ({})).then((chainBody) => {
+    // Shared with the options-strategy panel: one request per minute serves both.
+    const loadChain = () => fetchJsonShared<Record<string, any>>(`/api/option-chain?symbol=${symbol}&full=1`, 20_000).catch(() => ({} as Record<string, any>)).then((chainBody) => {
       if (cancelled) return;
       const all: OptionCandidate[] = Array.isArray(chainBody.contracts) ? chainBody.contracts : [];
       const strikes = [...new Set(all.map((item) => item.strike))].sort((a, b) => a - b);
@@ -258,10 +284,51 @@ export default function ExecutionPage() {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+    // Ticks arrive one message at a time; each used to be its own render of the whole page. They
+    // are now collected here and applied together at most every TICK_FLUSH_MS.
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const pendingQuotes: Record<string, number> = {};
+    const pendingChain = new Map<string, number>();
+    const pendingOrders = new Map<string, number>();
+    let candlesDirty = false;
+    const flush = () => {
+      flushTimer = null;
+      if (closed) return;
+      if (Object.keys(pendingQuotes).length) {
+        const next = { ...pendingQuotes };
+        for (const key of Object.keys(pendingQuotes)) delete pendingQuotes[key];
+        setQuotes((current) => (Object.entries(next).every(([key, value]) => current[key] === value) ? current : { ...current, ...next }));
+      }
+      if (candlesDirty) { candlesDirty = false; setCandles(candlesRef.current); }
+      if (pendingChain.size) {
+        let touched = false;
+        const nextChain = chainRef.current.map((item) => { const price = pendingChain.get(norm(item.symbol)); if (!price || price === item.premium) return item; touched = true; return { ...item, premium: price, bid: price, ask: price }; });
+        pendingChain.clear();
+        if (touched) { chainRef.current = nextChain; setChain(nextChain); }
+      }
+      if (pendingOrders.size) {
+        const prices = new Map(pendingOrders);
+        pendingOrders.clear();
+        setPaperOrders((current) => {
+          let touched = false;
+          const next = current.map((order) => {
+            const price = prices.get(norm(order.symbol));
+            if (!price || price === order.currentPrice) return order;
+            touched = true;
+            const pnl = (price - order.price) * order.quantity;
+            const highWaterMark = order.trailingDistance ? Math.max(order.highWaterMark ?? order.price, price) : order.highWaterMark;
+            return { ...order, currentPrice: price, highWaterMark, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
+          });
+          return touched ? next : current;
+        });
+      }
+    };
+    const scheduleFlush = () => { if (!flushTimer) flushTimer = setTimeout(flush, TICK_FLUSH_MS); };
+
     const applyMarkets = (items: Array<{ symbol?: string; price?: number | null }>) => {
-      const next: Record<string, number> = {};
-      for (const item of items) if (item.symbol && typeof item.price === "number" && item.price > 0) next[item.symbol] = item.price;
-      if (Object.keys(next).length) setQuotes((current) => ({ ...current, ...next }));
+      let any = false;
+      for (const item of items) if (item.symbol && typeof item.price === "number" && item.price > 0) { pendingQuotes[item.symbol] = item.price; any = true; }
+      if (any) scheduleFlush();
     };
     const pollHttp = async () => {
       if (document.visibilityState !== "visible") return;
@@ -286,7 +353,8 @@ export default function ExecutionPage() {
         : last.time >= bucket ? [...current.slice(0, -1), { ...last, high: Math.max(last.high, price), low: Math.min(last.low, price), close: price }]
           : [...current.slice(-150), { time: bucket, open: last.close, high: Math.max(last.close, price), low: Math.min(last.close, price), close: price, volume: 0 }];
       candlesRef.current = next;
-      setCandles(next);
+      candlesDirty = true;
+      scheduleFlush();
     };
 
     const connect = () => {
@@ -320,7 +388,7 @@ export default function ExecutionPage() {
         }
         if (payload.type === "market" && payload.quote?.price) {
           const price = payload.quote.price;
-          setQuotes((current) => ({ ...current, [payload.quote!.symbol || symbol]: price }));
+          pendingQuotes[payload.quote.symbol || symbol] = price;
           onTick(price);
           return;
         }
@@ -329,19 +397,8 @@ export default function ExecutionPage() {
           const prices = new Map<string, number>();
           for (const quote of updates) if (quote.price && quote.price > 0) prices.set(norm(quote.symbol), quote.price);
           if (!prices.size) return;
-          if (payload.type === "chain") {
-            let touched = false;
-            const nextChain = chainRef.current.map((item) => { const price = prices.get(norm(item.symbol)); if (!price || price === item.premium) return item; touched = true; return { ...item, premium: price, bid: price, ask: price }; });
-            if (touched) { chainRef.current = nextChain; setChain(nextChain); }
-          } else {
-            setPaperOrders((current) => current.map((order) => {
-              const price = prices.get(norm(order.symbol));
-              if (!price || price === order.currentPrice) return order;
-              const pnl = (price - order.price) * order.quantity;
-              const highWaterMark = order.trailingDistance ? Math.max(order.highWaterMark ?? order.price, price) : order.highWaterMark;
-              return { ...order, currentPrice: price, highWaterMark, pnl, pnlPercent: order.price ? (price - order.price) / order.price * 100 : 0, quoteSource: "Groww live" };
-            }));
-          }
+          for (const [key, price] of prices) (payload.type === "chain" ? pendingChain : pendingOrders).set(key, price);
+          scheduleFlush();
         }
       };
     };
@@ -350,6 +407,7 @@ export default function ExecutionPage() {
     return () => {
       closed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      if (flushTimer) clearTimeout(flushTimer);
       stopPolling();
       socket?.close();
       socketRef.current = null;
@@ -645,7 +703,7 @@ export default function ExecutionPage() {
           {safety.killSwitch && <span className="exec-badge exec-badge-danger" title={safety.reason}>KILL SWITCH</span>}
           {safety.safeMode && <span className="exec-badge exec-badge-danger" title={safety.reason}>SAFE MODE</span>}
           <span className="exec-badge">{sessionLabel}</span>
-          <span className="exec-badge">IST {clock || "--:--:--"}</span>
+          <IstClock />
           <span className={streamStatus === "live" ? "exec-badge gain" : "exec-badge warning"}>Quotes {streamStatus}</span>
           <button type="button" className="exec-badge exec-badge-button" onClick={() => void clearCache()} disabled={cacheClearing}>{cacheClearing ? "Clearing…" : "Clear cache"}</button>
           <span className="exec-badge">Margin {account?.available !== null && account?.available !== undefined ? `₹${money(account.available)}` : "--"}</span>
@@ -655,11 +713,10 @@ export default function ExecutionPage() {
       <div className="exec-content">
         <p className="exec-message" role="status">{message}</p>
         <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadPlan} />
-        <SentimentPanel />
-        <OptionStrategyPanel symbol={symbol} onSymbolChange={switchIndex} vix={quotes["INDIA VIX"] ?? null} trend={strategyTrend} />
+        <WhenVisible><OptionStrategyPanel symbol={symbol} onSymbolChange={switchIndex} vix={quotes["INDIA VIX"] ?? null} trend={strategyTrend} /></WhenVisible>
         <AIMonitoringPanel symbol={symbol} strategyId={strategy.id} buildContext={aiContext} onLoadAdvice={loadAdvice} />
 
-        <NextDayPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadNextDayPlan} />
+        <WhenVisible minHeight={160}><NextDayPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadNextDayPlan} /></WhenVisible>
 
         <div className="exec-grid">
           <article className="mi-card exec-strategy">
