@@ -175,6 +175,12 @@ git -C /tmp/dts diff 3d0f4ef6986f4984b7c6bd46f7ff4f87744c3abd HEAD -- trader-sca
 Apply the upstream changes by hand, then run `npm run test:trader-skills`. The upstream suites must
 keep passing with `TRADER_MARKET=US`, and the India suites must keep passing too.
 
+## Validation
+
+See [VALIDATION.md](VALIDATION.md): US mode is byte-identical to upstream, India mode runs the same
+logic on the same candles (checked by `test_upstream_parity.py`), and the India rules are checked
+against independent calculations.
+
 ## Fine print
 
 This is not financial advice. The tools read free, unofficial public data and do arithmetic. Most
