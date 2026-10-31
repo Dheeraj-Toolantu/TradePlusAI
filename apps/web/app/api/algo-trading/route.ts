@@ -438,7 +438,7 @@ function toScalperContract(value: RecordValue): ScalperContract {
 }
 
 type ScalpSetup = {
-  side: "BUY" | "SELL"; entry: number; stop_loss: number; target: number; risk_reward: number; rr_choice: string; lots: number; quantity: number; setup_id: string;
+  side: "BUY" | "SELL"; entry: number; stop_loss: number; target: number; risk_reward: number; rr_choice: string; lots: number; quantity: number; setup_id: string; cost_per_unit?: number;
   contract: { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string | null; lot_size?: number | null };
   spot: { entry: number; stop: number; target: number };
 };
@@ -479,6 +479,8 @@ async function placeOnScalper(body: RecordValue, origin: string) {
     riskPerLot: Math.round((setup.entry - setup.stop_loss) * lot * 100) / 100, rewardPerLot: Math.round((setup.target - setup.entry) * lot * 100) / 100,
     riskReward: setup.risk_reward, spot: setup.spot,
     reason: `VWAP-EMA scalper ${setup.rr_choice}: ${setup.side === "BUY" ? "long" : "short"} ${underlying}, index stop ${setup.spot.stop} / target ${setup.spot.target}`,
+    // Staged, cost-covered trail: breakeven at +0.5R, lock +0.5R at +1R, trail 0.6R beyond.
+    trail: { rule: "VWAP_EMA", costPerUnit: Number(setup.cost_per_unit) || 0 },
   };
   const result = await getScalper().place(underlying, plan, contracts, { setupId: setup.setup_id, settings, entryBlockedReason });
   return NextResponse.json({ ...result, setup }, { status: result.placed ? 200 : 409 });

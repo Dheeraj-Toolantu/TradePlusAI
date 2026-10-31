@@ -625,6 +625,8 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         "lots": plan["lots"], "quantity": plan["quantity"], "max_loss": plan["max_loss"],
         "spot": {"entry": plan["spot_entry"], "stop": plan["spot_stop"], "target": plan["spot_target"]},
         "greeks": plan["greeks"], "trigger_time": trigger["time"] if trigger else None,
+        # round-trip charges per unit: the breakeven stop covers them (cost-covered breakeven)
+        "cost_per_unit": round(plan["costs_per_lot"]["at_target"] / plan["lot_size"], 2),
         "setup_id": f"{STRATEGY_ID}:{symbol}:{side}:{trigger['time'] if trigger else ''}",
         "stop_method": "PULLBACK_EXTREME_OR_EMA9_MINUS_ATR_BUFFER", "target_method": f"DELTA_GAMMA_{rr_label.replace(':', 'TO')}",
     }

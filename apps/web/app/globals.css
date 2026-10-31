@@ -1258,3 +1258,6 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-premium-chart { margin: 8px 0; padding: 6px 8px 8px; border: 1px solid #173a47; border-radius: 6px; background: #081c26; }
 .exec-premium-chart .mi-note { display: block; margin-bottom: 4px; }
 @media (max-width: 640px) { .exec-strategy-controls { justify-content: flex-start; } .exec-premium-chart { padding: 4px; } }
+/* Scalper: VWAP-EMA strategy selector and the OI-picked strike badge */
+.scalper-strategy { padding: 5px 8px; color: var(--text); border: 1px solid #25505f; border-radius: 5px; background: #0d2a37; font: 600 12px "Manrope", sans-serif; }
+.scalper-oi-pick { margin-left: 4px; padding: 1px 6px; color: #0b1a20 !important; border-radius: 4px; background: #f0c36b; font-style: normal; font-weight: 700; font-size: 10px; }

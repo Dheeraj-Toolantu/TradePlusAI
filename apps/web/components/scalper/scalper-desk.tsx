@@ -1,12 +1,28 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel } from "./premium-chart";
+import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, type RiskRewardBox } from "./premium-chart";
 import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 
 export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; lotSize?: number; tickSize?: number };
 type ScalperState = { positions: PositionView[]; closed: PositionView[]; unrealizedPnl: number; realizedPnl: number; tradesToday: number; decision?: ScalperDecision; summary?: string; error?: string; signalReady?: boolean };
 type View = "CALL" | "SPOT" | "PUT";
+/** The algo page's VWAP-EMA scalper read, handed to the desk so it can trade it. */
+export type VwapScalpSignal = {
+  confirmed: boolean;
+  setupId: string | null;
+  side: "CE" | "PE" | null;
+  selected: { symbol: string; strike: number; type: "CE" | "PE" } | null;
+  plan: { entry: number; stop: number; target: number; quantity?: number; rrChoice: string; riskReward?: number; netRiskReward?: number } | null;
+  triggerTime: string | null;
+  criteriaMet: number;
+  criteriaTotal: number;
+  waitingOn: string[];
+  reason: string;
+};
+type EngineStrategy = "VWAP_EMA" | "LEVELS";
+const TRAIL_TEXT: Record<string, string> = { INITIAL: "initial SL", BREAKEVEN: "breakeven (charges covered)", LOCKED: "+0.5R locked", TRAILING: "trailing 0.6R" };
+const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.parse(iso) : NaN; return Number.isFinite(value) ? Math.floor(value / 1000) : null; };
 
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TIMEFRAMES = [1, 3, 5] as const;
@@ -41,7 +57,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0 }: {
+export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -51,6 +67,10 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   onAutoChange?: (enabled: boolean) => void;
   /** Bumped when another panel (the VWAP-EMA scalper) places a position in this book. */
   refreshSignal?: number;
+  /** The VWAP-EMA scalper's latest read (criteria, OI-selected premium, plan). */
+  vwapScalp?: VwapScalpSignal | null;
+  /** Place the confirmed VWAP-EMA scalp in this book (the server re-checks every gate). */
+  onPlaceVwapScalp?: (origin: "AUTO" | "MANUAL") => Promise<{ placed: boolean; error?: string }>;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -59,6 +79,9 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   // AUTOMATIC: the engine places its own trades. MANUAL: it only signals; you take the trade.
   const [tradeMode, setTradeMode] = useState<"AUTOMATIC" | "MANUAL">("MANUAL");
   const [engineOn, setEngineOn] = useState(false);
+  // Which strategy the engine trades: the VWAP-EMA scalper (all 7 criteria) or the level scalper.
+  const [engineStrategy, setEngineStrategy] = useState<EngineStrategy>("VWAP_EMA");
+  const vwapMode = engineStrategy === "VWAP_EMA";
   const auto = engineOn && tradeMode === "AUTOMATIC";
   const [showControls, setShowControls] = useState(false);
   const [callOffset, setCallOffset] = useState(0);
@@ -78,14 +101,15 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
 
   useEffect(() => {
     setSettings(load(SETTINGS_KEY, DEFAULT_SETTINGS));
-    const prefs = load(PREFS_KEY, { views: ["CALL", "PUT"] as View[], timeframe: 1, instant: true, tradeMode: "MANUAL" as "AUTOMATIC" | "MANUAL" });
+    const prefs = load(PREFS_KEY, { views: ["CALL", "PUT"] as View[], timeframe: 1, instant: true, tradeMode: "MANUAL" as "AUTOMATIC" | "MANUAL", engineStrategy: "VWAP_EMA" as EngineStrategy });
     setTradeMode(prefs.tradeMode === "AUTOMATIC" ? "AUTOMATIC" : "MANUAL");
+    setEngineStrategy(prefs.engineStrategy === "LEVELS" ? "LEVELS" : "VWAP_EMA");
     setViews(prefs.views);
     setTimeframe(TIMEFRAMES.includes(prefs.timeframe as 1) ? prefs.timeframe as 1 : 1);
     setInstant(prefs.instant);
   }, []);
   useEffect(() => { save(SETTINGS_KEY, settings); }, [settings]);
-  useEffect(() => { save(PREFS_KEY, { views, timeframe, instant, tradeMode }); }, [views, timeframe, instant, tradeMode]);
+  useEffect(() => { save(PREFS_KEY, { views, timeframe, instant, tradeMode, engineStrategy }); }, [views, timeframe, instant, tradeMode, engineStrategy]);
   useEffect(() => { onAutoChange?.(auto); }, [auto, onAutoChange]);
 
   // ---- strike ladder ------------------------------------------------------------------
@@ -104,6 +128,18 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   const put = rowAt("PUT", putOffset);
   const moneyness = (type: "CALL" | "PUT", offset: number) => offset === 0 ? "ATM" : (type === "CALL" ? offset > 0 : offset < 0) ? `OTM ${Math.abs(offset)}` : `ITM ${Math.abs(offset)}`;
   const premiumOf = useCallback((value: string) => chain.find((row) => norm(row.symbol) === norm(value))?.premium, [chain]);
+
+  // VWAP-EMA mode: the card and chart of the trade side follow the strike the scalper picked from
+  // the OI data. ▲▼ still move it; the next new pick re-centres it.
+  const followed = useRef<string | null>(null);
+  const pick = vwapMode ? vwapScalp?.selected ?? null : null;
+  useEffect(() => {
+    if (!pick || followed.current === pick.symbol || !strikes.length) return;
+    const index = strikes.indexOf(pick.strike);
+    if (index < 0) return;
+    followed.current = pick.symbol;
+    (pick.type === "CE" ? setCallOffset : setPutOffset)(index - atmIndex);
+  }, [atmIndex, pick, strikes]);
 
   // ---- data: underlying 1m bars + premium bars for the two selected contracts ----------
   useEffect(() => {
@@ -146,7 +182,9 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
     if (busy.current || !chain.length || !(spot > 0)) return;
     busy.current = true;
     try {
-      const { data } = await post({ action: "scan", spot, autoEntries: auto, settings, contracts: chain, bars: spotBarsRef.current.slice(-240) });
+      // In VWAP-EMA mode the level engine never enters (it still manages exits); entries come from
+      // the VWAP-EMA scalper via onPlaceVwapScalp.
+      const { data } = await post({ action: "scan", spot, autoEntries: auto && !vwapMode, settings, contracts: chain, bars: spotBarsRef.current.slice(-240) });
       const before = state.positions.map((position) => position.id);
       apply(data, true);
       if (data.summary) setNotice(data.summary);
@@ -162,7 +200,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
       for (const position of exited) onLog?.(`[Scalper] exit ${position.label} · ${position.exitReason} · P&L ₹${money(position.realizedPnl)}`, "exit");
     } catch { setNotice("Scalper scan unavailable; retrying"); }
     finally { busy.current = false; }
-  }, [apply, atmIndex, auto, chain, onLog, post, settings, spot, state.positions, strikes]);
+  }, [apply, atmIndex, auto, chain, onLog, post, settings, spot, state.positions, strikes, vwapMode]);
   const scanRef = useRef(scan);
   scanRef.current = scan;
   const hasOpen = state.positions.length > 0;
@@ -192,6 +230,24 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
     apply(data);
     if (!data.error) onLog?.(`[Scalper] ${data.summary}`, "entry");
   }, [apply, chain, instant, onLog, post, settings, state.decision?.plan]);
+  // ---- VWAP-EMA scalper entries ------------------------------------------------------------
+  const attempted = useRef(new Set<string>());
+  const [placing, setPlacing] = useState(false);
+  const placeVwap = useCallback(async (origin: "AUTO" | "MANUAL") => {
+    if (!onPlaceVwapScalp || !vwapScalp?.confirmed || !vwapScalp.setupId || placing) return;
+    if (origin === "MANUAL" && !instant && !window.confirm(`Take the VWAP-EMA scalp?\nBUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · Target ₹${money(vwapScalp.plan?.target)} (${vwapScalp.plan?.rrChoice})\nPaper order.`)) return;
+    attempted.current.add(vwapScalp.setupId);
+    setPlacing(true);
+    try {
+      const result = await onPlaceVwapScalp(origin);
+      setNotice(result.placed ? `VWAP-EMA scalp ${origin === "AUTO" ? "auto-placed" : "placed"}: BUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · T ₹${money(vwapScalp.plan?.target)}. Stop trails: breakeven at +0.5R, +0.5R locked at +1R, then 0.6R under the best premium.` : `VWAP-EMA scalp not placed: ${result.error ?? "refused"}`);
+    } finally { setPlacing(false); }
+  }, [instant, onPlaceVwapScalp, placing, vwapScalp]);
+  useEffect(() => {
+    if (vwapMode && auto && vwapScalp?.confirmed && vwapScalp.setupId && !attempted.current.has(vwapScalp.setupId)) void placeVwap("AUTO");
+  }, [auto, placeVwap, vwapMode, vwapScalp]);
+  const vwapReady = Boolean(vwapScalp?.confirmed && vwapScalp.setupId && !attempted.current.has(vwapScalp.setupId));
+
   const exit = useCallback(async (ids: string[] | "ALL") => {
     if (!instant && !window.confirm(ids === "ALL" ? "Exit all scalper positions?" : `Exit ${ids.length} position(s)?`)) return;
     const { data } = await post(ids === "ALL" ? { action: "exitAll", contracts: chain } : { action: "exit", ids, contracts: chain });
@@ -234,10 +290,13 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   const levelsFor = useCallback((contractSymbol: string | undefined): ChartLevel[] => {
     const position = livePositions.find((item) => item.legs.length === 1 && norm(item.legs[0].symbol) === norm(contractSymbol));
     if (!position) return [];
+    // With a risk-reward drawing (stop and target both set) the zones carry the labels; the lines
+    // keep only their price tags so the two never overlap.
+    const drawn = position.stop !== null && position.target !== null;
     return [
-      { price: position.entry, color: "#5aa9ff", title: "Avg" },
-      ...(position.stop ? [{ price: position.stop, color: "#fa6b78", title: position.trailing ? "Trail SL" : "SL", dashed: true }] : []),
-      ...(position.target ? [{ price: position.target, color: "#22d59b", title: "Target", dashed: true }] : []),
+      { price: position.entry, color: "#5aa9ff", title: drawn ? "" : "Avg" },
+      ...(position.stop ? [{ price: position.stop, color: "#fa6b78", title: drawn ? "" : position.trailing ? "Trail SL" : "SL", dashed: true }] : []),
+      ...(position.target ? [{ price: position.target, color: "#22d59b", title: drawn ? "" : "Target", dashed: true }] : []),
     ];
   }, [livePositions]);
   const spotLevels = useMemo<ChartLevel[]>(() => {
@@ -251,6 +310,18 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
   }, [decision, livePositions]);
   const callLevels = useMemo(() => levelsFor(call?.symbol), [call?.symbol, levelsFor]);
   const putLevels = useMemo(() => levelsFor(put?.symbol), [put?.symbol, levelsFor]);
+  // Risk-reward drawing: the open position's live zones (the SL moves as it trails), else the
+  // VWAP-EMA plan on the contract it picked.
+  const boxFor = useCallback((contractSymbol: string | undefined): RiskRewardBox | null => {
+    const position = livePositions.find((item) => item.legs.length === 1 && norm(item.legs[0].symbol) === norm(contractSymbol) && item.stop !== null && item.target !== null);
+    if (position) return { entry: position.entry, stop: position.stop!, target: position.target!, fromTime: epochOf(position.openedAt), quantity: position.quantity, label: `${position.kind} ${position.trail ? "VWAP-EMA" : ""}`.trim(), stopTitle: position.trail ? `SL · ${TRAIL_TEXT[position.trail.stage]}` : position.trailing ? "Trail SL" : "SL" };
+    if (vwapMode && vwapScalp?.plan && vwapScalp.selected && norm(vwapScalp.selected.symbol) === norm(contractSymbol) && vwapScalp.plan.stop < vwapScalp.plan.entry && vwapScalp.plan.target > vwapScalp.plan.entry) {
+      return { entry: vwapScalp.plan.entry, stop: vwapScalp.plan.stop, target: vwapScalp.plan.target, fromTime: epochOf(vwapScalp.triggerTime), quantity: vwapScalp.plan.quantity, label: vwapScalp.confirmed ? `Signal ${vwapScalp.plan.rrChoice}` : `Plan ${vwapScalp.plan.rrChoice} (not confirmed)` };
+    }
+    return null;
+  }, [livePositions, vwapMode, vwapScalp]);
+  const callBox = useMemo(() => boxFor(call?.symbol), [boxFor, call?.symbol]);
+  const putBox = useMemo(() => boxFor(put?.symbol), [boxFor, put?.symbol]);
   const tfBars = useCallback((bars: ChartBar[]) => regroupBars(bars, timeframe), [timeframe]);
 
   const exchange = symbol === "SENSEX" ? "BSE" : "NSE";
@@ -282,7 +353,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
       <div className={`scalper-card scalper-card-${type.toLowerCase()}`}>
         <div className="scalper-card-head">
           <span className="scalper-strike">
-            <b>{contract?.strike ?? "--"} {type}</b> <em>{moneyness(type, offset)}</em>
+            <b>{contract?.strike ?? "--"} {type}</b> <em>{moneyness(type, offset)}</em>{pick && contract && norm(pick.symbol) === norm(contract.symbol) ? <em className="scalper-oi-pick" title="Strike picked by the VWAP-EMA scalper from OI, volume and build-up (delta 0.40-0.60)">OI pick</em> : null}
             <button type="button" aria-label={`Higher ${label} strike`} onClick={() => setOffset((value) => Math.min(value + 1, strikes.length - 1 - atmIndex))}>▲</button>
             <button type="button" aria-label={`Lower ${label} strike`} onClick={() => setOffset((value) => Math.max(value - 1, -atmIndex))}>▼</button>
           </span>
@@ -321,6 +392,10 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
 
         <div className="scalper-engine-bar" role="group" aria-label="Auto option engine">
           <span className="algo-kicker">AUTO OPTION ENGINE · PAPER</span>
+          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => { const next = event.target.value as EngineStrategy; setEngineStrategy(next); setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 7 criteria and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically." : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape."); }}>
+            <option value="VWAP_EMA">Strategy: VWAP-EMA scalper</option>
+            <option value="LEVELS">Strategy: Level scalper</option>
+          </select>
           <label className="scalper-switch scalper-switch-auto"><input type="checkbox" checked={engineOn} onChange={(event) => { setEngineOn(event.target.checked); setNotice(event.target.checked ? `Engine on (${tradeMode === "AUTOMATIC" ? "automatic: it places its own trades" : "manual: it signals, you take the trade"}). Scanning the 1m tape.` : "Engine off: open positions are still managed."); }} /><span /> Engine</label>
           <span className="scalper-trade-mode" role="radiogroup" aria-label="Trade selection">
             <small>Trade</small>
@@ -328,7 +403,8 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
               <button key={value} type="button" role="radio" aria-checked={tradeMode === value} className={tradeMode === value ? "on" : ""} onClick={() => { setTradeMode(value); setNotice(value === "AUTOMATIC" ? "Automatic: the engine enters its own signals within your risk limits." : "Manual: the engine only signals; press Take trade to enter, or use the Buy/Sell cards."); }}>{value === "AUTOMATIC" ? "Automatic" : "Manual"}</button>
             ))}
           </span>
-          {engineOn && tradeMode === "MANUAL" ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
+          {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
+          {engineOn && tradeMode === "MANUAL" && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 7 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -343,6 +419,22 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
           </div>
         )}
 
+        {vwapMode ? (
+          <div className={`scalper-engine ${vwapScalp?.confirmed ? "scalper-engine-live" : ""}`}>
+            <span className={`scalper-mode scalper-mode-${vwapScalp?.confirmed ? "scalp" : "wait"}`}>{engineOn ? `VWAP-EMA · ${vwapScalp?.confirmed ? "CONFIRMED" : "WAITING"} · ${tradeMode === "AUTOMATIC" ? "AUTO" : "MANUAL"}` : "ENGINE OFF"}</span>
+            {vwapScalp?.side ? <span className={vwapScalp.side === "CE" ? "scalper-side gain" : "scalper-side loss"}>{vwapScalp.side === "CE" ? "CE · long" : "PE · short"}</span> : null}
+            {vwapScalp ? <span className="scalper-read">criteria {vwapScalp.criteriaMet}/{vwapScalp.criteriaTotal}{vwapScalp.waitingOn.length ? ` · waiting on ${vwapScalp.waitingOn.join(", ")}` : ""}{vwapScalp.selected ? ` · OI pick ${vwapScalp.selected.strike} ${vwapScalp.selected.type}` : ""}</span> : <span className="scalper-read">waiting for the VWAP-EMA engine…</span>}
+            <p>{notice}</p>
+            {vwapScalp?.plan ? (
+              <div className="scalper-plan">
+                <b>{vwapScalp.confirmed ? "Signal" : "Plan (not confirmed)"} · BUY {vwapScalp.selected?.symbol} · {vwapScalp.plan.rrChoice}{vwapScalp.plan.riskReward ? ` = ${vwapScalp.plan.riskReward}R on the premium` : ""}{vwapScalp.plan.netRiskReward ? ` (${vwapScalp.plan.netRiskReward}R after charges)` : ""}</b>
+                <span>Entry ₹{money(vwapScalp.plan.entry)} · SL ₹{money(vwapScalp.plan.stop)} · Target ₹{money(vwapScalp.plan.target)}{vwapScalp.plan.quantity ? ` · ${vwapScalp.plan.quantity} qty` : ""}</span>
+                <span>Trailing: SL to breakeven + charges at +0.5R · lock +0.5R at +1R · then 0.6R under the best premium · exit if a 1m candle closes back through the 9 EMA</span>
+              </div>
+            ) : null}
+            <small className="mi-note">{vwapScalp?.reason ?? ""}</small>
+          </div>
+        ) : (
         <div className={`scalper-engine ${decision?.mode === "WAIT" || !decision ? "" : "scalper-engine-live"}`}>
           <span className={`scalper-mode scalper-mode-${(decision?.mode ?? "WAIT").toLowerCase()}`}>{engineOn ? `${decision?.mode ?? "SCANNING"} · ${tradeMode === "AUTOMATIC" ? "AUTO" : "MANUAL"}` : "ENGINE OFF"}</span>
           {decision?.side ? <span className={decision.side === "CE" ? "scalper-side gain" : "scalper-side loss"}>{decision.side === "CE" ? "CE · bullish" : "PE · bearish"}</span> : null}
@@ -364,16 +456,17 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
             </details>
           )}
         </div>
+        )}
 
         <div className="scalper-charts" style={{ gridTemplateColumns: `repeat(${views.length}, minmax(0, 1fr))` }}>
-          {views.includes("CALL") && <div className="scalper-chart">{chartHead(call, callBars, callLots)}<PremiumChart bars={tfBars(callBars)} levels={callLevels} /></div>}
+          {views.includes("CALL") && <div className="scalper-chart">{chartHead(call, callBars, callLots)}<PremiumChart bars={tfBars(callBars)} levels={callLevels} riskReward={callBox} /></div>}
           {views.includes("SPOT") && (
             <div className="scalper-chart">
               <div className="scalper-chart-head"><div><b>{symbol} spot · {timeframe} · {exchange}</b><small>LTP <em>{money(spot)}</em> · supports green, resistances red (1m engine levels)</small></div></div>
               <PremiumChart bars={tfBars(spotBars)} levels={spotLevels} />
             </div>
           )}
-          {views.includes("PUT") && <div className="scalper-chart">{chartHead(put, putBars, putLots)}<PremiumChart bars={tfBars(putBars)} levels={putLevels} /></div>}
+          {views.includes("PUT") && <div className="scalper-chart">{chartHead(put, putBars, putLots)}<PremiumChart bars={tfBars(putBars)} levels={putLevels} riskReward={putBox} /></div>}
         </div>
 
         <div className="scalper-cards">
@@ -415,11 +508,11 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
               <small>Mkt ₹{money(position.value)} · Avg ₹{money(position.entry)} · {position.kind}{position.legs.length > 1 ? " · spread" : ""}{position.exitReason ? ` · ${position.exitReason}` : ""}</small>
               <small className="scalper-qty">{positionsTab === "OPEN" ? position.quantity : 0}</small>
               {positionsTab === "OPEN" ? <button type="button" title="Exit this position" onClick={() => void exit([position.id])}>✕</button> : null}
-              {position.stop !== null && positionsTab === "OPEN" ? <small className="scalper-levels">SL ₹{money(position.stop)}{position.trailing ? " (trailing)" : ""} · T ₹{money(position.target)}</small> : null}
+              {position.stop !== null && positionsTab === "OPEN" ? <small className="scalper-levels">SL ₹{money(position.stop)}{position.trail ? ` (${TRAIL_TEXT[position.trail.stage]})` : position.trailing ? " (trailing)" : ""} · T ₹{money(position.target)}</small> : null}
             </div>
           )) : <div className="algo-empty">{positionsTab === "OPEN" ? "No open scalper positions." : "No closed trades today."}</div>}
         </div>
-        <p className="scalper-footnote">Engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
+        <p className="scalper-footnote">{vwapMode ? "VWAP-EMA entries: all 7 criteria (VWAP, 5/9 EMA trigger, delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
       </aside>
     </section>
   );

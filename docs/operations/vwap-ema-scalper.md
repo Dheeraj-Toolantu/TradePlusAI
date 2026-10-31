@@ -12,7 +12,8 @@ Code:
 | `quant/src/tradepulse_quant/algo_engine/scalp_strategy.py` | Rules, strike selection, the delta-gamma plan |
 | `quant/src/tradepulse_quant/algo_engine/engine.py` | V5 evidence (`_scalp_evidence`) |
 | `apps/web/app/api/algo-trading/route.ts` | Inputs, the server re-check, place-on-scalper |
-| `services/paper-trading/src/smart-scalper.ts` | `SmartScalper.place` |
+| `services/paper-trading/src/smart-scalper.ts` | `SmartScalper.place`, `vwapEmaTrail`, `emaMomentumLost` |
+| `apps/web/components/scalper/scalper-desk.tsx` | The strategy selector, auto and manual placing, the OI-picked strike, the drawings |
 | `apps/web/app/execution/page.tsx` | The panel |
 | `apps/web/components/scalper/premium-chart.tsx` | The risk-reward drawing |
 
@@ -72,29 +73,57 @@ bigger, for example on BANKNIFTY.
 **Lots.** The number of lots is floor(max loss per trade ÷ (risk per lot + charges)). It is capped by
 the scalper desk's lots setting, using the desk's own saved limits.
 
-## Auto-place on the Smart Scalper
+## Trading it on the Scalper (auto or manual)
 
-With **Auto-place on Scalper** ticked, a CONFIRMED setup is placed automatically into the Smart
-Scalper's paper book. **Place on Scalper (paper)** does the same manually. Each setup is placed once,
-keyed on the trigger candle and side.
+The Scalper desk has a **Strategy** selector. It defaults to *VWAP-EMA scalper*; the other choice is
+*Level scalper*, the desk's original support/resistance engine. With VWAP-EMA selected:
 
-1. The server (`POST /api/algo-trading`, `action: PLACE_ON_SCALPER`) re-runs the strategy. It checks
-   every V5 gate itself, using broker health, daily risk, contract metadata, SAFE_MODE and the kill
-   switch. Nothing the browser sends can confirm a trade.
-2. `SmartScalper.place` applies the book's own limits:
-   - the kill switch and SAFE_MODE;
-   - the daily loss limit, a 5-minute cool-down after a loss, and 3 losses in a row;
-   - the trade cap and one engine position per index;
-   - market hours (09:15-15:15 IST, trading days).
-3. The scalper then manages the position like its own:
-   - the premium stop and target;
-   - the index stop and target, as `SPOT_LEVEL_BROKEN` / `SPOT_TARGET`;
-   - breakeven at +1R and a trail beyond 1.5R;
-   - a time stop if the trade hasn't reached +0.5R within the hold limit;
-   - the 15:15 square-off.
+- **Engine on + Automatic.** A CONFIRMED setup is placed in the Smart Scalper's paper book as soon as
+  all 7 criteria and every V5 gate pass.
+- **Engine on + Manual.** "⚡ Take trade" lights up when the setup is confirmed, and you place it with
+  a click.
+- **Level engine.** It never enters while VWAP-EMA is selected. It still manages exits.
+- **Auto-selected premium.** The trade side's card and chart follow the strike the scalper picked from
+  OI, marked with an "OI pick" badge. ▲▼ still move the strike, and the next new pick re-centres it.
+- **Risk-reward drawing.** It appears on that premium's chart. Before entry it shows the plan. After
+  entry it shows the live position: entry, the current SL and the target. Once the SL has trailed above
+  the entry, the drawing shows the profit it locks.
 
-Auto-place is **paper only**. It never sends a live order. Live orders still go through
-`/api/live-orders`, with a preview and a PIN.
+Every placement goes through the server first. `POST /api/algo-trading` with
+`action: PLACE_ON_SCALPER` re-runs the strategy and checks every V5 gate itself: broker health, daily
+risk, contract metadata, SAFE_MODE and the kill switch. Nothing the browser sends can confirm a trade.
+
+`SmartScalper.place` then applies the book's own limits:
+- the kill switch and SAFE_MODE;
+- the daily loss limit, a 5-minute cool-down after a loss, and 3 losses in a row;
+- the trade cap and one engine position per index;
+- market hours (09:15-15:15 IST, trading days).
+
+Each setup is placed once, keyed on its trigger candle and side. Placing is **paper only**. It never
+sends a live order; live orders still go through `/api/live-orders`, with a preview and a PIN.
+
+### Systematic SL, target and trailing SL
+
+R is the initial premium risk: the entry minus the delta-gamma SL. The stop only ever moves up.
+
+| Stage | When | SL moves to |
+| --- | --- | --- |
+| Initial | entry | the delta-gamma SL |
+| Breakeven | the best premium reaches +0.5R | the entry plus round-trip charges per unit (cost-covered breakeven) |
+| Locked | +1R | the entry + 0.5R |
+| Trailing | beyond +1R | the best premium − 0.6R |
+
+Exits:
+- **Target.** The premium target, or the index target (`SPOT_TARGET`).
+- **Stop.** `STOP_LOSS`, `BREAKEVEN_STOP`, `LOCKED_PROFIT_STOP` or `TRAILING_STOP`, depending on the stage.
+- **Momentum lost.** After breakeven, a completed 1-minute index candle closes back through the 9 EMA
+  (`EMA9_LOST`).
+- **Index invalidation.** `SPOT_LEVEL_BROKEN`.
+- **Time stop.** The trade hasn't reached +0.5R within the desk's scalp time stop.
+- **Risk limits.** The max loss per trade, and the 15:15 square-off.
+
+The stage, the initial SL and the charges are saved with the order, so a restart resumes the same
+trail. Exits are managed by the desk's 10-second scan, which runs while the execution page is open.
 
 ## The panel
 

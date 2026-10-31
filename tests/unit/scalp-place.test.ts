@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SmartScalper, valueOption, type ScalperContract, type ScalperPlan } from "../../services/paper-trading/src/smart-scalper";
+import { SmartScalper, emaMomentumLost, valueOption, vwapEmaTrail, type ScalperContract, type ScalperPlan } from "../../services/paper-trading/src/smart-scalper";
 import { riskRewardLayout } from "../../apps/web/components/scalper/premium-chart";
 
 const at = (ist: string, day = "2026-11-02") => () => new Date(`${day}T${ist}:00+05:30`);
@@ -95,5 +95,79 @@ describe("risk-reward drawing on the premium chart", () => {
     expect(riskRewardLayout(box, toY, 600, 590)!.left).toBe(410); // always at least 190 px wide, so labels fit
     expect(riskRewardLayout(box, toY, 120, 100)!.width).toBe(120); // a narrow plot gets the whole width
     expect(riskRewardLayout(box, (price) => (price > 130 ? null : toY(price)), 600, 200)).toBeNull();
+  });
+});
+
+describe("VWAP-EMA staged trail (systematic SL / target / trailing SL)", () => {
+  const trail = { risk: 6.75, costPerUnit: 2.15, stage: "INITIAL" as const };
+  const at10 = (minute: number) => Date.parse(`2026-11-02T10:${String(minute).padStart(2, "0")}:00+05:30`) / 1000;
+  /** 1m index bars 09:35-10:04: a steady rise; `drop` makes the last completed bar close under the 9 EMA. */
+  const bars = (drop = false) => Array.from({ length: 30 }, (_, i) => {
+    const time = at10(4) - (29 - i) * 60;
+    const close = 24790 + i * 1.2 - (drop && i === 29 ? 12 : 0);
+    return { time, open: close - 0.5, high: close + 1, low: close - (drop && i === 29 ? 13 : 1), close, volume: 5000 };
+  });
+
+  it("moves the stop up in stages and never down", () => {
+    expect(vwapEmaTrail({ entry: 120.85, stop: 114.1, highWater: 123, trail })).toEqual({ stop: 114.1, stage: "INITIAL" });
+    expect(vwapEmaTrail({ entry: 120.85, stop: 114.1, highWater: 124.25, trail })).toEqual({ stop: 123, stage: "BREAKEVEN" }); // +0.5R → entry + charges
+    expect(vwapEmaTrail({ entry: 120.85, stop: 123, highWater: 127.6, trail: { ...trail, stage: "BREAKEVEN" } })).toEqual({ stop: 124.23, stage: "LOCKED" }); // +1R → +0.5R locked
+    expect(vwapEmaTrail({ entry: 120.85, stop: 124.23, highWater: 131, trail: { ...trail, stage: "LOCKED" } })).toEqual({ stop: 126.95, stage: "TRAILING" }); // 0.6R under the best premium
+    expect(vwapEmaTrail({ entry: 120.85, stop: 126.95, highWater: 129, trail: { ...trail, stage: "TRAILING" } }).stop).toBe(126.95); // never lowered
+  });
+
+  it("detects a 1m close back through the 9 EMA on completed candles only", () => {
+    const now = new Date(at10(5) * 1000);
+    expect(emaMomentumLost(bars(), true, now)).toBe(false);
+    expect(emaMomentumLost(bars(true), true, now)).toBe(true);
+    expect(emaMomentumLost(bars(true), true, new Date(at10(4) * 1000 + 30_000))).toBe(false); // that candle is still forming
+  });
+
+  async function placed(clock: { now: Date }) {
+    const scalper = new SmartScalper({ now: () => clock.now, hydrate: false });
+    await scalper.place("NIFTY", plan({ trail: { rule: "VWAP_EMA", costPerUnit: 2.15 } }), [contract], { setupId: "trail" });
+    return scalper;
+  }
+  const scanAt = (scalper: SmartScalper, premium: number, drop = false) => scalper.scan({ symbol: "NIFTY", spot: 24825, bars: bars(drop), contracts: [{ ...contract, premium, bid: premium, ask: premium }], autoEntries: false });
+
+  it("manages a placed scalp through breakeven, lock and trail to a profitable trailing-stop exit", async () => {
+    const clock = { now: new Date(at10(5) * 1000) };
+    const scalper = await placed(clock);
+    let state = await scanAt(scalper, 124.3);
+    expect(state.positions[0]).toMatchObject({ stop: 123, trailing: true, trail: { stage: "BREAKEVEN" } });
+    state = await scanAt(scalper, 127.7);
+    expect(state.positions[0]).toMatchObject({ stop: 124.23, trail: { stage: "LOCKED" } });
+    state = await scanAt(scalper, 131);
+    expect(state.positions[0]).toMatchObject({ stop: 126.95, trail: { stage: "TRAILING" } });
+    state = await scanAt(scalper, 126.9);
+    expect(state.positions).toHaveLength(0);
+    expect(state.closed[0]).toMatchObject({ exitReason: "TRAILING_STOP" });
+    expect(state.closed[0].realizedPnl).toBeGreaterThan(0);
+  });
+
+  it("exits at a cost-covered breakeven instead of a loss once +0.5R was reached", async () => {
+    const clock = { now: new Date(at10(5) * 1000) };
+    const scalper = await placed(clock);
+    await scanAt(scalper, 124.3);
+    const state = await scanAt(scalper, 122.9);
+    expect(state.closed[0]).toMatchObject({ exitReason: "BREAKEVEN_STOP" });
+  });
+
+  it("exits when momentum is lost after breakeven, and takes the target when it trades", async () => {
+    const clock = { now: new Date(at10(5) * 1000) };
+    const scalper = await placed(clock);
+    await scanAt(scalper, 124.3);
+    const lost = await scanAt(scalper, 124.5, true);
+    expect(lost.closed[0]).toMatchObject({ exitReason: "EMA9_LOST" });
+    const second = await placed(clock);
+    const won = await scanAt(second, 134);
+    expect(won.closed[0]).toMatchObject({ exitReason: "TARGET" });
+  });
+
+  it("keeps the initial stop for a loser", async () => {
+    const clock = { now: new Date(at10(5) * 1000) };
+    const scalper = await placed(clock);
+    const state = await scanAt(scalper, 114);
+    expect(state.closed[0]).toMatchObject({ exitReason: "STOP_LOSS" });
   });
 });

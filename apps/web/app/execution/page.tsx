@@ -6,6 +6,7 @@ import { formatMarketCalculationValue, getOrderExitState } from "../../lib/optio
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
 import type { ChartBar, ChartLevel, RiskRewardBox } from "../../components/scalper/premium-chart";
+import type { VwapScalpSignal } from "../../components/scalper/scalper-desk";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -97,12 +98,11 @@ export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");
   // Per-viewer preferences: the chosen reward:risk and whether confirmed scalps are auto-placed.
   const [riskReward, setRiskReward] = useState<RiskReward>("1:2");
-  const [autoPlace, setAutoPlace] = useState(false);
   const [scalperRefresh, setScalperRefresh] = useState(0);
   const [premiumBars, setPremiumBars] = useState<ChartBar[]>([]);
   const attemptedSetups = useRef(new Set<string>());
-  useEffect(() => { const prefs = readLocal(STRATEGY_PREFS_KEY, { riskReward: "1:2" as RiskReward, autoPlace: false }); setRiskReward(prefs.riskReward === "1:1" ? "1:1" : "1:2"); setAutoPlace(Boolean(prefs.autoPlace)); }, []);
-  useEffect(() => { try { window.localStorage.setItem(STRATEGY_PREFS_KEY, JSON.stringify({ riskReward, autoPlace })); } catch { /* per-viewer convenience */ } }, [riskReward, autoPlace]);
+  useEffect(() => { const prefs = readLocal(STRATEGY_PREFS_KEY, { riskReward: "1:2" as RiskReward }); setRiskReward(prefs.riskReward === "1:1" ? "1:1" : "1:2"); }, []);
+  useEffect(() => { try { window.localStorage.setItem(STRATEGY_PREFS_KEY, JSON.stringify({ riskReward })); } catch { /* per-viewer convenience */ } }, [riskReward]);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [paperOrders, setPaperOrders] = useState<Order[]>([]);
   const [history, setHistory] = useState<Order[]>([]);
@@ -538,9 +538,9 @@ export default function ExecutionPage() {
   // ---- place on the Smart Scalper (paper) --------------------------------------------------
   // The server re-runs the scalper and every V5 gate before it places anything; the scalper book's
   // own limits (trade cap, max loss, daily loss, loss streak, one position, 15:15) still apply.
-  const placeOnScalper = useCallback(async (reason: "AUTO" | "MANUAL") => {
+  const placeOnScalper = useCallback(async (reason: "AUTO" | "MANUAL"): Promise<{ placed: boolean; error?: string }> => {
     const setup = analysis?.setup;
-    if (!setup?.setup_id || analysis?.pipeline?.decision !== "CONFIRMED") return;
+    if (!setup?.setup_id || analysis?.pipeline?.decision !== "CONFIRMED") return { placed: false, error: "No confirmed VWAP-EMA setup" };
     attemptedSetups.current.add(setup.setup_id);
     try {
       const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
@@ -551,18 +551,14 @@ export default function ExecutionPage() {
         const text = `${reason === "AUTO" ? "Auto-place" : "Place"} on scalper refused: ${data.error ?? "request failed"}${Array.isArray(data.reasons) && data.reasons.length ? ` (${data.reasons.slice(0, 4).join(", ")})` : ""}`;
         setMessage(text);
         log(text, "info");
-        return;
+        return { placed: false, error: String(data.error ?? "refused") };
       }
       setScalperRefresh((value) => value + 1);
       setMessage(`${reason === "AUTO" ? "Auto-placed" : "Placed"} on the Smart Scalper (paper): ${data.summary ?? ""}`);
       log(`[${strategy.name}] ${data.summary ?? "placed on the scalper"}`, "entry");
-    } catch { setMessage("Place on scalper request failed"); }
+      return { placed: true };
+    } catch { setMessage("Place on scalper request failed"); return { placed: false, error: "request failed" }; }
   }, [analysis, log, riskReward, symbol]);
-
-  useEffect(() => {
-    const id = analysis?.setup?.setup_id;
-    if (autoPlace && id && analysis?.pipeline?.decision === "CONFIRMED" && !attemptedSetups.current.has(id)) void placeOnScalper("AUTO");
-  }, [analysis, autoPlace, placeOnScalper]);
 
   // The selected premium's 1-minute candles (the scalper's volume-profile series), folded with
   // the live premium from the chain socket.
@@ -612,6 +608,22 @@ export default function ExecutionPage() {
     if (scalpPlan?.entry && scalpPlan.stop_loss && scalpPlan.target && scalpPlan.stop_loss < scalpPlan.entry && scalpPlan.target > scalpPlan.entry) return { entry: scalpPlan.entry, stop: scalpPlan.stop_loss, target: scalpPlan.target, fromTime: epochOf(scalp?.trigger?.time), quantity: scalpPlan.quantity, label: `Plan ${riskReward} (not confirmed)` };
     return null;
   }, [analysis?.setup, riskReward, scalp?.trigger?.time, scalpPlan]);
+  // The scalper read handed to the Smart Scalper desk, which trades it (auto or manual).
+  const vwapScalp: VwapScalpSignal | null = useMemo(() => {
+    if (!scalp) return null;
+    const setup = analysis?.setup;
+    const confirmed = analysis?.pipeline?.decision === "CONFIRMED" && Boolean(setup?.contract && setup.setup_id);
+    const picked = scalp.selected ? { symbol: scalp.selected.symbol, strike: scalp.selected.strike, type: scalp.selected.type } : null;
+    const planned = confirmed && setup ? { entry: setup.entry, stop: setup.stop_loss, target: setup.target, quantity: setup.quantity, rrChoice: setup.rr_choice ?? riskReward, riskReward: setup.risk_reward, netRiskReward: setup.net_risk_reward }
+      : scalpPlan?.entry && scalpPlan.stop_loss && scalpPlan.target ? { entry: scalpPlan.entry, stop: scalpPlan.stop_loss, target: scalpPlan.target, quantity: scalpPlan.quantity, rrChoice: scalp.rr_choice, riskReward: scalpPlan.risk_reward, netRiskReward: scalpPlan.net_risk_reward } : null;
+    const failedGates = (analysis?.pipeline?.gates ?? []).filter((gate) => !gate.passed).map((gate) => GATE_LABELS[gate.code] ?? gate.code.toLowerCase().replaceAll("_", " "));
+    return {
+      confirmed, setupId: confirmed ? setup?.setup_id ?? null : null, side: scalp.tape.side ?? null, selected: picked, plan: planned, triggerTime: setup?.trigger_time ?? scalp.trigger?.time ?? null,
+      criteriaMet: scalp.criteria.filter((item) => item.passed).length, criteriaTotal: scalp.criteria.length,
+      waitingOn: [...scalp.criteria.filter((item) => !item.passed).map((item) => item.name), ...(scalp.criteria.every((item) => item.passed) ? failedGates : [])],
+      reason: String(analysis?.strategy_reason ?? scalp.tape.reason ?? ""),
+    };
+  }, [analysis, riskReward, scalp, scalpPlan]);
   const profileLevels: ChartLevel[] = useMemo(() => scalp?.profile ? [
     { price: scalp.profile.poc, color: "#f0c36b", title: "POC", dashed: true },
     { price: scalp.profile.vah, color: "#8fa3a8", title: "VAH", dashed: true },
@@ -654,9 +666,7 @@ export default function ExecutionPage() {
               <div><span className="algo-kicker">V5 RULE ENGINE · VWAP-EMA SCALPER · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
               <div className="exec-strategy-controls">
                 <select aria-label="Risk reward" value={riskReward} onChange={(event) => setRiskReward(event.target.value as RiskReward)} title="Target as a multiple of the stop distance on the index; the premium target follows from delta and gamma">{RR_CHOICES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-                <label className="exec-auto-place" title="When every criterion and V5 gate is green, place the scalp on the Smart Scalper (paper book) automatically. The server re-checks every gate; the scalper's own limits apply. Never a live order.">
-                  <input type="checkbox" checked={autoPlace} onChange={(event) => { setAutoPlace(event.target.checked); setMessage(event.target.checked ? "Auto-place on: a confirmed scalp goes to the Smart Scalper paper book (server re-checks every gate; scalper limits apply)." : "Auto-place off: place confirmed scalps yourself."); }} /> Auto-place on Scalper
-                </label>
+                <button type="button" className="exec-auto-place" onClick={() => document.querySelector(".scalper")?.scrollIntoView({ behavior: "smooth", block: "start" })} title="Automatic placing runs on the Scalper: Strategy VWAP-EMA, Engine on, Trade Automatic">Auto-trade on the Scalper ↓</button>
                 <button type="button" onClick={() => void refresh()} disabled={busy}>{busy ? "…" : "Refresh"}</button>
               </div>
             </div>
@@ -747,7 +757,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

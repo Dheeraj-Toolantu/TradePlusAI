@@ -83,6 +83,8 @@ export type ScalperPlan = {
   riskReward: number;
   spot: { entry: number; stop: number; target: number };
   reason: string;
+  /** A systematic trailing rule for the position (the VWAP-EMA scalper's staged trail). */
+  trail?: { rule: "VWAP_EMA"; costPerUnit: number };
 };
 export type ScalperDecision = {
   mode: "SCALP" | "HEDGE" | "WAIT";
@@ -110,6 +112,8 @@ export type ScalperPosition = {
   trailing: boolean;
   spot: { entry: number; stop: number; target: number } | null;
   reason: string;
+  /** VWAP-EMA staged trail: INITIAL → BREAKEVEN (+0.5R) → LOCKED (+1R) → TRAILING (beyond +1R). */
+  trail?: { rule: "VWAP_EMA"; risk: number; costPerUnit: number; stage: TrailStage };
   status: "OPEN" | "EXITED";
   exitAt?: string;
   exitReason?: string;
@@ -117,6 +121,31 @@ export type ScalperPosition = {
   realizedPnl?: number;
 };
 export type PositionView = ScalperPosition & { quantity: number; value: number; pnl: number; label: string };
+export type TrailStage = "INITIAL" | "BREAKEVEN" | "LOCKED" | "TRAILING";
+
+/** The VWAP-EMA scalper's staged trail, in units of the initial premium risk R. */
+export const VWAP_EMA_TRAIL = { breakevenAt: 0.5, lockAt: 1.0, lockTo: 0.5, trailGap: 0.6 } as const;
+
+/**
+ * Next stop for a VWAP-EMA scalp. R = entry − initial stop (premium). At +0.5R the stop goes to
+ * a cost-covered breakeven (entry + round-trip charges per unit); at +1R it locks +0.5R; beyond +1R
+ * it trails 0.6R under the best premium. The stop only ever moves up.
+ */
+export function vwapEmaTrail(position: { entry: number; stop: number; highWater: number; trail: { risk: number; costPerUnit: number; stage: TrailStage } }) {
+  const { entry, highWater } = position;
+  const { risk, costPerUnit } = position.trail;
+  let stop = position.stop;
+  let stage: TrailStage = position.trail.stage;
+  if (!(risk > 0)) return { stop, stage };
+  const gain = highWater - entry;
+  if (gain >= risk * VWAP_EMA_TRAIL.breakevenAt) { stop = Math.max(stop, entry + Math.max(costPerUnit, 0)); if (stage === "INITIAL") stage = "BREAKEVEN"; }
+  if (gain >= risk * VWAP_EMA_TRAIL.lockAt) { stop = Math.max(stop, entry + risk * VWAP_EMA_TRAIL.lockTo); if (stage === "INITIAL" || stage === "BREAKEVEN") stage = "LOCKED"; }
+  if (gain > risk * VWAP_EMA_TRAIL.lockAt) {
+    const trailed = highWater - risk * VWAP_EMA_TRAIL.trailGap;
+    if (trailed > stop) { stop = trailed; stage = "TRAILING"; }
+  }
+  return { stop: round2(stop), stage };
+}
 
 export type ScanInput = {
   symbol: string;
@@ -169,6 +198,18 @@ function rsiOf(closes: number[], period = 14) {
   }
   if (loss === 0) return gain === 0 ? 50 : 100;
   return 100 - 100 / (1 + gain / loss);
+}
+
+/**
+ * VWAP-EMA momentum exit: the latest COMPLETED 1-minute index candle closed back through the 9 EMA
+ * against the trade (below it for a CE, above it for a PE), so the scalp's reason is gone.
+ */
+export function emaMomentumLost(bars: ScalperBar[], bull: boolean, now: Date) {
+  const done = bars.filter((bar) => (bar.time + 60) * 1000 <= now.getTime());
+  if (done.length < 10) return false;
+  const ema9 = emaSeries(done.map((bar) => bar.close), 9).at(-1)!;
+  const close = done.at(-1)!.close;
+  return bull ? close < ema9 : close > ema9;
 }
 
 function trueRanges(bars: ScalperBar[]) {
@@ -465,7 +506,10 @@ export class SmartScalper {
       const single = orders.length === 1 ? orders[0] : undefined;
       const kind = /HEDGE/.test(orders[0].strategyName ?? "") ? "HEDGE" : /SCALP/.test(orders[0].strategyName ?? "") ? "SCALP" : "MANUAL";
       const stop = single?.stopLoss ?? null;
-      this.positions.push({ id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk: stop !== null ? entry - stop : null, highWater: entry, trailing: false, spot: null, reason: orders[0].source ?? "restored", status: "OPEN" });
+      const trail = single?.trailRule === "VWAP_EMA" && single.initialStopLoss !== undefined
+        ? { rule: "VWAP_EMA" as const, risk: round2(entry - single.initialStopLoss), costPerUnit: Number(single.trailCostPerUnit ?? 0), stage: (["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"].includes(String(single.trailStage)) ? single.trailStage : "INITIAL") as TrailStage }
+        : undefined;
+      this.positions.push({ id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk: trail ? trail.risk : stop !== null ? entry - stop : null, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL"), spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}) });
     }
   }
 
@@ -632,6 +676,7 @@ export class SmartScalper {
       id, kind: plan.kind, side: plan.side, underlying, legs, openedAt: timestamp, entry,
       stop: round2(plan.stop + shift), target: round2(plan.target), initialRisk: round2(plan.entry - plan.stop), highWater: entry, trailing: false,
       spot: plan.spot, reason: plan.reason, status: "OPEN",
+      ...(plan.trail ? { trail: { rule: plan.trail.rule, risk: round2(plan.entry - plan.stop), costPerUnit: round2(plan.trail.costPerUnit), stage: "INITIAL" as TrailStage } } : {}),
     };
     this.positions.push(position);
     this.tradesToday += 1;
@@ -663,8 +708,17 @@ export class SmartScalper {
       if (!reason && position.kind !== "MANUAL" && position.underlying === input.symbol) {
         const risk = position.initialRisk ?? 0;
         position.highWater = Math.max(position.highWater, value);
-        // +1R → stop to breakeven; beyond 1.5R trail 0.75R behind the best value.
-        if (risk > 0 && position.stop !== null) {
+        if (position.trail && position.stop !== null) {
+          // VWAP-EMA scalp: staged, cost-covered trail (see vwapEmaTrail).
+          const next = vwapEmaTrail({ entry: position.entry, stop: position.stop, highWater: position.highWater, trail: position.trail });
+          if (next.stop > position.stop || next.stage !== position.trail.stage) {
+            position.stop = next.stop;
+            position.trail.stage = next.stage;
+            position.trailing = next.stage !== "INITIAL";
+            this.persist(position);
+          }
+        } else if (risk > 0 && position.stop !== null) {
+          // +1R → stop to breakeven; beyond 1.5R trail 0.75R behind the best value.
           const gain = position.highWater - position.entry;
           let stop = position.stop;
           if (gain >= risk) stop = Math.max(stop, position.entry + Math.min(risk * 0.1, gain * 0.1));
@@ -676,7 +730,8 @@ export class SmartScalper {
         if (position.spot && (bull ? spotPrice <= position.spot.stop : spotPrice >= position.spot.stop)) reason = "SPOT_LEVEL_BROKEN";
         else if (position.spot && (bull ? spotPrice >= position.spot.target : spotPrice <= position.spot.target)) reason = "SPOT_TARGET";
         else if (position.target !== null && value >= position.target) reason = "TARGET";
-        else if (position.stop !== null && value <= position.stop) reason = position.trailing ? "TRAILING_STOP" : "STOP_LOSS";
+        else if (position.stop !== null && value <= position.stop) reason = position.trail ? (position.trail.stage === "INITIAL" ? "STOP_LOSS" : position.trail.stage === "BREAKEVEN" ? "BREAKEVEN_STOP" : position.trail.stage === "LOCKED" ? "LOCKED_PROFIT_STOP" : "TRAILING_STOP") : position.trailing ? "TRAILING_STOP" : "STOP_LOSS";
+        else if (position.trail && position.trail.stage !== "INITIAL" && emaMomentumLost(input.bars, bull, now)) reason = "EMA9_LOST";
         else if (position.kind === "SCALP" && risk > 0 && now.getTime() - Date.parse(position.openedAt) >= settings.maxHoldMinutes * 60_000 && value - position.entry < risk * 0.5) reason = "SCALP_TIME_STOP";
       }
       if (reason) this.close(position, reason);
@@ -712,10 +767,11 @@ export class SmartScalper {
     position.legs.forEach((leg, index) => {
       const legPnl = (leg.side === "BUY" ? 1 : -1) * ((exits?.[index] ?? leg.ltp) - leg.entry) * leg.quantity;
       const record: OrderRecord = {
-        id: leg.orderId, referenceId: position.id, strategy: STRATEGY_ID, strategyName: `Smart Scalper · ${position.kind}`, underlying: position.underlying,
+        id: leg.orderId, referenceId: position.id, strategy: STRATEGY_ID, strategyName: `Smart Scalper · ${position.kind}${position.trail ? " · VWAP-EMA" : ""}`, underlying: position.underlying,
         symbol: leg.symbol, growwSymbol: leg.symbol, expiry: leg.expiry, strike: leg.strike, side: leg.side, quantity: leg.quantity, lotSize: leg.quantity,
         price: leg.entry, currentPrice: leg.ltp, pnl: round2(legPnl),
         ...(position.legs.length === 1 && position.stop !== null ? { stopLoss: position.stop, target: position.target ?? undefined, trailingStop: position.trailing ? position.stop : undefined } : {}),
+        ...(position.trail ? { trailRule: position.trail.rule, trailStage: position.trail.stage, trailCostPerUnit: position.trail.costPerUnit, initialStopLoss: round2(position.entry - position.trail.risk), highWaterMark: position.highWater } : {}),
         status: position.status === "OPEN" ? "OPEN" : "EXITED", mode: "PAPER", source: position.reason, createdAt: position.openedAt, updatedAt: this.clock().toISOString(),
         ...(position.status === "EXITED" ? { exitPrice: exits?.[index], exitAt: position.exitAt, exitReason: position.exitReason, realizedPnl: round2(legPnl) } : {}),
       };
