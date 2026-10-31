@@ -9,11 +9,15 @@ import os
 import re
 import unittest
 
-from _load import ROOT, REPO
+from _load import ROOT, REPO, load
+
+MARKET = load("trader-market", "market")
 
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
           "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
-          "trader-pelosi"]
+          "trader-pelosi",
+          # added for TradePulse (Indian markets): the shared market profile and the bulk/block deals tracker
+          "trader-market", "trader-deals"]
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
               "trader-pelosi", "trader-risk", "trader-broker", "trader-alerts"]
@@ -27,7 +31,7 @@ def frontmatter(path):
 
 
 class VendoredSkills(unittest.TestCase):
-    def test_all_eleven_trader_skills_are_installed(self):
+    def test_all_trader_skills_are_installed(self):
         found = sorted(d for d in os.listdir(ROOT)
                        if d.startswith("trader-") and os.path.isfile(os.path.join(ROOT, d, "SKILL.md")))
         self.assertEqual(found, sorted(SKILLS))
@@ -67,21 +71,41 @@ class VendoredSkills(unittest.TestCase):
                 for bad in ("list[", "dict[", "tuple["):
                     self.assertNotRegex(src, r"(?<![\w.])%s" % re.escape(bad), "%s/%s" % (s, f))
 
-    def test_day_trading_limits_ship_in_the_example_config(self):
+    def _configs(self):
+        for name in ("config.example.json", "config.us.example.json"):
+            with open(os.path.join(ROOT, "trader-budget", name)) as fh:
+                yield name, json.load(fh)
+
+    def test_india_is_the_default_example_config(self):
         with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:
             cfg = json.load(fh)
-        for k in ("max_loss_per_trade_usd", "max_daily_loss_usd", "max_trades_per_day",
-                  "min_reward_risk", "require_stop", "no_entries_after", "flat_by"):
-            self.assertIn(k, cfg, k)
-        self.assertIs(cfg["require_stop"], True)
-        self.assertIs(cfg.get("allow_short", False), False)
-        self.assertIs(cfg.get("allow_margin", False), False)
+        self.assertEqual(MARKET.resolve(None, cfg).code, "IN")
+        self.assertIn("max_loss_per_trade_inr", cfg)
+        with open(os.path.join(ROOT, "trader-budget", "config.us.example.json")) as fh:
+            self.assertEqual(MARKET.resolve(None, json.load(fh)).code, "US")
+
+    def test_day_trading_limits_ship_in_the_example_configs(self):
+        for name, raw in self._configs():
+            cfg = MARKET.normalize_config(raw)
+            for k in ("max_loss_per_trade_usd", "max_daily_loss_usd", "max_trades_per_day",
+                      "min_reward_risk", "require_stop", "no_entries_after", "flat_by"):
+                self.assertIn(k, cfg, "%s: %s" % (name, k))
+            self.assertIs(cfg["require_stop"], True, name)
+            self.assertIs(cfg.get("allow_short", False), False, name)
+            self.assertIs(cfg.get("allow_margin", False), False, name)
 
     def test_paper_trading_is_the_default(self):
-        with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:
-            cfg = json.load(fh)
-        self.assertIs(cfg["paper"], True)
-        self.assertIs(cfg.get("allow_options", False), False)
+        for name, cfg in self._configs():
+            self.assertIs(cfg["paper"], True, name)
+            self.assertIs(cfg.get("allow_options", False), False, name)
+
+    def test_no_em_dashes_outside_fixtures(self):
+        for base, dirs, files in os.walk(ROOT):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for f in files:
+                if f.endswith((".md", ".py", ".json", ".txt")):
+                    with open(os.path.join(base, f), encoding="utf-8", errors="replace") as fh:
+                        self.assertNotIn("\u2014", fh.read(), os.path.join(base, f))
 
     def test_trader_workspace_is_git_ignored(self):
         # trader/ holds the user's budget, positions, state and SEC contact: never commit it
