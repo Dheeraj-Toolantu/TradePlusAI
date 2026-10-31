@@ -1,0 +1,11 @@
+{
+  "source": "Illustrative NSE weights for the weights mode (made up for the example: not an index, a fund or a recommendation)",
+  "as_of": "2026-11-02",
+  "weights": [
+    {"ticker": "RELIANCE", "name": "Reliance Industries", "weight": 25},
+    {"ticker": "HDFCBANK", "name": "HDFC Bank", "weight": 25},
+    {"ticker": "TCS", "name": "Tata Consultancy Services", "weight": 20},
+    {"ticker": "INFY", "name": "Infosys", "weight": 15},
+    {"ticker": "M&M", "name": "Mahindra & Mahindra", "weight": 15}
+  ]
+}

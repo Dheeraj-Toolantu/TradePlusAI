@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """Order tickets and the decision log for trader-broker. Standard library only.
 
+India first (NSE, IST, rupees, Groww). `--market US` (or "market": "US" in the
+config, or TRADER_MARKET=US) gives the original Alpaca / IBKR behaviour below.
+
+India and Groww:
+  - Claude never places a live Groww order. There is no Groww connector: the
+    ticket shows the order in plain words plus the exact Groww Trade API
+    place_order params, and YOU place it (Groww app, the Trade API with your own
+    GROWW_API_KEY / GROWW_API_SECRET, or TradePulse's own gated execution service).
+  - Groww has no paper account, so with "paper": true `simulate` records a
+    simulated fill in the same local ledger upstream keeps (trader/portfolio.json
+    and trader/state/broker.json), after your recorded yes.
+  - The bracket is legs: the entry, then an SL-M sell at the stop once it fills.
+    The target is not a resting order: trader-alerts rings, then you modify or
+    cancel the SL-M and sell (`flatten`).
+
+  simulate  (paper only) after your yes: records the order as placed on the
+            simulated account and the fill at its limit price (or --price).
+
 This tool never talks to a broker and never places anything. It does its
 work around the one moment that matters, your yes:
 
@@ -36,10 +54,26 @@ New York dates; --now "2026-10-19 10:15" pins the clock.
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import sys
+
+
+def _market_module():
+    name = "trader_market_shared"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-market", "market.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+market = _market_module()
 
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -55,8 +89,35 @@ DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "m
                "hold", "unless", "if"}
 
 
+FINGERPRINT_EXTRA = ("product", "groww")   # India orders only; US orders never carry them
+MK = None
+PLACE = "New York"
+CFG = {}          # the loaded config (India: charges overrides for the max loss)
+
+
 class TicketError(Exception):
     pass
+
+
+def apply_market(mk):
+    global MK, PLACE
+    MK = mk
+    PLACE = "New York" if mk.code == "US" else mk.tz_label
+    return mk
+
+
+def india():
+    return MK is not None and MK.code == "IN"
+
+
+apply_market(market.resolve())
+
+
+def _resolve(a, cfg):
+    try:
+        apply_market(market.resolve(getattr(a, "market", None), cfg if isinstance(cfg, dict) else {}))
+    except market.MarketError as e:
+        raise TicketError(str(e))
 
 
 # ---------------------------------------------------------------- time (New York, no tz files)
@@ -68,46 +129,43 @@ def _nth_sunday(year, month, n):
 
 
 def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
-    DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
-    first Sunday of November (US rule since 2007)."""
-    y = utc.year
-    start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
-    end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
-    naive = utc.replace(tzinfo=None)
-    return -4 if start <= naive < end else -5
+    """Hours from UTC for the active market's clock (upstream's name): New York -4 / -5
+    (US rule since 2007), India 5.5 all year."""
+    return MK.utc_offset(utc)
 
 
 def to_eastern(utc):
-    return utc.replace(tzinfo=None) + datetime.timedelta(hours=eastern_offset(utc))
+    """naive UTC -> naive exchange-local time (New York, or IST in India)."""
+    return MK.to_local(utc)
 
 
 def eastern_to_utc(local):
-    for off in (-4, -5):
-        utc = local - datetime.timedelta(hours=off)
-        if eastern_offset(utc) == off:
-            return utc
-    return local + datetime.timedelta(hours=5)
+    return MK.local_to_utc(local)
 
 
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """ISO time -> naive UTC. A time without an offset is taken as exchange-local time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
     t = text.strip().replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % PLACE)
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
 
 
 def ny_iso(now_utc):
-    """naive UTC -> "2026-10-19T10:15:00-04:00" (New York wall clock with its offset)."""
+    """naive UTC -> "2026-10-19T10:15:00-04:00" (exchange wall clock with its offset;
+    "2026-11-02T09:46:00+05:30" in India)."""
     off = eastern_offset(now_utc)
-    return "%s%+03d:00" % (to_eastern(now_utc).replace(microsecond=0).isoformat(), off)
+    local = to_eastern(now_utc).replace(microsecond=0).isoformat()
+    if off == int(off):
+        return "%s%+03d:00" % (local, off)
+    mins = int(round(abs(off) * 60))
+    return "%s%s%02d:%02d" % (local, "-" if off < 0 else "+", mins // 60, mins % 60)
 
 
 # ---------------------------------------------------------------- files
@@ -144,7 +202,7 @@ def rec_day(rec):
 
 def fingerprint(order):
     """Same function as trader-risk/check.py: identifies the exact order."""
-    core = {k: order[k] for k in ALPACA_FIELDS if k in order and order[k] is not None}
+    core = {k: order[k] for k in ALPACA_FIELDS + FINGERPRINT_EXTRA if k in order and order[k] is not None}
     blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -178,8 +236,22 @@ def tool_input(order):
 
 def _money(v):
     f = float(v)
+    if india():
+        s = MK.money(f)
+        return s[:-3] if s.endswith(".00") else s
     s = "{:,.2f}".format(f)
     return "$" + (s[:-3] if s.endswith(".00") else s)
+
+
+def _sym(x):
+    s = str(x or "").strip().upper()
+    return MK.plain_symbol(s) if india() else s
+
+
+def _charges(qty, buy, sell):
+    if not india() or not CFG.get("include_charges", True) or not qty:
+        return 0.0
+    return float(MK.charges(qty, buy, sell, CFG)["total"])
 
 
 def _p(v):
@@ -193,12 +265,24 @@ def is_bracket(order):
 
 
 def max_loss(order):
-    """(dollars, stop) lost if the stop fills exactly at the stop, or (None, stop)."""
+    """(dollars, stop) lost if the stop fills exactly at the stop, or (None, stop).
+    India: charges at the stop are included (when "include_charges")."""
     stop = _f(order.get("stop_loss_stop_price")) or _f((order.get("plan") or {}).get("stop"))
     q = _f(order.get("qty"))
     if not stop or not q:
         return None, stop
     plan = order.get("plan") or {}
+    if india():
+        if str(order.get("type", "market")) == "limit" and _f(order.get("limit_price")):
+            entry = _f(order["limit_price"])
+        elif _f(plan.get("max_loss")) is not None:
+            return round(_f(plan["max_loss"]), 2), stop
+        else:
+            entry = _f(plan.get("entry"))
+        if not entry:
+            return None, stop
+        gross = q * int(round(abs(entry - stop) * 100)) / 100.0
+        return round(gross + _charges(q, entry, stop), 2), stop
     if str(order.get("type", "market")) == "limit" and _f(order.get("limit_price")):
         entry = _f(order["limit_price"])
     elif _f(plan.get("max_loss")) is not None:
@@ -211,8 +295,37 @@ def max_loss(order):
     return round(q * int(round(risk * 100)) / 100.0, 2), stop
 
 
+def _india_parts(order):
+    """India: the bracket as the Groww legs, in plain words."""
+    side = str(order.get("side", "")).upper()
+    sym = order.get("symbol", "?")
+    typ = str(order.get("type", "market"))
+    prod = str(order.get("product") or ((order.get("groww") or {}).get("entry") or {}).get("product") or "MIS")
+    q = _str_num(order.get("qty"))
+    how = "limit %s" % _p(order["limit_price"]) if typ == "limit" and order.get("limit_price") else typ
+    parts = ["%s %s %s, %s, good for today, NSE %s" % (side, q, sym, how, prod)]
+    if is_bracket(order):
+        if order.get("stop_loss_stop_price") is not None:
+            parts.append("then, once it fills, SL-M sell %s at trigger %s (the stop-loss)"
+                         % (q, _p(order["stop_loss_stop_price"])))
+        if order.get("take_profit_limit_price") is not None:
+            parts.append("target %s is watched by trader-alerts, not a resting order"
+                         % _p(order["take_profit_limit_price"]))
+        loss, stop = max_loss(order)
+        if loss is not None:
+            incl = ""
+            ch = _f((order.get("plan") or {}).get("charges_at_stop"))
+            if ch and CFG.get("include_charges", True):
+                incl = " incl. %s charges" % _money(ch)
+            parts.append("max loss about %s%s if the stop fills at %s (it can fill worse in a fast market)"
+                         % (_money(loss), incl, _p(stop)))
+    return parts
+
+
 def plain_parts(order):
     """The ticket in plain words, one part per line."""
+    if india() and order.get("qty") is not None:
+        return _india_parts(order)
     side = str(order.get("side", "")).upper()
     sym = order.get("symbol", "?")
     typ = str(order.get("type", "market"))
@@ -282,9 +395,12 @@ def parse_yes(reply, order, batch_symbols=()):
         return False, "a yes covers one order at a time, not a batch"
     if DOUBT_WORDS & set(words[1:]):
         return False, "the reply has a condition or a doubt in it; ask again"
-    sym = str(order.get("symbol", "")).upper()
-    tokens = set(re.findall(r"[A-Z][A-Z.\-]{0,6}", raw.upper()))
-    others = {s.upper() for s in batch_symbols} - {sym}
+    sym = _sym(order.get("symbol", ""))
+    if india():
+        tokens = {_sym(t) for t in re.findall(r"[A-Z][A-Z0-9&.\-]{0,24}", raw.upper())}
+    else:
+        tokens = set(re.findall(r"[A-Z][A-Z.\-]{0,6}", raw.upper()))
+    others = {_sym(s) for s in batch_symbols} - {sym}
     named = tokens & others
     if named:
         return False, "the reply names %s, but this order is for %s" % (", ".join(sorted(named)), sym)
