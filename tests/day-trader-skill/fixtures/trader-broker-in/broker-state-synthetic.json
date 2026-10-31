@@ -1,0 +1,12 @@
+{
+  "orders": [
+    {"at": "2026-11-02T09:41:00+05:30", "date": "2026-11-02", "index": 1, "fingerprint": "synthetic0000001",
+     "symbol": "TCS", "side": "buy", "qty": "12", "kind": "entry", "max_loss": 498.6, "stop": 3055.0,
+     "plain": "BUY 12 TCS, limit 3095.00, good for today, NSE MIS", "status": "placed",
+     "broker_order_id": "GMK39038RDT490CCVRO"},
+    {"at": "2026-11-02T09:52:00+05:30", "date": "2026-11-02", "index": 1, "fingerprint": "synthetic0000002",
+     "symbol": "INFY", "side": "buy", "qty": "30", "kind": "entry", "max_loss": 498.6, "stop": 1480.0,
+     "plain": "BUY 30 INFY, limit 1496.50, good for today, NSE MIS", "status": "placed",
+     "broker_order_id": "GMK39038RDT490CCVRP"}
+  ]
+}

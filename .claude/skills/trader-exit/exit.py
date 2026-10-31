@@ -281,6 +281,16 @@ def money(x):
     return "$%s" % format(D(x).quantize(CENT), ",f")
 
 
+def amt(x):
+    """An exact amount in a sentence: $358.325 (upstream) or Rs 1,405.00 / Rs 1,401.177 in India."""
+    if is_us():
+        return "$%s" % num(x)
+    d = D(x)
+    if d == d.quantize(CENT):
+        return MK.money(float(d))
+    return MK.symbol + num(d)
+
+
 def tick_of(x):
     """The price step at x: 0.01 in the US; the NSE tick band in India."""
     if is_us():
@@ -381,7 +391,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         if stop_rule == "or_mid":
             raw = (oh + ol) / 2
             label = "opening-range midpoint"
-            detail = "(%s + %s) / 2 = %s%s" % (money(oh), money(ol), MK.symbol if not is_us() else "$", num(raw))
+            detail = "(%s + %s) / 2 = %s" % (money(oh), money(ol), amt(raw))
         else:
             raw, label = ol, "opening-range low"
     elif stop_rule == "price":
@@ -389,7 +399,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     elif stop_rule == "pct":
         raw = e * (1 - stop_param / 100)
         label = "%s%% under the entry" % num(stop_param)
-        detail = "%s x (1 - %s%%) = %s%s" % (money(e), num(stop_param), "$" if is_us() else MK.symbol, num(raw))
+        detail = "%s x (1 - %s%%) = %s" % (money(e), num(stop_param), amt(raw))
     elif stop_rule == "atr":
         if atr is None:
             raise PlanError("an atr stop needs the session's bars")
@@ -403,7 +413,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     stop = stop_px(raw)
     if stop != D(raw):
         how = "rounded down" if is_us() else "rounded down to the %s tick" % num(tick_of(raw))
-        detail = (detail + ", " + how if detail else "%s%s %s" % ("$" if is_us() else MK.symbol, num(raw), how))
+        detail = (detail + ", " + how if detail else "%s %s" % (amt(raw), how))
     if stop >= e:
         raise PlanError("the stop %s (%s) is at or above the entry %s: a long's stop goes under the entry"
                         % (money(stop), label, money(e)))
