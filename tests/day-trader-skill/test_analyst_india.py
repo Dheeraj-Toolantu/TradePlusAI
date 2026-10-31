@@ -203,5 +203,30 @@ class Cli(unittest.TestCase):
         facts.apply_market(facts.market.get("IN"))
 
 
+class CompanyName(unittest.TestCase):
+    def test_equity_list_cache_picks_the_right_reliance(self):
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "EQUITY_L.csv")
+            with open(csv_path, "w", newline="") as fh:
+                fh.write("SYMBOL,NAME OF COMPANY, SERIES, DATE OF LISTING\r\n"
+                         "RELINFRA,Reliance Infrastructure Limited,EQ,01-JAN-1995\r\n"
+                         "RELIANCE,Reliance Industries Limited,EQ,29-NOV-1995\r\n")
+            name = facts.company_name("reliance", os.path.join(d, "none.json"), csv_path)
+            self.assertEqual(name, "Reliance Industries Limited")
+            with open(os.path.join(DIR, "Financial_Results.xml"), "rb") as fh:
+                items = facts.parse_results_rss(fh.read())
+            pick = facts.latest_result_filing(items, "RELIANCE", name)
+            self.assertEqual(pick["title"], "Reliance Industries Limited")
+
+    def test_names_json_wins_and_missing_files_are_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            names = os.path.join(d, "names.json")
+            with open(names, "w") as fh:
+                json.dump({"TCS": "Tata Consultancy Services Limited"}, fh)
+            self.assertEqual(facts.company_name("TCS", names, os.path.join(d, "x.csv")),
+                             "Tata Consultancy Services Limited")
+            self.assertIsNone(facts.company_name("INFY", names, os.path.join(d, "x.csv")))
+
+
 if __name__ == "__main__":
     unittest.main()

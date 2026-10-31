@@ -753,6 +753,33 @@ def parse_results_rss(xml_bytes):
     return out
 
 
+EQUITY_CACHE = os.path.join("trader", "cache", "EQUITY_L.csv")
+NAMES_FILE = os.path.join("trader", "names.json")
+
+
+def company_name(symbol, names_file=NAMES_FILE, equity_csv=EQUITY_CACHE):
+    """The NSE company name for a symbol, from trader/names.json ({"RELIANCE": "Reliance
+    Industries Limited"}) or the scanner's cached EQUITY_L.csv. None when neither has it."""
+    sym = str(symbol or "").upper()
+    try:
+        with open(names_file, encoding="utf-8") as fh:
+            got = (json.load(fh) or {}).get(sym)
+        if got:
+            return got
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        import csv
+        with open(equity_csv, encoding="utf-8", errors="replace", newline="") as fh:
+            for row in csv.DictReader(fh):
+                row = dict(((k or "").strip().upper(), (v or "").strip()) for k, v in row.items())
+                if row.get("SYMBOL", "").upper() == sym and row.get("NAME OF COMPANY"):
+                    return row["NAME OF COMPANY"]
+    except OSError:
+        pass
+    return None
+
+
 def latest_result_filing(items, symbol, name=None):
     """The newest feed item for the company, with "also_matched": other company names that
     matched the symbol too (RELIANCE could be Reliance Infrastructure: pass --name)."""
@@ -888,7 +915,10 @@ def run_india(args):
             print("facts: %s: %s" % (sym, exc), file=sys.stderr)
             failed += 1
             continue
-        filing = latest_result_filing(items, sym, args.name) if items else None
+        # an exact company name beats a symbol match (RELIANCE is also the start of Reliance
+        # Infrastructure): --name, then trader/names.json, then the scanner's EQUITY_L.csv cache
+        known = args.name or company_name(sym)
+        filing = latest_result_filing(items, sym, known) if items else None
         if filing and not args.name and not filing.get("also_matched"):
             result["entity"] = filing["title"]
         results.append({"ticker": sym, "result": result, "filing": filing,

@@ -78,7 +78,9 @@ class TheReel(unittest.TestCase):
 
     def test_config_example_is_the_contract(self):
         with open(CFG) as fh:
-            self.assertEqual(json.load(fh), CONTRACT_CFG)
+            cfg = json.load(fh)
+        self.assertEqual(cfg.pop("market", None), "US")  # TradePulse: the US example names its market
+        self.assertEqual(cfg, CONTRACT_CFG)
 
     def test_tsla_is_8_shares_bound_by_the_max_loss(self):
         s = size.size_trade(plan(), cfg(), today=TODAY)

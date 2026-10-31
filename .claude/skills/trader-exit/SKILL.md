@@ -165,5 +165,8 @@ make a plan pass, and never calls a stop a guarantee.
   passed that exact order today, the user typed an explicit yes for that one order in the chat, and the
   user clicked Allow once on Claude's own card because the order tool is set to "Needs approval"
   (Customize > Connectors > tool permissions). Never set an order tool to "Always allow".
+- India (Groww): there is no order connector, so Claude never places a live order. Paper fills are
+  simulated locally. A live order is placed by the user, in the Groww app or Trade API or through
+  TradePulse's own execution service with its PIN, kill switch and LIVE_* limits.
 - No options, margin, short selling or leverage unless the config allows it and the user confirms.
 - Broker keys live in environment variables or the Claude Desktop config, never in the chat.

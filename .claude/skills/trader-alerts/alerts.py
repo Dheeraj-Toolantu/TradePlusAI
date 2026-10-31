@@ -790,7 +790,10 @@ def cmd_add(a):
         for r in new:
             print("Added %s: %s" % (r["id"], json.dumps(r)))
         print("Run alerts.py check every few minutes while the trade is open (a scheduled task or /loop). "
-              "Free quotes are delayed; the broker's bracket orders are what actually stop you out.")
+              + ("Free quotes are delayed; the SL-M stop order at the broker is what actually stops you out, "
+                 "and the target alert is your cue to cancel it and sell."
+                 if MK.code == "IN" else
+                 "Free quotes are delayed; the broker's bracket orders are what actually stop you out."))
         return 0
     if a.opening_bell:
         rule = {"id": a.id or "opening-bell", "type": "opening_bell"}
