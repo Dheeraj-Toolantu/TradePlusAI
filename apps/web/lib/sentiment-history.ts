@@ -95,12 +95,44 @@ export function detectReversals(instruments: Instrument[], state: HistoryState, 
   return { reversals, next };
 }
 
-const store = globalThis as typeof globalThis & { __tradepulseSentimentHistory?: HistoryState | null; __tradepulseSentimentRecording?: Promise<RecordResult> | null };
+export type RecorderStatus = {
+  attempts: number; failures: number; lastAttemptAt: string | null; lastRecordedAt: string | null; lastSnapshotId: string | null; lastError: string | null; lastErrorAt: string | null;
+};
+const store = globalThis as typeof globalThis & {
+  __tradepulseSentimentHistory?: HistoryState | null; __tradepulseSentimentRecording?: Promise<RecordResult> | null; __tradepulseSentimentRecorder?: RecorderStatus;
+};
 const firestoreId = (value: string) => value.replace(/[/.:+]/g, "-");
+
+/**
+ * Firestore calls through the client SDK wait for the server's acknowledgement and, when the
+ * backend can't be reached, retry without ever settling. A hung write used to hold the single
+ * in-flight recording forever, so nothing was saved again until a restart; every call now has a
+ * deadline.
+ */
+export const FIRESTORE_TIMEOUT_MS = 20_000;
+function withTimeout<T>(work: Promise<T>, what: string, ms = FIRESTORE_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Firestore ${what} timed out after ${Math.round(ms / 1000)}s`)), ms); });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+/** Firestore rejects a whole document if any field is `undefined`; drop those fields (and non-finite numbers become null). */
+export function firestoreSafe<T>(value: T): T {
+  if (Array.isArray(value)) return value.filter((item) => item !== undefined).map((item) => firestoreSafe(item)) as T;
+  if (typeof value === "number") return (Number.isFinite(value) ? value : null) as T;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined).map(([key, item]) => [key, firestoreSafe(item)])) as T;
+  }
+  return value;
+}
+
+const recorder = (): RecorderStatus => (store.__tradepulseSentimentRecorder ??= { attempts: 0, failures: 0, lastAttemptAt: null, lastRecordedAt: null, lastSnapshotId: null, lastError: null, lastErrorAt: null });
+/** What the recorder last did: shown on the page so an empty history says why. */
+export const recorderStatus = (): RecorderStatus => ({ ...recorder() });
 
 async function loadState(): Promise<HistoryState> {
   if (store.__tradepulseSentimentHistory) return store.__tradepulseSentimentHistory;
-  const snapshot = await getDoc(doc(db, STATE, "latest"));
+  const snapshot = await withTimeout(getDoc(doc(db, STATE, "latest")), "read of sentimentState/latest");
   const data = snapshot.exists() ? (snapshot.data() as Partial<HistoryState>) : {};
   return { lastSlot: data.lastSlot ?? null, lastScanAt: data.lastScanAt ?? null, instruments: data.instruments ?? {} };
 }
@@ -122,14 +154,16 @@ async function record(scan: IndexSentiment, now: Date): Promise<RecordResult> {
   }
   const snapshotId = reasons.includes("SCHEDULED") ? slot : `${slotId(now, 1)}-reversal`;
   const recordedAt = now.toISOString();
-  await setDoc(doc(db, SNAPSHOTS, snapshotId), {
+  await withTimeout(setDoc(doc(db, SNAPSHOTS, snapshotId), firestoreSafe({
     id: snapshotId, slot, date: istDate(now), time: istTime(now), recordedAt, scanAt, reasons,
     reversals: reversals.map((item) => ({ instrument: item.instrument, type: item.type, from: item.from, to: item.to })),
     indices: Object.fromEntries(instruments.filter((item) => item.kind === "INDEX").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra }])),
     commodities: Object.fromEntries(instruments.filter((item) => item.kind === "COMMODITY").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra }])),
-  }, { merge: true });
-  for (const reversal of reversals) await setDoc(doc(db, REVERSALS, firestoreId(reversal.id)), { ...reversal, date: istDate(now), time: istTime(now), recordedAt, snapshotId });
-  await setDoc(doc(db, STATE, "latest"), { ...nextState, updatedAt: recordedAt });
+  }), { merge: true }), `write of snapshot ${snapshotId}`);
+  for (const reversal of reversals) {
+    await withTimeout(setDoc(doc(db, REVERSALS, firestoreId(reversal.id)), firestoreSafe({ ...reversal, date: istDate(now), time: istTime(now), recordedAt, snapshotId })), "write of a reversal");
+  }
+  await withTimeout(setDoc(doc(db, STATE, "latest"), firestoreSafe({ ...nextState, updatedAt: recordedAt })), "write of sentimentState/latest");
   store.__tradepulseSentimentHistory = nextState;
   return { recorded: true, snapshotId, reasons, reversals, scanAt };
 }
@@ -139,14 +173,33 @@ async function record(scan: IndexSentiment, now: Date): Promise<RecordResult> {
  * Meant to be called about once a minute (the API server does); calls in between are cheap no-ops.
  */
 export function recordSentiment(scan: IndexSentiment, now = new Date()): Promise<RecordResult> {
-  store.__tradepulseSentimentRecording ??= record(scan, now).finally(() => { store.__tradepulseSentimentRecording = null; });
+  store.__tradepulseSentimentRecording ??= record(scan, now)
+    .then((result) => { noteRecorder(result); return result; }, (error: unknown) => { noteRecorder(error); throw error; })
+    .finally(() => { store.__tradepulseSentimentRecording = null; });
   return store.__tradepulseSentimentRecording;
+}
+
+/** Track every recording attempt (including a failed scan before it reaches Firestore). */
+export function noteRecorder(outcome: RecordResult | unknown, at = new Date()): void {
+  const status = recorder();
+  status.attempts += 1;
+  status.lastAttemptAt = at.toISOString();
+  const result = outcome as Partial<RecordResult> | null;
+  if (result && typeof result === "object" && "recorded" in result && !result.error) {
+    if (result.recorded) { status.lastRecordedAt = at.toISOString(); status.lastSnapshotId = result.snapshotId ?? null; }
+    status.lastError = null;
+    return;
+  }
+  status.failures += 1;
+  status.lastError = outcome instanceof Error ? outcome.message : result?.error ?? String(outcome);
+  status.lastErrorAt = at.toISOString();
 }
 
 /** Test hook: forget the cached state so the next call reads Firestore again. */
 export function resetSentimentHistoryCache(): void {
   store.__tradepulseSentimentHistory = null;
   store.__tradepulseSentimentRecording = null;
+  store.__tradepulseSentimentRecorder = undefined;
 }
 
 export type HistoryReading = { name: string; score: number | null; label: string; price: number | null; change_pct: number | null; [key: string]: unknown };
@@ -163,15 +216,28 @@ const newestFirst = <T extends { recordedAt?: unknown }>(rows: T[]) => rows.sort
 
 /**
  * Latest snapshots and reversals, newest first. With `date` ("2026-10-21", IST) only that day's,
- * read by an equality filter and sorted here, so Firestore needs no composite index.
+ * read by an equality filter and sorted here, so Firestore needs no composite index. Snapshots
+ * saved before `date` was stored are found by their `recordedAt` instead. A failed reversals read
+ * doesn't hide the snapshots; it comes back as a warning.
  */
-export async function recentHistory(count = 20, date?: string): Promise<{ snapshots: StoredSnapshot[]; reversals: StoredReversal[] }> {
+export async function recentHistory(count = 20, date?: string): Promise<{ snapshots: StoredSnapshot[]; reversals: StoredReversal[]; warnings: string[] }> {
   const size = Math.max(1, Math.min(200, count));
+  const rowsOf = (result: { docs: Array<{ id: string; data(): unknown }> }) => result.docs.map((item) => ({ ...(item.data() as object), id: item.id }) as { id: string; recordedAt?: unknown; date?: unknown });
   const read = async <T,>(name: string) => {
-    const result = await getDocs(date ? query(collection(db, name), where("date", "==", date)) : query(collection(db, name), orderBy("recordedAt", "desc"), limit(size)));
-    const rows = result.docs.map((item) => ({ ...item.data(), id: item.id }) as { id: string; recordedAt?: unknown });
-    return newestFirst(rows).slice(0, date ? 200 : size) as unknown as T[];
+    if (!date) return newestFirst(rowsOf(await withTimeout(getDocs(query(collection(db, name), orderBy("recordedAt", "desc"), limit(size))), `read of ${name}`))).slice(0, size) as unknown as T[];
+    // The IST day runs from 18:30 UTC the evening before to 18:30 UTC.
+    const start = new Date(new Date(`${date}T00:00:00Z`).getTime() - 330 * 60_000).toISOString();
+    const end = new Date(new Date(start).getTime() + 86_400_000).toISOString();
+    const [byDate, byTime] = await Promise.all([
+      withTimeout(getDocs(query(collection(db, name), where("date", "==", date))), `read of ${name}`),
+      withTimeout(getDocs(query(collection(db, name), where("recordedAt", ">=", start), where("recordedAt", "<", end))), `read of ${name}`).catch(() => null),
+    ]);
+    const merged = new Map<string, { id: string; recordedAt?: unknown; date?: unknown }>();
+    for (const row of [...rowsOf(byDate), ...(byTime ? rowsOf(byTime) : [])]) if (row.date === undefined || row.date === date) merged.set(row.id, row);
+    return newestFirst([...merged.values()]).slice(0, 200) as unknown as T[];
   };
-  const [snapshots, reversals] = await Promise.all([read<StoredSnapshot>(SNAPSHOTS), read<StoredReversal>(REVERSALS)]);
-  return { snapshots, reversals };
+  const [snapshots, reversals] = await Promise.allSettled([read<StoredSnapshot>(SNAPSHOTS), read<StoredReversal>(REVERSALS)]);
+  if (snapshots.status === "rejected") throw snapshots.reason;
+  const warnings = reversals.status === "rejected" ? [`Reversals unavailable: ${reversals.reason instanceof Error ? reversals.reason.message : String(reversals.reason)}`] : [];
+  return { snapshots: snapshots.value, reversals: reversals.status === "fulfilled" ? reversals.value : [], warnings };
 }
