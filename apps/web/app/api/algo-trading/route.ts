@@ -9,6 +9,7 @@ import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/gr
 import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-intel";
 import { DAILY_RISK_RULES, evaluateDailyRisk } from "../../../lib/daily-risk";
 import { getScalper } from "../../../lib/scalper-instance";
+import { ensureScalperMonitor } from "../../../lib/scalper-monitor";
 import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import {
   saveOrderToFirestore,
@@ -31,6 +32,8 @@ const rrOf = (value: unknown) => (String(value ?? "").replace(/\s/g, "") === "1:
 // Tick rounding may shave up to 3% off the chosen ratio on the premium (same as the engine).
 const scalpMinimumRr = (value: unknown) => (rrOf(value) === "1:1" ? 0.97 : 1.94);
 type ScalpOptions = { riskReward?: string; maxLossPerTrade?: number; maxLots?: number };
+// The Smart Scalper's fill slippage (per side). The scalper plans with the same number it fills with.
+const SCALPER_SLIPPAGE = Number(process.env.SCALPER_SLIPPAGE_PCT ?? 0.3) / 100;
 
 type RecordValue = Record<string, unknown>;
 
@@ -168,7 +171,11 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
   if (!scalping) return runPythonEngine(payload);
   // Pass 1 reads the tape and picks the strike from the OI data; pass 2 adds that premium's own
   // 1-minute candles for its volume profile.
-  Object.assign(payload, await scalpInputs(origin, intel ?? { symbol }), { risk_reward: rrOf(scalp.riskReward), max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null });
+  // The tape is read on the near-month future's own OHLCV (true VWAP); without it VWAP fails closed.
+  Object.assign(payload, await scalpInputs(origin, intel ?? { symbol }), {
+    risk_reward: rrOf(scalp.riskReward), max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null,
+    futures_candles: Array.isArray(history.futuresCandles) ? history.futuresCandles : [], slippage_pct: SCALPER_SLIPPAGE,
+  });
   const first = await runPythonEngine(payload);
   const contract = typeof first.needs_premium_candles === "string" ? first.needs_premium_candles : null;
   if (!contract) return first;
@@ -439,6 +446,7 @@ function toScalperContract(value: RecordValue): ScalperContract {
 
 type ScalpSetup = {
   side: "BUY" | "SELL"; entry: number; stop_loss: number; target: number; risk_reward: number; rr_choice: string; lots: number; quantity: number; setup_id: string; cost_per_unit?: number;
+  max_entry: number; max_target: number; min_risk_reward: number; stop_gap: number; fees_at_stop_per_lot: number; slippage_pct: number;
   contract: { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string | null; lot_size?: number | null };
   spot: { entry: number; stop: number; target: number };
 };
@@ -481,8 +489,12 @@ async function placeOnScalper(body: RecordValue, origin: string) {
     reason: `VWAP-EMA scalper ${setup.rr_choice}: ${setup.side === "BUY" ? "long" : "short"} ${underlying}, index stop ${setup.spot.stop} / target ${setup.spot.target}`,
     // Staged, cost-covered trail: breakeven at +0.5R, lock +0.5R at +1R, trail 0.6R beyond.
     trail: { rule: "VWAP_EMA", costPerUnit: Number(setup.cost_per_unit) || 0 },
+    // Re-plan on the actual fill: refuse beyond max_entry, re-check R:R, re-size on stressed risk.
+    risk: { maxEntry: setup.max_entry, maxTarget: setup.max_target, minRiskReward: setup.min_risk_reward, stopGap: setup.stop_gap, feesAtStopPerLot: setup.fees_at_stop_per_lot, lotSize: lot },
   };
   const result = await getScalper().place(underlying, plan, contracts, { setupId: setup.setup_id, settings, entryBlockedReason });
+  // Exits are managed on the server from here on, whether or not a browser stays open.
+  if (result.placed) ensureScalperMonitor(origin);
   return NextResponse.json({ ...result, setup }, { status: result.placed ? 200 : 409 });
 }
 

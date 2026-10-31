@@ -102,10 +102,18 @@ class ScalpConfig:
     max_risk_atr: float = 1.50  # a stop wider than this is not a scalp
     hold_minutes: float = 10.0
     max_cost_share: float = 0.25
-    # Liquid ATM index options: slippage beyond the spread is small. Groww's chain has no live
-    # bid/ask (the route estimates the spread from IV), so the estimate is capped per side.
-    slippage_pct: float = 0.0015
+    # Adverse slippage per side beyond the spread. The route passes the Smart Scalper's own fill
+    # slippage (SCALPER_SLIPPAGE_PCT, 0.3% by default) so the plan and the fills use the same number.
+    # Groww's chain has no live bid/ask (the route estimates the spread from IV), so it is capped.
+    slippage_pct: float = 0.003
     max_half_spread_pct: float = 0.005
+    # Stressed risk: a stop can fill through its price between checks. Allow the larger of 2 ticks
+    # and 10% of the premium risk on top of the adverse entry and exit slippage.
+    stop_gap_risk_share: float = 0.10
+    stop_gap_min_ticks: int = 2
+    # The live fill may sit at most this share of the premium risk (or 2 ticks) above the planned
+    # entry; beyond that the plan is stale and the trade is refused.
+    fill_tolerance_risk_share: float = 0.20
     rr_tolerance: float = 0.03  # tick rounding may shave up to 3% off the chosen ratio
     tick: float = 0.05
     max_loss_per_trade: float = 1500.0
@@ -400,22 +408,57 @@ def read_oi(flow: dict | None, side: str, spot: float, target_points: float | No
     return points, "; ".join(parts), detail
 
 
+PCR_ZONES = {
+    "STRETCHED_LOW": "stretched low: call writers crowded, reversal risk (no trades)",
+    "BEARISH": "bearish: call writing dominates (shorts only)",
+    "NEUTRAL": "balanced (either side; the 5-minute PCR change decides)",
+    "BULLISH": "bullish: put writing supports (longs only)",
+    "STRETCHED_HIGH": "stretched high: put writers crowded, reversal risk (no trades)",
+}
+
+
+def pcr_zone(pcr: float, config: ScalpConfig) -> str:
+    """The PCR zone, with explicit boundaries (defaults shown):
+
+        STRETCHED_LOW   pcr <  0.50
+        BEARISH         0.50 <= pcr <  0.80     shorts only
+        NEUTRAL         0.80 <= pcr <= 1.20     longs or shorts, decided by the 5-minute PCR change
+        BULLISH         1.20 <  pcr <= 1.60     longs only
+        STRETCHED_HIGH  pcr >  1.60
+
+    A long needs NEUTRAL or BULLISH and a PCR that is not falling (change >= 0); a short needs
+    BEARISH or NEUTRAL and a PCR that is not rising (change <= 0). A missing change does not block.
+    """
+    if pcr < config.pcr_stretched_low:
+        return "STRETCHED_LOW"
+    if pcr < config.pcr_bull_min:
+        return "BEARISH"
+    if pcr <= config.pcr_bear_max:
+        return "NEUTRAL"
+    if pcr <= config.pcr_stretched_high:
+        return "BULLISH"
+    return "STRETCHED_HIGH"
+
+
 def read_pcr(flow: dict | None, side: str, config: ScalpConfig) -> tuple[int, str, dict]:
     pcr = _num((flow or {}).get("pcr_oi"))
     change = _num((flow or {}).get("pcr_change_5m"))
-    info = {"pcr": _r(pcr), "pcr_change_5m": _r(change, 3)}
+    info = {"pcr": _r(pcr), "pcr_change_5m": _r(change, 3), "zone": None}
     if pcr is None:
         return 0, "PCR unavailable", info
-    if pcr > config.pcr_stretched_high or pcr < config.pcr_stretched_low:
-        return 0, f"PCR {pcr:.2f} is stretched (outside {config.pcr_stretched_low}-{config.pcr_stretched_high}): reversal risk", info
-    if side == "CE":
-        ok = pcr >= config.pcr_bull_min and (change is None or change >= 0)
-        need = f"needs {config.pcr_bull_min}+ and not falling"
-    else:
-        ok = pcr <= config.pcr_bear_max and (change is None or change <= 0)
-        need = f"needs {config.pcr_bear_max} or less and not rising"
+    zone = pcr_zone(pcr, config)
+    info["zone"] = zone
     trend = "" if change is None else f", {change:+.3f} in 5m"
-    return int(ok), f"PCR {pcr:.2f}{trend}" + ("" if ok else f" ({need})"), info
+    if zone.startswith("STRETCHED"):
+        return 0, f"PCR {pcr:.2f}{trend}: {PCR_ZONES[zone]}", info
+    if side == "CE":
+        zone_ok, change_ok = zone in ("NEUTRAL", "BULLISH"), change is None or change >= 0
+        need = "a long needs PCR 0.80-1.60 (neutral or bullish zone)" if not zone_ok else "a long needs a PCR that is not falling"
+    else:
+        zone_ok, change_ok = zone in ("BEARISH", "NEUTRAL"), change is None or change <= 0
+        need = "a short needs PCR 0.50-1.20 (bearish or neutral zone)" if not zone_ok else "a short needs a PCR that is not rising"
+    ok = zone_ok and change_ok
+    return int(ok), f"PCR {pcr:.2f}{trend}, {PCR_ZONES[zone]}" + ("" if ok else f": {need}"), info
 
 
 def read_vix(vix: dict | None, config: ScalpConfig) -> tuple[int, str, dict]:
@@ -455,59 +498,104 @@ def read_profile(premium_candles: list[CandleLike], config: ScalpConfig) -> tupl
     return 0, f"Premium {last.close:.2f} above POC {profile['poc']:.2f} but inside value (VAH {profile['vah']:.2f}) without a volume burst", profile
 
 
+def index_move_for(gain: float, delta: float, gamma: float) -> float:
+    """Index points x that move the premium by ``gain``: solve |delta|·x + ½·gamma·x² = gain."""
+    if gain <= 0:
+        return 0.0
+    if gamma <= 1e-12:
+        return gain / max(delta, 1e-6)
+    return (-delta + math.sqrt(delta * delta + 2.0 * gamma * gain)) / gamma
+
+
 def premium_plan(selected: dict, spot: float, tape: dict, rr: float, symbol: str, now: datetime, config: ScalpConfig) -> dict:
-    """Map the index-point stop and target onto the premium with delta and gamma, net of charges."""
+    """The premium plan, with R measured from the EXPECTED FILL.
+
+    The stop comes from the index structure: the premium where the index stop would leave it,
+    mapped with delta and gamma from the market premium (|delta|·R − ½·gamma·R² + theta drag).
+    The entry is what the scalper actually pays: the ask plus its adverse slippage. R is that fill
+    minus the stop, and the target is fill + k·R, so 1:1 / 1:2 hold on the real fill. The index move
+    the target needs is solved back through delta and gamma (it is a little more than k index R,
+    because the fill pays the spread and slippage) and checked against the OI wall.
+    """
     side = selected["type"]
     d = 1 if side == "CE" else -1
     risk_points = float(tape["risk_points"])
-    target_points = risk_points * rr
-    entry = selected["ask"] if selected.get("ask") and selected["ask"] > 0 else selected["premium"]
+    market = float(selected["premium"])
+    ask = selected["ask"] if selected.get("ask") and selected["ask"] > 0 else market
     delta = abs(float(selected["delta"]))
     years = years_to_expiry(selected.get("expiry"), now)
     sigma = (selected.get("iv") or 0) / 100.0
     if (sigma <= 0) and years:
-        sigma = premium_math.implied_vol(selected["premium"], spot, selected["strike"], years, side) or 0.0
+        sigma = premium_math.implied_vol(market, spot, selected["strike"], years, side) or 0.0
     greeks = premium_math.bs_greeks(spot, selected["strike"], years, sigma, side) if years and sigma > 0 else None
     gamma = greeks["gamma"] if greeks else 0.0
     theta = selected.get("theta")
     theta_day = abs(float(theta)) if theta not in (None, 0) else abs(greeks["theta"]) if greeks else 0.0
     drag = theta_day * config.hold_minutes / TRADING_MINUTES_PER_DAY
-    loss = delta * risk_points - 0.5 * gamma * risk_points ** 2 + drag
-    gain = delta * target_points + 0.5 * gamma * target_points ** 2 - drag
     tick = selected.get("tick_size") or config.tick
-    stop = _tick_round(entry - loss, tick)
-    target = _tick_round(entry + gain, tick)
+    slip = config.slippage_pct
+    entry = _tick_round(ask * (1.0 + slip), tick, "up")  # the expected fill
+    loss = delta * risk_points - 0.5 * gamma * risk_points ** 2 + drag
+    stop = _tick_round(market - loss, tick)
+    risk_unit = entry - stop
+    target = _tick_round(entry + rr * max(risk_unit, 0.0), tick, "up")
+    gain_needed = target - market + drag  # premium the index move must add, from the market premium
+    target_points = index_move_for(gain_needed, delta, gamma)
     lot = int(selected.get("lot_size") or FALLBACK_LOT.get(symbol, 1))
-    half_spread = min(max(((selected.get("ask") or entry) - (selected.get("bid") or entry)) / 2.0, 0.0), entry * config.max_half_spread_pct)
-    costs = premium_math.PremiumConfig(slippage_pct=config.slippage_pct)
-    at_target = premium_math.round_trip_costs(entry, target, lot, half_spread, costs)["total"]
-    at_stop = premium_math.round_trip_costs(entry, max(stop, tick), lot, half_spread, costs)["total"]
-    risk_unit, reward_unit = entry - stop, target - entry
+    half_spread = min(max(((selected.get("ask") or market) - (selected.get("bid") or market)) / 2.0, 0.0), market * config.max_half_spread_pct)
+    # Fees, plus the exit half-spread (a sell fills at the bid; the entry's spread is already in the
+    # ask-based fill). The entry slippage is in the fill; the exit slippage is modelled below.
+    fees = premium_math.PremiumConfig(slippage_pct=0.0)
+    fees_target = premium_math.round_trip_costs(entry, target, lot, 0.0, fees)["total"] + half_spread * lot
+    fees_stop = premium_math.round_trip_costs(entry, max(stop, tick), lot, 0.0, fees)["total"] + half_spread * lot
+    slip_target = slip * target * lot  # the exit sell fills below
+    slip_stop = slip * max(stop, tick) * lot
+    at_target = round(fees_target + slip_target, 2)
+    at_stop = round(fees_stop + slip_stop, 2)
+    reward_unit = target - entry
+    stop_gap = max(config.stop_gap_min_ticks * tick, config.stop_gap_risk_share * max(risk_unit, 0.0))
     plan = {
         "spot_entry": round(spot, 2), "spot_stop": round(spot - risk_points * d, 2), "spot_target": round(spot + target_points * d, 2),
-        "risk_points": round(risk_points, 2), "target_points": round(target_points, 2), "rr_choice": rr,
-        "entry": round(entry, 2), "stop_loss": stop, "target": target, "lot_size": lot,
+        "risk_points": round(risk_points, 2), "target_points": round(target_points, 2), "structural_target_points": round(risk_points * rr, 2), "rr_choice": rr,
+        "market_premium": round(market, 2), "ask": round(ask, 2), "entry": entry, "stop_loss": stop, "target": target, "lot_size": lot,
         "greeks": {"delta": round(delta, 3), "gamma": round(gamma, 6), "theta_per_day": round(theta_day, 2), "iv": round(sigma * 100, 2) if sigma else None},
         "theta_drag": round(drag, 2),
-        "premium_loss_delta_only": round(delta * risk_points, 2), "premium_gain_delta_only": round(delta * target_points, 2),
+        "premium_loss_delta_only": round(delta * risk_points, 2), "premium_gain_needed": round(gain_needed, 2),
         "gamma_effect": {"on_loss": round(-0.5 * gamma * risk_points ** 2, 2), "on_gain": round(0.5 * gamma * target_points ** 2, 2)},
-        "costs_per_lot": {"at_target": at_target, "at_stop": at_stop},
+        "spread_paid": round(ask - market, 2), "entry_slippage": round(entry - ask, 2),
+        "costs_per_lot": {"at_target": at_target, "at_stop": at_stop, "fees_at_target": round(fees_target, 2), "fees_at_stop": round(fees_stop, 2),
+                          "slippage_at_target": round(slip_target, 2), "slippage_at_stop": round(slip_stop, 2),
+                          "entry_slippage": round((entry - ask) * lot, 2), "half_spread": round(half_spread, 2)},
+        "slippage_pct": slip, "stop_gap": round(stop_gap, 2),
         "valid": True, "reason": "",
     }
     if risk_unit <= 0 or stop < tick or reward_unit <= 0:
         plan.update(valid=False, reason="Premium stop or target is not on the right side of the entry")
         return plan
     plan["risk_reward"] = round(reward_unit / risk_unit, 2)
-    plan["net_risk_reward"] = round((reward_unit * lot - at_target) / (risk_unit * lot + at_stop), 2)
-    plan["cost_share"] = round(at_target / (reward_unit * lot), 3)
-    risk_lot = risk_unit * lot + at_stop
-    lots = min(config.max_lots, int(config.max_loss_per_trade // risk_lot)) if risk_lot > 0 else 0
-    plan.update(lots=lots, quantity=lots * lot, risk_per_lot=round(risk_lot, 2), reward_per_lot=round(reward_unit * lot - at_target, 2),
-                max_loss=round(risk_lot * lots, 2))
+    # Planned loss: from the actual (expected) fill to the stop, plus fees and the exit slippage.
+    planned_lot = risk_unit * lot + at_stop
+    # Stressed loss: the planned loss plus a stop filled through its price (stop gap).
+    stressed_lot = planned_lot + stop_gap * lot
+    plan["net_risk_reward"] = round((reward_unit * lot - at_target) / planned_lot, 2)
+    plan["stressed_risk_reward"] = round((reward_unit * lot - at_target) / stressed_lot, 2)
+    # Charges, the exit slippage AND what the fill paid above the market (spread + entry slippage).
+    plan["cost_share"] = round((at_target + (entry - market) * lot) / ((target - market) * lot), 3) if target > market else 1.0
+    # Size on the STRESSED loss, so a gap through the stop still fits the max loss per trade.
+    lots = min(config.max_lots, int(config.max_loss_per_trade // stressed_lot)) if stressed_lot > 0 else 0
+    tolerance = max(2 * tick, config.fill_tolerance_risk_share * risk_unit)
+    worst_entry = _tick_round(entry + tolerance, tick, "down")
+    # At the worst accepted fill the target is re-derived (fill + k·R); the OI wall may cap it
+    # further once it is known (analyze_scalp).
+    max_target = _tick_round(worst_entry + rr * (worst_entry - stop), tick, "up")
+    plan.update(lots=lots, quantity=lots * lot, risk_per_lot=round(planned_lot, 2), stressed_risk_per_lot=round(stressed_lot, 2),
+                reward_per_lot=round(reward_unit * lot - at_target, 2), planned_max_loss=round(planned_lot * lots, 2), max_loss=round(stressed_lot * lots, 2),
+                fill_tolerance=round(tolerance, 2), max_entry=worst_entry, max_target=max_target,
+                fees_at_stop_per_lot=round(fees_stop, 2))
     if plan["cost_share"] > config.max_cost_share:
-        plan.update(valid=False, reason=f"Charges take {plan['cost_share'] * 100:.0f}% of the reward (max {config.max_cost_share * 100:.0f}%): too small a move to scalp")
+        plan.update(valid=False, reason=f"Charges and slippage take {plan['cost_share'] * 100:.0f}% of the reward (max {config.max_cost_share * 100:.0f}%): too small a move to scalp")
     elif lots < 1:
-        plan.update(valid=False, reason=f"One lot risks ₹{risk_lot:.0f} including charges, more than the ₹{config.max_loss_per_trade:.0f} max loss per trade")
+        plan.update(valid=False, reason=f"One lot risks ₹{stressed_lot:.0f} stressed (₹{planned_lot:.0f} planned + stop gap), more than the ₹{config.max_loss_per_trade:.0f} max loss per trade")
     return plan
 
 
@@ -517,9 +605,11 @@ def config_for(context: dict) -> ScalpConfig:
     base = ScalpConfig()
     loss = _num(context.get("max_loss_per_trade"))
     lots = _num(context.get("max_lots"))
+    slip = _num(context.get("slippage_pct"))
     return ScalpConfig(
         max_loss_per_trade=loss if loss and loss > 0 else base.max_loss_per_trade,
         max_lots=max(1, int(lots)) if lots and lots >= 1 else base.max_lots,
+        slippage_pct=slip if slip is not None and 0 <= slip < 0.05 else base.slippage_pct,
     )
 
 
@@ -530,24 +620,36 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
     chain_wrap = context.get("option_chain") or {}
     chain = chain_wrap.get("contracts") or []
     flow = context.get("options_flow") or None
-    tape = read_tape(candles, config)
+    # True VWAP needs one instrument's own price AND volume. The index has no traded volume, so the
+    # tape (VWAP, EMAs, ATR, trigger, structural stop) is read on the near-month FUTURE's 1-minute
+    # OHLCV. Points on the future and on the index move together intraday (the basis is near
+    # constant), so the stop and target distances carry over; index levels = future levels − basis.
+    futures = list(context.get("futures_candles") or [])
+    tape_candles = futures if futures else candles
+    tape = read_tape(tape_candles, config)
+    tape["source"] = "FUTURES" if futures else "INDEX"
     calc: dict = {"rr_choice": rr_label, "tape": {k: (_r(v) if isinstance(v, float) else v) for k, v in tape.items() if k not in ("trigger",)},
                   "trigger": tape.get("trigger"), "criteria": [], "candidates": [], "selected": None, "plan": None, "profile": None}
     side = tape.get("side")
     if side is None:
         return {**base, "decision": "WAIT_FOR_CONFIRMATION", "reason": tape.get("reason", "No side"), "scalp": calc}
     d = 1 if side == "CE" else -1
-    spot = float(chain_wrap.get("spot") or tape.get("close") or 0)
+    index_close = candles[-1].close if candles else None
+    spot = float(chain_wrap.get("spot") or index_close or tape.get("close") or 0)
+    if futures and spot > 0:
+        calc["basis"] = round(float(tape["close"]) - spot, 2)
     maxes = config.criteria_max
     criteria = []
 
-    # VWAP
+    # VWAP (on the future's own price and volume)
     vw_points = 0
-    if not tape["vwap_observable"]:
-        vw_detail = "No futures volume: VWAP is unobservable (time-weighted fallback), so it cannot confirm"
+    if tape["source"] != "FUTURES":
+        vw_detail = "No near-month futures OHLCV: a true VWAP needs one instrument's own price and volume, so VWAP cannot confirm"
+    elif not tape["vwap_observable"]:
+        vw_detail = "The future's candles carry no volume: VWAP is unobservable, so it cannot confirm"
     else:
         vw_points = int(tape["vwap_on_side"] and not tape["vwap_extended"]) + int(tape["vwap_sloping"])
-        vw_detail = (f"close {tape['close']:.2f} {'above' if d > 0 else 'below'} VWAP {tape['vwap']:.2f}" if tape["vwap_on_side"] else f"close {tape['close']:.2f} on the wrong side of VWAP {tape['vwap']:.2f}") \
+        vw_detail = (f"future {tape['close']:.2f} {'above' if d > 0 else 'below'} its VWAP {tape['vwap']:.2f}" if tape["vwap_on_side"] else f"future {tape['close']:.2f} on the wrong side of its VWAP {tape['vwap']:.2f}") \
             + (f", VWAP {'rising' if tape['vwap_slope'] > 0 else 'falling'} {abs(tape['vwap_slope']):.1f} pts in {config.vwap_slope_bars}m" if tape["vwap_sloping"] else f", VWAP flat/against ({tape['vwap_slope']:+.1f} pts)") \
             + (f"; stretched {tape['vwap_extension_atr']} ATR from VWAP (max {config.max_vwap_extension_atr}): don't chase" if tape["vwap_extended"] else "")
     criteria.append(_criterion("vwap", "VWAP", vw_points, maxes["vwap"], vw_detail))
@@ -574,9 +676,26 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
     criteria.append(_criterion("delta", "Delta", int(delta_ok), maxes["delta"],
                                f"{selected['symbol']} delta {selected['delta']:.2f}" + ("" if delta_ok else f" (needs {config.delta_min}-{config.delta_max})") if selected else f"No liquid {side} strike with delta {config.select_delta_min}-{config.select_delta_max} and premium ₹{config.min_premium:.0f}+"))
 
-    target_points = tape["risk_points"] * rr if tape.get("risk_points") else None
+    plan = None
+    if selected and tape.get("risk_points"):
+        if tape["atr"] and tape["risk_points"] > config.max_risk_atr * tape["atr"]:
+            plan = {"valid": False, "reason": f"Structural stop is {tape['risk_points'] / tape['atr']:.1f} ATR away (max {config.max_risk_atr}): not a scalp"}
+        else:
+            plan = premium_plan(selected, spot, tape, rr, symbol, now, config)
+    calc["plan"] = plan
+
+    # The OI wall must sit beyond the index move the premium target actually needs (solved back
+    # through delta and gamma from the fill-based target), not just k x the index risk.
+    target_points = (plan or {}).get("target_points") or (tape["risk_points"] * rr if tape.get("risk_points") else None)
     oi_points, oi_detail, oi_info = read_oi(flow, side, spot, target_points)
     calc["oi"] = oi_info
+    if plan and plan.get("valid") and oi_info.get("room_points"):
+        # The premium the option would show with the index AT the OI wall caps any re-derived target.
+        g = plan["greeks"]
+        room = float(oi_info["room_points"])
+        wall_premium = plan["market_premium"] + g["delta"] * room + 0.5 * g["gamma"] * room * room - plan["theta_drag"]
+        plan["wall_premium"] = round(wall_premium, 2)
+        plan["max_target"] = min(plan["max_target"], _tick_round(wall_premium, selected.get("tick_size") or config.tick, "down"))
     criteria.append(_criterion("oi", "OI", oi_points, maxes["oi"], oi_detail))
     pcr_points, pcr_detail, pcr_info = read_pcr(flow, side, config)
     calc["pcr"] = pcr_info
@@ -601,14 +720,6 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
     if selected and premium_rows is None:
         result["needs_premium_candles"] = selected["symbol"]
 
-    plan = None
-    if selected and tape.get("risk_points"):
-        if tape["atr"] and tape["risk_points"] > config.max_risk_atr * tape["atr"]:
-            plan = {"valid": False, "reason": f"Structural stop is {tape['risk_points'] / tape['atr']:.1f} ATR away (max {config.max_risk_atr}): not a scalp"}
-        else:
-            plan = premium_plan(selected, spot, tape, rr, symbol, now, config)
-    calc["plan"] = plan
-
     failing = [c for c in criteria if not c["passed"]]
     score = sum(c["points"] for c in criteria)
     calc["score"] = {"total": score, "minimum": config.minimum_score, "maximum": config.maximum_score}
@@ -627,11 +738,17 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         "greeks": plan["greeks"], "trigger_time": trigger["time"] if trigger else None,
         # round-trip charges per unit: the breakeven stop covers them (cost-covered breakeven)
         "cost_per_unit": round(plan["costs_per_lot"]["at_target"] / plan["lot_size"], 2),
+        # Re-plan on the actual fill: the scalper refuses a fill above max_entry, re-checks the R:R
+        # against min_risk_reward and re-sizes on the stressed risk (stop gap + exit slippage).
+        "max_entry": plan["max_entry"], "max_target": plan["max_target"], "fill_tolerance": plan["fill_tolerance"],
+        "min_risk_reward": round(rr * (1.0 - config.rr_tolerance), 2), "stop_gap": plan["stop_gap"],
+        "slippage_pct": plan["slippage_pct"], "fees_at_stop_per_lot": plan["fees_at_stop_per_lot"],
+        "planned_max_loss": plan["planned_max_loss"], "stressed_risk_reward": plan["stressed_risk_reward"],
         "setup_id": f"{STRATEGY_ID}:{symbol}:{side}:{trigger['time'] if trigger else ''}",
         "stop_method": "PULLBACK_EXTREME_OR_EMA9_MINUS_ATR_BUFFER", "target_method": f"DELTA_GAMMA_{rr_label.replace(':', 'TO')}",
     }
     return {**result, "decision": "CONFIRMED", "confidence": 100, "setup": setup,
-            "reason": f"All {len(criteria)} criteria met: BUY {selected['symbol']} @ ₹{plan['entry']:.2f}, SL ₹{plan['stop_loss']:.2f}, target ₹{plan['target']:.2f} ({rr_label} on the index, {plan['risk_reward']}R on the premium)"}
+            "reason": f"All {len(criteria)} criteria met: BUY {selected['symbol']} at an expected fill of ₹{plan['entry']:.2f}, SL ₹{plan['stop_loss']:.2f}, target ₹{plan['target']:.2f} ({rr_label} on the fill; the index needs {plan['target_points']:.1f} pts)"}
 
 
 def score_card(result: dict) -> dict:

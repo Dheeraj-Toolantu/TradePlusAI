@@ -30,6 +30,7 @@ type ScalpPlan = {
   entry?: number; stop_loss?: number; target?: number; lot_size?: number; lots?: number; quantity?: number; risk_reward?: number; net_risk_reward?: number; cost_share?: number;
   greeks?: { delta: number; gamma: number; theta_per_day: number; iv: number | null }; theta_drag?: number; premium_loss_delta_only?: number; premium_gain_delta_only?: number;
   gamma_effect?: { on_loss: number; on_gain: number }; costs_per_lot?: { at_target: number; at_stop: number }; risk_per_lot?: number; reward_per_lot?: number; max_loss?: number;
+  planned_max_loss?: number; stressed_risk_reward?: number; stop_gap?: number; slippage_pct?: number; max_entry?: number; fill_tolerance?: number;
 };
 type ScalpCalc = {
   rr_choice: "1:1" | "1:2";
@@ -45,7 +46,7 @@ type ScalpCalc = {
   vix?: { value: number | null; regime: string | null };
   score?: { total: number; minimum: number; maximum: number };
 };
-type StrategySetup = { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; net_risk_reward?: number; rr_choice?: string; lots?: number; quantity?: number; max_loss?: number; setup_id?: string; trigger_time?: string | null; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: ScalpContract; spot?: { entry: number; stop: number; target: number } };
+type StrategySetup = { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; net_risk_reward?: number; planned_max_loss?: number; max_entry?: number; stressed_risk_reward?: number; rr_choice?: string; lots?: number; quantity?: number; max_loss?: number; setup_id?: string; trigger_time?: string | null; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: ScalpContract; spot?: { entry: number; stop: number; target: number } };
 type Analysis = {
   decision: string; reason?: string;
   setup?: StrategySetup;
@@ -672,7 +673,7 @@ export default function ExecutionPage() {
             </div>
             <p className="mi-note">{strategy.description}</p>
             {analysis?.setup?.contract ? (
-              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol} × {analysis.setup.quantity ?? "--"}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · target ₹{money(analysis.setup.target)} · {analysis.setup.rr_choice} on the index = {analysis.setup.risk_reward}R on the premium ({analysis.setup.net_risk_reward}R after charges) · max loss ₹{money(analysis.setup.max_loss)}</span></div>
+              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol} × {analysis.setup.quantity ?? "--"}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · target ₹{money(analysis.setup.target)} · {analysis.setup.rr_choice} on the index = {analysis.setup.risk_reward}R on the premium ({analysis.setup.net_risk_reward}R after charges) · max loss ₹{money(analysis.setup.planned_max_loss)} planned / ₹{money(analysis.setup.max_loss)} stressed · refused if filled above ₹{money(analysis.setup.max_entry)}</span></div>
             ) : null}
             {analysis?.setup?.contract && analysis.pipeline?.decision === "CONFIRMED" && (
               <div className="exec-actions">
@@ -703,7 +704,8 @@ export default function ExecutionPage() {
                 <span>Index <b>{scalpSide === "PE" ? "short" : "long"}</b> from {money(scalpPlan.spot_entry)} · stop {money(scalpPlan.spot_stop)} ({calc(scalpPlan.risk_points)} pts) · target {money(scalpPlan.spot_target)} ({calc(scalpPlan.target_points)} pts, {scalp?.rr_choice})</span>
                 <span>Premium SL = ₹{money(scalpPlan.entry)} − (Δ×{calc(scalpPlan.risk_points)} = ₹{money(scalpPlan.premium_loss_delta_only)} {(scalpPlan.gamma_effect?.on_loss ?? 0) <= 0 ? "−" : "+"} Γ ₹{money(Math.abs(scalpPlan.gamma_effect?.on_loss ?? 0))} + θ ₹{money(scalpPlan.theta_drag)}) = <b className="loss">₹{money(scalpPlan.stop_loss)}</b></span>
                 <span>Premium target = ₹{money(scalpPlan.entry)} + (Δ×{calc(scalpPlan.target_points)} = ₹{money(scalpPlan.premium_gain_delta_only)} + Γ ₹{money(scalpPlan.gamma_effect?.on_gain)} − θ ₹{money(scalpPlan.theta_drag)}) = <b className="gain">₹{money(scalpPlan.target)}</b></span>
-                <span>Premium R:R <b>{calc(scalpPlan.risk_reward)}</b> · after charges <b>{calc(scalpPlan.net_risk_reward)}</b> · charges ₹{money(scalpPlan.costs_per_lot?.at_target)}/lot ({scalpPlan.cost_share !== undefined ? `${Math.round(scalpPlan.cost_share * 100)}%` : "--"} of the reward, max 25%) · {scalpPlan.lots ?? 0} lot(s) · max loss ₹{money(scalpPlan.max_loss)}</span>
+                <span>Premium R:R <b>{calc(scalpPlan.risk_reward)}</b> · after charges <b>{calc(scalpPlan.net_risk_reward)}</b> · stressed <b>{calc(scalpPlan.stressed_risk_reward)}</b> · charges + slippage ₹{money(scalpPlan.costs_per_lot?.at_target)}/lot ({scalpPlan.cost_share !== undefined ? `${Math.round(scalpPlan.cost_share * 100)}%` : "--"} of the reward, max 25%)</span>
+                <span>{scalpPlan.lots ?? 0} lot(s) · max loss ₹{money(scalpPlan.planned_max_loss)} planned / <b>₹{money(scalpPlan.max_loss)} stressed</b> (stop gap ₹{money(scalpPlan.stop_gap)}/unit, slippage {scalpPlan.slippage_pct !== undefined ? `${(scalpPlan.slippage_pct * 100).toFixed(2)}%` : "--"} each leg) · fill tolerance up to ₹{money(scalpPlan.max_entry)}</span>
                 {!scalpPlan.valid && scalpPlan.reason ? <small className="warning">{scalpPlan.reason}</small> : null}
               </div>
             )}

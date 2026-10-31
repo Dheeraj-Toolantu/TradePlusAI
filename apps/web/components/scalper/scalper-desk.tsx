@@ -5,7 +5,8 @@ import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, ty
 import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 
 export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; lotSize?: number; tickSize?: number };
-type ScalperState = { positions: PositionView[]; closed: PositionView[]; unrealizedPnl: number; realizedPnl: number; tradesToday: number; decision?: ScalperDecision; summary?: string; error?: string; signalReady?: boolean };
+type MonitorStatus = { running: boolean; intervalMs: number; lastTickAt: string | null; lastError: string | null; managedLegs: number; exits: number };
+type ScalperState = { positions: PositionView[]; closed: PositionView[]; unrealizedPnl: number; realizedPnl: number; tradesToday: number; decision?: ScalperDecision; summary?: string; error?: string; signalReady?: boolean; monitor?: MonitorStatus };
 type View = "CALL" | "SPOT" | "PUT";
 /** The algo page's VWAP-EMA scalper read, handed to the desk so it can trade it. */
 export type VwapScalpSignal = {
@@ -165,7 +166,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
 
   // ---- server calls ---------------------------------------------------------------------
   const apply = useCallback((data: ScalperState, quiet = false) => {
-    setState((current) => ({ ...current, ...data, decision: data.decision ?? current.decision }));
+    setState((current) => ({ ...current, ...data, decision: data.decision ?? current.decision, monitor: data.monitor ?? current.monitor }));
     if (data.error) setNotice(data.error);
     else if (data.summary && !quiet) setNotice(data.summary);
   }, []);
@@ -430,6 +431,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
                 <b>{vwapScalp.confirmed ? "Signal" : "Plan (not confirmed)"} · BUY {vwapScalp.selected?.symbol} · {vwapScalp.plan.rrChoice}{vwapScalp.plan.riskReward ? ` = ${vwapScalp.plan.riskReward}R on the premium` : ""}{vwapScalp.plan.netRiskReward ? ` (${vwapScalp.plan.netRiskReward}R after charges)` : ""}</b>
                 <span>Entry ₹{money(vwapScalp.plan.entry)} · SL ₹{money(vwapScalp.plan.stop)} · Target ₹{money(vwapScalp.plan.target)}{vwapScalp.plan.quantity ? ` · ${vwapScalp.plan.quantity} qty` : ""}</span>
                 <span>Trailing: SL to breakeven + charges at +0.5R · lock +0.5R at +1R · then 0.6R under the best premium · exit if a 1m candle closes back through the 9 EMA</span>
+                <span>On placing: re-planned on the actual fill (refused if it drifts past tolerance or the R:R drops); sized on the stressed loss (stop gap + slippage on both legs). Exits run on the server.</span>
               </div>
             ) : null}
             <small className="mi-note">{vwapScalp?.reason ?? ""}</small>
@@ -495,6 +497,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
           <span><small>Unrealised P&amp;L</small><em className={unrealized >= 0 ? "gain" : "loss"}>{signed(unrealized)}</em></span>
           <span><small>Realised P&amp;L</small><em className={state.realizedPnl >= 0 ? "gain" : "loss"}>{signed(state.realizedPnl)}</em></span>
           <span><small>Engine trades today</small><em>{state.tradesToday}/{settings.maxTrades}</em></span>
+          <span title="Stops, targets, the trail, time stops and the 15:15 square-off run on the server, with or without this page open"><small>Exit monitor (server)</small><em className={state.monitor?.running && !state.monitor.lastError ? "gain" : "loss"}>{state.monitor ? (state.monitor.running ? `${state.monitor.lastError ? "error" : "running"}${state.monitor.lastTickAt ? ` · ${new Date(state.monitor.lastTickAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}` : ""}` : "stopped") : "--"}</em></span>
         </div>
         {positionsTab === "OPEN" && selected.length > 0 && <button type="button" className="scalper-exit-selected" onClick={() => void exit(selected)}>Exit selected ({selected.length})</button>}
         <div className="scalper-positions">
@@ -509,6 +512,7 @@ export function ScalperDesk({ symbol, onSymbolChange, chain, expiry, spot, onLog
               <small className="scalper-qty">{positionsTab === "OPEN" ? position.quantity : 0}</small>
               {positionsTab === "OPEN" ? <button type="button" title="Exit this position" onClick={() => void exit([position.id])}>✕</button> : null}
               {position.stop !== null && positionsTab === "OPEN" ? <small className="scalper-levels">SL ₹{money(position.stop)}{position.trail ? ` (${TRAIL_TEXT[position.trail.stage]})` : position.trailing ? " (trailing)" : ""} · T ₹{money(position.target)}</small> : null}
+              {position.fill && positionsTab === "OPEN" ? <small className="scalper-levels">Filled ₹{money(position.fill.actual)} (planned ₹{money(position.fill.planned)}, {position.fill.deviation >= 0 ? "+" : ""}{money(position.fill.deviation)}) · {position.fill.riskReward}R at the fill · max loss ₹{money(position.fill.plannedLoss, 0)} planned / ₹{money(position.fill.stressedLoss, 0)} stressed</small> : null}
             </div>
           )) : <div className="algo-empty">{positionsTab === "OPEN" ? "No open scalper positions." : "No closed trades today."}</div>}
         </div>

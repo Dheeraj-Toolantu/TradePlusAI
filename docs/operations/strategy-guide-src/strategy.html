@@ -63,7 +63,7 @@
   <div class="band">
     <div class="kicker">TRADEPULSE AI · INDEX OPTIONS · STRATEGY GUIDE</div>
     <h1>VWAP-EMA Scalper</h1>
-    <div class="sub">A 1-minute scalping strategy for NIFTY, BANKNIFTY and SENSEX options. It combines VWAP, the 5 and 9 EMAs, option delta, open interest, PCR, the premium's volume profile and India VIX. The premium is picked from the OI data. Risk-reward is set from delta and gamma, and trades are managed with a staged trailing stop.</div>
+    <div class="sub">A 1-minute scalping strategy for NIFTY, BANKNIFTY and SENSEX options. It reads the near-month future's own price and volume (a true VWAP) with the 5 and 9 EMAs, and confirms with option delta, open interest, PCR, the premium's volume profile and India VIX. The premium is picked from the OI data. The stop comes from structure through delta and gamma, and R:R is measured on the actual fill. Positions are sized on a stressed loss and managed on the server with a staged trailing stop.</div>
   </div>
   <div>
     <div class="kpis">
@@ -73,7 +73,7 @@
       <div class="kpi"><small>Execution</small><b>Paper (Scalper)</b></div>
     </div>
     <div class="callout warn"><b>Status and scope</b>This document describes the strategy as implemented in the TradePlusAI repository (branch <code>claude/busy-planck-kqqyyn</code>). It has been tested on synthetic 1-minute data and has not yet run against live Groww market data. Automatic placement goes to the paper Smart Scalper only; live orders still need TradePulse's preview-and-PIN flow. This is software documentation, not investment advice.</div>
-    <div class="meta">Version 1.0 · 1 November 2026 · Source: <code>quant/src/tradepulse_quant/algo_engine/scalp_strategy.py</code>, <code>services/paper-trading/src/smart-scalper.ts</code>, <code>apps/web/components/scalper/</code></div>
+    <div class="meta">Version 1.1 · 1 November 2026 (v1.1: true futures VWAP, fill-based R:R, stressed-risk sizing, explicit PCR zones, server-side exits) · Source: <code>quant/src/tradepulse_quant/algo_engine/scalp_strategy.py</code>, <code>services/paper-trading/src/smart-scalper.ts</code>, <code>apps/web/components/scalper/</code></div>
   </div>
 </div>
 
@@ -102,11 +102,11 @@
   <h2 style="margin-top:20pt">1. The strategy at a glance</h2>
   <p>The VWAP-EMA Scalper buys an index option (a <b>CE</b> for a long, a <b>PE</b> for a short) when the 1-minute index tape and the option chain agree on a short, clean move. It enters only when <b>all seven criteria</b> pass, worth 10 points in total, and every V5 rule gate is green.</p>
   <ol>
-    <li><b>Trend and location.</b> Price is on the trade side of a sloping session VWAP and is not stretched away from it.</li>
+    <li><b>Trend and location.</b> The near-month <b>future</b> is on the trade side of its own sloping session VWAP and is not stretched away from it.</li>
     <li><b>Momentum trigger.</b> The 5 EMA leads the 9 EMA, price pulls back to the 9 EMA, and a candle resumes the move on above-average futures volume.</li>
     <li><b>Option confirmation.</b> The selected strike has a delta of 0.40-0.60. Option writers (OI) and the PCR support the side. The premium itself is accepted above its point of control. India VIX is in a tradeable range.</li>
-    <li><b>Plan.</b> The stop is placed on the index chart (structure), then translated to the premium with <b>delta and gamma</b>. The target is the chosen 1:1 or 1:2 multiple. A trade is refused if charges eat more than a quarter of the reward.</li>
-    <li><b>Execution and management.</b> The trade is placed on the paper Smart Scalper, automatically or with one click. The stop then moves to a cost-covered breakeven, locks profit, and trails.</li>
+    <li><b>Plan.</b> The stop is placed on the chart (structure) and translated to the premium with <b>delta and gamma</b>. R is measured from the <b>actual fill</b> (ask plus slippage), and the target is fill + 1R or 2R. Lots are sized on a <b>stressed</b> loss (slippage on both legs plus a stop gap). A trade is refused if charges and slippage eat more than a quarter of the reward.</li>
+    <li><b>Execution and management.</b> The trade is placed on the paper Smart Scalper, automatically or with one click, after a re-plan on the real fill. A <b>server-side monitor</b> then moves the stop to a cost-covered breakeven, locks profit and trails, with or without a browser open.</li>
   </ol>
 
   <figure>
@@ -151,8 +151,8 @@
   <p>All inputs are fetched server-side by <code>/api/algo-trading</code> and passed to the Python engine. If an input is missing, the criteria that need it <b>fail closed</b>: the strategy waits instead of guessing.</p>
   <table>
     <tr><th>Input</th><th>Source in TradePulse</th><th>Used for</th></tr>
-    <tr><td>Index 1-minute candles, today</td><td>Groww history, <code>timeframe=1m</code></td><td>VWAP, 5/9 EMA, ATR(14), trigger, structural stop</td></tr>
-    <tr><td>Near-month futures volume</td><td>Attached to the index candles (<code>volume=futures</code>)</td><td>VWAP weighting and the trigger's volume check. Index candles carry no volume of their own.</td></tr>
+    <tr><td><b>Near-month future, 1-minute OHLCV</b></td><td>Groww history (<code>volume=futures</code> returns <code>futuresCandles</code>)</td><td>The tape: <b>true VWAP</b> (the future's own price and volume), 5/9 EMA, ATR(14), trigger, structural stop. Without it, VWAP fails closed.</td></tr>
+    <tr><td>Index 1-minute candles and spot</td><td>Groww history and the chain's spot</td><td>Data-quality and gap gates; index levels = future levels − basis</td></tr>
     <tr><td>Option chain (full, ±3%)</td><td><code>/api/option-chain?full=1</code></td><td>Premium, delta, IV, theta, OI, volume, lot and tick size for every strike</td></tr>
     <tr><td>Options flow</td><td>Market-intel engine (<code>options_flow</code>)</td><td>Per-strike 5-minute OI change and build-up type, OI direction score, PCR and its 5-minute change, OI walls</td></tr>
     <tr><td>India VIX</td><td>Market-intel volatility (value and regime)</td><td>Volatility criterion</td></tr>
@@ -236,9 +236,9 @@
   <div class="criteria-card">
     <h3>① VWAP <span>2 points</span></h3>
     <ul>
-      <li><b>1 point:</b> the close is above the session VWAP <b>and</b> not more than <b>1.5 × ATR(1m)</b> away from it.</li>
+      <li><b>1 point:</b> the <b>future's</b> close is above its session VWAP <b>and</b> not more than <b>1.5 × ATR(1m)</b> away from it.</li>
       <li><b>1 point:</b> VWAP has risen over the last <b>5 bars</b>.</li>
-      <li>VWAP is weighted by near-month <b>futures volume</b>. Without volume it can't be trusted, so the criterion fails ("VWAP unobservable").</li>
+      <li>VWAP is computed on the <b>near-month future's own OHLCV</b>, the same instrument's price and volume. Weighting the index price by futures volume would only be a proxy. Without futures OHLCV, the criterion fails closed.</li>
     </ul>
     <p class="why">Why: VWAP is the session's fair price, where institutions benchmark fills. A long above a rising VWAP is with the session's flow. Stretching far above it is chasing, and those moves often snap back to VWAP inside a scalp's time frame.</p>
   </div>
@@ -273,8 +273,14 @@
   <div class="criteria-card">
     <h3>⑤ PCR (put-call ratio, OI) <span>1 point</span></h3>
     <ul>
-      <li>Long: PCR <b>0.80 to 1.60</b> and not falling over 5 minutes. Short: PCR <b>0.50 to 1.20</b> and not rising.</li>
-      <li>Outside <b>0.50-1.60</b> the PCR counts as <b>stretched</b>, which signals reversal risk, and the criterion fails on either side.</li>
+      <li>Explicit zones (inclusive bounds as written):
+        <table style="margin:3pt 0 4pt"><tr><th>Zone</th><th>PCR</th><th>Long (CE)</th><th>Short (PE)</th></tr>
+        <tr><td>Stretched low</td><td>&lt; 0.50</td><td>no</td><td>no</td></tr>
+        <tr><td>Bearish</td><td>0.50 ≤ PCR &lt; 0.80</td><td>no</td><td>yes, if not rising</td></tr>
+        <tr><td>Neutral</td><td>0.80 ≤ PCR ≤ 1.20</td><td>yes, if not falling</td><td>yes, if not rising</td></tr>
+        <tr><td>Bullish</td><td>1.20 &lt; PCR ≤ 1.60</td><td>yes, if not falling</td><td>no</td></tr>
+        <tr><td>Stretched high</td><td>&gt; 1.60</td><td>no</td><td>no</td></tr></table></li>
+      <li>"Not falling" means a 5-minute PCR change ≥ 0, and "not rising" means ≤ 0. A missing change does not block. In the neutral zone the change decides the side.</li>
     </ul>
     <p class="why">Why: a healthy, rising PCR means puts are being written under the market (support). Extreme readings mean positioning is crowded and tends to unwind.</p>
   </div>
@@ -343,24 +349,28 @@
 <div class="section">
   <h2>7. Stop, target and delta-gamma risk-reward</h2>
   <h3>7.1 Structure first: the stop on the index</h3>
-  <div class="formula">stop level   = min(pullback low, 9 EMA) − 0.15 × ATR(1m)        (long)
+  <div class="formula">stop level   = min(pullback low, 9 EMA) − 0.15 × ATR(1m)        (long, on the future's tape)
 R (points)   = entry close − stop level
 if R &lt; 0.30 × ATR  → widen R to 0.30 × ATR     (tighter is inside 1-minute noise)
 if R &gt; 1.50 × ATR  → NO TRADE                   (too wide to be a scalp)
-target level = entry + k × R,   k = 1 (1:1) or k = 2 (1:2)</div>
-  <p>The stop is where the scalp is proven wrong: back through the pullback and the 9 EMA. The target is a multiple of that risk, so reward-to-risk is fixed by design, not hoped for.</p>
+index levels = future levels − basis            (basis = future − index, near constant intraday)</div>
+  <p>The stop is where the scalp is proven wrong: back through the pullback and the 9 EMA. Future points and index points move together intraday, so the distance carries over to the index, and from there to the premium.</p>
 
   <h3>7.2 Mapping index points to the premium with delta and gamma</h3>
   <p>An option premium does not move one-for-one with the index. For a small index move <i>x</i>, its change is approximately:</p>
   <div class="formula">Δpremium(x) ≈ |delta| · x + ½ · gamma · x²</div>
-  <p>Applied to the stop and the target, with theta charged for the expected 10-minute hold:</p>
-  <div class="formula">theta drag    = |theta per day| × 10 / 375            (375 trading minutes a day)
-premium SL     = P − ( |delta| · R  − ½ · gamma · R²  + theta drag )
-premium target = P + ( |delta| · kR + ½ · gamma · (kR)² − theta drag )
-P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes using the chain's IV and expiry</div>
+  <p>The stop comes from structure. R:R is measured on what the trader actually pays:</p>
+  <div class="formula">theta drag      = |theta per day| × 10 / 375                 (375 trading minutes a day)
+premium SL      = M − ( |delta| · R − ½ · gamma · R² + theta drag )   ← structural, from the market premium M
+expected fill F = ask × (1 + slippage), rounded UP to the tick      ← what the scalper pays
+premium R       = F − premium SL
+premium target  = F + k · premium R,   k = 1 (1:1) or 2 (1:2)       ← 1:1 / 1:2 hold on the real fill
+index move x needed for the target: |delta| · x + ½ · gamma · x² = target − M + theta drag
+delta from the chain;  gamma from Black-Scholes using the chain's IV and expiry</div>
+  <p>Because the fill pays the spread and slippage, the index has to move a little more than k × R to reach the target. The engine solves for that move <i>x</i> and checks it against the OI wall.</p>
   <div class="grid2">
     <div>
-      <p><b>Why gamma matters.</b> Gamma makes the premium's response convex. On an adverse move the long option loses a little <i>less</i> than delta alone predicts (−½γR²). On a favourable move it gains a little <i>more</i> (+½γ(kR)²). The premium reward-to-risk is therefore usually slightly better than the index ratio. Theta and tick rounding take some of that back.</p>
+      <p><b>Why gamma matters.</b> Gamma makes the premium's response convex. On an adverse move the long option loses a little <i>less</i> than delta alone predicts (−½γR²), which lifts the structural SL slightly. On a favourable move it gains a little <i>more</i>, so the index needs a little less distance to reach the premium target. Theta works against both.</p>
       <p><b>Effect by expiry.</b> With a week or more to expiry, gamma is small and the correction is a few paise. On expiry day gamma is large, so premium stops and targets move fast. The panel flags expiry days.</p>
       <p>Both prices are rounded to the contract's tick (₹0.05).</p>
     </div>
@@ -380,16 +390,16 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
   </div>
 
   <h3>7.3 The reward-to-risk gate</h3>
-  <p>The V5 R:R gate compares the <b>premium</b> reward-to-risk with the ratio the trader chose, allowing 3% for tick rounding. Every other strategy in TradePulse keeps its 2.0 minimum.</p>
+  <p>The V5 R:R gate compares the premium reward-to-risk <b>at the expected fill</b> with the ratio the trader chose, allowing 3% for tick rounding. Every other strategy in TradePulse keeps its 2.0 minimum.</p>
   <table>
-    <tr><th>Chosen</th><th>Index target</th><th class="num">Premium R:R needed</th></tr>
-    <tr><td>1:2 (default)</td><td>2 × R</td><td class="num">≥ 1.94</td></tr>
-    <tr><td>1:1</td><td>1 × R</td><td class="num">≥ 0.97</td></tr>
+    <tr><th>Chosen</th><th>Premium target</th><th class="num">R:R needed at the fill</th></tr>
+    <tr><td>1:2 (default)</td><td>fill + 2 × premium R</td><td class="num">≥ 1.94</td></tr>
+    <tr><td>1:1</td><td>fill + 1 × premium R</td><td class="num">≥ 0.97</td></tr>
   </table>
 </div>
 
 <!-- ============================== CHARGES + EXAMPLE ============================== -->
-<div class="section">
+<div class="flow">
   <h2>8. Charges and position size</h2>
   <p>Every plan is costed per lot, for both exits (target and stop), with a model tuned for liquid near-ATM index options:</p>
   <table>
@@ -399,38 +409,45 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
     <tr><td>Exchange transaction charge</td><td>0.03503% of premium turnover</td></tr>
     <tr><td>SEBI fee / stamp duty</td><td>₹10 per crore / 0.003% of the buy premium</td></tr>
     <tr><td>GST</td><td>18% on brokerage + exchange + SEBI</td></tr>
-    <tr><td>Slippage</td><td>0.15% per side, beyond the spread</td></tr>
-    <tr><td>Spread</td><td>The chain's bid/ask, capped at 0.5% of the premium per side (Groww's chain has no live bid/ask; the route estimates it from IV)</td></tr>
+    <tr><td>Slippage</td><td>The Smart Scalper's own fill slippage (<code>SCALPER_SLIPPAGE_PCT</code>, 0.3% per side by default), applied <b>adversely on both legs</b>: in the entry fill and on the exit</td></tr>
+    <tr><td>Spread</td><td>Entry: paid in the ask. Exit: half-spread at the bid. Capped at 0.5% of the premium per side (Groww's chain has no live bid/ask; the route estimates it from IV)</td></tr>
   </table>
-  <div class="callout warn"><b>The 25% rule</b>If round-trip charges at the target exceed <b>25% of the reward</b>, the trade is refused: the move is too small to scalp profitably. In practice a <b>1:1</b> NIFTY scalp with a 10-15 point stop is usually refused (about a ₹6 premium move, roughly a third of it lost to charges). <b>1:2</b> is the practical default; 1:1 passes when the structural move is larger, for example on BANKNIFTY.</div>
-  <p><b>Lots.</b> lots = ⌊ max loss per trade ÷ (premium risk × lot size + charges at the stop) ⌋, capped by the Scalper's lots setting. The defaults are a ₹1,500 max loss and 1 lot, taken from the Scalper desk's own controls. If one lot already risks more than the max loss, there is no trade.</p>
+  <div class="callout warn"><b>The 25% rule</b>If the fees, the exit spread and slippage, and what the fill paid above the market together exceed <b>25% of the reward</b>, the trade is refused: the move is too small to scalp profitably. A <b>1:1</b> NIFTY scalp with a 10-15 point stop is usually refused (30% in the worked example). <b>1:2</b> is the practical default; 1:1 passes when the structural move is larger, for example on BANKNIFTY (21% in the tests).</div>
+  <h3>Planned and stressed loss, and lot sizing</h3>
+  <div class="formula">planned loss / lot  = (F − SL) × lot + fees + exit half-spread + exit slippage
+stop gap / unit     = max(2 ticks, 10% × premium R)
+stressed loss / lot = planned loss / lot + stop gap × lot
+lots                = ⌊ max loss per trade ÷ stressed loss / lot ⌋  (≤ lots setting)</div>
+  <p>Sizing on the <b>stressed</b> loss means a gap through the stop still fits the max loss. The defaults are a ₹1,500 max loss and 1 lot, from the Scalper desk's own controls. Both losses and both R:R figures (net and stressed) are shown before the trade.</p>
 
   <h2 style="margin-top:14pt">9. Worked example (real engine output)</h2>
-  <p class="muted">Inputs: a synthetic NIFTY 1-minute tape (morning chop, a measured trend, a pullback to the 9 EMA, then a high-volume resumption candle at 09:40) and a synthetic chain and OI flow, run through the real engine path with every V5 gate. <span class="demo">DEMO DATA, not live prices</span></p>
+  <p class="muted">Inputs: a synthetic near-month NIFTY future 1-minute tape (morning chop, a measured trend, a pullback to the 9 EMA, then a high-volume resumption candle at 09:40), the index 60 points below it, and a synthetic chain and OI flow (the quant test fixture), run through the real engine. <span class="demo">DEMO DATA, not live prices</span></p>
   <table>
     <tr><th>Criterion</th><th>Reading</th><th class="num">Points</th></tr>
-    <tr><td>VWAP</td><td>Close 24,819.00 above VWAP 24,807.75, VWAP rising 2.4 pts in 5 min, 0.99 ATR from VWAP</td><td class="num">2 / 2</td></tr>
-    <tr><td>5/9 EMA</td><td>5 EMA 24,816.23 &gt; 9 EMA 24,815.17 &gt; VWAP; pullback to the 9 EMA, resumed at 09:40 on 1.65× volume</td><td class="num">2 / 2</td></tr>
+    <tr><td>VWAP</td><td>Future 24,879.00 above its VWAP 24,867.75 (index 24,819, basis 60), VWAP rising 2.4 pts in 5 min</td><td class="num">2 / 2</td></tr>
+    <tr><td>5/9 EMA</td><td>5 EMA 24,876.23 &gt; 9 EMA 24,875.21 &gt; VWAP (future); pullback to the 9 EMA, resumed at 09:40 on 1.65× volume</td><td class="num">2 / 2</td></tr>
     <tr><td>Delta</td><td>NIFTY 24800 CE, delta 0.58 (picked from OI)</td><td class="num">1 / 1</td></tr>
     <tr><td>OI</td><td>Writer score +1; ATM 24800: call short covering, put short build-up; call wall 24950 is 131 pts away</td><td class="num">2 / 2</td></tr>
-    <tr><td>PCR</td><td>1.05, +0.02 in 5 min</td><td class="num">1 / 1</td></tr>
-    <tr><td>Volume profile</td><td>Premium ₹125.40 above POC ₹125.01, on a 2.2× volume burst (VAH ₹126.70)</td><td class="num">1 / 1</td></tr>
+    <tr><td>PCR</td><td>1.05, +0.02 in 5 min: neutral zone, rising, so longs are allowed</td><td class="num">1 / 1</td></tr>
+    <tr><td>Volume profile</td><td>Premium ₹127.80 above POC ₹127.26, on a 2.2× volume burst (VAH ₹129.10)</td><td class="num">1 / 1</td></tr>
     <tr><td>India VIX</td><td>13.2, normal</td><td class="num">1 / 1</td></tr>
     <tr><th>Total</th><th>All seven met; all 17 V5 gates green</th><th class="num">10 / 10</th></tr>
   </table>
   <table style="break-inside: avoid">
     <tr><th>Step</th><th>Calculation</th><th class="num">Result</th></tr>
-    <tr><td>Index stop / R</td><td>24,819.00 − stop 24,807.29</td><td class="num">R = 11.71 pts</td></tr>
-    <tr><td>Index target (1:2)</td><td>24,819.00 + 2 × 11.71</td><td class="num">24,842.42</td></tr>
+    <tr><td>Index stop / R</td><td>structural stop 11.39 pts below (future 24,879.00 → index 24,819.00 − 11.39)</td><td class="num">R = 11.39 pts</td></tr>
     <tr><td>Greeks</td><td>delta 0.576 · gamma 0.000791 · theta ₹9/day · IV 13.5%</td><td class="num">theta drag ₹0.24</td></tr>
-    <tr><td>Premium SL</td><td>₹120.85 − (0.576 × 11.71 = ₹6.74 − gamma ₹0.05 + theta ₹0.24)</td><td class="num">₹113.90</td></tr>
-    <tr><td>Premium target</td><td>₹120.85 + (0.576 × 23.42 = ₹13.49 + gamma ₹0.22 − theta ₹0.24)</td><td class="num">₹134.30</td></tr>
-    <tr><td>Premium R:R</td><td>(134.30 − 120.85) ÷ (120.85 − 113.90)</td><td class="num">1.94 (≥ 1.94 ✓)</td></tr>
-    <tr><td>Charges per lot</td><td>₹139.92 at the target = 16% of the reward (≤ 25% ✓)</td><td class="num">net R:R 1.25</td></tr>
-    <tr><td>Size</td><td>₹1,500 ÷ (6.95 × 65 + ₹136.05) → 2, capped at 1 lot</td><td class="num">1 lot = 65 qty</td></tr>
-    <tr><td>Max loss</td><td>6.95 × 65 + charges at the stop</td><td class="num">₹587.80</td></tr>
+    <tr><td>Premium SL (structure)</td><td>market ₹120.45 − (0.576 × 11.39 = ₹6.56 − gamma ₹0.05 + theta ₹0.24)</td><td class="num">₹113.70</td></tr>
+    <tr><td>Expected fill</td><td>ask ₹120.85 + 0.3% slippage, rounded up to the tick</td><td class="num">₹121.25</td></tr>
+    <tr><td>Premium R / target (1:2)</td><td>R = 121.25 − 113.70 = ₹7.55; target = 121.25 + 2 × 7.55</td><td class="num">₹136.35 (2.00R on the fill)</td></tr>
+    <tr><td>Index move needed</td><td>0.576·x + ½·0.000791·x² = ₹16.14 → x (vs 22.79 structural; OI wall 131 pts away ✓)</td><td class="num">27.5 pts</td></tr>
+    <tr><td>Costs per lot</td><td>fees + exit half-spread ₹89.24, exit slippage ₹26.59; entry slippage and spread are in the fill</td><td class="num">16% of the reward ✓</td></tr>
+    <tr><td>Planned / stressed loss</td><td>7.55 × 65 + ₹109.33 = ₹600.08; + stop gap ₹0.75 × 65</td><td class="num">₹600 / ₹649</td></tr>
+    <tr><td>Net / stressed R:R</td><td>(15.10 × 65 − ₹115.83) ÷ planned or stressed loss</td><td class="num">1.44 / 1.33</td></tr>
+    <tr><td>Size</td><td>⌊₹1,500 ÷ ₹649⌋ = 2, capped at the 1-lot setting</td><td class="num">1 lot = 65 qty</td></tr>
+    <tr><td>Fill tolerance</td><td>max(2 ticks, 0.2 × ₹7.55) above the expected fill; worst-fill target capped at ₹140.85</td><td class="num">max entry ₹122.75</td></tr>
   </table>
-  <p><b>Same tape at 1:1:</b> target ₹127.40, charges 33% of the reward, net R:R 0.49. The trade is <b>refused</b> by the 25% rule.</p>
+  <p><b>Same tape at 1:1:</b> target ₹128.80, charges and slippage 30% of the reward. The trade is <b>refused</b> by the 25% rule.</p>
 </div>
 
 <!-- ============================== GATES + EXECUTION ============================== -->
@@ -467,7 +484,14 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
   <ol>
     <li><b>Server re-check.</b> <code>POST /api/algo-trading</code> with <code>action: PLACE_ON_SCALPER</code> re-runs the strategy and all V5 gates on the server. The browser can't confirm a trade.</li>
     <li><b>Book limits.</b> The Smart Scalper applies its own limits: kill switch, SAFE_MODE, daily loss limit, a 5-minute cool-down after a loss, a stop after 3 consecutive losses, the trade cap, one engine position per index, and 09:15-15:15 IST on trading days only.</li>
-    <li><b>Fill.</b> The leg is filled at the live ask, plus the scalper's configured slippage. Slippage reduces the reward, never the stop distance.</li>
+    <li><b>Re-plan on the actual fill.</b> The fill is the live ask plus slippage, rounded against the trader.
+      <ul>
+        <li>A fill above the plan's <b>max entry</b> (expected fill + tolerance) is refused as a stale setup.</li>
+        <li>The <b>stop stays at its structural price</b>; it is never moved by slippage.</li>
+        <li>R and the target are re-derived from the fill (target = fill + k × R), but never beyond the OI-wall cap, and the R:R must still reach the minimum.</li>
+        <li>Lots are re-sized so the <b>stressed</b> loss at that fill fits the max loss.</li>
+        <li>The position records the planned versus actual fill and the planned and stressed loss.</li>
+      </ul></li>
   </ol>
   <div class="callout"><b>Paper only</b>Automatic placement never sends a live order. Real-money orders remain on TradePulse's separate live path: <code>/api/live-orders</code>, with a preview, a PIN, the LIVE limits and the kill switch.</div>
 </div>
@@ -477,22 +501,22 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
   <h2>12. Trade management: SL, target and trailing SL</h2>
   <p>Once in, the position is managed by a <b>staged, cost-covered trail</b>. R is the initial premium risk (entry − initial SL). The stop only ever moves <b>up</b>.</p>
   <table>
-    <tr><th>Stage</th><th>Triggered when the best premium reaches</th><th>SL moves to</th><th>Example (entry ₹120.85, R ₹6.95)</th></tr>
-    <tr><td><b>Initial</b></td><td>entry</td><td>the delta-gamma SL</td><td class="num">₹113.90</td></tr>
-    <tr><td><b>Breakeven</b></td><td>+0.5R (₹124.33)</td><td>entry + round-trip charges per unit (cost-covered)</td><td class="num">₹123.00</td></tr>
-    <tr><td><b>Locked</b></td><td>+1R (₹127.80)</td><td>entry + 0.5R</td><td class="num">≈ ₹124.32</td></tr>
-    <tr><td><b>Trailing</b></td><td>beyond +1R</td><td>best premium − 0.6R</td><td class="num">at ₹131 → ₹126.83</td></tr>
+    <tr><th>Stage</th><th>Triggered when the best premium reaches</th><th>SL moves to</th><th>Example (fill ₹121.25, R ₹7.55)</th></tr>
+    <tr><td><b>Initial</b></td><td>entry</td><td>the structural (delta-gamma) SL</td><td class="num">₹113.70</td></tr>
+    <tr><td><b>Breakeven</b></td><td>+0.5R (₹125.03)</td><td>entry + round-trip costs per unit (cost-covered)</td><td class="num">₹123.03</td></tr>
+    <tr><td><b>Locked</b></td><td>+1R (₹128.80)</td><td>entry + 0.5R</td><td class="num">≈ ₹125.03</td></tr>
+    <tr><td><b>Trailing</b></td><td>beyond +1R</td><td>best premium − 0.6R</td><td class="num">at ₹132 → ₹127.47</td></tr>
   </table>
 
   <figure>
     <svg viewBox="0 0 720 200" width="86%" style="display:block;margin:0 auto" xmlns="http://www.w3.org/2000/svg">
       <rect x="0" y="0" width="720" height="200" fill="#fbfcfd" stroke="#d6dee3"/>
-      <line x1="40" y1="20" x2="700" y2="20" stroke="#0f7b55" stroke-dasharray="5 3"/><text x="44" y="15" font-size="10" fill="#0f7b55">target ₹134.30</text>
-      <line x1="40" y1="120" x2="700" y2="120" stroke="#1560c4" stroke-dasharray="3 3"/><text x="44" y="134" font-size="10" fill="#1560c4">entry ₹120.85</text>
+      <line x1="40" y1="20" x2="700" y2="20" stroke="#0f7b55" stroke-dasharray="5 3"/><text x="44" y="15" font-size="10" fill="#0f7b55">target ₹136.35</text>
+      <line x1="40" y1="120" x2="700" y2="120" stroke="#1560c4" stroke-dasharray="3 3"/><text x="44" y="134" font-size="10" fill="#1560c4">fill ₹121.25</text>
       <polyline points="40,120 110,112 170,95 230,104 290,80 350,70 410,58 470,48 520,66 560,86" fill="none" stroke="#14212b" stroke-width="2"/>
       <polyline points="40,178 170,178 170,110 350,110 350,101 470,101 470,86 560,86" fill="none" stroke="#b4323f" stroke-width="2.2"/>
-      <text x="60" y="173" font-size="9.5" fill="#b4323f">initial SL ₹113.90</text>
-      <text x="176" y="128" font-size="9.5" fill="#b4323f">breakeven + charges ₹123.00</text>
+      <text x="60" y="173" font-size="9.5" fill="#b4323f">initial SL ₹113.70</text>
+      <text x="176" y="128" font-size="9.5" fill="#b4323f">breakeven + costs ₹123.03</text>
       <text x="356" y="97" font-size="9.5" fill="#b4323f">+0.5R locked</text>
       <text x="476" y="82" font-size="9.5" fill="#b4323f">trail 0.6R</text>
       <circle cx="560" cy="86" r="5" fill="#a3620a"/><text x="572" y="90" font-size="9.5" fill="#a3620a" font-weight="700">TRAILING_STOP (in profit)</text>
@@ -512,13 +536,14 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
     <tr><td><code>EMA9_LOST</code></td><td>After breakeven: a <b>completed</b> 1-minute index candle closes back below the 9 EMA (above it, for a PE). The scalp's reason is gone.</td></tr>
     <tr><td><code>SCALP_TIME_STOP</code></td><td>The trade hasn't reached +0.5R within the Scalper's time stop (default 12 minutes)</td></tr>
   </table>
-  <p>The trail stage, the initial SL and the charges per unit are saved with the order, so a server restart resumes the same trail. On the premium chart the risk-reward drawing follows the live SL. Once the SL is above the entry, it shows the profit locked, e.g. "SL · +0.5R locked ₹124.32 (+₹225.55)". <b>Keep the execution page open:</b> exits are evaluated by the Scalper desk's 10-second scan, which runs in the browser while the page is open, the same way the Smart Scalper has always worked.</p>
+  <p>The trail stage, the initial SL and the costs per unit are saved with the order, so a server restart resumes the same trail. On the premium chart the risk-reward drawing follows the live SL. Once the SL is above the entry, it shows the profit locked, e.g. "SL · +0.5R locked ₹124.32 (+₹225.55)". </p>
+  <div class="callout"><b>Exits run on the server</b>A server-side monitor (<code>apps/web/lib/scalper-monitor.ts</code>) runs in the Node server process every 5 seconds. It fetches the live option quotes, the index spot and 1-minute candles itself, and applies every exit above. It starts at server boot (<code>instrumentation.ts</code>), which also reloads persisted open positions after a restart, so a closed, sleeping or disconnected browser no longer leaves a position unmanaged. A missing spot quote never triggers an index exit, and the 15:15 square-off runs even without a fresh quote. The desk shows the monitor's status, and its own 10-second scan still runs; the scalper serialises both, so a position is never closed twice.</div>
 </div>
 
 <!-- ============================== SCREENS ============================== -->
 <div class="section">
   <h2>13. Screens</h2>
-  <p class="muted">All screens below show <span class="demo">DEMO DATA</span>: the built application rendering the real engine's output for the synthetic tape of section 9. They are not live market prices.</p>
+  <p class="muted">All screens below show <span class="demo">DEMO DATA</span>, not live market prices. They were captured with v1.0 of the plan (ask-based entry), so their premium figures differ slightly from section 9. The layout is unchanged in v1.1, which adds planned/stressed loss, fill tolerance and the server exit-monitor status.</p>
   <figure><img style="width:92%;display:block;margin:0 auto" src="desk-1-signal.png" alt="Scalper desk with a confirmed VWAP-EMA signal"><figcaption>Figure 4. The Scalper desk with Strategy set to VWAP-EMA: criteria 7/7, the OI-picked 24800 CE (badge), the plan (entry ₹120.85, SL ₹113.90, target ₹134.30) and the risk-reward drawing on the call chart.</figcaption></figure>
   <figure><img style="width:92%;display:block;margin:0 auto" src="desk-2-placed-trailing.png" alt="Scalper desk after automatic placement with trailing stop"><figcaption>Figure 5. Engine on + Automatic: the scalp was placed (server re-check mocked for the demo). Shown after a simulated move to +1R: the SL has trailed to "+0.5R locked" and the position cannot lose. A second attempt on the same setup is refused as already placed.</figcaption></figure>
 </div>
@@ -542,14 +567,17 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
     <tr><td>Trigger age / max drift</td><td class="num">≤ 1 bar / 0.5 ATR</td><td>Freshness of the signal</td></tr>
     <tr><td>Strike pool delta / criterion delta</td><td class="num">0.35-0.65 / 0.40-0.60</td><td>Selection band / pass band</td></tr>
     <tr><td>Min premium / max spread</td><td class="num">₹20 / 3%</td><td>Candidate filters</td></tr>
-    <tr><td>PCR long / short / stretched</td><td class="num">≥ 0.80 / ≤ 1.20 / &lt;0.50 or &gt;1.60</td><td>PCR bands</td></tr>
+    <tr><td>PCR zones</td><td class="num">0.50 / 0.80 / 1.20 / 1.60</td><td>Stretched &lt; 0.50 ≤ bearish &lt; 0.80 ≤ neutral ≤ 1.20 &lt; bullish ≤ 1.60 &lt; stretched</td></tr>
     <tr><td>India VIX</td><td class="num">10-24, not EXTREME</td><td>Tradeable volatility</td></tr>
     <tr><td>Profile bins / value area / burst</td><td class="num">24 / 70% / 1.5×</td><td>Premium volume profile</td></tr>
     <tr><td>Stop buffer / min R / max R</td><td class="num">0.15 / 0.30 / 1.50 ATR</td><td>Structural stop rules</td></tr>
     <tr><td>Hold for theta</td><td class="num">10 min</td><td>Theta charged on the plan</td></tr>
     <tr><td>Max charges share</td><td class="num">25%</td><td>Of the reward at the target</td></tr>
-    <tr><td>Slippage / spread cap</td><td class="num">0.15% / 0.5% per side</td><td>Scalper cost model</td></tr>
-    <tr><td>R:R tolerance</td><td class="num">3%</td><td>Tick-rounding allowance on the premium ratio</td></tr>
+    <tr><td>Slippage (both legs) / spread cap</td><td class="num">0.3% / 0.5% per side</td><td>Same as the Smart Scalper's fills (<code>SCALPER_SLIPPAGE_PCT</code>)</td></tr>
+    <tr><td>Stop gap (stressed risk)</td><td class="num">max(2 ticks, 10% R)</td><td>Added to the planned loss for sizing</td></tr>
+    <tr><td>Fill tolerance</td><td class="num">max(2 ticks, 20% R)</td><td>Max fill above the expected fill</td></tr>
+    <tr><td>R:R tolerance</td><td class="num">3%</td><td>Tick-rounding allowance on the premium ratio at the fill</td></tr>
+    <tr><td>Exit monitor interval</td><td class="num">5 s</td><td>Server-side exit checks</td></tr>
     <tr><td>Trail: breakeven / lock / lock to / gap</td><td class="num">+0.5R / +1R / +0.5R / 0.6R</td><td>Staged trailing stop</td></tr>
     <tr><td>Max loss per trade / lots cap</td><td class="num">₹1,500 / 1</td><td>Scalper Controls (defaults)</td></tr>
     <tr><td>Scalp time stop</td><td class="num">12 min</td><td>Scalper Controls (default)</td></tr>
@@ -560,22 +588,37 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
 <div class="flow">
   <h2>15. Limitations and first-live checklist</h2>
   <ul>
-    <li><b>Not yet run on live data.</b> The build environment could not reach market data. The strategy is covered by tests on synthetic tapes (21 Python and 14 TypeScript tests for the strategy, placement, trail and chart), and the full suites pass. Watch the first live sessions in paper mode.</li>
+    <li><b>Not yet run on live data.</b> The build environment could not reach market data. The strategy is covered by tests on synthetic tapes (29 Python and 23 TypeScript tests for the strategy, fill re-planning, stressed sizing, PCR zones, futures VWAP, the trail, the server monitor and the chart), and the full suites pass. Watch the first live sessions in paper mode.</li>
     <li><b>Check on the first live sessions:</b>
       <ul>
-        <li>near-month futures volume arrives on the 1-minute index candles, so VWAP is observable;</li>
+        <li>the near-month future's 1-minute OHLCV arrives (<code>futuresCandles</code>), so VWAP is observable;</li>
         <li>market-intel's per-strike 5-minute OI change and build-up are populated (they need a 5-minute baseline after the open);</li>
         <li>the selected premium's 1-minute candles load for the volume profile;</li>
         <li>the chain's delta and IV look sane on expiry day.</li>
       </ul>
     </li>
-    <li><b>Spread estimate.</b> Groww's chain carries no live bid/ask, so the spread is estimated from IV and capped. Real fills may differ.</li>
-    <li><b>1:1 rarely qualifies on NIFTY</b> because of the 25% charges rule. That is by design, not a fault.</li>
-    <li><b>Browser-driven management.</b> Exits run while the execution page is open.</li>
+    <li><b>Spread estimate.</b> Groww's chain carries no live bid/ask, so the spread is estimated from IV and capped. Real fills may differ, which is why placement re-plans on the actual fill.</li>
+    <li><b>Futures data dependency.</b> Without the near-month future's 1-minute OHLCV the VWAP criterion fails closed (no trades), by design.</li>
+    <li><b>1:1 rarely qualifies on NIFTY</b> because of the 25% charges rule, now that slippage is counted on both legs. That is by design, not a fault.</li>
+    <li><b>Server-side exits are paper only.</b> The monitor manages the paper Smart Scalper book. Live orders use TradePulse's separate live monitor with broker stop orders.</li>
     <li><b>Paper first.</b> Run the strategy in paper mode for several weeks and review the closed-trade log (exit reasons, R multiples, charges) before considering live trading through TradePulse's PIN-confirmed flow.</li>
   </ul>
   <div class="callout warn"><b>Risk disclaimer</b>Options trading involves substantial risk, and most intraday traders lose money. This document describes software behaviour; it is not investment advice, and TradePulse is not a SEBI-registered adviser. Live API trading may require static-IP registration and algo approval with your broker under SEBI's retail algo framework.</div>
 
+  <h3>Revision history</h3>
+  <table>
+    <tr><th>Version</th><th>Change</th></tr>
+    <tr><td>1.1</td><td>Fixes from an independent review:
+      <ul>
+        <li>R:R measured on the actual fill, with a structural stop and a fill tolerance;</li>
+        <li>placement re-plans on the real fill;</li>
+        <li>slippage counted on both legs and lots sized on the stressed loss;</li>
+        <li>explicit PCR zones;</li>
+        <li>true VWAP on the near-month future's OHLCV;</li>
+        <li>exits moved to a server-side monitor.</li>
+      </ul></td></tr>
+    <tr><td>1.0</td><td>First release.</td></tr>
+  </table>
   <h2 style="margin-top:14pt">Appendix: code and tests</h2>
   <table>
     <tr><th>File</th><th>Role</th></tr>
@@ -583,11 +626,12 @@ P = entry premium (the ask);  delta from the chain;  gamma from Black-Scholes us
     <tr><td><code>quant/src/tradepulse_quant/algo_engine/engine.py</code></td><td>Wiring into the V5 engine (<code>_scalp_evidence</code>); completed-candle filtering</td></tr>
     <tr><td><code>quant/src/tradepulse_quant/algo_engine/no_trade_engine.py</code></td><td>The V5 gates; strategy-specific R:R minimum</td></tr>
     <tr><td><code>apps/web/app/api/algo-trading/route.ts</code></td><td>Inputs, two-pass evaluation, <code>PLACE_ON_SCALPER</code> with the server re-check</td></tr>
-    <tr><td><code>services/paper-trading/src/smart-scalper.ts</code></td><td><code>place()</code>, <code>vwapEmaTrail()</code>, <code>emaMomentumLost()</code>, exits</td></tr>
+    <tr><td><code>services/paper-trading/src/smart-scalper.ts</code></td><td><code>place()</code> with the fill re-plan, <code>manage()</code>, <code>vwapEmaTrail()</code>, <code>emaMomentumLost()</code>, exits</td></tr>
+    <tr><td><code>apps/web/lib/scalper-monitor.ts</code>, <code>apps/web/instrumentation.ts</code></td><td>Server-side exit monitor, started at boot</td></tr>
     <tr><td><code>apps/web/components/scalper/scalper-desk.tsx</code></td><td>Strategy selector, auto and manual placement, OI-pick strike, drawings</td></tr>
     <tr><td><code>apps/web/components/scalper/premium-chart.tsx</code></td><td>Risk-reward drawing (reward zone, risk zone, locked-profit line)</td></tr>
     <tr><td><code>quant/tests/test_scalp_strategy.py</code></td><td>Criteria, delta-gamma maths, 1:1 vs 1:2, PE mirror, V5 integration</td></tr>
-    <tr><td><code>tests/unit/scalp-place.test.ts</code>, <code>tests/contract/algo-trading-route.test.ts</code></td><td>Placement limits, staged trail, momentum exit, chart layout, route guards</td></tr>
+    <tr><td><code>tests/unit/scalp-place.test.ts</code>, <code>tests/unit/scalper-monitor.test.ts</code>, <code>tests/contract/algo-trading-route.test.ts</code></td><td>Placement limits, fill re-plan, stressed sizing, staged trail, momentum exit, server monitor, chart layout, route guards</td></tr>
     <tr><td><code>docs/operations/vwap-ema-scalper.md</code></td><td>Operator notes (Markdown)</td></tr>
   </table>
 </div>

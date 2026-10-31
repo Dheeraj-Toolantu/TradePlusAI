@@ -171,3 +171,64 @@ describe("VWAP-EMA staged trail (systematic SL / target / trailing SL)", () => {
     expect(state.closed[0]).toMatchObject({ exitReason: "STOP_LOSS" });
   });
 });
+
+describe("VWAP-EMA placement re-plans on the actual fill (defects 1 and 2)", () => {
+  // The engine's plan (quant test_scalp_strategy): expected fill 121.25 = ask 120.85 + 0.3%, rounded
+  // up; structural SL 113.70; target = fill + 2R = 136.35; tolerance 0.2R → max entry 122.75.
+  const risk = { maxEntry: 122.75, maxTarget: 139.45, minRiskReward: 1.94, stopGap: 0.76, feesAtStopPerLot: 113.18, lotSize: 65 };
+  const vwapPlan = (overrides: Partial<ScalperPlan> = {}) => plan({ entry: 121.25, stop: 113.7, target: 136.35, riskReward: 2, trail: { rule: "VWAP_EMA", costPerUnit: 2.13 }, risk, ...overrides });
+  const quoted = (ask: number) => [{ ...contract, premium: ask - 0.4, bid: ask - 0.8, ask }];
+  const scalperAt = () => new SmartScalper({ now: at("10:05"), hydrate: false, slippagePct: 0.003 });
+
+  it("fills where the plan expected, keeps the structural stop and holds 2R on the fill", async () => {
+    const result = await scalperAt().place("NIFTY", vwapPlan(), quoted(120.85), { setupId: "fill-ok", settings: { maxLossPerTrade: 1500 } });
+    expect(result.placed).toBe(true);
+    const position = result.positions[0];
+    expect(position.entry).toBe(121.25); // ask + 0.3%, rounded up: the same price the plan used
+    expect(position.stop).toBe(113.7); // NOT shifted by slippage: the structural SL
+    expect(position.target).toBe(136.35);
+    expect(position.trail?.risk).toBe(7.55);
+    expect(position.fill).toMatchObject({ planned: 121.25, actual: 121.25, deviation: 0, riskReward: 2 });
+  });
+
+  it("re-plans a worse fill: same structural stop, R and target re-derived from the fill", async () => {
+    const result = await scalperAt().place("NIFTY", vwapPlan(), quoted(121.1), { setupId: "worse" });
+    expect(result.placed).toBe(true);
+    const position = result.positions[0];
+    expect(position.entry).toBe(121.5); // 121.10 + 0.3%, rounded up
+    expect(position.stop).toBe(113.7); // unchanged
+    expect(position.trail?.risk).toBe(7.8); // R grew with the worse fill
+    expect(position.target).toBe(137.1); // 121.50 + 2 x 7.80: still 1:2 on the fill
+    expect(position.fill).toMatchObject({ deviation: 0.25, riskReward: 2 });
+  });
+
+  it("caps a re-derived target at the OI wall and still places when the ratio holds", async () => {
+    // wanted 137.10, wall cap 136.90: (136.90 − 121.50) / 7.80 = 1.97 ≥ 1.94
+    const capped = await scalperAt().place("NIFTY", vwapPlan({ risk: { ...risk, maxTarget: 136.9 } }), quoted(121.1), { setupId: "wall" });
+    expect(capped.placed).toBe(true);
+    expect(capped.positions[0].target).toBe(136.9);
+    expect(capped.positions[0].fill?.riskReward).toBe(1.97);
+  });
+
+  it("refuses a fill that drifted past the tolerance", async () => {
+    const result = await scalperAt().place("NIFTY", vwapPlan(), quoted(122.5), { setupId: "drift" });
+    expect(result).toMatchObject({ placed: false, error: expect.stringContaining("above the planned entry") });
+    expect(result.positions).toHaveLength(0);
+  });
+
+  it("refuses when the wall-capped target leaves less than the chosen R:R", async () => {
+    // fill 121.50, R 7.80, but the wall caps the target at 135.40: (135.40 − 121.50) / 7.80 = 1.78 < 1.94
+    const result = await scalperAt().place("NIFTY", vwapPlan({ risk: { ...risk, maxTarget: 135.4 } }), quoted(121.1), { setupId: "rr" });
+    expect(result).toMatchObject({ placed: false, error: expect.stringContaining("reward:risk is 1.78") });
+  });
+
+  it("sizes on the stressed loss: fewer lots, or none, when the max loss cannot absorb it", async () => {
+    // stressed per lot at the 121.25 fill: (7.55 + 0.34 exit slippage + 0.76 gap) x 65 + 113.18 = ₹675
+    const two = await scalperAt().place("NIFTY", vwapPlan({ lots: 3, quantity: 195 }), quoted(120.85), { setupId: "two", settings: { maxLossPerTrade: 1400 } });
+    expect(two.positions[0].legs[0].quantity).toBe(130); // 2 lots fit ₹1,400, not 3
+    expect(two.positions[0].fill!.stressedLoss).toBeLessThanOrEqual(1400);
+    expect(two.positions[0].fill!.stressedLoss).toBeGreaterThan(two.positions[0].fill!.plannedLoss);
+    const none = await scalperAt().place("NIFTY", vwapPlan(), quoted(120.85), { setupId: "none", settings: { maxLossPerTrade: 600 } });
+    expect(none).toMatchObject({ placed: false, error: expect.stringContaining("stressed") });
+  });
+});

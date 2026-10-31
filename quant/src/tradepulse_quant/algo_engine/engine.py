@@ -634,6 +634,8 @@ def analyze_payload(payload: dict) -> dict:
             "risk_reward": payload.get("risk_reward"),
             "max_loss_per_trade": payload.get("max_loss_per_trade"),
             "max_lots": payload.get("max_lots"),
+            "slippage_pct": payload.get("slippage_pct"),
+            "futures_candles": completed_candles(_candles_from(payload.get("futures_candles")), now, interval) or None,
             "premium_candles": {"symbol": premium.get("symbol"), "candles": completed_candles(_candles_from(premium.get("candles")), now, 1)} if premium else None,
         }
     result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy, daily_candles, _expiry_today(option_evidence, now), context, now)
