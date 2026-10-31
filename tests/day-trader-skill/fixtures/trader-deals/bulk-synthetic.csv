@@ -1,0 +1,6 @@
+Date ,Symbol ,Security Name ,Client Name ,Buy/Sell ,Quantity Traded ,Trade Price / Wght. Avg. Price ,Remarks 
+30-Oct-2026,ACMEIND,Acme Industries Limited,EXAMPLE CAPITAL FUND LP,BUY,"12,50,000",412.35,-
+30-Oct-2026,ACMEIND,Acme Industries Limited,SAMPLE BROKING PRIVATE LIMITED,SELL,"12,40,000",412.60,-
+30-Oct-2026,M&M,Mahindra & Mahindra Limited,DEMO MUTUAL FUND A/C DEMO FLEXI CAP,BUY,7000000,3105.50,-
+30-Oct-2026,TINYCAP,Tinycap Textiles Limited,RAMESH KUMAR,BUY,250000,18.40,-
+30-Oct-2026,TINYCAP,Tinycap Textiles Limited,RAMESH KUMAR,SELL,248000,18.95,-

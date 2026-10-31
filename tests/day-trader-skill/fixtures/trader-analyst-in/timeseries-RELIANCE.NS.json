@@ -1,0 +1,552 @@
+{
+ "timeseries": {
+  "result": [
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "quarterlyTotalRevenue"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001,
+     1700000002,
+     1700000003,
+     1700000004
+    ],
+    "quarterlyTotalRevenue": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 2360000000000.0,
+       "fmt": "2.36T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 2550000000000.0,
+       "fmt": "2.55T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-12-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 2650000000000.0,
+       "fmt": "2.65T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 2500000000000.0,
+       "fmt": "2.50T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 2700000000000.0,
+       "fmt": "2.70T"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "quarterlyGrossProfit"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001,
+     1700000002,
+     1700000003,
+     1700000004,
+     1700000005
+    ],
+    "quarterlyGrossProfit": [
+     null,
+     {
+      "dataId": 0,
+      "asOfDate": "2025-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 700000000000.0,
+       "fmt": "0.70T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 765000000000.0,
+       "fmt": "0.77T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-12-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 795000000000.0,
+       "fmt": "0.80T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-03-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 800000000000.0,
+       "fmt": "0.80T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 750000000000.0,
+       "fmt": "0.75T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 823500000000.0,
+       "fmt": "0.82T"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "quarterlyOperatingIncome"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001,
+     1700000002,
+     1700000003,
+     1700000004,
+     1700000005
+    ],
+    "quarterlyOperatingIncome": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 300000000000.0,
+       "fmt": "0.30T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 320000000000.0,
+       "fmt": "0.32T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-12-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 330000000000.0,
+       "fmt": "0.33T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-03-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 340000000000.0,
+       "fmt": "0.34T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 310000000000.0,
+       "fmt": "0.31T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 355000000000.0,
+       "fmt": "0.35T"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "quarterlyNetIncome"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001,
+     1700000002,
+     1700000003,
+     1700000004
+    ],
+    "quarterlyNetIncome": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 269940000000.0,
+       "fmt": "0.27T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 181650000000.0,
+       "fmt": "0.18T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-12-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 185400000000.0,
+       "fmt": "0.19T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 270000000000.0,
+       "fmt": "0.27T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 200000000000.0,
+       "fmt": "0.20T"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "quarterlyDilutedEPS"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001,
+     1700000002,
+     1700000003,
+     1700000004
+    ],
+    "quarterlyDilutedEPS": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 19.95,
+       "fmt": "19.95"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 13.42,
+       "fmt": "13.42"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-12-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 13.7,
+       "fmt": "13.70"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 19.96,
+       "fmt": "19.96"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 14.78,
+       "fmt": "14.78"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "quarterlyBasicEPS"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001,
+     1700000002,
+     1700000003,
+     1700000004
+    ],
+    "quarterlyBasicEPS": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 19.95,
+       "fmt": "19.95"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 13.42,
+       "fmt": "13.42"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2025-12-31",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 13.7,
+       "fmt": "13.70"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-06-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 19.96,
+       "fmt": "19.96"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-09-30",
+      "periodType": "3M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 14.78,
+       "fmt": "14.78"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "annualTotalRevenue"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001
+    ],
+    "annualTotalRevenue": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-03-31",
+      "periodType": "12M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 9650000000000.0,
+       "fmt": "9.65T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-03-31",
+      "periodType": "12M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 10300000000000.0,
+       "fmt": "10.30T"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "annualNetIncome"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001
+    ],
+    "annualNetIncome": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-03-31",
+      "periodType": "12M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 696480000000.0,
+       "fmt": "0.70T"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-03-31",
+      "periodType": "12M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 800000000000.0,
+       "fmt": "0.80T"
+      }
+     }
+    ]
+   },
+   {
+    "meta": {
+     "symbol": [
+      "RELIANCE.NS"
+     ],
+     "type": [
+      "annualDilutedEPS"
+     ]
+    },
+    "timestamp": [
+     1700000000,
+     1700000001
+    ],
+    "annualDilutedEPS": [
+     {
+      "dataId": 0,
+      "asOfDate": "2025-03-31",
+      "periodType": "12M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 51.47,
+       "fmt": "51.47"
+      }
+     },
+     {
+      "dataId": 0,
+      "asOfDate": "2026-03-31",
+      "periodType": "12M",
+      "currencyCode": "INR",
+      "reportedValue": {
+       "raw": 59.12,
+       "fmt": "59.12"
+      }
+     }
+    ]
+   }
+  ],
+  "error": null
+ }
+}

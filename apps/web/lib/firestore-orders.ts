@@ -52,6 +52,10 @@ export type OrderRecord = {
   exchange?: string;
   underlying?: string;
   initialStopLoss?: number;
+  /** Smart Scalper trailing rule (e.g. VWAP_EMA), its stage and the round-trip charges per unit. */
+  trailRule?: string;
+  trailStage?: string;
+  trailCostPerUnit?: number;
   charges?: number;
   exitError?: string;
   reconcileWarning?: string;

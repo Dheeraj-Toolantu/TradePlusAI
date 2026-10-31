@@ -1,0 +1,79 @@
+{
+  "created_by": "trader-budget",
+  "created_at": "2026-11-02T04:16:00Z",
+  "status": "proposed",
+  "paper": true,
+  "note": "Proposals only. Nothing is placed until trader-risk passes each order and you say yes to it in the chat. Claude never places a live Groww order: you place it in the Groww app or Trade API. Paper fills are simulated in trader/portfolio.json.",
+  "source": "trader/plan.json (RELIANCE orb 2026-11-02)",
+  "orders": [
+    {
+      "symbol": "RELIANCE",
+      "side": "buy",
+      "qty": "43",
+      "type": "limit",
+      "time_in_force": "day",
+      "limit_price": "1412.40",
+      "order_class": "bracket",
+      "take_profit_limit_price": "1432.40",
+      "stop_loss_stop_price": "1402.40",
+      "market": "IN",
+      "currency": "INR",
+      "exchange": "NSE",
+      "product": "MIS",
+      "why": "opening-range breakout on RELIANCE: 43 shares, bound by your \u20b9500 max loss per trade (43 x 10.00 = \u20b9430 + \u20b968.60 charges = \u20b9498.60 at the stop)",
+      "plan": {
+        "entry": 1412.4,
+        "stop": 1402.4,
+        "target": 1432.4,
+        "risk_per_share": 10.0,
+        "max_loss": 498.6,
+        "max_loss_gross": 430.0,
+        "charges_at_stop": 68.6,
+        "charges_at_target": 68.97,
+        "reward_risk": 2.0,
+        "reward_risk_net": 1.59,
+        "setup": "orb",
+        "entry_time": "09:45",
+        "flat_by": "15:10"
+      },
+      "groww": {
+        "api": "Groww Trade API place_order (POST /v1/order/create)",
+        "entry": {
+          "trading_symbol": "RELIANCE",
+          "quantity": 43,
+          "price": 1412.4,
+          "validity": "DAY",
+          "exchange": "NSE",
+          "segment": "CASH",
+          "product": "MIS",
+          "order_type": "LIMIT",
+          "transaction_type": "BUY",
+          "order_reference_id": "TPE-261102-52b40717"
+        },
+        "stop_loss": {
+          "trading_symbol": "RELIANCE",
+          "quantity": 43,
+          "trigger_price": 1402.4,
+          "validity": "DAY",
+          "exchange": "NSE",
+          "segment": "CASH",
+          "product": "MIS",
+          "order_type": "SL_M",
+          "transaction_type": "SELL",
+          "order_reference_id": "TPS-261102-52b40717"
+        },
+        "stop_loss_when": "only after the entry fills, for the filled quantity: a protective SL-M SELL with its trigger at the stop",
+        "target": {
+          "price": 1432.4,
+          "resting_order": false,
+          "how": "not placed: a second live sell could fill as well as the SL-M and leave you short. trader-alerts rings at the target; then modify or cancel the SL-M and sell (ticket.py flatten)"
+        },
+        "flat_by": "15:10",
+        "square_off": "Groww squares off open MIS positions itself near the close and charges for it; be flat by 15:10 IST"
+      }
+    }
+  ],
+  "market": "IN",
+  "currency": "INR",
+  "broker": "groww"
+}

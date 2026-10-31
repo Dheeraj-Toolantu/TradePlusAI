@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+<title>Financial Results</title>
+<link>https://www.nseindia.com</link>
+<description>Financial Results (synthetic test copy)</description>
+<item>
+<title>Reliance Infrastructure Limited</title>
+<link>https://nsearchives.nseindia.com/corporate/xbrl/SYNTHETIC_RELINFRA_30092026.xml</link>
+<description>Financial Results for the period ended 30-Sep-2026</description>
+<pubDate>Fri, 30 Oct 2026 19:10:00 +0530</pubDate>
+</item>
+<item>
+<title>Tata Consultancy Services Limited</title>
+<link>https://nsearchives.nseindia.com/corporate/xbrl/SYNTHETIC_TCS_30092026.xml</link>
+<description>Financial Results for the period ended 30-Sep-2026</description>
+<pubDate>Thu, 09 Oct 2026 17:05:00 +0530</pubDate>
+</item>
+<item>
+<title>Reliance Industries Limited</title>
+<link>https://nsearchives.nseindia.com/corporate/xbrl/SYNTHETIC_RELIANCE_30092026.xml</link>
+<description>Financial Results for the period ended 30-Sep-2026</description>
+<pubDate>Fri, 17 Oct 2026 19:42:00 +0530</pubDate>
+</item>
+<item>
+<title>HDFC Bank Limited</title>
+<link>https://nsearchives.nseindia.com/corporate/xbrl/SYNTHETIC_HDFCBANK_30092026.xml</link>
+<description>Financial Results for the period ended 30-Sep-2026</description>
+<pubDate>Sat, 18 Oct 2026 16:20:00 +0530</pubDate>
+</item>
+</channel>
+</rss>

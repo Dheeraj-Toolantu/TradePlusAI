@@ -79,13 +79,42 @@ describe("algo trading execution boundary", () => {
     expect(firestoreFake.documents("orders")).toEqual([expect.objectContaining({ symbol: "NIFTY2691523300PE", status: "OPEN" })]);
   });
 
-  it("stores the intrinsic-value premium trail on a manual paper order", async () => {
-    const response = await POST(requestFor({
-      mode: "PAPER", orderSource: "MANUAL", strategy: "INTRINSIC_VALUE", strategyName: "Intrinsic Value OTM", underlying: "NIFTY",
-      symbol: "NIFTY2691523300PE", growwSymbol: "NIFTY2691523300PE", side: "BUY", quantity: 65, price: 52.5, target: 76.25, stopLoss: 48, trailingDistance: 4.5,
-      lotSize: 65, expiry: "2026-09-15", optionType: "PE", strike: 23300, tickSize: 0.05, freezeQuantity: 1801, contractActive: true, sentimentMapping: "CONTRARIAN",
-    }));
+  const scalpTicket = (overrides: Record<string, unknown>) => requestFor({
+    mode: "PAPER", orderSource: "MANUAL", strategy: "VWAP_EMA_SCALP", strategyName: "VWAP-EMA Scalper", underlying: "NIFTY",
+    symbol: "NIFTY2691523300PE", growwSymbol: "NIFTY2691523300PE", side: "BUY", quantity: 65, price: 52.5, lotSize: 65, expiry: "2026-09-15",
+    optionType: "PE", strike: 23300, tickSize: 0.05, freezeQuantity: 1801, contractActive: true, ...overrides,
+  });
+
+  it("lets the scalper trade the 1:1 the trader chose", async () => {
+    const response = await POST(scalpTicket({ target: 57, stopLoss: 48, riskReward: "1:1" }));
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({ order: expect.objectContaining({ strategy: "INTRINSIC_VALUE", trailingDistance: 4.5, initialStopLoss: 48, highWaterMark: 52.5 }) });
+    await expect(response.json()).resolves.toMatchObject({ order: expect.objectContaining({ strategy: "VWAP_EMA_SCALP", target: 57, stopLoss: 48 }) });
+  });
+
+  it("holds a 1:2 scalp to its 1.94R premium minimum", async () => {
+    const response = await POST(scalpTicket({ target: 59.25, stopLoss: 48, riskReward: "1:2" }));  // 1.5R
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining("1.94R") });
+  });
+
+  it("keeps the 2R minimum for every other strategy", async () => {
+    const response = await POST(scalpTicket({ strategy: "ORB_RETEST", target: 57, stopLoss: 48, riskReward: "1:1" }));
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining("2R") });
+  });
+
+  it("only places index scalps on the scalper", async () => {
+    const response = await POST(requestFor({ action: "PLACE_ON_SCALPER", underlying: "RELIANCE", riskReward: "1:2" }));
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ placed: false, error: expect.stringContaining("index options") });
+  });
+
+  it("never places on the scalper while the kill switch is on", async () => {
+    process.env.ALGO_KILL_SWITCH = "true";
+    try {
+      const response = await POST(requestFor({ action: "PLACE_ON_SCALPER", underlying: "NIFTY", riskReward: "1:2" }));
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({ placed: false, error: expect.stringContaining("KILL_SWITCH_ACTIVE") });
+    } finally { delete process.env.ALGO_KILL_SWITCH; }
   });
 });

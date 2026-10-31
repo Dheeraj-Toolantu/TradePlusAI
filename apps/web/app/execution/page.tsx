@@ -5,7 +5,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
-import { PremiumCalculator, type PremiumCheck } from "../../components/execution/premium-calculator";
+import type { ChartBar, ChartLevel, RiskRewardBox } from "../../components/scalper/premium-chart";
+import type { VwapScalpSignal } from "../../components/scalper/scalper-desk";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -18,27 +19,38 @@ const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitorin
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
 const NextDayPanel = dynamic(() => import("../../components/execution/next-day-panel").then((module) => module.NextDayPanel), { ssr: false });
 const ScalperDesk = dynamic(() => import("../../components/scalper/scalper-desk").then((module) => module.ScalperDesk), { ssr: false, loading: () => <div className="algo-empty">Loading scalper…</div> });
+const PremiumChart = dynamic(() => import("../../components/scalper/premium-chart").then((module) => module.PremiumChart), { ssr: false });
 
 type PipelineGate = { code: string; passed: boolean; detail: string };
-type IntrinsicContract = { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string; lot_size?: number | null; tick_size?: number | null; freeze_quantity?: number | null };
-type IntrinsicCandidate = { symbol: string; strike: number; premium: number; delta?: number; market_odds: number; itm_chance: number; intrinsic_at_key: number; premium_at_key: number; value_gain: number; liquidity_score: number; eligible: boolean; target_reachable?: boolean; premium_check?: PremiumCheck };
-type IntrinsicCalc = {
-  mapping: "CONTRARIAN" | "FOLLOW"; spot?: number | null; reach?: number | null;
-  sentiment: { score: number | null; label?: string | null; zone?: string | null; option_type: "CE" | "PE" | null; lean_option_type?: "CE" | "PE" | null; ok: boolean; reason: string; age_minutes?: number | null; threshold: number };
-  watch?: boolean;
-  premium_check?: PremiumCheck | null;
-  key_value: { price: number; distance: number; sources: string[]; strength: number } | null;
-  levels: Array<{ name: string; price: number; distance: number }>;
-  candidates: IntrinsicCandidate[];
-  selected: IntrinsicCandidate | null;
-  premium: { status: string; reason: string; impulse_low?: number; impulse_high?: number; pullback_low?: number; retrace?: number } | null;
-  plan: { entry: number; stop_loss: number; target: number; risk_reward: number; trailing_distance: number; breakeven_at: number; trailing_rule: string } | null;
+type ScalpContract = { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string | null; lot_size?: number | null; tick_size?: number | null; freeze_quantity?: number | null };
+type ScalpCriterion = { key: string; name: string; points: number; max: number; passed: boolean; detail: string };
+type ScalpCandidate = { symbol: string; strike: number; type: "CE" | "PE"; premium: number; delta: number; iv?: number | null; open_interest: number; volume: number; oi_change_5m?: number | null; activity?: string | null; spread_pct?: number | null; liquidity_score: number; selection_score: number };
+type ScalpPlan = {
+  valid: boolean; reason: string; spot_entry?: number; spot_stop?: number; spot_target?: number; risk_points?: number; target_points?: number; rr_choice?: number;
+  entry?: number; stop_loss?: number; target?: number; lot_size?: number; lots?: number; quantity?: number; risk_reward?: number; net_risk_reward?: number; cost_share?: number;
+  greeks?: { delta: number; gamma: number; theta_per_day: number; iv: number | null }; theta_drag?: number; premium_loss_delta_only?: number; premium_gain_delta_only?: number;
+  gamma_effect?: { on_loss: number; on_gain: number }; costs_per_lot?: { at_target: number; at_stop: number }; risk_per_lot?: number; reward_per_lot?: number; max_loss?: number;
+  planned_max_loss?: number; stressed_risk_reward?: number; stop_gap?: number; slippage_pct?: number; max_entry?: number; fill_tolerance?: number;
 };
-type StrategySetup = { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: IntrinsicContract; trailing_distance?: number; breakeven_at?: number; key_value?: number };
+type ScalpCalc = {
+  rr_choice: "1:1" | "1:2";
+  tape: { side?: "CE" | "PE" | null; close?: number; vwap?: number; ema5?: number; ema9?: number; atr?: number; vwap_slope?: number; vwap_extension_atr?: number; volume_ratio?: number | null; risk_points?: number; reason?: string };
+  trigger?: { time: string; close: number } | null;
+  criteria: ScalpCriterion[];
+  candidates: ScalpCandidate[];
+  selected: ScalpCandidate | null;
+  plan: ScalpPlan | null;
+  profile: { poc: number; vah: number; val: number; close?: number; volume_ratio?: number | null } | null;
+  oi?: { atm_strike?: number; wall?: number | null; room_points?: number | null; oi_direction_score?: number | null; atm_activity?: { CE?: string | null; PE?: string | null } };
+  pcr?: { pcr: number | null; pcr_change_5m: number | null };
+  vix?: { value: number | null; regime: string | null };
+  score?: { total: number; minimum: number; maximum: number };
+};
+type StrategySetup = { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; net_risk_reward?: number; planned_max_loss?: number; max_entry?: number; stressed_risk_reward?: number; rr_choice?: string; lots?: number; quantity?: number; max_loss?: number; setup_id?: string; trigger_time?: string | null; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: ScalpContract; spot?: { entry: number; stop: number; target: number } };
 type Analysis = {
   decision: string; reason?: string;
   setup?: StrategySetup;
-  calculations?: { underlying?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string; intrinsic?: IntrinsicCalc };
+  calculations?: { underlying?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string; scalp?: ScalpCalc };
   session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean };
   pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
   strategy_decision?: string;
@@ -55,8 +67,7 @@ type QuoteUpdate = { symbol: string; price: number | null; timestamp: string; so
 type OptionCandidate = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; score: number; riskReward: number; lotSize?: number; tickSize?: number; freezeQuantity?: number };
 type Contract = { symbol: string; growwSymbol: string; type: "CE" | "PE"; expiry?: string; strike?: number; lotSize: number; tickSize?: number; freezeQuantity?: number; active?: boolean };
 type SearchResult = Contract & { exchange?: string };
-type SentimentMapping = "CONTRARIAN" | "FOLLOW";
-type SentimentExtreme = "ACTIVE" | "BALANCED" | "STRICT";
+type RiskReward = "1:1" | "1:2";
 type NextDayPlan = NonNullable<NextDaySetup["plans"]>[number];
 type LiveStatus = { enabled: boolean; disabledReasons: string[]; limits?: { maxDailyLoss: number; maxTradesPerDay: number; maxLotsPerOrder: number; maxOrderValue: number; maxOpenPositions: number; minRewardRisk: number }; today?: { tradesToday: number; realizedPnl: number; openRisk: number; lossBudgetLeft: number }; positions: Order[]; monitor?: { running: boolean; lastTickAt: string | null; lastError: string | null } };
 type Tab = "LIVE" | "PAPER" | "HISTORY" | "LOGS";
@@ -65,17 +76,19 @@ type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
 const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
-// The algo page runs one strategy: the sentiment-driven intrinsic-value OTM option buy.
-const strategy = { id: "INTRINSIC_VALUE", name: "Intrinsic Value OTM", description: "Extreme index sentiment sets the side; the nearest key value sets where price is heading; the OTM strike with the best chance of turning ITM is bought after its premium pulls back and resumes. Stop under the premium pullback, target = premium at the key value, stop trails by the initial risk." } as const;
-const MAPPINGS: Array<{ id: SentimentMapping; name: string; note: string }> = [
-  { id: "CONTRARIAN", name: "Contrarian: +ve → PE, −ve → CE", note: "Fades the crowd at sentiment extremes, so it trades against the prevailing trend; the regime gate is not applied." },
-  { id: "FOLLOW", name: "Follow: +ve → CE, −ve → PE", note: "Trades with the sentiment; the regime gate still applies." },
+// The algo page runs one strategy: the 1-minute VWAP / 5-9 EMA index-option scalper.
+const strategy = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape: trade the side of a rising (falling) VWAP when the 5 EMA leads the 9 EMA, after a pullback to the 9 EMA resumes on volume. The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
+const RR_CHOICES: Array<{ id: RiskReward; name: string }> = [
+  { id: "1:2", name: "Risk:Reward 1:2" },
+  { id: "1:1", name: "Risk:Reward 1:1" },
 ];
-const EXTREMES: Array<{ id: SentimentExtreme; name: string }> = [
-  { id: "ACTIVE", name: "Trade at ±15 (Greed/Fear)" },
-  { id: "BALANCED", name: "Trade at ±25" },
-  { id: "STRICT", name: "Trade at ±40 (rare)" },
-];
+const SCALPER_SETTINGS_KEY = "tradepulse.scalper.settings";
+const STRATEGY_PREFS_KEY = "tradepulse.scalp.prefs";
+type ScalperLimits = { maxTrades?: number; maxLossPerTrade?: number; maxDailyLoss?: number; lots?: number; minRiskReward?: number; mode?: string; maxHoldMinutes?: number };
+function readLocal<T>(key: string, fallback: T): T {
+  try { const raw = window.localStorage.getItem(key); return raw ? { ...fallback, ...JSON.parse(raw) } : fallback; } catch { return fallback; }
+}
+const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.parse(iso) : NaN; return Number.isFinite(value) ? Math.floor(value / 1000) : null; };
 const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
 const calc = (value: unknown, percent = false) => formatMarketCalculationValue(value as number | string | null | undefined, { percent });
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -84,8 +97,13 @@ const nowLabel = () => new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/
 
 export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");
-  const [sentimentMapping, setSentimentMapping] = useState<SentimentMapping>("CONTRARIAN");
-  const [sentimentExtreme, setSentimentExtreme] = useState<SentimentExtreme>("ACTIVE");
+  // Per-viewer preferences: the chosen reward:risk and whether confirmed scalps are auto-placed.
+  const [riskReward, setRiskReward] = useState<RiskReward>("1:2");
+  const [scalperRefresh, setScalperRefresh] = useState(0);
+  const [premiumBars, setPremiumBars] = useState<ChartBar[]>([]);
+  const attemptedSetups = useRef(new Set<string>());
+  useEffect(() => { const prefs = readLocal(STRATEGY_PREFS_KEY, { riskReward: "1:2" as RiskReward }); setRiskReward(prefs.riskReward === "1:1" ? "1:1" : "1:2"); }, []);
+  useEffect(() => { try { window.localStorage.setItem(STRATEGY_PREFS_KEY, JSON.stringify({ riskReward })); } catch { /* per-viewer convenience */ } }, [riskReward]);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [paperOrders, setPaperOrders] = useState<Order[]>([]);
   const [history, setHistory] = useState<Order[]>([]);
@@ -135,7 +153,9 @@ export default function ExecutionPage() {
     if (!quiet) setBusy(true);
     const version = mutationVersion.current;
     try {
-      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&mapping=${sentimentMapping}&extreme=${sentimentExtreme}`, { cache: "no-store" }).then((response) => response.json());
+      // The scalper sizes to the Smart Scalper desk's own limits (max loss per trade, lots).
+      const limits = readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {});
+      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&rr=${encodeURIComponent(riskReward)}${limits.maxLossPerTrade ? `&maxLoss=${limits.maxLossPerTrade}` : ""}${limits.lots ? `&lots=${limits.lots}` : ""}`, { cache: "no-store" }).then((response) => response.json());
       setAnalysis(data.analysis ?? null);
       setAccount(data.account ?? null);
       setSafety({ safeMode: Boolean(data.safeMode), killSwitch: Boolean(data.killSwitch), reason: data.killSwitchReason ?? data.safeModeReason ?? "" });
@@ -147,23 +167,21 @@ export default function ExecutionPage() {
       if (data.error) setMessage(data.error);
     } catch { setMessage("Strategy engine unavailable; retrying on the next refresh."); }
     finally { if (!quiet) setBusy(false); }
-  }, [sentimentExtreme, sentimentMapping, symbol]);
+  }, [riskReward, symbol]);
 
   const refreshLive = useCallback(async () => {
     try { setLive(await fetch("/api/live-orders", { cache: "no-store" }).then((response) => response.json())); } catch { /* status is advisory */ }
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
-  // The engine only sees COMPLETED 5-minute candles and a premium continuation signal is actionable for about
-  // two candles, so re-run it shortly after every candle close (and every minute as a backstop).
-  // Previously the analysis loaded once, so the card showed stale/expired signals and the auto
-  // engine kept an out-of-date session window.
+  // The scalper only sees COMPLETED 1-minute candles and a trigger is actionable for about one
+  // candle, so re-run it a few seconds after every minute closes.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const schedule = () => {
       const now = Date.now();
-      const nextClose = Math.ceil(now / 300_000) * 300_000 + 5_000;
-      timer = setTimeout(() => { if (document.visibilityState === "visible") void refresh(true); schedule(); }, Math.min(nextClose - now, 60_000));
+      const nextClose = Math.ceil(now / 60_000) * 60_000 + 4_000;
+      timer = setTimeout(() => { if (document.visibilityState === "visible") void refresh(true); schedule(); }, nextClose - now);
     };
     schedule();
     return () => { if (timer) clearTimeout(timer); };
@@ -396,7 +414,7 @@ export default function ExecutionPage() {
       const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
         mode: "PAPER", orderSource: ticketOrigin, strategy: strategy.id, strategyName: `${strategy.name}${ticketSource !== "MANUAL" ? ` · ${ticketSource}` : ""}`, underlying: symbol,
         symbol: enriched.symbol, growwSymbol: enriched.growwSymbol, side: "BUY", quantity: lots * enriched.lotSize, lotSize: enriched.lotSize, price: premium,
-        target: Number(target), stopLoss: Number(stopLoss), ...(Number(trailing) > 0 ? { trailingDistance: Number(trailing) } : {}), sentimentMapping, sentimentExtreme, expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
+        target: Number(target), stopLoss: Number(stopLoss), ...(Number(trailing) > 0 ? { trailingDistance: Number(trailing) } : {}), riskReward, maxLossPerTrade: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}).maxLossPerTrade, maxLots: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}).lots, expiry: enriched.expiry, optionType: enriched.type, strike: enriched.strike,
         tickSize: enriched.tickSize, freezeQuantity: enriched.freezeQuantity, contractActive: enriched.active, analysisDecision: analysis?.decision,
       }) });
       const data = await response.json().catch(() => ({}));
@@ -508,15 +526,63 @@ export default function ExecutionPage() {
     const picked = setup.contract;
     const row = chainRef.current.find((item) => norm(item.symbol) === norm(picked.symbol));
     setContract({ symbol: picked.symbol, growwSymbol: picked.symbol, type: picked.type, expiry: picked.expiry ?? row?.expiry, strike: picked.strike, lotSize: Number(picked.lot_size) > 0 ? Number(picked.lot_size) : row?.lotSize || FALLBACK_LOT[symbol] || 1, tickSize: picked.tick_size ?? row?.tickSize, freezeQuantity: picked.freeze_quantity ?? row?.freezeQuantity });
-    setLots(1);
+    setLots(Math.max(1, setup.lots ?? 1));
     setStopLoss(String(setup.stop_loss));
     setTarget(String(setup.target));
-    setTrailing(String(setup.trailing_distance ?? ""));
-    setTicketSource(`${strategy.name} V5`);
+    setTrailing("");
+    setTicketSource(`${strategy.name} ${setup.rr_choice ?? riskReward}`);
     setTicketOrigin("ALGO");
-    setMessage(`${strategy.name} setup loaded: BUY ${picked.symbol} near ₹${setup.entry} · SL ₹${setup.stop_loss} · trail ₹${setup.trailing_distance} (breakeven at ₹${setup.breakeven_at}) · target ₹${setup.target} at key value ${money(setup.key_value)}. The server re-checks every V5 gate when you place it.`);
+    setMessage(`${strategy.name} setup loaded: BUY ${picked.symbol} near ₹${setup.entry} · SL ₹${setup.stop_loss} · target ₹${setup.target} (${setup.rr_choice ?? riskReward} on the index, ${setup.risk_reward}R on the premium). The server re-checks every V5 gate when you place it.`);
     document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [analysis, symbol]);
+  }, [analysis, riskReward, symbol]);
+
+  // ---- place on the Smart Scalper (paper) --------------------------------------------------
+  // The server re-runs the scalper and every V5 gate before it places anything; the scalper book's
+  // own limits (trade cap, max loss, daily loss, loss streak, one position, 15:15) still apply.
+  const placeOnScalper = useCallback(async (reason: "AUTO" | "MANUAL"): Promise<{ placed: boolean; error?: string }> => {
+    const setup = analysis?.setup;
+    if (!setup?.setup_id || analysis?.pipeline?.decision !== "CONFIRMED") return { placed: false, error: "No confirmed VWAP-EMA setup" };
+    attemptedSetups.current.add(setup.setup_id);
+    try {
+      const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        action: "PLACE_ON_SCALPER", underlying: symbol, riskReward, settings: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}), contracts: chainRef.current,
+      }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.placed) {
+        const text = `${reason === "AUTO" ? "Auto-place" : "Place"} on scalper refused: ${data.error ?? "request failed"}${Array.isArray(data.reasons) && data.reasons.length ? ` (${data.reasons.slice(0, 4).join(", ")})` : ""}`;
+        setMessage(text);
+        log(text, "info");
+        return { placed: false, error: String(data.error ?? "refused") };
+      }
+      setScalperRefresh((value) => value + 1);
+      setMessage(`${reason === "AUTO" ? "Auto-placed" : "Placed"} on the Smart Scalper (paper): ${data.summary ?? ""}`);
+      log(`[${strategy.name}] ${data.summary ?? "placed on the scalper"}`, "entry");
+      return { placed: true };
+    } catch { setMessage("Place on scalper request failed"); return { placed: false, error: "request failed" }; }
+  }, [analysis, log, riskReward, symbol]);
+
+  // The selected premium's 1-minute candles (the scalper's volume-profile series), folded with
+  // the live premium from the chain socket.
+  const scalpSymbol = analysis?.calculations?.scalp?.selected?.symbol ?? analysis?.setup?.contract?.symbol ?? "";
+  useEffect(() => {
+    if (!scalpSymbol) { setPremiumBars([]); return; }
+    let cancelled = false;
+    const load = () => fetch(`/api/market-data/option-history?symbol=${encodeURIComponent(scalpSymbol)}&timeframe=1m`, { cache: "no-store" }).then((response) => response.json())
+      .then((body) => { if (!cancelled && Array.isArray(body.candles)) setPremiumBars(body.candles as ChartBar[]); }).catch(() => undefined);
+    void load();
+    const timer = setInterval(() => { if (document.visibilityState === "visible") void load(); }, 60_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [scalpSymbol]);
+  const scalpPremium = chain.find((item) => norm(item.symbol) === norm(scalpSymbol))?.premium;
+  useEffect(() => {
+    if (!(scalpPremium && scalpPremium > 0)) return;
+    setPremiumBars((current) => {
+      const bucket = Math.floor(Date.now() / 60_000) * 60;
+      const last = current.at(-1);
+      if (!last || bucket > last.time) return [...current.slice(-400), { time: bucket, open: last?.close ?? scalpPremium, high: Math.max(last?.close ?? scalpPremium, scalpPremium), low: Math.min(last?.close ?? scalpPremium, scalpPremium), close: scalpPremium }];
+      return [...current.slice(0, -1), { ...last, high: Math.max(last.high, scalpPremium), low: Math.min(last.low, scalpPremium), close: scalpPremium }];
+    });
+  }, [scalpPremium]);
 
   const switchIndex = useCallback((next: string) => { setSymbol(next); setContract(null); setResults([]); setQuery(""); }, []);
 
@@ -531,11 +597,39 @@ export default function ExecutionPage() {
   const underlying = analysis?.calculations?.underlying ?? {};
   const regime = analysis?.calculations?.regime;
   const { vwap, ema20, ema50 } = underlying;
-  const intrinsic = analysis?.calculations?.intrinsic;
-  const mappingInfo = MAPPINGS.find((item) => item.id === sentimentMapping) ?? MAPPINGS[0];
-  const scoreTiles: Array<[string, unknown, number]> = [["Sentiment extreme", score.sentiment_extreme, 3], ["Key value", score.key_value, 2], ["ITM chance", score.itm_chance, 2], ["Premium structure", score.premium_structure, 2], ["Option flow", score.option_flow, 1]];
+  const scalp = analysis?.calculations?.scalp;
+  const scalpPlan = scalp?.plan ?? null;
+  const scalpSide = scalp?.selected?.type ?? scalp?.tape.side ?? null;
   // Pipeline gate codes are shared with the other strategies; name them for this one.
-  const GATE_LABELS: Record<string, string> = { BREAKOUT_INVALID: "key value + strike", RETEST_NOT_CONFIRMED: "premium pullback", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "premium target" };
+  const GATE_LABELS: Record<string, string> = { BREAKOUT_INVALID: "VWAP", RETEST_NOT_CONFIRMED: "5/9 EMA trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "charges vs reward", RR_BELOW_MINIMUM: `R:R ${scalp?.rr_choice ?? riskReward}` };
+  // The risk-reward drawing on the selected premium: the confirmed setup, else the plan in progress.
+  const rrBox: RiskRewardBox | null = useMemo(() => {
+    const setup = analysis?.setup;
+    if (setup?.contract && setup.entry && setup.stop_loss && setup.target) return { entry: setup.entry, stop: setup.stop_loss, target: setup.target, fromTime: epochOf(setup.trigger_time), quantity: setup.quantity, label: `BUY ${setup.contract.type} ${setup.rr_choice ?? riskReward}` };
+    if (scalpPlan?.entry && scalpPlan.stop_loss && scalpPlan.target && scalpPlan.stop_loss < scalpPlan.entry && scalpPlan.target > scalpPlan.entry) return { entry: scalpPlan.entry, stop: scalpPlan.stop_loss, target: scalpPlan.target, fromTime: epochOf(scalp?.trigger?.time), quantity: scalpPlan.quantity, label: `Plan ${riskReward} (not confirmed)` };
+    return null;
+  }, [analysis?.setup, riskReward, scalp?.trigger?.time, scalpPlan]);
+  // The scalper read handed to the Smart Scalper desk, which trades it (auto or manual).
+  const vwapScalp: VwapScalpSignal | null = useMemo(() => {
+    if (!scalp) return null;
+    const setup = analysis?.setup;
+    const confirmed = analysis?.pipeline?.decision === "CONFIRMED" && Boolean(setup?.contract && setup.setup_id);
+    const picked = scalp.selected ? { symbol: scalp.selected.symbol, strike: scalp.selected.strike, type: scalp.selected.type } : null;
+    const planned = confirmed && setup ? { entry: setup.entry, stop: setup.stop_loss, target: setup.target, quantity: setup.quantity, rrChoice: setup.rr_choice ?? riskReward, riskReward: setup.risk_reward, netRiskReward: setup.net_risk_reward }
+      : scalpPlan?.entry && scalpPlan.stop_loss && scalpPlan.target ? { entry: scalpPlan.entry, stop: scalpPlan.stop_loss, target: scalpPlan.target, quantity: scalpPlan.quantity, rrChoice: scalp.rr_choice, riskReward: scalpPlan.risk_reward, netRiskReward: scalpPlan.net_risk_reward } : null;
+    const failedGates = (analysis?.pipeline?.gates ?? []).filter((gate) => !gate.passed).map((gate) => GATE_LABELS[gate.code] ?? gate.code.toLowerCase().replaceAll("_", " "));
+    return {
+      confirmed, setupId: confirmed ? setup?.setup_id ?? null : null, side: scalp.tape.side ?? null, selected: picked, plan: planned, triggerTime: setup?.trigger_time ?? scalp.trigger?.time ?? null,
+      criteriaMet: scalp.criteria.filter((item) => item.passed).length, criteriaTotal: scalp.criteria.length,
+      waitingOn: [...scalp.criteria.filter((item) => !item.passed).map((item) => item.name), ...(scalp.criteria.every((item) => item.passed) ? failedGates : [])],
+      reason: String(analysis?.strategy_reason ?? scalp.tape.reason ?? ""),
+    };
+  }, [analysis, riskReward, scalp, scalpPlan]);
+  const profileLevels: ChartLevel[] = useMemo(() => scalp?.profile ? [
+    { price: scalp.profile.poc, color: "#f0c36b", title: "POC", dashed: true },
+    { price: scalp.profile.vah, color: "#8fa3a8", title: "VAH", dashed: true },
+    { price: scalp.profile.val, color: "#8fa3a8", title: "VAL", dashed: true },
+  ] : [], [scalp?.profile]);
   const strategyTrend = useMemo(() => ({ regime: regime ?? null, vwap: Number(vwap) || null, ema20: Number(ema20) || null, ema50: Number(ema50) || null }), [regime, vwap, ema20, ema50]);
   const ticketPremium = premiumFor(contract);
   const ticketRisk = ticketPremium && Number(stopLoss) > 0 ? (ticketPremium - Number(stopLoss)) * lots * lotSize : null;
@@ -570,56 +664,74 @@ export default function ExecutionPage() {
         <div className="exec-grid">
           <article className="mi-card exec-strategy">
             <div className="algo-panel-head">
-              <div><span className="algo-kicker">V5 RULE ENGINE · INTRINSIC VALUE · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
+              <div><span className="algo-kicker">V5 RULE ENGINE · VWAP-EMA SCALPER · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
               <div className="exec-strategy-controls">
-                <select aria-label="Sentiment cut-off" value={sentimentExtreme} onChange={(event) => setSentimentExtreme(event.target.value as SentimentExtreme)} title="How far from zero the index sentiment must be before the strategy trades">{EXTREMES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-                <select aria-label="Sentiment mapping" value={sentimentMapping} onChange={(event) => setSentimentMapping(event.target.value as SentimentMapping)} title={mappingInfo.note}>{MAPPINGS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+                <select aria-label="Risk reward" value={riskReward} onChange={(event) => setRiskReward(event.target.value as RiskReward)} title="Target as a multiple of the stop distance on the index; the premium target follows from delta and gamma">{RR_CHOICES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+                <button type="button" className="exec-auto-place" onClick={() => document.querySelector(".scalper")?.scrollIntoView({ behavior: "smooth", block: "start" })} title="Automatic placing runs on the Scalper: Strategy VWAP-EMA, Engine on, Trade Automatic">Auto-trade on the Scalper ↓</button>
                 <button type="button" onClick={() => void refresh()} disabled={busy}>{busy ? "…" : "Refresh"}</button>
               </div>
             </div>
-            <p className="mi-note">{strategy.description} {mappingInfo.note}</p>
+            <p className="mi-note">{strategy.description}</p>
             {analysis?.setup?.contract ? (
-              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · trail ₹{money(analysis.setup.trailing_distance)} (breakeven at ₹{money(analysis.setup.breakeven_at)}) · target ₹{money(analysis.setup.target)} · {analysis.setup.risk_reward}R net of costs</span></div>
+              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol} × {analysis.setup.quantity ?? "--"}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · target ₹{money(analysis.setup.target)} · {analysis.setup.rr_choice} on the index = {analysis.setup.risk_reward}R on the premium ({analysis.setup.net_risk_reward}R after charges) · max loss ₹{money(analysis.setup.planned_max_loss)} planned / ₹{money(analysis.setup.max_loss)} stressed · refused if filled above ₹{money(analysis.setup.max_entry)}</span></div>
             ) : null}
-            {analysis?.setup?.contract && analysis.pipeline?.decision === "CONFIRMED" && <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load {strategy.name} setup into the order ticket</button>}
-            {intrinsic && (
-              <div className="exec-orb" aria-label="Intrinsic value plan">
-                <span>Sentiment <b className={(intrinsic.sentiment.score ?? 0) >= 0 ? "gain" : "loss"}>{intrinsic.sentiment.score === null ? "--" : `${intrinsic.sentiment.score > 0 ? "+" : ""}${calc(intrinsic.sentiment.score)}`}</b>{intrinsic.sentiment.label ? ` ${String(intrinsic.sentiment.label).replaceAll("_", " ").toLowerCase()}` : ""} → <b>{intrinsic.sentiment.option_type ? `buy ${intrinsic.sentiment.option_type}` : intrinsic.watch && intrinsic.sentiment.lean_option_type ? `watching ${intrinsic.sentiment.lean_option_type} (trades at ${(intrinsic.sentiment.score ?? 0) < 0 ? "−" : "+"}${calc(intrinsic.sentiment.threshold)})` : "no side"}</b></span>
-                <span>Key value <b>{intrinsic.key_value ? money(intrinsic.key_value.price) : "--"}</b>{intrinsic.key_value ? ` (${intrinsic.key_value.sources.join(" + ")}, ${money(intrinsic.key_value.distance)} pts)` : ""}</span>
-                <span>Strike <b>{intrinsic.selected ? `${money(intrinsic.selected.strike)} ${intrinsic.sentiment.option_type ?? intrinsic.sentiment.lean_option_type ?? ""}` : "--"}</b>{intrinsic.selected ? ` · ITM chance ${Math.round(intrinsic.selected.itm_chance * 100)}% (market ${Math.round(intrinsic.selected.market_odds * 100)}%) · ₹${money(intrinsic.selected.premium)} → ₹${money(intrinsic.selected.premium_at_key)} at key` : ""}</span>
-                <span>Premium <b className={intrinsic.premium?.status === "CONFIRMED" ? "gain" : "warning"}>{intrinsic.premium ? intrinsic.premium.status.replaceAll("_", " ") : "--"}</b>{intrinsic.premium?.retrace !== undefined ? ` · pullback ${Math.round(intrinsic.premium.retrace * 100)}% to ₹${money(intrinsic.premium.pullback_low)}` : ""}</span>
-                {intrinsic.plan && <span>Trailing <b>{intrinsic.plan.trailing_rule}</b></span>}
-                <small>{String(analysis?.strategy_reason ?? intrinsic.sentiment.reason ?? "")}</small>
-                {intrinsic.candidates.length > 1 && <small>Other OTM strikes: {intrinsic.candidates.filter((item) => item.symbol !== intrinsic.selected?.symbol).slice(0, 3).map((item) => `${money(item.strike)} (${Math.round(item.itm_chance * 100)}%, ₹${money(item.premium)}${item.eligible ? "" : item.target_reachable === false ? ", key level too close for +50%" : ", under a 50% premium gain at the key value"})`).join(" · ")}</small>}
+            {analysis?.setup?.contract && analysis.pipeline?.decision === "CONFIRMED" && (
+              <div className="exec-actions">
+                <button type="button" className="exec-paper" onClick={() => void placeOnScalper("MANUAL")} disabled={busy || attemptedSetups.current.has(analysis.setup.setup_id ?? "")}>Place on Scalper (paper)</button>
+                <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load into the order ticket</button>
               </div>
             )}
-            {(() => {
-              const check = intrinsic?.premium_check ?? intrinsic?.selected?.premium_check ?? intrinsic?.candidates[0]?.premium_check;
-              const side = intrinsic?.sentiment.option_type ?? intrinsic?.sentiment.lean_option_type;
-              return check && side ? <PremiumCalculator check={check} optionType={side} title={intrinsic?.premium_check ? "Premium target check at entry" : `Premium target check · ${intrinsic?.selected?.symbol ?? intrinsic?.candidates[0]?.symbol ?? ""}`} /> : null;
-            })()}
-            {analysis?.pipeline ? (
-              <p className="mi-note">
-                <b>Rule gates {analysis.pipeline.gates.filter((gate) => gate.passed).length}/{analysis.pipeline.gates.length} passing</b>: every gate must pass; one red gate blocks the trade.{" "}
-                <b>Strategy score {calc(score.total)}/10 (minimum {calc(score.minimum ?? 8)})</b>: the score is itself one of the gates ("score"), so a score below the minimum blocks the trade, and a high score never overrides a red gate.
-                {!analysis.setup ? " No setup until every gate is green." : ""}
-              </p>
-            ) : !analysis?.setup && <p className="mi-note">{analysis?.reason ?? "Waiting for the engine…"}</p>}
             <div className="exec-score">
-              {scoreTiles.map(([name, value, max]) => (
-                <span key={String(name)}><small>{name}</small><b>{calc(value)} / {String(max)}</b></span>
+              {(scalp?.criteria ?? []).map((item) => (
+                <span key={item.key} className={item.passed ? "pass" : "fail"} title={item.detail}><small>{item.name}</small><b className={item.passed ? "gain" : "warning"}>{item.points} / {item.max}</b></span>
               ))}
-              <span className="exec-score-total"><small>Strategy score</small><b className={Number(score.total) >= Number(score.minimum ?? 8) ? "gain" : "warning"}>{calc(score.total)} / 10</b><em>min {calc(score.minimum ?? 8)}</em></span>
+              <span className="exec-score-total"><small>Criteria met</small><b className={Number(scalp?.score?.total ?? 0) >= Number(scalp?.score?.minimum ?? 10) ? "gain" : "warning"}>{calc(scalp?.score?.total ?? score.total)} / 10</b><em>all 10 needed</em></span>
             </div>
+            {scalp && (
+              <ul className="exec-criteria" aria-label="Scalper criteria">
+                {scalp.criteria.map((item) => <li key={item.key} className={item.passed ? "gain" : "warning"}><b>{item.passed ? "✓" : "✗"} {item.name}</b> {item.detail}</li>)}
+              </ul>
+            )}
+            {scalp?.selected && (
+              <div className="exec-orb" aria-label="Selected premium">
+                <span>Premium (auto-selected from OI) <b className={scalp.selected.type === "PE" ? "loss" : "gain"}>{scalp.selected.symbol}</b> · ₹{money(scalp.selected.premium)} · Δ {calc(scalp.selected.delta)}{scalpPlan?.greeks ? ` · Γ ${scalpPlan.greeks.gamma.toFixed(5)} · θ ₹${money(scalpPlan.greeks.theta_per_day)}/day · IV ${calc(scalpPlan.greeks.iv)}%` : ""}</span>
+                <span>OI {money(scalp.selected.open_interest)}{scalp.selected.oi_change_5m !== null && scalp.selected.oi_change_5m !== undefined ? ` (${scalp.selected.oi_change_5m >= 0 ? "+" : ""}${money(scalp.selected.oi_change_5m)} in 5m)` : ""} · volume {money(scalp.selected.volume)} · {scalp.selected.activity ? scalp.selected.activity.replaceAll("_", " ").toLowerCase() : "no 5m build-up yet"} · liquidity {scalp.selected.liquidity_score}/3</span>
+                {scalp.candidates.length > 1 && <small>Next strikes: {scalp.candidates.slice(1, 4).map((item) => `${money(item.strike)} ${item.type} (Δ ${calc(item.delta)}, score ${calc(item.selection_score)}${item.activity ? `, ${item.activity.replaceAll("_", " ").toLowerCase()}` : ""})`).join(" · ")}</small>}
+              </div>
+            )}
+            {scalpPlan && scalpPlan.entry !== undefined && (
+              <div className="exec-orb" aria-label="Delta-gamma risk reward">
+                <span>Index <b>{scalpSide === "PE" ? "short" : "long"}</b> from {money(scalpPlan.spot_entry)} · stop {money(scalpPlan.spot_stop)} ({calc(scalpPlan.risk_points)} pts) · target {money(scalpPlan.spot_target)} ({calc(scalpPlan.target_points)} pts, {scalp?.rr_choice})</span>
+                <span>Premium SL = ₹{money(scalpPlan.entry)} − (Δ×{calc(scalpPlan.risk_points)} = ₹{money(scalpPlan.premium_loss_delta_only)} {(scalpPlan.gamma_effect?.on_loss ?? 0) <= 0 ? "−" : "+"} Γ ₹{money(Math.abs(scalpPlan.gamma_effect?.on_loss ?? 0))} + θ ₹{money(scalpPlan.theta_drag)}) = <b className="loss">₹{money(scalpPlan.stop_loss)}</b></span>
+                <span>Premium target = ₹{money(scalpPlan.entry)} + (Δ×{calc(scalpPlan.target_points)} = ₹{money(scalpPlan.premium_gain_delta_only)} + Γ ₹{money(scalpPlan.gamma_effect?.on_gain)} − θ ₹{money(scalpPlan.theta_drag)}) = <b className="gain">₹{money(scalpPlan.target)}</b></span>
+                <span>Premium R:R <b>{calc(scalpPlan.risk_reward)}</b> · after charges <b>{calc(scalpPlan.net_risk_reward)}</b> · stressed <b>{calc(scalpPlan.stressed_risk_reward)}</b> · charges + slippage ₹{money(scalpPlan.costs_per_lot?.at_target)}/lot ({scalpPlan.cost_share !== undefined ? `${Math.round(scalpPlan.cost_share * 100)}%` : "--"} of the reward, max 25%)</span>
+                <span>{scalpPlan.lots ?? 0} lot(s) · max loss ₹{money(scalpPlan.planned_max_loss)} planned / <b>₹{money(scalpPlan.max_loss)} stressed</b> (stop gap ₹{money(scalpPlan.stop_gap)}/unit, slippage {scalpPlan.slippage_pct !== undefined ? `${(scalpPlan.slippage_pct * 100).toFixed(2)}%` : "--"} each leg) · fill tolerance up to ₹{money(scalpPlan.max_entry)}</span>
+                {!scalpPlan.valid && scalpPlan.reason ? <small className="warning">{scalpPlan.reason}</small> : null}
+              </div>
+            )}
+            {scalpSymbol ? (
+              <div className="exec-premium-chart">
+                <small className="mi-note">{scalpSymbol} · 1-minute premium{scalp?.profile ? ` · POC ₹${money(scalp.profile.poc)} · value area ₹${money(scalp.profile.val)}–₹${money(scalp.profile.vah)}` : ""}{rrBox ? ` · ${rrBox.label}` : ""}</small>
+                <PremiumChart bars={premiumBars} levels={profileLevels} riskReward={rrBox} height={280} />
+              </div>
+            ) : null}
+            <p className="mi-note">{String(analysis?.strategy_reason ?? scalp?.tape.reason ?? analysis?.reason ?? "Waiting for the engine…")}</p>
+            {analysis?.pipeline ? (
+              <p className="mi-note"><b>Rule gates {analysis.pipeline.gates.filter((gate) => gate.passed).length}/{analysis.pipeline.gates.length} passing</b>: every gate must pass; one red gate blocks the trade. Auto-place and the server re-check use the same gates.</p>
+            ) : null}
             <div className="exec-gates">{(analysis?.pipeline?.gates ?? []).map((gate) => <span key={gate.code} className={gate.passed ? "pass" : "fail"} title={gate.detail}>{gate.passed ? "✓" : "✗"} {GATE_LABELS[gate.code] ?? gate.code.replace(/_(BLOCKED|NOT_CONFIRMED|NOT_SUPPORTIVE|BELOW_MINIMUM|UNRESOLVED|MISSING|REQUIRED|UNHEALTHY|STALE|INVALID|NOT_READY)$/, "").replaceAll("_", " ").toLowerCase()}</span>)}</div>
             <details className="mi-management">
               <summary>Show calculations</summary>
               <div className="exec-calcs">
-                <span>VWAP <b>{calc(underlying.vwap)}</b></span><span>EMA 20/50 <b>{calc(underlying.ema20)} / {calc(underlying.ema50)}</b></span><span>ADX <b>{calc(underlying.adx14)}</b></span><span>ATR <b>{calc(underlying.atr14)}</b></span>
-                <span>Spot <b>{calc(intrinsic?.spot)}</b></span><span>Key-value reach <b>{intrinsic?.reach ? `${calc(intrinsic.reach)} pts` : "--"}</b></span><span>Sentiment age <b>{intrinsic?.sentiment.age_minutes !== null && intrinsic?.sentiment.age_minutes !== undefined ? `${calc(intrinsic.sentiment.age_minutes)} min` : "--"}</b></span><span>Mapping <b>{intrinsic?.mapping ?? sentimentMapping}</b></span>
-                {(intrinsic?.levels ?? []).map((level) => <span key={`${level.name}-${level.price}`}>{level.name} <b>{money(level.price)}</b> <small>{money(level.distance)} pts</small></span>)}
-                <span>Regime <b>{analysis?.calculations?.regime ?? "--"}</b></span><span>Gap day <b>{calc(analysis?.calculations?.gap?.status)}</b></span><span>VIX regime <b>{calc(analysis?.calculations?.option?.iv_regime)}</b></span>
-                <span>Rel. volume <b>{calc(underlying.relative_volume)}×</b></span><span>Volume source <b>{String(underlying.volume_source ?? "--").replace("NEAR_MONTH_FUTURES:", "Futures ")}</b></span>{analysis?.session && "expiry_day" in analysis.session && (analysis.session as { expiry_day?: boolean }).expiry_day ? <span>Expiry day <b className="warning">min score 9, size ½, entries end 14:30</b></span> : null}
+                <span>Close <b>{calc(scalp?.tape.close)}</b></span><span>VWAP <b>{calc(scalp?.tape.vwap)}</b> <small>{scalp?.tape.vwap_slope !== undefined ? `${scalp.tape.vwap_slope >= 0 ? "+" : ""}${calc(scalp.tape.vwap_slope)} pts / 5m` : ""}</small></span>
+                <span>EMA 5 / 9 <b>{calc(scalp?.tape.ema5)} / {calc(scalp?.tape.ema9)}</b></span><span>ATR (1m) <b>{calc(scalp?.tape.atr)}</b></span><span>From VWAP <b>{calc(scalp?.tape.vwap_extension_atr)} ATR</b></span>
+                <span>Trigger <b>{scalp?.trigger ? scalp.trigger.time.slice(11, 16) : "--"}</b></span><span>Futures volume <b>{scalp?.tape.volume_ratio ? `${calc(scalp.tape.volume_ratio)}×` : "--"}</b></span>
+                <span>PCR (OI) <b>{calc(scalp?.pcr?.pcr)}</b> <small>{scalp?.pcr?.pcr_change_5m !== null && scalp?.pcr?.pcr_change_5m !== undefined ? `${scalp.pcr.pcr_change_5m >= 0 ? "+" : ""}${scalp.pcr.pcr_change_5m} / 5m` : ""}</small></span>
+                <span>OI flow score <b>{calc(scalp?.oi?.oi_direction_score)}</b></span><span>ATM {calc(scalp?.oi?.atm_strike)} <b>{[scalp?.oi?.atm_activity?.CE && `CE ${scalp.oi.atm_activity.CE.replaceAll("_", " ").toLowerCase()}`, scalp?.oi?.atm_activity?.PE && `PE ${scalp.oi.atm_activity.PE.replaceAll("_", " ").toLowerCase()}`].filter(Boolean).join(", ") || "--"}</b></span>
+                <span>OI wall <b>{calc(scalp?.oi?.wall)}</b> <small>{scalp?.oi?.room_points ? `${calc(scalp.oi.room_points)} pts away` : ""}</small></span>
+                <span>India VIX <b>{calc(scalp?.vix?.value)}</b> <small>{scalp?.vix?.regime ?? ""}</small></span>
+                <span>Premium POC / VAH / VAL <b>{scalp?.profile ? `${money(scalp.profile.poc)} / ${money(scalp.profile.vah)} / ${money(scalp.profile.val)}` : "--"}</b></span>
+                <span>Gap day <b>{calc(analysis?.calculations?.gap?.status)}</b></span>{analysis?.session && "expiry_day" in analysis.session && (analysis.session as { expiry_day?: boolean }).expiry_day ? <span>Expiry day <b className="warning">gamma is high: the premium stop and target move fast</b></span> : null}
               </div>
             </details>
           </article>
@@ -647,7 +759,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

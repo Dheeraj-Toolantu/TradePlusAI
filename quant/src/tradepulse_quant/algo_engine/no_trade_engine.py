@@ -45,6 +45,8 @@ class PipelineEvidence:
     option_quote_fresh: bool | None = None
     liquidity_score: float | None = None
     risk_reward: float | None = None
+    # The strategy's own minimum (the scalper allows the 1:1 the trader picks); 2.0 otherwise.
+    minimum_risk_reward: float = 2.0
     daily_risk_allowed: bool | None = None
     daily_risk_detail: str | None = None
     broker_healthy: bool | None = None
@@ -142,8 +144,9 @@ class NoTradeEngine:
         elif not valid_liquidity:
             reasons.append("LIQUIDITY_BLOCKED")
 
-        valid_rr = evidence.risk_reward is not None and evidence.risk_reward >= 2.0
-        gates.append(GateEvidence("RR_BELOW_MINIMUM", valid_rr, "minimum expected reward/risk is 2.0"))
+        minimum_rr = evidence.minimum_risk_reward if evidence.minimum_risk_reward and evidence.minimum_risk_reward > 0 else 2.0
+        valid_rr = evidence.risk_reward is not None and evidence.risk_reward >= minimum_rr
+        gates.append(GateEvidence("RR_BELOW_MINIMUM", valid_rr, f"minimum expected reward/risk is {minimum_rr:g}"))
         if evidence.risk_reward is None:
             reasons.append("MISSING_RISK_REWARD")
         elif not valid_rr:

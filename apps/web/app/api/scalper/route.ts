@@ -1,12 +1,15 @@
 import { NextResponse } from "next/server";
-import { SmartScalper, type ScalperBar, type ScalperContract, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
+import type { ScalperBar, ScalperContract, ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
 import { getMarketIntel, isIntelSymbol, type MarketIntel } from "../../../lib/market-intel";
 
-// Paper-only smart scalper behind the execution page's scalper desk. One process-wide book so
-// scans and manual Buy/Sell/Exit act on the same positions. Fills include slippage.
-const globalScalper = globalThis as typeof globalThis & { __tradepulseScalper?: SmartScalper };
-const scalper = (globalScalper.__tradepulseScalper ??= new SmartScalper({ slippagePct: Number(process.env.SCALPER_SLIPPAGE_PCT ?? 0.3) / 100 }));
+import { getScalper } from "../../../lib/scalper-instance";
+import { ensureScalperMonitor, scalperMonitorStatus } from "../../../lib/scalper-monitor";
+
+// Paper-only smart scalper behind the execution page's scalper desk. One process-wide book (shared
+// with the algo page's "place on scalper") so scans and manual Buy/Sell/Exit act on the same
+// positions. Fills include slippage.
+const scalper = getScalper();
 
 type RecordValue = Record<string, unknown>;
 const numberOf = (value: unknown) => { const result = Number(value); return Number.isFinite(result) ? result : 0; };
@@ -25,11 +28,14 @@ function toBar(value: RecordValue): ScalperBar {
 }
 
 export async function GET(request: Request) {
-  const symbol = (new URL(request.url).searchParams.get("symbol") ?? "NIFTY").toUpperCase();
-  return NextResponse.json(await scalper.snapshot(symbol));
+  const url = new URL(request.url);
+  ensureScalperMonitor(url.origin);
+  const symbol = (url.searchParams.get("symbol") ?? "NIFTY").toUpperCase();
+  return NextResponse.json({ ...(await scalper.snapshot(symbol)), monitor: scalperMonitorStatus() });
 }
 
 export async function POST(request: Request) {
+  ensureScalperMonitor(new URL(request.url).origin);
   const body = await request.json().catch(() => ({})) as RecordValue;
   const action = String(body.action ?? "scan");
   const symbol = String(body.symbol ?? "NIFTY").toUpperCase();

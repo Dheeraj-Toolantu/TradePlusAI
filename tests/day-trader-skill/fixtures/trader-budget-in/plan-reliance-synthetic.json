@@ -1,0 +1,23 @@
+{
+  "created_by": "trader-exit",
+  "market": "IN",
+  "currency": "INR",
+  "symbol": "RELIANCE",
+  "side": "buy",
+  "date": "2026-11-02",
+  "setup": "orb",
+  "entry": 1412.40,
+  "entry_time": "09:45",
+  "entry_bar": 6,
+  "interval": "5m",
+  "opening_range": {"high": 1411.80, "low": 1392.40, "minutes": 15},
+  "stop": 1402.40,
+  "stop_rule": "or_mid",
+  "stop_label": "opening-range midpoint",
+  "target": 1432.40,
+  "target_r": 2.0,
+  "target_label": "2R (two times the risk)",
+  "risk_per_share": 10.0,
+  "reward_risk": 2.0,
+  "flat_by": "15:10"
+}

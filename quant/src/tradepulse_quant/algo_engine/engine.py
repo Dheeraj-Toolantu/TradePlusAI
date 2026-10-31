@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Literal
 
-from . import indicators, intrinsic_value
+from . import indicators, scalp_strategy
 from .configuration import StrategyConfiguration
 from .data_quality_gate import DataQualityGate
 from .gap_engine import evaluate_gap_day
@@ -342,7 +342,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "vix_regime": iv_regime,
         "option_quote_fresh": option_evidence.get("option_quote_fresh"),
         "liquidity_score": liquidity_score,
-        # Observed, so a caller can never switch these off; only the intrinsic-value strategy does.
+        # Observed, so a caller can never switch these off; only the scalper's own evidence does.
         "regime_gate": True,
         "option_flow_gate": True,
     }
@@ -509,10 +509,8 @@ def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, 
         }}
     if strategy == "VWAP_REVERSAL":
         return _vwap_reversal(symbol, candles, risk_per_trade)
-    if strategy == intrinsic_value.STRATEGY_ID:
-        now = now or datetime.now(MARKET_TIMEZONE)
-        daily_atr = _daily_atr(_daily_bars(candles, daily_candles, now.date()), StrategyConfiguration().atr_period)
-        return intrinsic_value.analyze_intrinsic(symbol, candles, context or {}, now, daily_atr, intrinsic_value.config_for((context or {}).get("sentiment_extreme")))
+    if strategy == scalp_strategy.STRATEGY_ID:
+        return scalp_strategy.analyze_scalp(symbol, candles, context or {}, now or datetime.now(MARKET_TIMEZONE))
     return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "Range Defined Risk is analysis-only until the multi-leg builder is enabled", "confidence": 0, "setup": None}
 
 
@@ -582,39 +580,39 @@ def _candles_from(items: object) -> list[Candle]:
     return [Candle(timestamp=_normalize_timestamp(item.get("timestamp", item.get("time", ""))), open=_number(item["open"]), high=_number(item["high"]), low=_number(item["low"]), close=_number(item["close"]), volume=_number(item.get("volume"))) for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
 
 
-def _intrinsic_evidence(result: dict, evidence: dict, calculations: dict, option_evidence: dict | None, expiry_day: bool, extreme: object = None) -> None:
-    """Swap the trend-following ORB evidence for the intrinsic-value strategy's own.
+def _scalp_evidence(result: dict, evidence: dict, calculations: dict) -> None:
+    """Swap the trend-following ORB evidence for the VWAP-EMA scalper's own.
 
-    Every operational gate (data quality, session, VIX, gap, liquidity, 2R, broker, risk,
-    SAFE_MODE, kill switch) still applies. The breakout/retest gates become "key value and
-    strike selected" / "premium pullback and continuation confirmed", the score is the
-    strategy's own 10-point card, and option flow is scored rather than a hard gate. A
-    contrarian trade fades the prevailing trend by design, so the regime gate is applied
-    only when the mapping follows the sentiment.
+    Every operational gate (data quality, session, VIX, gap, liquidity, R:R, broker, risk,
+    SAFE_MODE, kill switch) still applies. The breakout/retest gates become "VWAP side and slope"
+    and "5/9 EMA pullback-and-resume trigger"; the OI and PCR reads are strategy criteria (scored,
+    all required) rather than the generic option-flow gate; the 1-minute VWAP/EMA stack is the
+    scalper's trend filter, so the 5-minute ADX regime gate is not applied. The R:R gate uses the
+    premium reward-to-risk (delta and gamma) against the ratio the trader chose (1:1 or 1:2).
     """
-    config = intrinsic_value.config_for(extreme)
-    calc = result.get("intrinsic") or {}
-    card = intrinsic_value.score(result, option_evidence, config)
-    if expiry_day:
-        card["minimum"] = card["minimum"] + float(StrategyConfiguration().expiry_day_adjustments["minimum_score_increase"])
-    # A watch-mode strike (sentiment not extreme yet) is shown, never counted as a passed gate.
-    selected = {} if calc.get("watch") else calc.get("selected") or {}
-    # The entry check once the premium has triggered; before that, the selected strike's own.
-    check = calc.get("premium_check") or selected.get("premium_check")
+    calc = result.get("scalp") or {}
+    criteria = {item["key"]: item for item in calc.get("criteria") or []}
+    card = scalp_strategy.score_card(result)
+    plan = calc.get("plan") or {}
+    selected = calc.get("selected") or {}
+    rr_choice = scalp_strategy.rr_ratio(calc.get("rr_choice"))[1]
     evidence.update({
         "setup_side": (result.get("setup") or {}).get("side") or result.get("side"),
-        "breakout_valid": bool(not calc.get("watch") and calc.get("key_value") and selected),
-        "retest_confirmed": (calc.get("premium") or {}).get("status") == "CONFIRMED",
+        "breakout_valid": bool(criteria.get("vwap", {}).get("passed")),
+        "retest_confirmed": bool(criteria.get("ema", {}).get("passed")),
         "score": card["total"],
         "minimum_score": card["minimum"],
         "liquidity_score": selected.get("liquidity_score"),
-        "regime_gate": calc.get("mapping") == "FOLLOW",
-        "premium_target_reachable": bool(check and check.get("valid")),
-        "premium_target_detail": (check or {}).get("reason") or "No strike selected yet, so the premium target is unchecked",
+        "regime_gate": False,
         "option_flow_gate": False,
+        "vix_regime": (calc.get("vix") or {}).get("regime") or evidence.get("vix_regime"),
+        "risk_reward": plan.get("risk_reward"),
+        "minimum_risk_reward": round(rr_choice * (1.0 - scalp_strategy.ScalpConfig().rr_tolerance), 2),
+        "premium_target_reachable": bool(plan.get("valid")) if plan else None,
+        "premium_target_detail": plan.get("reason") or (f"Charges are {plan['cost_share'] * 100:.0f}% of the reward; 1 lot risks ₹{plan.get('risk_per_lot')}" if plan.get("cost_share") is not None else "No premium plan yet"),
     })
-    calculations["score"] = {**calculations["score"], **card, "card": "INTRINSIC_VALUE"}
-    calculations["intrinsic"] = calc
+    calculations["score"] = {**calculations["score"], **card, "card": scalp_strategy.STRATEGY_ID}
+    calculations["scalp"] = calc
 
 
 def analyze_payload(payload: dict) -> dict:
@@ -623,17 +621,22 @@ def analyze_payload(payload: dict) -> dict:
     symbol = str(payload.get("symbol", "UNKNOWN"))
     strategy = str(payload.get("strategy", "ORB_RETEST"))
     now = datetime.now(MARKET_TIMEZONE)
-    candles = completed_candles(candles, now)
+    interval = int(_number(payload.get("interval_minutes"), CANDLE_MINUTES)) or CANDLE_MINUTES
+    candles = completed_candles(candles, now, interval)
     option_evidence = payload.get("option_evidence")
     context = None
-    if strategy == intrinsic_value.STRATEGY_ID:
+    if strategy == scalp_strategy.STRATEGY_ID:
         premium = payload.get("premium_candles") if isinstance(payload.get("premium_candles"), dict) else {}
         context = {
-            "index_sentiment": payload.get("index_sentiment"),
             "option_chain": payload.get("option_chain"),
-            "sentiment_mapping": payload.get("sentiment_mapping"),
-            "sentiment_extreme": payload.get("sentiment_extreme"),
-            "premium_candles": {"symbol": premium.get("symbol"), "candles": completed_candles(_candles_from(premium.get("candles")), now)} if premium else None,
+            "options_flow": payload.get("options_flow"),
+            "vix": payload.get("vix"),
+            "risk_reward": payload.get("risk_reward"),
+            "max_loss_per_trade": payload.get("max_loss_per_trade"),
+            "max_lots": payload.get("max_lots"),
+            "slippage_pct": payload.get("slippage_pct"),
+            "futures_candles": completed_candles(_candles_from(payload.get("futures_candles")), now, interval) or None,
+            "premium_candles": {"symbol": premium.get("symbol"), "candles": completed_candles(_candles_from(premium.get("candles")), now, 1)} if premium else None,
         }
     result = analyze(symbol, candles, float(payload.get("risk_per_trade", 1000)), strategy, daily_candles, _expiry_today(option_evidence, now), context, now)
     # Evidence the engine can observe directly from candles and the IST clock is computed
@@ -642,8 +645,8 @@ def analyze_payload(payload: dict) -> dict:
     # observed data-quality, session, regime, gap, breakout, or retest evidence with this merge.
     volume_source = payload.get("volume_source") if isinstance(payload.get("volume_source"), str) else None
     evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, option_evidence, daily_candles, volume_source)
-    if strategy == intrinsic_value.STRATEGY_ID:
-        _intrinsic_evidence(result, evidence, calculations, option_evidence, bool(session_info.get("expiry_day")), payload.get("sentiment_extreme"))
+    if strategy == scalp_strategy.STRATEGY_ID:
+        _scalp_evidence(result, evidence, calculations)
     result["calculations"] = calculations
     result["session"] = session_info
     caller_evidence = payload.get("pipeline") or {}
