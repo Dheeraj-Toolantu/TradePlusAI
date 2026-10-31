@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { CandlestickSeries, ColorType, CrosshairMode, LineStyle, createChart, type IChartApi, type IPriceLine, type ISeriesApi, type UTCTimestamp } from "lightweight-charts";
 
 export type ChartBar = { time: number; open: number; high: number; low: number; close: number };
@@ -28,7 +28,7 @@ const IST_S = 330 * 60;
 const chartTime = (epochS: number) => (epochS + IST_S) as UTCTimestamp;
 
 /** Candles plus horizontal levels (entry/SL/target, supports/resistances). Data is owned by the caller. */
-export function PremiumChart({ bars, levels, height = 300, riskReward = null }: { bars: ChartBar[]; levels: ChartLevel[]; height?: number; riskReward?: RiskRewardBox | null }) {
+function PremiumChartView({ bars, levels, height = 300, riskReward = null }: { bars: ChartBar[]; levels: ChartLevel[]; height?: number; riskReward?: RiskRewardBox | null }) {
   const host = useRef<HTMLDivElement | null>(null);
   const [layout, setLayout] = useState<BoxLayout | null>(null);
   const boxRef = useRef<RiskRewardBox | null>(riskReward);
@@ -158,3 +158,6 @@ export function regroupBars(bars: ChartBar[], minutes: number): ChartBar[] {
   }
   return out;
 }
+
+/** Memoised: the algo page re-renders on every quote flush; this panel only when its own props change. */
+export const PremiumChart = memo(PremiumChartView);

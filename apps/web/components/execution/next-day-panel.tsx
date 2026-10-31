@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { OpenPremiumEstimator, type EstimatorPreset } from "./open-premium-estimator";
 import { PremiumCalculator, type PremiumCheck } from "./premium-calculator";
 
@@ -28,7 +28,7 @@ const num = (value: number | null | undefined, digits = 2) => (value === null ||
 const pct = (value: number | null | undefined) => (value === null || value === undefined ? "--" : `${Math.round(value * 100)}%`);
 
 /** Next-day setup per index: predicted opening from the last session's opening and closing candles, and a planned OTM option trade. */
-export function NextDayPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: string; onSymbolChange?: (symbol: string) => void; onUsePlan?: (plan: Plan, setup: NextDaySetup) => void }) {
+function NextDayPanelView({ symbol, onSymbolChange, onUsePlan }: { symbol: string; onSymbolChange?: (symbol: string) => void; onUsePlan?: (plan: Plan, setup: NextDaySetup) => void }) {
   const [setups, setSetups] = useState<NextDaySetup[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -113,3 +113,6 @@ export function NextDayPanel({ symbol, onSymbolChange, onUsePlan }: { symbol: st
     </article>
   );
 }
+
+/** Memoised: the algo page re-renders on every quote flush; this panel only when its own props change. */
+export const NextDayPanel = memo(NextDayPanelView);

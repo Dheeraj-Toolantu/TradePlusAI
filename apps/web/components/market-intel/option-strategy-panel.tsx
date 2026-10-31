@@ -1,14 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { buildOptionStrategy, type ChainRow, type SentimentInput, type StrategyPlan, type TrendInput } from "../../lib/option-strategy";
+import { memo, useEffect, useMemo, useState } from "react";
+import { buildOptionStrategy, type ChainRow, type StrategyPlan, type TrendInput } from "../../lib/option-strategy";
+import { fetchJsonShared } from "../../lib/shared-fetch";
 
 type Props = { symbol: string; onSymbolChange: (symbol: string) => void; vix: number | null; trend: TrendInput | null };
 type ChainState = { spot: number; expiry: string; contracts: ChainRow[]; lotSize?: number; at: number } | null;
 
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const CHAIN_REFRESH_MS = 60_000;
-const SENTIMENT_REFRESH_MS = 10 * 60_000;
 const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: 2 }));
 const signed = (value: number) => `${value > 0 ? "+" : ""}${money(value)}`;
 const phaseLabel: Record<string, string> = { EXPIRY_DAY: "Expiry day", NEAR: "Near expiry", MID: "Mid cycle", FAR: "Far from expiry" };
@@ -48,10 +48,9 @@ function PlanCard({ plan, lotSize, primary }: { plan: StrategyPlan; lotSize: num
   );
 }
 
-export function OptionStrategyPanel({ symbol, onSymbolChange, vix, trend }: Props) {
+function OptionStrategyPanelView({ symbol, onSymbolChange, vix, trend }: Props) {
   const [chain, setChain] = useState<ChainState>(null);
   const [chainError, setChainError] = useState<string | null>(null);
-  const [sentiment, setSentiment] = useState<SentimentInput | null>(null);
   const [clock, setClock] = useState(() => Date.now());
 
   useEffect(() => {
@@ -60,11 +59,11 @@ export function OptionStrategyPanel({ symbol, onSymbolChange, vix, trend }: Prop
     setChainError(null);
     const load = async () => {
       try {
-        const response = await fetch(`/api/option-chain?symbol=${symbol}&full=1`, { cache: "no-store" });
-        const body = await response.json();
+        // Shared with the algo page's own chain poll: one request serves both.
+        const body = await fetchJsonShared<{ contracts?: ChainRow[]; expiry?: string; spot?: number; error?: string }>(`/api/option-chain?symbol=${symbol}&full=1`, 20_000);
         if (cancelled) return;
         const contracts: ChainRow[] = Array.isArray(body.contracts) ? body.contracts : [];
-        if (!response.ok || !contracts.length || !body.expiry) { setChainError(body.error ?? "Option chain unavailable"); return; }
+        if (!contracts.length || !body.expiry) { setChainError(body.error ?? "Option chain unavailable"); return; }
         setChain({ spot: Number(body.spot) || 0, expiry: String(body.expiry), contracts, at: Date.now() });
         setChainError(null);
         setClock(Date.now());
@@ -75,29 +74,15 @@ export function OptionStrategyPanel({ symbol, onSymbolChange, vix, trend }: Prop
     return () => { cancelled = true; clearInterval(timer); };
   }, [symbol]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const body = await fetch("/api/sentiment", { cache: "no-store" }).then((response) => response.json());
-        if (cancelled || !body?.summary?.india) return;
-        const usable = (aggregate: { score: number; label: string } | undefined) => (aggregate && aggregate.label !== "INSUFFICIENT_DATA" ? aggregate.score : null);
-        setSentiment({ indiaScore: usable(body.summary.india), globalScore: usable(body.summary.global), eventRisk: Array.isArray(body.event_risk) ? body.event_risk.map((event: { event: string }) => event.event) : [], contrarianNote: body.contrarian_note ?? null });
-      } catch { /* sentiment is one input among several; the strategy still runs without it */ }
-    };
-    void load();
-    const timer = setInterval(() => { if (document.visibilityState === "visible") void load(); }, SENTIMENT_REFRESH_MS);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, []);
 
-  const result = useMemo(() => (chain ? buildOptionStrategy({ symbol, spot: chain.spot, expiry: chain.expiry, chain: chain.contracts, vix, sentiment, trend, now: new Date(clock) }) : null), [chain, clock, sentiment, symbol, trend, vix]);
+  const result = useMemo(() => (chain ? buildOptionStrategy({ symbol, spot: chain.spot, expiry: chain.expiry, chain: chain.contracts, vix, sentiment: null, trend, now: new Date(clock) }) : null), [chain, clock, symbol, trend, vix]);
   const f = result?.factors;
   const strikes = useMemo(() => [...new Set((result?.rows ?? []).map((row) => row.strike))], [result]);
 
   return (
-    <section className="mi-card ost-panel" aria-label="Options strategy by value, time and sentiment">
+    <section className="mi-card ost-panel" aria-label="Options strategy by value, time, trend and positioning">
       <div className="algo-panel-head">
-        <div><span className="algo-kicker">OPTIONS STRATEGY · INTRINSIC · TIME VALUE · EXPIRY · VOLATILITY · SENTIMENT</span><h2>Which structure fits {symbol} right now</h2></div>
+        <div><span className="algo-kicker">OPTIONS STRATEGY · INTRINSIC · TIME VALUE · EXPIRY · VOLATILITY · TREND · PCR</span><h2>Which structure fits {symbol} right now</h2></div>
         <div className="ost-tabs" role="tablist">{INDICES.map((item) => <button key={item} type="button" role="tab" aria-selected={item === symbol} className={item === symbol ? "active" : ""} onClick={() => onSymbolChange(item)}>{item}</button>)}</div>
       </div>
       {!result && <div className="algo-empty">{chainError ?? `Loading the ${symbol} option chain…`}</div>}
@@ -112,7 +97,7 @@ export function OptionStrategyPanel({ symbol, onSymbolChange, vix, trend }: Prop
             <span><small>ATM straddle</small><b>₹{money(f.straddle)}</b><em>time value ₹{money(f.atmExtrinsic)} · θ ≈ ₹{money(f.thetaPerDay)}/day</em></span>
             <span><small>OI positioning</small><b>PCR {money(f.pcr)}</b><em>S {money(f.support)} · R {money(f.resistance)} · max pain {money(f.maxPain)}</em></span>
             <span><small>Market bias</small><b className={biasTone(f.bias.score)}>{signed(f.bias.score)}</b><em>{f.bias.label.replaceAll("_", " ").toLowerCase()}</em></span>
-            <span><small>Bias inputs</small><b className="ost-small">news {signed(f.bias.sentiment)} · global {signed(f.bias.global)}</b><em>trend {signed(f.bias.trend)} · PCR {signed(f.bias.pcr)}</em></span>
+            <span><small>Bias inputs</small><b className="ost-small">trend {signed(f.bias.trend)} · PCR {signed(f.bias.pcr)}</b><em>news sentiment not used on this page</em></span>
           </div>
           {result.notes.length > 0 && <ul className="ost-notes">{result.notes.map((note) => <li key={note}>{note}</li>)}</ul>}
           {result.primary && <PlanCard plan={result.primary} lotSize={f.lotSize} primary />}
@@ -141,3 +126,6 @@ export function OptionStrategyPanel({ symbol, onSymbolChange, vix, trend }: Prop
     </section>
   );
 }
+
+/** Memoised: the algo page re-renders on every quote flush; this panel only when its own props change. */
+export const OptionStrategyPanel = memo(OptionStrategyPanelView);
