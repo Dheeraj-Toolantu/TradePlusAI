@@ -8,7 +8,7 @@ from tradepulse_quant.algo_engine.pipeline import evaluate_payload
 
 IST = timezone(timedelta(hours=5, minutes=30))
 T0 = datetime(2026, 11, 2, 9, 15, tzinfo=IST)
-CHOP = [4, -5, 3, -4, 5, -3, 2, -4, 3, -2, 4, -3]        # opening chop
+CHOP = [3, -3, 4, -5, 3, -4, 5, -3, 2, -4, 3, -2, 4, -3]        # opening chop
 TREND = [4, 2, 5, -2, 3, 4, -1, 2, 3, 1]                  # a measured trend
 PULLBACK = [-4, -3, -2]                                   # into the 9 EMA
 RESUME = [7]                                              # the resumption candle
@@ -98,12 +98,12 @@ def criteria(result):
 
 
 class ConfirmedScalp(unittest.TestCase):
-    def test_ce_scalp_meets_all_seven_criteria_at_1_to_2(self):
+    def test_ce_scalp_meets_all_eight_criteria_at_1_to_2(self):
         first, result, _, _ = run()
         self.assertEqual(first["needs_premium_candles"], "IDX24800CE")  # pass 1 asks for the premium's candles
         self.assertEqual(result["decision"], "CONFIRMED", result["reason"])
         self.assertTrue(all(c["passed"] for c in result["scalp"]["criteria"]))
-        self.assertEqual(result["scalp"]["score"]["total"], 10)
+        self.assertEqual(result["scalp"]["score"]["total"], 11)
         setup = result["setup"]
         self.assertEqual((setup["side"], setup["contract"]["symbol"], setup["contract"]["type"]), ("BUY", "IDX24800CE", "CE"))
         # expected fill = ask 120.85 + 0.3% slippage → 121.25; structural SL 113.70; target = fill + 2R
@@ -112,7 +112,7 @@ class ConfirmedScalp(unittest.TestCase):
         self.assertEqual(setup["spot"]["stop"], round(setup["spot"]["entry"] - result["scalp"]["plan"]["risk_points"], 2))
         self.assertGreater(setup["spot"]["target"] - setup["spot"]["entry"], 2 * result["scalp"]["plan"]["risk_points"])  # the fill paid spread + slippage
         # one breakout is one setup: keyed on the trigger candle, so it is never auto-placed twice
-        self.assertEqual(setup["setup_id"], "VWAP_EMA_SCALP:NIFTY:CE:2026-11-02T09:40:00+05:30")
+        self.assertEqual(setup["setup_id"], "VWAP_EMA_SCALP:NIFTY:CE:2026-11-02T09:42:00+05:30")
 
     def test_stop_from_structure_and_target_from_the_fill_via_delta_and_gamma(self):
         _, result, _, _ = run()
@@ -374,6 +374,58 @@ class EngineIntegration(unittest.TestCase):
         rr_gate = next(g for g in pipeline["gates"] if g["code"] == "RR_BELOW_MINIMUM")
         self.assertFalse(rr_gate["passed"])
         self.assertIn("2", rr_gate["detail"])
+
+
+class AdxCriterion(unittest.TestCase):
+    """ADX(14) on the confirmation candle must be above 20 (strictly)."""
+
+    def test_adx_matches_the_reference_implementation(self):
+        from tradepulse_quant.algo_engine import indicators
+        bars = tape()
+        for n in range(28, len(bars) + 1):
+            self.assertAlmostEqual(S.adx_series(bars[:n], 14)[-1][0], indicators.adx(bars[:n], 14), places=6)
+        self.assertIsNone(S.adx_series(bars[:27], 14)[-1])  # needs 2 x 14 candles
+
+    def test_confirmed_setup_carries_the_trigger_candle_adx(self):
+        _, result, _, _ = run()
+        adx = criteria(result)["adx"]
+        self.assertTrue(adx["passed"], adx["detail"])
+        setup_adx = result["setup"]["adx"]
+        self.assertGreater(setup_adx["value"], 20)
+        self.assertGreater(setup_adx["plus_di"], setup_adx["minus_di"])  # a long: +DI leads
+        self.assertIn("09:42 confirmation candle", adx["detail"])
+
+    def test_pe_side_reports_minus_di_leading(self):
+        _, result, _, _ = run(direction=-1)
+        self.assertEqual(result["decision"], "CONFIRMED", result["reason"])
+        self.assertGreater(result["setup"]["adx"]["minus_di"], result["setup"]["adx"]["plus_di"])
+
+    def test_adx_at_or_below_the_threshold_blocks_the_entry(self):
+        _, result, _, _ = run()
+        value = result["setup"]["adx"]["value"]
+        for threshold in (value, value + 5):  # "above 20" is strict: equal does not pass
+            config = S.ScalpConfig(adx_min=threshold)
+            bars = index_of(tape(1, 1.0, base=24800.0 + BASIS))
+            ctx = {"futures_candles": tape(1, 1.0, base=24800.0 + BASIS), "option_chain": {"spot": bars[-1].close, "expiry": "2026-11-10", "contracts": chain(bars[-1].close)},
+                   "options_flow": flow(bars[-1].close), "vix": {"value": 13.2, "regime": "NORMAL"}, "risk_reward": "1:2", "premium_candles": premium_candles("IDX24800CE")}
+            blocked = S.analyze_scalp("NIFTY", bars, ctx, T0 + timedelta(minutes=len(bars)), config)
+            self.assertEqual(blocked["decision"], "WAIT_FOR_CONFIRMATION")
+            self.assertIn("waiting on ADX", blocked["reason"])
+            self.assertIn("lacks trend strength", criteria(blocked)["adx"]["detail"])
+
+    def test_adx_not_warmed_up_blocks_the_entry(self):
+        short = tape()[2:]  # 26 candles today: ADX(14) is not available yet
+        _, result, _, _ = run(bars=short)
+        self.assertFalse(criteria(result)["adx"]["passed"])
+        self.assertIn("warms up on 28", criteria(result)["adx"]["detail"])
+        self.assertNotEqual(result["decision"], "CONFIRMED")
+
+    def test_v5_score_gate_takes_the_eleven_point_card(self):
+        base = {"score": 11.0, "minimum_score": 11.0, "maximum_score": 11.0}
+        gate = lambda payload: next(g for g in evaluate_payload(payload)["gates"] if g["code"] == "SCORE_BELOW_MINIMUM")["passed"]  # noqa: E731
+        self.assertTrue(gate(base))
+        self.assertFalse(gate({**base, "score": 10.0}))  # 10/11: ADX (or any criterion) missing
+        self.assertFalse(gate({"score": 11.0, "minimum_score": 8.0}))  # other strategies still top out at 10
 
 
 if __name__ == "__main__":

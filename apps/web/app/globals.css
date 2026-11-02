@@ -1230,3 +1230,54 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 /* Scalper: VWAP-EMA strategy selector and the OI-picked strike badge */
 .scalper-strategy { padding: 5px 8px; color: var(--text); border: 1px solid #25505f; border-radius: 5px; background: #0d2a37; font: 600 12px "Manrope", sans-serif; }
 .scalper-oi-pick { margin-left: 4px; padding: 1px 6px; color: #0b1a20 !important; border-radius: 4px; background: #f0c36b; font-style: normal; font-weight: 700; font-size: 10px; }
+
+/* Scalper position card: the open position as a trading terminal shows it. */
+.pos-card { display: grid; gap: 7px; padding: 10px; border: 1px solid #1f2b30; border-left: 3px solid #2d3b40; border-radius: 8px; background: #111a1d; font-size: 12px; }
+.pos-card.up { border-left-color: #22d59b; }
+.pos-card.down { border-left-color: #fa6b78; }
+.pos-card.closed { opacity: .92; }
+.pos-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pos-head input { margin: 0; }
+.pos-side { flex: none; padding: 2px 6px; border-radius: 4px; font: 800 10px "Manrope", sans-serif; letter-spacing: .4px; }
+.pos-side.ce { color: #06231a; background: #22d59b; }
+.pos-side.pe { color: #2a0a0e; background: #fa6b78; }
+.pos-symbol { flex: 1; min-width: 0; overflow: hidden; color: #f1f6f7; font: 700 12px "DM Mono", monospace; white-space: nowrap; text-overflow: ellipsis; }
+.pos-stage { flex: none; padding: 2px 7px; border: 1px solid #2d3b40; border-radius: 999px; color: #aebdc1; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.pos-stage.s-breakeven { color: #f0bf66; border-color: #5d4a22; }
+.pos-stage.s-locked, .pos-stage.s-trailing { color: #22d59b; border-color: #1f5c47; }
+.pos-stage.exit { color: #dfe8ea; }
+.pos-exit { flex: none; padding: 3px 9px; color: #fff; border: 0; border-radius: 5px; background: #c2434f; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
+.pos-exit:hover { background: #d9505d; }
+.pos-meta { display: flex; flex-wrap: wrap; gap: 3px 10px; color: #8a9ba0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.pos-meta .warn { color: #f0bf66; }
+.pos-pnl { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.pos-pnl b { font: 800 22px "DM Mono", monospace; }
+.pos-card.up .pos-pnl b { color: #22d59b; }
+.pos-card.down .pos-pnl b { color: #fa6b78; }
+.pos-pnl span { color: #dfe8ea; font: 700 12px "DM Mono", monospace; }
+.pos-pnl .pos-stage { margin-left: auto; }
+.pos-pnl small { width: 100%; color: #6f8287; font-size: 10px; }
+.pos-ladder { display: grid; gap: 3px; }
+.pos-track { position: relative; height: 12px; margin: 4px 0; border-radius: 6px; background: #1a2427; }
+.pos-track i { position: absolute; top: 3px; height: 6px; border-radius: 3px; }
+.pos-track .zone-risk { background: rgba(250, 107, 120, .35); }
+.pos-track .zone-reward { background: rgba(34, 213, 155, .22); }
+.pos-track .mfe { top: 5px; height: 2px; background: #22d59b; }
+.pos-track em { position: absolute; top: -2px; width: 2px; height: 16px; margin-left: -1px; border-radius: 1px; }
+.pos-track .tick.initial { background: #6f3a40; }
+.pos-track .tick.stop { background: #fa6b78; }
+.pos-track .tick.entry { background: #5aa9ff; }
+.pos-track .tick.target { background: #22d59b; }
+.pos-track .ltp { top: 0; width: 12px; height: 12px; margin-left: -6px; border: 2px solid #111a1d; border-radius: 50%; background: #f1f6f7; box-shadow: 0 0 0 1px #f1f6f7; }
+.pos-ladder-labels { display: flex; justify-content: space-between; gap: 6px; color: #8a9ba0; font: 600 10px "DM Mono", monospace; }
+.pos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 0; }
+.pos-grid div { min-width: 0; }
+.pos-grid div.wide { grid-column: 1 / -1; }
+.pos-grid dt { color: #6f8287; font-size: 10px; text-transform: uppercase; letter-spacing: .3px; }
+.pos-grid dd { margin: 1px 0 0; overflow: hidden; color: #e4ecee; font: 700 12px "DM Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.pos-grid dd small { color: #6f8287; font-weight: 500; font-size: 10px; }
+.pos-next, .pos-signal, .pos-fill { margin: 0; color: #8a9ba0; font-size: 11px; line-height: 1.4; }
+.pos-next b, .pos-signal b { font-family: "DM Mono", monospace; }
+.pos-next { padding: 5px 7px; border-radius: 5px; background: #142024; color: #b9c8cc; }
+.scalper-positions { gap: 8px; max-height: 680px; }
+.bt-hint { grid-column: 1 / -1; color: var(--muted, #8a9ba0); font-size: 11px; line-height: 1.4; }

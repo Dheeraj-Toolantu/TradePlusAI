@@ -55,7 +55,17 @@ export function optimizeSettings(input: { strategy: StrategyId; symbol: string; 
   const grid: Array<Partial<BacktestSettings>> = [];
   const windows: Array<[string, string]> = [["09:35", "14:45"], ["09:45", "13:30"], ["10:00", "14:30"]];
   const confidences = input.usesConfidence ? [input.settings.minConfidence, 65, 75] : [input.settings.minConfidence];
-  for (const timeStopMinutes of [0, 15, 30, 45])
+  if (input.strategy === "VWAP_EMA_ADX") {
+    // The scalper manages exits with its own staged trail, so the knobs are the ADX threshold on the
+    // confirmation candle, 1:1 vs 1:2, the time stop, trades per day and the entry window.
+    for (const adxMin of [15, 20, 25, 30])
+      for (const scalpRiskReward of [1, 2] as const)
+        for (const timeStopMinutes of [0, 8, 12, 20])
+          for (const maxTradesPerDay of [1, 2, 3])
+            for (const [entryStart, entryEnd] of windows)
+              grid.push({ adxMin, scalpRiskReward, timeStopMinutes, maxTradesPerDay, entryStart, entryEnd });
+  }
+  else for (const timeStopMinutes of [0, 15, 30, 45])
     for (const partialAtT1 of [true, false])
       for (const trailR of [0, 1, 1.5])
         for (const minConfidence of [...new Set(confidences)])

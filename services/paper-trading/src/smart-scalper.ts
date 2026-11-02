@@ -1,4 +1,5 @@
 import { getActiveOrdersFromFirestore, saveOrderToFirestore, type OrderRecord } from "../../../apps/web/lib/firestore-orders";
+import { VWAP_EMA_TRAIL } from "./scalper-trail";
 
 /**
  * Smart scalper (paper only).
@@ -85,6 +86,8 @@ export type ScalperPlan = {
   reason: string;
   /** A systematic trailing rule for the position (the VWAP-EMA scalper's staged trail). */
   trail?: { rule: "VWAP_EMA"; costPerUnit: number };
+  /** What confirmed the entry (the VWAP-EMA scalper: ADX on the confirmation candle). */
+  signal?: EntrySignal;
   /**
    * Re-plan on the actual fill (VWAP-EMA plans). The stop stays at its structural price; the fill
    * must not exceed maxEntry; the target is re-derived from the fill (fill + k·R, k = plan.riskReward)
@@ -94,6 +97,8 @@ export type ScalperPlan = {
    */
   risk?: { maxEntry: number; maxTarget: number; minRiskReward: number; stopGap: number; feesAtStopPerLot: number; lotSize: number };
 };
+/** Trend strength on the confirmation candle that triggered a VWAP-EMA entry. */
+export type EntrySignal = { adx: number; plusDi: number; minusDi: number; rising: boolean | null; triggerTime: string | null };
 export type ScalperDecision = {
   mode: "SCALP" | "HEDGE" | "WAIT";
   side: "CE" | "PE" | null;
@@ -117,6 +122,8 @@ export type ScalperPosition = {
   target: number | null;
   initialRisk: number | null;
   highWater: number;
+  /** Lowest premium seen since entry (maximum adverse excursion). */
+  lowWater?: number;
   trailing: boolean;
   spot: { entry: number; stop: number; target: number } | null;
   reason: string;
@@ -124,6 +131,7 @@ export type ScalperPosition = {
   trail?: { rule: "VWAP_EMA"; risk: number; costPerUnit: number; stage: TrailStage };
   /** The planned entry versus the actual fill, and the risk at that fill (planned and stressed). */
   fill?: { planned: number; actual: number; deviation: number; riskReward: number; plannedLoss: number; stressedLoss: number };
+  signal?: EntrySignal;
   status: "OPEN" | "EXITED";
   exitAt?: string;
   exitReason?: string;
@@ -133,8 +141,8 @@ export type ScalperPosition = {
 export type PositionView = ScalperPosition & { quantity: number; value: number; pnl: number; label: string };
 export type TrailStage = "INITIAL" | "BREAKEVEN" | "LOCKED" | "TRAILING";
 
-/** The VWAP-EMA scalper's staged trail, in units of the initial premium risk R. */
-export const VWAP_EMA_TRAIL = { breakevenAt: 0.5, lockAt: 1.0, lockTo: 0.5, trailGap: 0.6 } as const;
+/** The VWAP-EMA scalper's staged trail, in units of the initial premium risk R (see scalper-trail). */
+export { VWAP_EMA_TRAIL };
 
 /**
  * Next stop for a VWAP-EMA scalp. R = entry − initial stop (premium). At +0.5R the stop goes to
@@ -521,7 +529,7 @@ export class SmartScalper {
       const trail = single?.trailRule === "VWAP_EMA" && single.initialStopLoss !== undefined
         ? { rule: "VWAP_EMA" as const, risk: round2(entry - single.initialStopLoss), costPerUnit: Number(single.trailCostPerUnit ?? 0), stage: (["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"].includes(String(single.trailStage)) ? single.trailStage : "INITIAL") as TrailStage }
         : undefined;
-      this.positions.push({ id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk: trail ? trail.risk : stop !== null ? entry - stop : null, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL"), spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}) });
+      this.positions.push({ id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk: trail ? trail.risk : stop !== null ? entry - stop : null, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), lowWater: Math.min(entry, Number(single?.lowWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL"), spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}), ...(single?.entrySignal ? { signal: single.entrySignal } : {}) });
     }
   }
 
@@ -759,8 +767,8 @@ export class SmartScalper {
     const shift = anchorStop ? 0 : entry - plan.entry;
     const position: ScalperPosition = {
       id, kind: plan.kind, side: plan.side, underlying, legs, openedAt: timestamp, entry,
-      stop: round2(plan.stop + shift), target: round2(plan.target), initialRisk: round2((anchorStop ? entry : plan.entry) - plan.stop), highWater: entry, trailing: false,
-      spot: plan.spot, reason: plan.reason, status: "OPEN",
+      stop: round2(plan.stop + shift), target: round2(plan.target), initialRisk: round2((anchorStop ? entry : plan.entry) - plan.stop), highWater: entry, lowWater: entry, trailing: false,
+      spot: plan.spot, reason: plan.reason, status: "OPEN", ...(plan.signal ? { signal: plan.signal } : {}),
       // R for the staged trail is measured from the ACTUAL entry to the stop.
       ...(plan.trail ? { trail: { rule: plan.trail.rule, risk: round2((anchorStop ? entry : plan.entry) - plan.stop), costPerUnit: round2(plan.trail.costPerUnit), stage: "INITIAL" as TrailStage } } : {}),
     };
@@ -794,6 +802,7 @@ export class SmartScalper {
       if (!reason && position.kind !== "MANUAL" && position.underlying === input.symbol) {
         const risk = position.initialRisk ?? 0;
         position.highWater = Math.max(position.highWater, value);
+        position.lowWater = Math.min(position.lowWater ?? position.entry, value);
         if (position.trail && position.stop !== null) {
           // VWAP-EMA scalp: staged, cost-covered trail (see vwapEmaTrail).
           const next = vwapEmaTrail({ entry: position.entry, stop: position.stop, highWater: position.highWater, trail: position.trail });
@@ -860,6 +869,8 @@ export class SmartScalper {
         price: leg.entry, currentPrice: leg.ltp, pnl: round2(legPnl),
         ...(position.legs.length === 1 && position.stop !== null ? { stopLoss: position.stop, target: position.target ?? undefined, trailingStop: position.trailing ? position.stop : undefined } : {}),
         ...(position.trail ? { trailRule: position.trail.rule, trailStage: position.trail.stage, trailCostPerUnit: position.trail.costPerUnit, initialStopLoss: round2(position.entry - position.trail.risk), highWaterMark: position.highWater } : {}),
+        ...(position.lowWater !== undefined ? { lowWaterMark: position.lowWater } : {}),
+        ...(position.signal ? { entrySignal: position.signal } : {}),
         status: position.status === "OPEN" ? "OPEN" : "EXITED", mode: "PAPER", source: position.reason, createdAt: position.openedAt, updatedAt: this.clock().toISOString(),
         ...(position.status === "EXITED" ? { exitPrice: exits?.[index], exitAt: position.exitAt, exitReason: position.exitReason, realizedPnl: round2(legPnl) } : {}),
       };

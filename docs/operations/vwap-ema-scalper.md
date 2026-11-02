@@ -18,12 +18,13 @@ Code:
 | `apps/web/app/execution/page.tsx` | The panel |
 | `apps/web/components/scalper/premium-chart.tsx` | The risk-reward drawing |
 
-## The criteria (all 10 points needed)
+## The criteria (all 11 points needed)
 
 | Criterion | Points | Long (CE) rule; the short (PE) side is the mirror |
 | --- | --- | --- |
 | VWAP | 2 | The future's close is above its own session VWAP (the future's price and volume). VWAP rises over the last 5 bars. Price is at most 1.5 ATR(1m) above VWAP, so no chasing. Without the future's OHLCV, VWAP fails closed. |
 | 5/9 EMA | 2 | The 5 EMA is above the 9 EMA, which is above VWAP. A pullback inside the last 3 bars tags the 9 EMA. Then a green candle closes above the 5 EMA and the prior high, on at least 1.2× the futures volume of the prior 20 bars. The trigger counts on the latest completed candle, or on the one before it while price is within 0.5 ATR. |
+| ADX | 1 | ADX(14) on the **confirmation candle** (the trigger candle above) is above 20. It is Wilder's ADX on the same 1-minute futures tape, computed on today's session only (yesterday's close would put the overnight gap into the first bar and inflate ADX at the open). It warms up on 28 candles, so the first possible entry is about 09:43 IST. +DI / −DI and whether ADX is rising are shown with it, and the value is stored on the position. |
 | Delta | 1 | The selected strike's \|delta\| is 0.40-0.60. |
 | OI | 2 | (1) The 5-minute writer flow score is +1 or higher. (2) The ATM strike shows put writing, call short covering or call buying, with no fresh call writing. The biggest call-OI wall above spot must be beyond the target. |
 | PCR | 1 | Explicit zones: stretched < 0.50 ≤ bearish < 0.80 ≤ neutral ≤ 1.20 < bullish ≤ 1.60 < stretched. A long needs neutral or bullish with a PCR that is not falling (5-minute change ≥ 0). A short needs bearish or neutral with a PCR that is not rising (≤ 0). Stretched zones block both sides. |
@@ -90,7 +91,7 @@ The Scalper desk has a **Strategy** selector. It defaults to *VWAP-EMA scalper*;
 *Level scalper*, the desk's original support/resistance engine. With VWAP-EMA selected:
 
 - **Engine on + Automatic.** A CONFIRMED setup is placed in the Smart Scalper's paper book as soon as
-  all 7 criteria and every V5 gate pass.
+  all 8 criteria and every V5 gate pass.
 - **Engine on + Manual.** "⚡ Take trade" lights up when the setup is confirmed, and you place it with
   a click.
 - **Level engine.** It never enters while VWAP-EMA is selected. It still manages exits.
@@ -156,6 +157,28 @@ same trail.
 - **Desk:** the desk shows the monitor's status. Its own 10-second scan still runs, and the scalper
   serialises both, so a position is never closed twice.
 
+### The position card
+
+Each open position on the Scalper desk is a card, the way a trading terminal shows it:
+
+- **Header:** BUY CE / BUY PE, the contract, and an Exit button (market exit, paper).
+- **Clock:** time in trade, the entry time, and the scalp time stop counting down until the premium
+  reaches +0.5R.
+- **P&L:** live, in rupees, percent of the premium and R (the initial premium risk), before charges.
+  The trail stage (Initial SL, Breakeven, +0.5R locked, Trailing) sits beside it.
+- **Price ladder:** from the initial SL to the target, with the entry, the current (trailing) SL, the
+  best premium so far and the last price.
+- **Levels:** LTP, average entry, the stop (and where it started), the target, the P&L if the stop or
+  the target is hit (a stop above the entry shows the profit it has locked), the best and worst
+  premium since entry (MFE / MAE, in rupees and R), R per unit, and the index plan against the live spot.
+- **Next trail step:** the premium that moves the stop next and where it goes.
+- **Entry signal:** ADX(14), +DI and −DI on the confirmation candle.
+- **Fill:** planned versus actual fill, R:R at the fill, planned and stressed max loss.
+
+The P&L summary above the cards adds the win rate and the book's P&L if every stop is hit from here
+(open risk, or profit locked by the trailing stops). Closed trades show the same card with the exit
+reason, the realised P&L in rupees, percent and R, and the time held.
+
 ## The panel
 
 The panel shows:
@@ -167,6 +190,37 @@ The panel shows:
   The drawing shows a green reward zone and a red risk zone with rupee amounts, drawn from the trigger
   candle;
 - the 17 V5 gates.
+
+## Backtesting it (Backtesting page, `/validation`)
+
+Pick **VWAP + EMA + ADX scalp** in the Backtest lab. `services/backtest/src/vwap-ema-adx-strategy.ts`
+replays the live tape rules on 1-minute index history, and a parity test checks that it fires on the
+same candle with the same ADX and stop as the Python strategy. Trades are managed like the live
+scalper:
+- the target is re-derived from the fill (1:1 or 1:2);
+- breakeven plus charges and exit slippage at +0.5R;
+- +0.5R locked at +1R, then a 0.6R trail;
+- the 9 EMA momentum exit, the time stop and the square-off.
+
+Two settings are specific to it:
+- **ADX on confirmation candle above** (20 live);
+- **Target (from the fill)**, 1:1 or 1:2.
+
+"Optimize settings" sweeps:
+- ADX 15/20/25/30;
+- 1:1 vs 1:2;
+- the time stop, trades per day and the entry window.
+
+It picks on the first two thirds of the sessions and reports the last third separately, so you can
+see whether a better ADX threshold holds on data it was not chosen on.
+
+What the backtest cannot replay, and so does not apply:
+- the option-chain criteria (strike delta, OI, PCR, the premium's volume profile);
+- India VIX.
+
+Live entries are therefore stricter. Historical index candles carry no volume, so on sessions without
+futures volume VWAP is time-weighted and the 1.2× volume check is skipped. The funnel note says how
+many signals that affected.
 
 ## Not verified live
 

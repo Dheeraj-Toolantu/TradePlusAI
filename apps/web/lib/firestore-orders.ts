@@ -30,6 +30,10 @@ export type OrderRecord = {
   minimumLossExitPrice?: number;
   maxProfitToTrail?: number;
   highWaterMark?: number;
+  /** Lowest premium since entry (maximum adverse excursion), Smart Scalper positions. */
+  lowWaterMark?: number;
+  /** What confirmed a VWAP-EMA scalper entry: ADX and the DIs on the confirmation candle. */
+  entrySignal?: { adx: number; plusDi: number; minusDi: number; rising: boolean | null; triggerTime: string | null };
   trailingStop?: number;
   trailingActivatedAt?: string;
   trailingDistance?: number;

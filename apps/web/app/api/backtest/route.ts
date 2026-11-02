@@ -4,6 +4,7 @@ import { smcSignalSource } from "../../../../../services/backtest/src/smc-strate
 import { trendPullbackSignalSource } from "../../../../../services/backtest/src/trend-pullback-strategy";
 import { smartSignalSource } from "../../../../../services/backtest/src/smart-strategy";
 import { orbProSignalSource } from "../../../../../services/backtest/src/orb-pro-strategy";
+import { vwapEmaAdxSignalSource } from "../../../../../services/backtest/src/vwap-ema-adx-strategy";
 import { optimizeSettings, precomputeSignals } from "../../../../../services/backtest/src/optimizer";
 import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, validateSourceRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
@@ -16,6 +17,7 @@ const STRATEGIES: Record<StrategyId, string> = {
   SMC_PLUS: "SMC sweep + CHoCH retest (adds 5m CHoCH → FVG/OB retest continuation entries in the 9 EMA trend)",
   TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
   SMART_COMBO: "Smart combo (regime-routed trend / ORB / SMC, AI multi-timeframe vote)",
+  VWAP_EMA_ADX: "VWAP + 5/9 EMA + ADX scalp (the live scalper's tape rules; ADX above 20 on the confirmation candle)",
 };
 /** Above this many sessions the chart gets 5-minute candles to keep the response small (about 3 months). */
 const MINUTE_CANDLE_SESSIONS = 70;
@@ -34,7 +36,7 @@ function settingsFrom(raw: Record<string, unknown>): BacktestSettings {
     thetaPerDay: clampNumber(raw.thetaPerDay, d.thetaPerDay, 0, 500),
     slippagePoints: clampNumber(raw.slippagePoints, d.slippagePoints, 0, 100),
     chargesPerTrade: clampNumber(raw.chargesPerTrade, d.chargesPerTrade, 0, 10_000),
-    partialAtT1: raw.partialAtT1 === undefined ? d.partialAtT1 : Boolean(raw.partialAtT1),
+    partialAtT1: raw.partialAtT1 === undefined ? d.partialAtT1 : raw.partialAtT1 === true || raw.partialAtT1 === "true",
     trailR: clampNumber(raw.trailR, d.trailR, 0, 5),
     timeStopMinutes: clampNumber(raw.timeStopMinutes, d.timeStopMinutes, 0, 240),
     maxTradesPerDay: clampNumber(raw.maxTradesPerDay, d.maxTradesPerDay, 1, 20),
@@ -45,6 +47,8 @@ function settingsFrom(raw: Record<string, unknown>): BacktestSettings {
     entryStart: hhmm(raw.entryStart, d.entryStart),
     entryEnd: hhmm(raw.entryEnd, d.entryEnd),
     squareOff: hhmm(raw.squareOff, d.squareOff),
+    adxMin: clampNumber(raw.adxMin, d.adxMin, 0, 60),
+    scalpRiskReward: Number(raw.scalpRiskReward) === 1 ? 1 : 2,
   };
 }
 
@@ -63,13 +67,20 @@ export async function POST(request: Request) {
   const from = String(body.from ?? "");
   const to = String(body.to ?? "");
   const source: BacktestSource = body.source === "yahoo" ? "yahoo" : body.source === "synthetic" ? "synthetic" : "groww";
-  if (!(strategy in STRATEGIES)) return NextResponse.json({ error: "Unknown strategy" }, { status: 400 });
+  if (!Object.hasOwn(STRATEGIES, strategy)) return NextResponse.json({ error: "Unknown strategy" }, { status: 400 });
   if (!(BACKTEST_SYMBOLS as readonly string[]).includes(symbol)) return NextResponse.json({ error: "Backtests support NIFTY, BANKNIFTY and SENSEX" }, { status: 400 });
   const rangeError = validateRange(from, to) ?? validateSourceRange(source, from);
   if (rangeError) return NextResponse.json({ error: rangeError }, { status: 400 });
   const settings = settingsFrom((body.settings ?? {}) as Record<string, unknown>);
+  const windowError = settings.entryStart >= settings.entryEnd ? `Entry from (${settings.entryStart}) must be before entry until (${settings.entryEnd}).`
+    : settings.entryEnd >= settings.squareOff ? `Entry until (${settings.entryEnd}) must be before the square-off (${settings.squareOff}): later entries would be closed in the same minute.`
+    : null;
+  if (windowError) return NextResponse.json({ error: windowError }, { status: 400 });
   const started = Date.now();
   const data = await loadBacktestData({ symbol, from, to, source, origin: new URL(request.url).origin });
+  // A run that ends today must not treat the 1-minute bar still forming as a completed one.
+  const nowS = Math.floor(Date.now() / 1000);
+  if (data.minute.length && data.minute.at(-1)!.time + 60 > nowS) data.minute = data.minute.filter((bar) => bar.time + 60 <= nowS);
   if (!data.sessions) {
     // Lead with the provider's own explanation when there is one (first issue is the missing-days list).
     const cause = data.issues.find((issue) => !issue.startsWith("No 1-minute candles for"));
@@ -88,10 +99,12 @@ export async function POST(request: Request) {
   let orbNote: string | null = null;
   let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
   let trendFunnel: ReturnType<typeof trendPullbackSignalSource>["funnel"] | null = null;
+  let scalpFunnel: ReturnType<typeof vwapEmaAdxSignalSource>["funnel"] | null = null;
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
   else if (strategy === "SMC_SWEEP" || strategy === "SMC_PLUS") { const smc = smcSignalSource(symbol, data.minute, data.daily, { chochRetest: strategy === "SMC_PLUS" }); funnel = smc.funnel; signalAt = smc; }
   else if (strategy === "TREND_PULLBACK") { const trend = trendPullbackSignalSource(symbol, data.minute, data.daily); trendFunnel = trend.funnel; signalAt = trend; }
   else if (strategy === "ORB_PRO") { const pro = orbProSignalSource(symbol, data.minute, data.daily); orbProFunnel = pro.funnel; signalAt = pro; }
+  else if (strategy === "VWAP_EMA_ADX") { const scalp = vwapEmaAdxSignalSource(symbol, data.minute); scalpFunnel = scalp.funnel; signalAt = scalp; }
   else if (strategy === "SMART_COMBO") {
     // ORB is one of four playbooks here: if the Python replay is unavailable, run without it.
     let orb: Signal[] | null = null;
@@ -110,7 +123,7 @@ export async function POST(request: Request) {
   // Signals do not depend on the simulator's settings: compute them once, then replay cheaply.
   signalAt = precomputeSignals(data.minute, signalAt, from, to);
   const result = runBacktest({ strategy, symbol, from, to, minute: data.minute, signalAt, settings });
-  const optimization = body.optimize ? optimizeSettings({ strategy, symbol, from, to, minute: data.minute, signalAt, settings, usesConfidence: strategy !== "ORB_RETEST" }) : null;
+  const optimization = body.optimize ? optimizeSettings({ strategy, symbol, from, to, minute: data.minute, signalAt, settings, usesConfidence: strategy !== "ORB_RETEST" && strategy !== "VWAP_EMA_ADX" }) : null;
   const notes = [...result.notes];
   if (strategy === "MTF_AI") notes.push("Replays the deterministic multi-timeframe engine the AI monitor relies on. The LLM's discretionary layer, live OI/PCR flow and sentiment cannot be replayed historically.");
   else if (strategy === "SMC_SWEEP" || strategy === "SMC_PLUS") {
@@ -135,6 +148,14 @@ export async function POST(request: Request) {
     }
     notes.push("Smart combo: trend day → trend pullbacks, ORB and sweeps only in the trend's direction; range day → sweep reversals only; undecided → sweeps of daily levels and ORB with the day's direction. The AI multi-timeframe engine votes (an opposite read vetoes, an agreeing one adds confidence). Stops and targets come from the playbook that fired.");
     if (orbNote) notes.push(orbNote);
+  }
+  else if (strategy === "VWAP_EMA_ADX") {
+    if (scalpFunnel) {
+      const f = scalpFunnel;
+      notes.push(`Setup funnel: ${f.evaluated} 1m closes checked (15+ bars into the session) → ${f.sided} on one side of VWAP with the 5/9 EMAs agreeing → ${f.stacked} with 5 EMA > 9 EMA > VWAP stacked → ${f.triggers} pullback-to-9-EMA resumption triggers → ${f.signals} signals. Dropped: ${f.adxUnavailable} before ADX(14) warmed up (28 bars, ~09:43), ${f.vwapFlat} VWAP not sloping the trade's way, ${f.vwapExtended} more than 1.5 ATR from VWAP, ${f.lowVolume} trigger volume under 1.2x, ${f.stopTooWide} stop wider than 1.5 ATR. The ADX threshold (${settings.adxMin}) is applied per trade: see "Skipped".`);
+      if (f.volumeUnavailable) notes.push(`${f.volumeUnavailable} of ${f.signals} signals came from sessions without futures volume in the history: there VWAP is time-weighted and the 1.2x volume check is skipped (live trading would fail closed).`);
+    }
+    notes.push(`VWAP-EMA-ADX rules, as the live scalper's tape: close beyond a VWAP sloping the trade's way (≤ 1.5 ATR away), 5 EMA beyond 9 EMA beyond VWAP, a pullback tagging the 9 EMA, then a candle closing beyond the 5 EMA and the prior candle on 1.2x volume, with ADX(14) above ${settings.adxMin} on that confirmation candle. Stop beyond the pullback / 9 EMA + 0.15 ATR (0.3–1.5 ATR). Managed like the live scalper: target = fill ± ${settings.scalpRiskReward}R, breakeven + charges at +0.5R, +0.5R locked at +1R, then a 0.6R trail; after breakeven a 1m close back through the 9 EMA exits; the time stop applies until +0.5R. "Partial at T1" and "Trail" do not apply. Not replayable, so not applied: strike delta, OI writers, PCR, the premium's volume profile and India VIX (live entries are stricter).`);
   }
   else if (strategy === "TREND_PULLBACK") {
     if (trendFunnel) notes.push(`Setup funnel: ${trendFunnel.evaluated} 5m closes checked → ${trendFunnel.trendBars} on a confirmed trend day → ${trendFunnel.pullbacks} pullbacks into value → ${trendFunnel.triggers} resumption candles (${trendFunnel.extended} too far from VWAP, ${trendFunnel.tooWide} stop > 1.6 ATR).`);

@@ -470,7 +470,7 @@ lots                = ⌊ max loss per trade ÷ stressed loss / lot ⌋  (≤ lo
     <tr><td>Charges vs reward</td><td>Charges ≤ 25% of the reward, and lots ≥ 1</td></tr>
     <tr><td>SAFE_MODE / kill switch</td><td>Either one blocks all new entries</td></tr>
   </table>
-  <p class="muted">Not applied, by design: the 5-minute ADX regime gate (the 1-minute VWAP/EMA stack is the scalper's own trend filter) and the generic option-flow gate (OI and PCR are strategy criteria ④ and ⑤ instead).</p>
+  <p class="muted">Not applied, by design: the 5-minute ADX regime gate (the scalper has its own ADX criterion instead: ADX(14) above 20 on the 1-minute confirmation candle) and the generic option-flow gate (OI and PCR are strategy criteria instead).</p>
 
   <h2 style="margin-top:14pt">11. Placing the trade on the Scalper</h2>
   <table>

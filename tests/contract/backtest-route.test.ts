@@ -6,7 +6,8 @@ const post = (body: Record<string, unknown>) => POST(new Request("http://localho
 describe("backtest route", () => {
   it("lists strategies and defaults", async () => {
     const body = await (await GET()).json();
-    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "SMC_PLUS", "TREND_PULLBACK", "SMART_COMBO"]);
+    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "SMC_PLUS", "TREND_PULLBACK", "SMART_COMBO", "VWAP_EMA_ADX"]);
+    expect(body.defaults).toMatchObject({ adxMin: 20, scalpRiskReward: 2 });
     expect(body.defaults).toMatchObject({ maxTradesPerDay: 3, squareOff: "15:15" });
   });
 
@@ -20,6 +21,23 @@ describe("backtest route", () => {
     expect(oldYahoo.status).toBe(400);
     expect((await oldYahoo.json()).error).toMatch(/Yahoo only keeps 1-minute candles/);
     expect((await post({ strategy: "MTF_AI", symbol: "NIFTY", from: "2026-09-05", to: "2026-09-01" })).status).toBe(400);
+    // Names inherited from Object.prototype are not strategies.
+    expect((await post({ strategy: "constructor", symbol: "NIFTY", from: "2026-09-01", to: "2026-09-05" })).status).toBe(400);
+    // Entries after the square-off would be closed in the same minute; an inverted window trades nothing.
+    const late = await post({ strategy: "MTF_AI", symbol: "NIFTY", from: "2026-09-21", to: "2026-09-25", source: "synthetic", settings: { entryEnd: "14:45", squareOff: "14:00" } });
+    expect(late.status).toBe(400);
+    expect((await late.json()).error).toMatch(/before the square-off/);
+    expect((await post({ strategy: "MTF_AI", symbol: "NIFTY", from: "2026-09-21", to: "2026-09-25", source: "synthetic", settings: { entryStart: "13:00", entryEnd: "10:00" } })).status).toBe(400);
+  });
+
+  it("runs the VWAP-EMA-ADX scalp with its own settings and funnel", { timeout: 60_000 }, async () => {
+    const response = await post({ strategy: "VWAP_EMA_ADX", symbol: "NIFTY", from: "2026-09-21", to: "2026-09-25", source: "synthetic", settings: { adxMin: 25, scalpRiskReward: "1", partialAtT1: "false" } });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.settings).toMatchObject({ adxMin: 25, scalpRiskReward: 1, partialAtT1: false });
+    expect(body.notes.some((note: string) => /Setup funnel: \d+ 1m closes checked/.test(note))).toBe(true);
+    expect(body.notes.some((note: string) => /ADX\(14\) above 25 on that confirmation candle/.test(note))).toBe(true);
+    for (const trade of body.trades) expect(["TARGET", "STOP_LOSS", "BREAKEVEN_STOP", "LOCKED_PROFIT_STOP", "TRAILING_STOP", "EMA9_LOST", "TIME_STOP", "SQUARE_OFF", "SESSION_END", "DATA_END"]).toContain(trade.exitReason);
   });
 
   it.each(["MTF_AI", "ORB_RETEST", "SMC_SWEEP"])("runs %s on synthetic data and labels it as such", { timeout: 60_000 }, async (strategy) => {

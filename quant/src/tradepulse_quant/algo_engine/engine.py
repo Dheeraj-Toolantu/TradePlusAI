@@ -336,6 +336,8 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         "retest_confirmed": (orb is not None and orb.status == "CONFIRMED") if strategy == "ORB_RETEST" else strategy_confirmed,
         "score": score_total,
         "minimum_score": minimum_score,
+        # Set by the engine for every strategy, so a caller can never widen the score range.
+        "maximum_score": float(config.score_thresholds["maximum_score"]),
         "risk_reward": setup.get("risk_reward"),
         "ors_confirmed": ors_confirmed if option_evidence else None,
         "oi_pcr_supportive": oi_supportive if option_evidence else None,
@@ -602,6 +604,7 @@ def _scalp_evidence(result: dict, evidence: dict, calculations: dict) -> None:
         "retest_confirmed": bool(criteria.get("ema", {}).get("passed")),
         "score": card["total"],
         "minimum_score": card["minimum"],
+        "maximum_score": card["maximum"],
         "liquidity_score": selected.get("liquidity_score"),
         "regime_gate": False,
         "option_flow_gate": False,

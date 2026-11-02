@@ -35,8 +35,8 @@ type ScalpPlan = {
 };
 type ScalpCalc = {
   rr_choice: "1:1" | "1:2";
-  tape: { side?: "CE" | "PE" | null; close?: number; vwap?: number; ema5?: number; ema9?: number; atr?: number; vwap_slope?: number; vwap_extension_atr?: number; volume_ratio?: number | null; risk_points?: number; reason?: string };
-  trigger?: { time: string; close: number } | null;
+  tape: { side?: "CE" | "PE" | null; close?: number; vwap?: number; ema5?: number; ema9?: number; atr?: number; vwap_slope?: number; vwap_extension_atr?: number; volume_ratio?: number | null; risk_points?: number; reason?: string; adx?: number; plus_di?: number; minus_di?: number };
+  trigger?: { time: string; close: number; adx?: { value: number; plus_di: number; minus_di: number; rising: boolean | null } } | null;
   criteria: ScalpCriterion[];
   candidates: ScalpCandidate[];
   selected: ScalpCandidate | null;
@@ -78,7 +78,7 @@ const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
 const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
 // The algo page runs one strategy: the 1-minute VWAP / 5-9 EMA index-option scalper.
-const strategy = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape: trade the side of a rising (falling) VWAP when the 5 EMA leads the 9 EMA, after a pullback to the 9 EMA resumes on volume. The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
+const strategy = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape: trade the side of a rising (falling) VWAP when the 5 EMA leads the 9 EMA, after a pullback to the 9 EMA resumes on volume. ADX(14) on that confirmation candle must be above 20 (trend strength behind the move). The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
 const RR_CHOICES: Array<{ id: RiskReward; name: string }> = [
   { id: "1:2", name: "Risk:Reward 1:2" },
   { id: "1:1", name: "Risk:Reward 1:1" },
@@ -742,7 +742,7 @@ export default function ExecutionPage() {
               {(scalp?.criteria ?? []).map((item) => (
                 <span key={item.key} className={item.passed ? "pass" : "fail"} title={item.detail}><small>{item.name}</small><b className={item.passed ? "gain" : "warning"}>{item.points} / {item.max}</b></span>
               ))}
-              <span className="exec-score-total"><small>Criteria met</small><b className={Number(scalp?.score?.total ?? 0) >= Number(scalp?.score?.minimum ?? 10) ? "gain" : "warning"}>{calc(scalp?.score?.total ?? score.total)} / 10</b><em>all 10 needed</em></span>
+              <span className="exec-score-total"><small>Criteria met</small><b className={Number(scalp?.score?.total ?? 0) >= Number(scalp?.score?.minimum ?? 10) ? "gain" : "warning"}>{calc(scalp?.score?.total ?? score.total)} / {scalp?.score?.maximum ?? 11}</b><em>all {scalp?.score?.maximum ?? 11} needed</em></span>
             </div>
             {scalp && (
               <ul className="exec-criteria" aria-label="Scalper criteria">
@@ -782,7 +782,8 @@ export default function ExecutionPage() {
               <div className="exec-calcs">
                 <span>Close <b>{calc(scalp?.tape.close)}</b></span><span>VWAP <b>{calc(scalp?.tape.vwap)}</b> <small>{scalp?.tape.vwap_slope !== undefined ? `${scalp.tape.vwap_slope >= 0 ? "+" : ""}${calc(scalp.tape.vwap_slope)} pts / 5m` : ""}</small></span>
                 <span>EMA 5 / 9 <b>{calc(scalp?.tape.ema5)} / {calc(scalp?.tape.ema9)}</b></span><span>ATR (1m) <b>{calc(scalp?.tape.atr)}</b></span><span>From VWAP <b>{calc(scalp?.tape.vwap_extension_atr)} ATR</b></span>
-                <span>Trigger <b>{scalp?.trigger ? scalp.trigger.time.slice(11, 16) : "--"}</b></span><span>Futures volume <b>{scalp?.tape.volume_ratio ? `${calc(scalp.tape.volume_ratio)}×` : "--"}</b></span>
+                <span>Trigger <b>{scalp?.trigger ? scalp.trigger.time.slice(11, 16) : "--"}</b></span>
+                <span>ADX(14) on trigger <b className={scalp?.trigger?.adx ? (scalp.trigger.adx.value > 20 ? "gain" : "warning") : undefined}>{calc(scalp?.trigger?.adx?.value)}</b> <small>{scalp?.trigger?.adx ? `+DI ${calc(scalp.trigger.adx.plus_di)} / −DI ${calc(scalp.trigger.adx.minus_di)}${scalp.trigger.adx.rising === null ? "" : scalp.trigger.adx.rising ? " · rising" : " · falling"} · needs > 20` : `now ${calc(scalp?.tape.adx)} · needs > 20 on the trigger`}</small></span><span>Futures volume <b>{scalp?.tape.volume_ratio ? `${calc(scalp.tape.volume_ratio)}×` : "--"}</b></span>
                 <span>PCR (OI) <b>{calc(scalp?.pcr?.pcr)}</b> <small>{scalp?.pcr?.pcr_change_5m !== null && scalp?.pcr?.pcr_change_5m !== undefined ? `${scalp.pcr.pcr_change_5m >= 0 ? "+" : ""}${scalp.pcr.pcr_change_5m} / 5m` : ""}</small></span>
                 <span>OI flow score <b>{calc(scalp?.oi?.oi_direction_score)}</b></span><span>ATM {calc(scalp?.oi?.atm_strike)} <b>{[scalp?.oi?.atm_activity?.CE && `CE ${scalp.oi.atm_activity.CE.replaceAll("_", " ").toLowerCase()}`, scalp?.oi?.atm_activity?.PE && `PE ${scalp.oi.atm_activity.PE.replaceAll("_", " ").toLowerCase()}`].filter(Boolean).join(", ") || "--"}</b></span>
                 <span>OI wall <b>{calc(scalp?.oi?.wall)}</b> <small>{scalp?.oi?.room_points ? `${calc(scalp.oi.room_points)} pts away` : ""}</small></span>
