@@ -449,6 +449,9 @@ type ScalpSetup = {
   max_entry: number; max_target: number; min_risk_reward: number; stop_gap: number; fees_at_stop_per_lot: number; slippage_pct: number;
   contract: { symbol: string; type: "CE" | "PE"; strike: number; expiry?: string | null; lot_size?: number | null };
   spot: { entry: number; stop: number; target: number };
+  trigger_time?: string | null;
+  /** ADX(14), +DI and −DI on the confirmation candle (the strategy requires ADX above 20). */
+  adx?: { value: number; plus_di: number; minus_di: number; rising: boolean | null } | null;
 };
 
 /**
@@ -486,7 +489,8 @@ async function placeOnScalper(body: RecordValue, origin: string) {
     lots: setup.lots, quantity: setup.lots * lot, entry: setup.entry, stop: setup.stop_loss, target: setup.target,
     riskPerLot: Math.round((setup.entry - setup.stop_loss) * lot * 100) / 100, rewardPerLot: Math.round((setup.target - setup.entry) * lot * 100) / 100,
     riskReward: setup.risk_reward, spot: setup.spot,
-    reason: `VWAP-EMA scalper ${setup.rr_choice}: ${setup.side === "BUY" ? "long" : "short"} ${underlying}, index stop ${setup.spot.stop} / target ${setup.spot.target}`,
+    reason: `VWAP-EMA scalper ${setup.rr_choice}: ${setup.side === "BUY" ? "long" : "short"} ${underlying}, index stop ${setup.spot.stop} / target ${setup.spot.target}${setup.adx ? `, ADX ${setup.adx.value}` : ""}`,
+    ...(setup.adx ? { signal: { adx: setup.adx.value, plusDi: setup.adx.plus_di, minusDi: setup.adx.minus_di, rising: setup.adx.rising, triggerTime: setup.trigger_time ?? null } } : {}),
     // Staged, cost-covered trail: breakeven at +0.5R, lock +0.5R at +1R, trail 0.6R beyond.
     trail: { rule: "VWAP_EMA", costPerUnit: Number(setup.cost_per_unit) || 0 },
     // Re-plan on the actual fill: refuse beyond max_entry, re-check R:R, re-size on stressed risk.

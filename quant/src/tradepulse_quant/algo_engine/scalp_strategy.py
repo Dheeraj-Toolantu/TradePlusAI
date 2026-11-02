@@ -1,6 +1,6 @@
 """VWAP-EMA option scalper (index options, 1-minute tape).
 
-The rule set an intraday index-option scalper runs, every rule a hard criterion (10 points, all 10
+The rule set an intraday index-option scalper runs, every rule a hard criterion (11 points, all 11
 needed). CE for a long, PE for a short; the PE side is the exact mirror.
 
   VWAP (2)            the close is on the trade side of the session VWAP (futures-volume weighted),
@@ -9,6 +9,9 @@ needed). CE for a long, PE for a short; the PE side is the exact mirror.
   5/9 EMA (2)         5 EMA beyond 9 EMA, both beyond VWAP (trend stack), then a pullback that tags
                       the 9 EMA and a candle that closes back beyond the 5 EMA and the prior candle's
                       extreme on above-average futures volume (momentum resumes).
+  ADX (1)             ADX(14) on the confirmation (trigger) candle is above 20: the move has trend
+                      strength behind it, not a chop between VWAP and the EMAs. Wilder's ADX on the
+                      same 1-minute futures tape; +DI / -DI are reported with it.
   Delta (1)           the selected strike's |delta| is 0.40-0.60: it moves with the index, it is not
                       a far-OTM lottery ticket or a deep-ITM proxy for the future.
   OI (2)              option writers lean the trade's way (5-minute OI flow score >= 1), there is no
@@ -79,6 +82,8 @@ class ScalpConfig:
     min_volume_ratio: float = 1.2  # trigger-candle futures volume vs the prior 20 candles
     volume_lookback: int = 20
     trigger_max_age_bars: int = 1  # the trigger is the latest completed candle, or the one before
+    adx_period: int = 14
+    adx_min: float = 20.0  # ADX on the confirmation candle must be ABOVE this (strictly)
     max_drift_atr: float = 0.5  # how far price may have run past a one-candle-old trigger
     select_delta_min: float = 0.35
     select_delta_max: float = 0.65
@@ -118,9 +123,9 @@ class ScalpConfig:
     tick: float = 0.05
     max_loss_per_trade: float = 1500.0
     max_lots: int = 1
-    minimum_score: float = 10.0
-    maximum_score: float = 10.0
-    criteria_max: dict[str, int] = field(default_factory=lambda: {"vwap": 2, "ema": 2, "delta": 1, "oi": 2, "pcr": 1, "volume_profile": 1, "vix": 1})
+    minimum_score: float = 11.0
+    maximum_score: float = 11.0
+    criteria_max: dict[str, int] = field(default_factory=lambda: {"vwap": 2, "ema": 2, "adx": 1, "delta": 1, "oi": 2, "pcr": 1, "volume_profile": 1, "vix": 1})
 
 
 def rr_ratio(choice: object) -> tuple[str, float]:
@@ -188,6 +193,44 @@ def atr_value(candles: list[CandleLike], period: int) -> float | None:
     for item in ranges[period:]:
         value = (value * (period - 1) + item) / period
     return value
+
+
+def adx_series(candles: list[CandleLike], period: int) -> list[tuple[float, float, float] | None]:
+    """Wilder's ADX with +DI / -DI for every candle (None until warmed up: 2 x period candles, so the
+    first value is on candle index 2·period − 1).
+
+    TR, +DM and -DM are Wilder-smoothed over ``period``; DX = 100·|+DI − −DI| / (+DI + −DI); the
+    first ADX is the mean of the first ``period`` DX values and is Wilder-smoothed after that.
+    """
+    out: list[tuple[float, float, float] | None] = [None] * len(candles)
+    if period <= 0 or len(candles) < 2 * period:
+        return out
+    tr = pdm = mdm = 0.0
+    dx: list[float] = []
+    adx: float | None = None
+    for i in range(1, len(candles)):
+        cur, prev = candles[i], candles[i - 1]
+        up, down = cur.high - prev.high, prev.low - cur.low
+        t = max(cur.high - cur.low, abs(cur.high - prev.close), abs(cur.low - prev.close))
+        p = up if up > down and up > 0 else 0.0
+        m = down if down > up and down > 0 else 0.0
+        if i <= period:  # seed: plain sums over the first period
+            tr, pdm, mdm = tr + t, pdm + p, mdm + m
+            if i < period:
+                continue
+        else:
+            tr, pdm, mdm = tr - tr / period + t, pdm - pdm / period + p, mdm - mdm / period + m
+        plus = 100.0 * pdm / tr if tr > 0 else 0.0
+        minus = 100.0 * mdm / tr if tr > 0 else 0.0
+        dx.append(100.0 * abs(plus - minus) / (plus + minus) if plus + minus > 0 else 0.0)
+        if adx is None:
+            if len(dx) < period:
+                continue
+            adx = sum(dx) / period
+        else:
+            adx = (adx * (period - 1) + dx[-1]) / period
+        out[i] = (adx, plus, minus)
+    return out
 
 
 def vwap_series(session: list[CandleLike]) -> tuple[list[float], bool]:
@@ -259,7 +302,12 @@ def read_tape(candles: list[CandleLike], config: ScalpConfig) -> dict:
     ema9 = ema_series(closes, config.ema_slow)[-len(session):]
     atr = atr_value(candles[-(config.atr_period * 3):], config.atr_period) or 0.0
     vwap, vwap_observable = vwap_series(session)
+    # ADX on today's session only: yesterday's close would put the overnight gap into the first
+    # true range and directional move, inflating ADX at the open (false trend strength).
+    adx = adx_series(session, config.adx_period)
     last = session[-1]
+    if adx[-1] is not None:
+        out.update(adx=adx[-1][0], plus_di=adx[-1][1], minus_di=adx[-1][2])
     out.update(close=last.close, vwap=vwap[-1], ema5=ema5[-1], ema9=ema9[-1], atr=atr, vwap_observable=vwap_observable,
                vwap_slope=vwap[-1] - vwap[-1 - config.vwap_slope_bars] if len(vwap) > config.vwap_slope_bars else 0.0)
     if last.close > vwap[-1] and ema5[-1] > ema9[-1]:
@@ -309,6 +357,11 @@ def read_tape(candles: list[CandleLike], config: ScalpConfig) -> dict:
         prior = [c.volume for c in session[max(0, i - config.volume_lookback):i] if c.volume > 0]
         if session[i].volume > 0 and len(prior) >= 5:
             volume_ratio = session[i].volume / (sum(prior) / len(prior))
+    if trigger is not None and adx[trigger["index"]] is not None:
+        value, plus, minus = adx[trigger["index"]]
+        before = adx[trigger["index"] - 1]
+        trigger["adx"] = {"value": round(value, 2), "plus_di": round(plus, 2), "minus_di": round(minus, 2),
+                          "rising": None if before is None else value > before[0]}
     out.update(trigger=trigger, volume_ratio=_r(volume_ratio))
 
     # Structural stop in index points
@@ -667,6 +720,19 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         trig_text = f"pullback to the 9 EMA, resumed at {trigger['time'][11:16]} on {tape['volume_ratio']}x volume"
     criteria.append(_criterion("ema", "5/9 EMA", ema_points, maxes["ema"], f"{stack_text}; {trig_text}"))
 
+    # ADX on the confirmation candle: trend strength behind the resumption.
+    trigger_adx = (trigger or {}).get("adx")
+    adx_ok = trigger_adx is not None and trigger_adx["value"] > config.adx_min
+    if trigger_adx is not None:
+        di = f"+DI {trigger_adx['plus_di']:.1f} / −DI {trigger_adx['minus_di']:.1f}"
+        slope = "" if trigger_adx["rising"] is None else ", rising" if trigger_adx["rising"] else ", falling"
+        adx_detail = f"ADX({config.adx_period}) {trigger_adx['value']:.1f} on the {trigger['time'][11:16]} confirmation candle{slope} ({di})" + ("" if adx_ok else f": needs above {config.adx_min:.0f}, the move lacks trend strength")
+    elif tape.get("adx") is not None:
+        adx_detail = f"ADX({config.adx_period}) {tape['adx']:.1f} now; waiting for a confirmation candle (it needs ADX above {config.adx_min:.0f} on that candle)"
+    else:
+        adx_detail = f"ADX({config.adx_period}) warms up on {2 * config.adx_period} one-minute candles of today's session (have {tape.get('session_bars', 0)})"
+    criteria.append(_criterion("adx", "ADX", int(adx_ok), maxes["adx"], adx_detail))
+
     # Strike selection from OI
     candidates = select_strikes(chain, flow, spot, side, config) if spot > 0 else []
     calc["candidates"] = candidates[:4]
@@ -736,6 +802,7 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         "lots": plan["lots"], "quantity": plan["quantity"], "max_loss": plan["max_loss"],
         "spot": {"entry": plan["spot_entry"], "stop": plan["spot_stop"], "target": plan["spot_target"]},
         "greeks": plan["greeks"], "trigger_time": trigger["time"] if trigger else None,
+        "adx": trigger_adx,
         # round-trip charges per unit: the breakeven stop covers them (cost-covered breakeven)
         "cost_per_unit": round(plan["costs_per_lot"]["at_target"] / plan["lot_size"], 2),
         # Re-plan on the actual fill: the scalper refuses a fill above max_entry, re-checks the R:R
@@ -752,8 +819,8 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
 
 
 def score_card(result: dict) -> dict:
-    """The strategy's own 10-point card for the V5 score gate (all 10 needed)."""
+    """The strategy's own 11-point card for the V5 score gate (all 11 needed)."""
     calc = result.get("scalp") or {}
     card = {item["key"]: item["points"] for item in calc.get("criteria") or []}
     total = sum(card.values())
-    return {**card, "total": float(total), "minimum": float(ScalpConfig().minimum_score)}
+    return {**card, "total": float(total), "minimum": float(ScalpConfig().minimum_score), "maximum": float(ScalpConfig().maximum_score)}

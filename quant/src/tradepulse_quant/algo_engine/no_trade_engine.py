@@ -42,6 +42,9 @@ class PipelineEvidence:
     vix_regime: str | None = None
     score: float | None = None
     minimum_score: float = 8.0
+    # The strategy's own card size (the engine sets it; 10 unless a strategy scores out of more,
+    # e.g. the VWAP-EMA scalper's 11-point card). A missing value means 10.
+    maximum_score: float | None = None
     option_quote_fresh: bool | None = None
     liquidity_score: float | None = None
     risk_reward: float | None = None
@@ -130,8 +133,9 @@ class NoTradeEngine:
         elif not valid_gap:
             reasons.append("GAP_UNRESOLVED")
 
-        valid_score = evidence.score is not None and evidence.score >= evidence.minimum_score and evidence.score <= 10
-        gates.append(GateEvidence("SCORE_BELOW_MINIMUM", valid_score, "score must be within 0-10 and meet the configured minimum"))
+        maximum_score = evidence.maximum_score if evidence.maximum_score is not None else 10.0
+        valid_score = evidence.score is not None and evidence.score >= evidence.minimum_score and evidence.score <= maximum_score
+        gates.append(GateEvidence("SCORE_BELOW_MINIMUM", valid_score, f"score must be within 0-{maximum_score:g} and meet the configured minimum"))
         if evidence.score is None:
             reasons.append("MISSING_SCORE")
         elif not valid_score:

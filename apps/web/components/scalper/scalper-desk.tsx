@@ -3,6 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, type RiskRewardBox } from "./premium-chart";
 import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
+import { PositionCard } from "./position-card";
 
 export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; lotSize?: number; tickSize?: number };
 type MonitorStatus = { running: boolean; intervalMs: number; lastTickAt: string | null; lastError: string | null; managedLegs: number; exits: number };
@@ -80,7 +81,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   // AUTOMATIC: the engine places its own trades. MANUAL: it only signals; you take the trade.
   const [tradeMode, setTradeMode] = useState<"AUTOMATIC" | "MANUAL">("MANUAL");
   const [engineOn, setEngineOn] = useState(false);
-  // Which strategy the engine trades: the VWAP-EMA scalper (all 7 criteria) or the level scalper.
+  // Which strategy the engine trades: the VWAP-EMA scalper (all 8 criteria) or the level scalper.
   const [engineStrategy, setEngineStrategy] = useState<EngineStrategy>("VWAP_EMA");
   const vwapMode = engineStrategy === "VWAP_EMA";
   const auto = engineOn && tradeMode === "AUTOMATIC";
@@ -286,6 +287,16 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   }), [premiumOf, state.positions]);
   const unrealized = livePositions.reduce((sum, position) => sum + position.pnl, 0);
   const overall = unrealized + state.realizedPnl;
+  // Book risk: what the open positions lose (or keep) if every stop is hit from here.
+  const atStops = livePositions.reduce((sum, position) => sum + (position.stop !== null ? (position.stop - position.entry) * position.quantity : 0), 0);
+  const wins = state.closed.filter((position) => (position.realizedPnl ?? 0) > 0).length;
+  // A 1-second clock for time-in-trade and the time stop, only while positions are open and visible.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!livePositions.length) return;
+    const timer = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 1_000);
+    return () => clearInterval(timer);
+  }, [livePositions.length]);
   const decision = state.decision;
 
   const levelsFor = useCallback((contractSymbol: string | undefined): ChartLevel[] => {
@@ -393,7 +404,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
 
         <div className="scalper-engine-bar" role="group" aria-label="Auto option engine">
           <span className="algo-kicker">AUTO OPTION ENGINE · PAPER</span>
-          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => { const next = event.target.value as EngineStrategy; setEngineStrategy(next); setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 7 criteria and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically." : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape."); }}>
+          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => { const next = event.target.value as EngineStrategy; setEngineStrategy(next); setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 8 criteria (incl. ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically." : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape."); }}>
             <option value="VWAP_EMA">Strategy: VWAP-EMA scalper</option>
             <option value="LEVELS">Strategy: Level scalper</option>
           </select>
@@ -405,7 +416,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             ))}
           </span>
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
-          {engineOn && tradeMode === "MANUAL" && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 7 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
+          {engineOn && tradeMode === "MANUAL" && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 8 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -497,26 +508,22 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
           <span><small>Unrealised P&amp;L</small><em className={unrealized >= 0 ? "gain" : "loss"}>{signed(unrealized)}</em></span>
           <span><small>Realised P&amp;L</small><em className={state.realizedPnl >= 0 ? "gain" : "loss"}>{signed(state.realizedPnl)}</em></span>
           <span><small>Engine trades today</small><em>{state.tradesToday}/{settings.maxTrades}</em></span>
+          <span title="Closed trades with a profit / all closed trades today"><small>Win rate</small><em>{state.closed.length ? `${Math.round((wins / state.closed.length) * 100)}% (${wins}/${state.closed.length})` : "--"}</em></span>
+          {livePositions.length ? <span title="P&L of the open positions if every stop is hit from here: negative is the risk still open, positive is profit the trailing stops have locked"><small>{atStops >= 0 ? "Locked by stops" : "Open risk to stops"}</small><em className={atStops >= 0 ? "gain" : "loss"}>{signed(atStops)}</em></span> : null}
           <span title="Stops, targets, the trail, time stops and the 15:15 square-off run on the server, with or without this page open"><small>Exit monitor (server)</small><em className={state.monitor?.running && !state.monitor.lastError ? "gain" : "loss"}>{state.monitor ? (state.monitor.running ? `${state.monitor.lastError ? "error" : "running"}${state.monitor.lastTickAt ? ` · ${new Date(state.monitor.lastTickAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}` : ""}` : "stopped") : "--"}</em></span>
         </div>
         {positionsTab === "OPEN" && selected.length > 0 && <button type="button" className="scalper-exit-selected" onClick={() => void exit(selected)}>Exit selected ({selected.length})</button>}
         <div className="scalper-positions">
           {shownPositions.length ? shownPositions.map((position) => (
-            <div key={position.id} className="scalper-position">
-              <label>
-                {positionsTab === "OPEN" ? <input type="checkbox" checked={selected.includes(position.id)} onChange={(event) => setSelected((current) => event.target.checked ? [...current, position.id] : current.filter((id) => id !== position.id))} /> : null}
-                <b>{position.label}</b>
-              </label>
-              <em className={position.pnl >= 0 ? "gain" : "loss"}>{signed(positionsTab === "OPEN" ? position.pnl : position.realizedPnl ?? 0)}</em>
-              <small>Mkt ₹{money(position.value)} · Avg ₹{money(position.entry)} · {position.kind}{position.legs.length > 1 ? " · spread" : ""}{position.exitReason ? ` · ${position.exitReason}` : ""}</small>
-              <small className="scalper-qty">{positionsTab === "OPEN" ? position.quantity : 0}</small>
-              {positionsTab === "OPEN" ? <button type="button" title="Exit this position" onClick={() => void exit([position.id])}>✕</button> : null}
-              {position.stop !== null && positionsTab === "OPEN" ? <small className="scalper-levels">SL ₹{money(position.stop)}{position.trail ? ` (${TRAIL_TEXT[position.trail.stage]})` : position.trailing ? " (trailing)" : ""} · T ₹{money(position.target)}</small> : null}
-              {position.fill && positionsTab === "OPEN" ? <small className="scalper-levels">Filled ₹{money(position.fill.actual)} (planned ₹{money(position.fill.planned)}, {position.fill.deviation >= 0 ? "+" : ""}{money(position.fill.deviation)}) · {position.fill.riskReward}R at the fill · max loss ₹{money(position.fill.plannedLoss, 0)} planned / ₹{money(position.fill.stressedLoss, 0)} stressed</small> : null}
-            </div>
+            <PositionCard
+              key={position.id} position={position} closed={positionsTab === "CLOSED"} now={now} spot={spot} maxHoldMinutes={settings.maxHoldMinutes}
+              selected={selected.includes(position.id)}
+              onSelect={(checked) => setSelected((current) => checked ? [...current, position.id] : current.filter((id) => id !== position.id))}
+              onExit={() => void exit([position.id])}
+            />
           )) : <div className="algo-empty">{positionsTab === "OPEN" ? "No open scalper positions." : "No closed trades today."}</div>}
         </div>
-        <p className="scalper-footnote">{vwapMode ? "VWAP-EMA entries: all 7 criteria (VWAP, 5/9 EMA trigger, delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
+        <p className="scalper-footnote">{vwapMode ? "VWAP-EMA entries: all 8 criteria (VWAP, 5/9 EMA trigger, ADX(14) above 20 on the confirmation candle, delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
       </aside>
     </section>
   );
