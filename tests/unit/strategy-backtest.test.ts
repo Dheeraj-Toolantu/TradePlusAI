@@ -82,8 +82,9 @@ describe("trade simulator", () => {
   it("estimates option P&L from delta, time decay and charges", () => {
     const bars = session(runner());
     const result = runBacktest({ ...base, minute: bars, signalAt: listSignalSource([signal(minute25)]), settings: { ...flat, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 37.5, lotSize: 10, lots: 2, chargesPerTrade: 50 } });
-    // 25 pts x 0.5 delta = 12.5 premium pts; decay 37.5 pts/day x 6/375 day = 0.6; x 20 units - 50 charges
-    expect(result.trades[0].pnl).toBeCloseTo((12.5 - 0.6) * 20 - 50, 5);
+    // 25 pts x 0.5 delta = 12.5 premium pts; decay per leg: half booked at T1 after 3 min, the rest at
+    // T2 after 6 min → 37.5 pts/day x (0.5 x 3 + 0.5 x 6)/375 day = 0.45; x 20 units - 50 charges
+    expect(result.trades[0].pnl).toBeCloseTo((12.5 - 0.45) * 20 - 50, 5);
   });
 });
 

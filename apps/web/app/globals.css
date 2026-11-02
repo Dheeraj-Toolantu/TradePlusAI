@@ -1280,3 +1280,4 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .pos-next b, .pos-signal b { font-family: "DM Mono", monospace; }
 .pos-next { padding: 5px 7px; border-radius: 5px; background: #142024; color: #b9c8cc; }
 .scalper-positions { gap: 8px; max-height: 680px; }
+.bt-hint { grid-column: 1 / -1; color: var(--muted, #8a9ba0); font-size: 11px; line-height: 1.4; }

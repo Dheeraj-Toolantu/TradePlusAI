@@ -10,6 +10,7 @@ type Source = "groww" | "yahoo" | "synthetic";
 type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
 const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
+  { id: "VWAP_EMA_ADX", title: "VWAP + EMA + ADX scalp", detail: "The live scalper's tape: close beyond a sloping VWAP, 5 EMA > 9 EMA > VWAP, pullback to the 9 EMA resumes on volume, ADX(14) above 20 on that confirmation candle. Staged trail (breakeven at +0.5R, +0.5R locked at +1R, 0.6R trail), 9 EMA exit, 1:1 or 1:2 target." },
   { id: "MTF_AI", title: "AI multi-timeframe", detail: "1D context · 15m direction · 5m pullback · 1m candle trigger, with the AI monitor's entry/stop/target rules." },
   { id: "ORB_PRO", title: "ORB retest Pro", detail: "Non-gap days only (validated on real NIFTY 2024–26) → conviction breakout of the 15-min range → retest that holds → 1m turn above VWAP. Stop beyond the retest low and round numbers; skipped if too wide." },
   { id: "ORB_RETEST", title: "V5 ORB retest", detail: "Opening-range break, retest and hold with a structural stop and 2R target capped at PDH/PDL." },
@@ -20,7 +21,7 @@ const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };
-const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60, partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15, minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15" };
+const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60, partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15, minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15", adxMin: 20, scalpRiskReward: 2 };
 
 const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
 const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
@@ -31,12 +32,12 @@ const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getU
  * does SMC sweep + CHoCH retest: on NIFTY 2018–26 dropping its 45-minute time stop took T1 hits from 41%
  * to 60%.
  */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, SMC_PLUS: 0, TREND_PULLBACK: 45, SMART_COMBO: 45 };
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, SMC_PLUS: 0, TREND_PULLBACK: 45, SMART_COMBO: 45, VWAP_EMA_ADX: 12 };
 /**
  * Trend entries are built for a trailing runner; the others default to fixed T1/T2. SMC + 9 EMA: a 1.5R
  * trail with a 45-min time stop was best on real NIFTY and BANKNIFTY data (2018–26).
  */
-const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 1.5, SMC_PLUS: 1.5, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5 };
+const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 1.5, SMC_PLUS: 1.5, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5, VWAP_EMA_ADX: 0 };
 type Preset = { key: string; label: string; sessions?: number; months?: number };
 const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
 function lastMonths(months: number) {
@@ -131,12 +132,22 @@ export function BacktestPanel() {
             <NumberField label="Daily loss limit (₹)" value={settings.maxDailyLoss} step={500} onChange={(value) => update("maxDailyLoss", value)} />
             <NumberField label="Stop after N losses" value={settings.maxConsecutiveLosses} min={1} onChange={(value) => update("maxConsecutiveLosses", value)} />
             <NumberField label="Cooldown after loss (min)" value={settings.cooldownMinutes} onChange={(value) => update("cooldownMinutes", value)} />
-            <NumberField label="Min confidence (%)" value={settings.minConfidence} min={0} max={100} disabled={strategy === "ORB_RETEST"} onChange={(value) => update("minConfidence", value)} />
+            <NumberField label="Min confidence (%)" value={settings.minConfidence} min={0} max={100} disabled={strategy === "ORB_RETEST" || strategy === "VWAP_EMA_ADX"} onChange={(value) => update("minConfidence", value)} />
             <label>Entry from<input type="time" value={settings.entryStart} onChange={(event) => update("entryStart", event.target.value)} /></label>
             <label>Entry until<input type="time" value={settings.entryEnd} onChange={(event) => update("entryEnd", event.target.value)} /></label>
             <label>Square-off<input type="time" value={settings.squareOff} onChange={(event) => update("squareOff", event.target.value)} /></label>
-            <NumberField label="Trail runner (R, 0 = fixed T2)" value={settings.trailR} step={0.5} min={0} max={5} onChange={(value) => update("trailR", value)} />
-            <label className="bt-check"><input type="checkbox" checked={settings.partialAtT1} onChange={(event) => update("partialAtT1", event.target.checked)} /> Book 50% at T1, stop to breakeven</label>
+            {strategy === "VWAP_EMA_ADX" ? (
+              <>
+                <NumberField label="ADX on confirmation candle above" value={settings.adxMin} step={1} min={0} max={60} onChange={(value) => update("adxMin", value)} />
+                <label>Target (from the fill)<select value={settings.scalpRiskReward} onChange={(event) => update("scalpRiskReward", Number(event.target.value) === 1 ? 1 : 2)}><option value={2}>1:2</option><option value={1}>1:1</option></select></label>
+                <small className="bt-hint">Exits are the live scalper&apos;s: breakeven + charges at +0.5R, +0.5R locked at +1R, 0.6R trail, 9 EMA momentum exit. Trail runner and Book 50% at T1 do not apply.</small>
+              </>
+            ) : (
+              <>
+                <NumberField label="Trail runner (R, 0 = fixed T2)" value={settings.trailR} step={0.5} min={0} max={5} onChange={(value) => update("trailR", value)} />
+                <label className="bt-check"><input type="checkbox" checked={settings.partialAtT1} onChange={(event) => update("partialAtT1", event.target.checked)} /> Book 50% at T1, stop to breakeven</label>
+              </>
+            )}
           </div>
           <button type="button" className="paper-button secondary bt-reset" onClick={() => setSettings({ ...DEFAULTS, lotSize: LOT_SIZE[symbol], thetaPerDay: THETA[symbol] })}>Reset to defaults</button>
         </details>
@@ -424,6 +435,8 @@ const describeSettings = (settings: Partial<BacktestSettings>) => {
   if (settings.partialAtT1 !== undefined) parts.push(settings.partialAtT1 ? "½ at T1" : "full at T1");
   if (settings.trailR !== undefined) parts.push(settings.trailR ? `trail ${settings.trailR}R` : "fixed T2");
   if (settings.timeStopMinutes !== undefined) parts.push(settings.timeStopMinutes ? `time stop ${settings.timeStopMinutes}m` : "no time stop");
+  if (settings.adxMin !== undefined) parts.push(`ADX > ${settings.adxMin}`);
+  if (settings.scalpRiskReward !== undefined) parts.push(`1:${settings.scalpRiskReward}`);
   return parts.length ? parts.join(" · ") : "Your current settings";
 };
 

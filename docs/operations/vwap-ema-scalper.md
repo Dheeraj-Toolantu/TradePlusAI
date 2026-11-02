@@ -191,6 +191,37 @@ The panel shows:
   candle;
 - the 17 V5 gates.
 
+## Backtesting it (Backtesting page, `/validation`)
+
+Pick **VWAP + EMA + ADX scalp** in the Backtest lab. `services/backtest/src/vwap-ema-adx-strategy.ts`
+replays the live tape rules on 1-minute index history, and a parity test checks that it fires on the
+same candle with the same ADX and stop as the Python strategy. Trades are managed like the live
+scalper:
+- the target is re-derived from the fill (1:1 or 1:2);
+- breakeven plus charges and exit slippage at +0.5R;
+- +0.5R locked at +1R, then a 0.6R trail;
+- the 9 EMA momentum exit, the time stop and the square-off.
+
+Two settings are specific to it:
+- **ADX on confirmation candle above** (20 live);
+- **Target (from the fill)**, 1:1 or 1:2.
+
+"Optimize settings" sweeps:
+- ADX 15/20/25/30;
+- 1:1 vs 1:2;
+- the time stop, trades per day and the entry window.
+
+It picks on the first two thirds of the sessions and reports the last third separately, so you can
+see whether a better ADX threshold holds on data it was not chosen on.
+
+What the backtest cannot replay, and so does not apply:
+- the option-chain criteria (strike delta, OI, PCR, the premium's volume profile);
+- India VIX.
+
+Live entries are therefore stricter. Historical index candles carry no volume, so on sessions without
+futures volume VWAP is time-weighted and the 1.2× volume check is skipped. The funnel note says how
+many signals that affected.
+
 ## Not verified live
 
 The build sandbox had no market access, so nothing here has run against live Groww data yet. The
