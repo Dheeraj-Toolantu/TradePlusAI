@@ -10,10 +10,11 @@ export { adxSeries };
  * The live scalper's tape rules (quant/.../algo_engine/scalp_strategy.py, read_tape and the ADX
  * criterion), bar for bar, on today's session only:
  *
- *   side      close above VWAP and 5 EMA above 9 EMA (long); the mirror for a short
+ *   trend     close above VWAP and 9 EMA above 21 EMA (long), ADX(14) above 25 with +DI leading on
+ *             the decision candle (spec v1.0 trend rule); the mirror for a short
  *   VWAP      close on the trade side, VWAP sloping that way over 5 bars, close no further than
  *             1.5 ATR(14, 1m) from VWAP (no chasing)
- *   EMA       5 EMA beyond 9 EMA beyond VWAP; a pullback within the last 3 bars tags the 9 EMA
+ *   EMA       entry confirmation: 5 EMA beyond 9 EMA beyond VWAP; a pullback within the last 3 bars tags the 9 EMA
  *             (± 0.05 ATR); the trigger candle closes beyond the 5 EMA and the prior candle's
  *             extreme, in the trade's direction, on at least 1.2x the prior 20 bars' volume
  *   ADX       Wilder ADX(14) on the trigger (confirmation) candle; the simulator applies the
@@ -33,11 +34,11 @@ export { adxSeries };
 export const VWAP_EMA_ADX = {
   emaFast: 5, emaSlow: 9, atrPeriod: 14, adxPeriod: 14, minSessionBars: 15, vwapSlopeBars: 5, maxVwapExtensionAtr: 1.5,
   pullbackBars: 3, emaTouchAtr: 0.05, minVolumeRatio: 1.2, volumeLookback: 20, triggerMaxAge: 1, maxDriftAtr: 0.5,
-  stopBufferAtr: 0.15, minRiskAtr: 0.3, maxRiskAtr: 1.5,
+  stopBufferAtr: 0.15, minRiskAtr: 0.3, maxRiskAtr: 1.5, trendEmaFast: 9, trendEmaSlow: 21, trendAdxMin: 25,
 } as const;
 
 export type VwapEmaAdxFunnel = {
-  evaluated: number; sided: number; stacked: number; triggers: number; adxUnavailable: number; vwapExtended: number; vwapFlat: number;
+  evaluated: number; sided: number; trendWeak: number; stacked: number; triggers: number; adxUnavailable: number; vwapExtended: number; vwapFlat: number;
   lowVolume: number; volumeUnavailable: number; stopTooWide: number; signals: number;
 };
 
@@ -45,7 +46,7 @@ export type VwapEmaAdxFunnel = {
 export type VwapEmaAdxSignal = Signal & { adx: number; plusDi: number; minusDi: number; management: "VWAP_EMA" };
 
 type Session = {
-  start: number; end: number; ema5: number[]; ema9: number[]; vwap: number[]; observable: boolean;
+  start: number; end: number; ema5: number[]; ema9: number[]; ema21: number[]; vwap: number[]; observable: boolean;
   adx: Array<[number, number, number] | null>;
 };
 
@@ -68,7 +69,7 @@ function atrValue(bars: Bar[], period: number) {
 
 export function vwapEmaAdxSignalSource(_symbol: string, minute: Bar[]) {
   const c = VWAP_EMA_ADX;
-  const funnel: VwapEmaAdxFunnel = { evaluated: 0, sided: 0, stacked: 0, triggers: 0, adxUnavailable: 0, vwapExtended: 0, vwapFlat: 0, lowVolume: 0, volumeUnavailable: 0, stopTooWide: 0, signals: 0 };
+  const funnel: VwapEmaAdxFunnel = { evaluated: 0, sided: 0, trendWeak: 0, stacked: 0, triggers: 0, adxUnavailable: 0, vwapExtended: 0, vwapFlat: 0, lowVolume: 0, volumeUnavailable: 0, stopTooWide: 0, signals: 0 };
   const sessions = new Map<string, Session>();
   const fired = new Set<number>(); // trigger bar indices that already signalled
 
@@ -92,7 +93,7 @@ export function vwapEmaAdxSignalSource(_symbol: string, minute: Bar[]) {
     }
     // Every series is causal (each value uses only bars up to its own), so caching the whole day
     // never lets a decision see the future.
-    const session: Session = { start, end, ema5: emaSeries(closes, c.emaFast), ema9: emaSeries(closes, c.emaSlow), vwap, observable, adx: adxSeries(bars, c.adxPeriod) };
+    const session: Session = { start, end, ema5: emaSeries(closes, c.emaFast), ema9: emaSeries(closes, c.emaSlow), ema21: emaSeries(closes, c.trendEmaSlow), vwap, observable, adx: adxSeries(bars, c.adxPeriod) };
     sessions.set(day, session);
     return session;
   }
@@ -108,11 +109,14 @@ export function vwapEmaAdxSignalSource(_symbol: string, minute: Bar[]) {
     const atr = atrValue(sessionBars.slice(-(c.atrPeriod * 3)), c.atrPeriod) ?? 0;
     const vwapNow = s.vwap[last];
     let side: 1 | -1;
-    if (close > vwapNow && s.ema5[last] > s.ema9[last]) side = 1;
-    else if (close < vwapNow && s.ema5[last] < s.ema9[last]) side = -1;
+    // Trend: VWAP + 9/21 EMA give the side; ADX above 25 with the trade-side DI leading grades it.
+    if (close > vwapNow && s.ema9[last] > s.ema21[last]) side = 1;
+    else if (close < vwapNow && s.ema9[last] < s.ema21[last]) side = -1;
     else return null;
     funnel.sided += 1;
     const d = side;
+    const trendAdx = s.adx[last];
+    if (!trendAdx || !(trendAdx[0] > c.trendAdxMin) || (trendAdx[1] - trendAdx[2]) * d <= 0) { funnel.trendWeak += 1; return null; }
     const stacked = (s.ema5[last] - s.ema9[last]) * d > 0 && (s.ema9[last] - vwapNow) * d > 0;
     if (!stacked) return null;
     funnel.stacked += 1;

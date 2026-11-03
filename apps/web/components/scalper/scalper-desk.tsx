@@ -59,7 +59,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -75,6 +75,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   onPlaceVwapScalp?: (origin: "AUTO" | "MANUAL") => Promise<{ placed: boolean; error?: string }>;
   /** Server-side auto-execution of the VWAP-EMA scalper (the algo page owns it); "Automatic" drives it. */
   vwapAuto?: { enabled: boolean; status: string; onChange: (enabled: boolean) => void } | null;
+  /** An open scalper trade on another index: the desk offers to show its chart. */
+  pinnedElsewhere?: { underlying: string; label: string } | null;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -83,7 +85,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   // AUTOMATIC: the engine places its own trades. MANUAL: it only signals; you take the trade.
   const [tradeMode, setTradeMode] = useState<"AUTOMATIC" | "MANUAL">("MANUAL");
   const [engineOn, setEngineOn] = useState(false);
-  // Which strategy the engine trades: the VWAP-EMA scalper (all 8 criteria) or the level scalper.
+  // Which strategy the engine trades: the VWAP-EMA scalper (all 9 criteria) or the level scalper.
   const [engineStrategy, setEngineStrategy] = useState<EngineStrategy>("VWAP_EMA");
   const vwapMode = engineStrategy === "VWAP_EMA";
   const auto = engineOn && tradeMode === "AUTOMATIC";
@@ -133,17 +135,30 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   const moneyness = (type: "CALL" | "PUT", offset: number) => offset === 0 ? "ATM" : (type === "CALL" ? offset > 0 : offset < 0) ? `OTM ${Math.abs(offset)}` : `ITM ${Math.abs(offset)}`;
   const premiumOf = useCallback((value: string) => chain.find((row) => norm(row.symbol) === norm(value))?.premium, [chain]);
 
+  // An open trade pins the charts: only the traded contract's chart (its CE or its PE) is shown, and
+  // it stays on that contract until the trade exits at its target, SL or trailing SL, or manually.
+  const lockedLeg = useMemo(() => state.positions.flatMap((position) => position.legs.filter((leg) => leg.side === "BUY"))[0] ?? null, [state.positions]);
+  const lockedSymbol = lockedLeg?.symbol ?? null;
+  const lockedRow = useMemo<ScalperChainRow | null>(() => {
+    if (!lockedLeg) return null;
+    return chain.find((row) => norm(row.symbol) === norm(lockedLeg.symbol))
+      ?? { symbol: lockedLeg.symbol, contract: lockedLeg.contract, expiry: lockedLeg.expiry, strike: lockedLeg.strike, premium: lockedLeg.ltp, bid: 0, ask: 0, openInterest: 0, volume: 0, iv: 0, delta: 0 };
+  }, [chain, lockedLeg]);
+  const chartCall = lockedRow ? (lockedRow.contract === "CALL" ? lockedRow : null) : call;
+  const chartPut = lockedRow ? (lockedRow.contract === "PUT" ? lockedRow : null) : put;
+  const shownViews: View[] = lockedRow ? [lockedRow.contract] : views;
+
   // VWAP-EMA mode: the card and chart of the trade side follow the strike the scalper picked from
   // the OI data. ▲▼ still move it; the next new pick re-centres it.
   const followed = useRef<string | null>(null);
   const pick = vwapMode ? vwapScalp?.selected ?? null : null;
   useEffect(() => {
-    if (!pick || followed.current === pick.symbol || !strikes.length) return;
+    if (lockedSymbol || !pick || followed.current === pick.symbol || !strikes.length) return;
     const index = strikes.indexOf(pick.strike);
     if (index < 0) return;
     followed.current = pick.symbol;
     (pick.type === "CE" ? setCallOffset : setPutOffset)(index - atmIndex);
-  }, [atmIndex, pick, strikes]);
+  }, [atmIndex, lockedSymbol, pick, strikes]);
 
   // ---- data: underlying 1m bars + premium bars for the two selected contracts ----------
   useEffect(() => {
@@ -164,8 +179,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   }, [symbol]);
   useEffect(() => { if (spot > 0) setSpotBars((current) => current.length ? foldTick(current, spot, 1) : current); }, [spot]);
 
-  usePremiumBars(call, setCallBars);
-  usePremiumBars(put, setPutBars);
+  usePremiumBars(chartCall, setCallBars);
+  usePremiumBars(chartPut, setPutBars);
 
   // ---- server calls ---------------------------------------------------------------------
   const apply = useCallback((data: ScalperState, quiet = false) => {
@@ -336,8 +351,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
     if (plan) levels.push({ price: plan.stop, color: "#fa6b78", title: "Spot SL" }, { price: plan.target, color: "#22d59b", title: "Spot T" });
     return levels;
   }, [decision, livePositions]);
-  const callLevels = useMemo(() => levelsFor(call?.symbol), [call?.symbol, levelsFor]);
-  const putLevels = useMemo(() => levelsFor(put?.symbol), [put?.symbol, levelsFor]);
+  const callLevels = useMemo(() => levelsFor(chartCall?.symbol), [chartCall?.symbol, levelsFor]);
+  const putLevels = useMemo(() => levelsFor(chartPut?.symbol), [chartPut?.symbol, levelsFor]);
   // Risk-reward drawing: the open position's live zones (the SL moves as it trails), else the
   // VWAP-EMA plan on the contract it picked.
   const boxFor = useCallback((contractSymbol: string | undefined): RiskRewardBox | null => {
@@ -348,8 +363,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
     }
     return null;
   }, [livePositions, vwapMode, vwapScalp]);
-  const callBox = useMemo(() => boxFor(call?.symbol), [boxFor, call?.symbol]);
-  const putBox = useMemo(() => boxFor(put?.symbol), [boxFor, put?.symbol]);
+  const callBox = useMemo(() => boxFor(chartCall?.symbol), [boxFor, chartCall?.symbol]);
+  const putBox = useMemo(() => boxFor(chartPut?.symbol), [boxFor, chartPut?.symbol]);
   const tfBars = useCallback((bars: ChartBar[]) => regroupBars(bars, timeframe), [timeframe]);
 
   const exchange = symbol === "SENSEX" ? "BSE" : "NSE";
@@ -413,14 +428,15 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
         <div className="scalper-toolbar">
           <span className="scalper-title">⚡ Scalper <small>paper</small></span>
           <select aria-label="Chart timeframe" value={timeframe} onChange={(event) => setTimeframe(Number(event.target.value) as 1)}>{TIMEFRAMES.map((value) => <option key={value} value={value}>{value}m</option>)}</select>
-          <span className="scalper-views">{(["CALL", "SPOT", "PUT"] as View[]).map((view) => <button key={view} type="button" className={views.includes(view) ? "on" : ""} onClick={() => toggleView(view)}>{view}</button>)}</span>
+          <span className="scalper-views">{(["CALL", "SPOT", "PUT"] as View[]).map((view) => <button key={view} type="button" className={shownViews.includes(view) ? "on" : ""} disabled={Boolean(lockedRow)} title={lockedRow ? "Pinned to the open trade until it exits" : undefined} onClick={() => toggleView(view)}>{view}</button>)}</span>
+          {lockedRow ? <span className="scalper-pinned" title="The chart stays on the traded contract until the target, SL or trailing SL is hit, or you exit">📌 {lockedRow.strike} {lockedRow.contract === "CALL" ? "CE" : "PE"} pinned until exit</span> : null}
           <button type="button" className="scalper-controls-button" onClick={() => setShowControls((value) => !value)}>⚙ Controls</button>
           <label className="scalper-switch"><input type="checkbox" checked={instant} onChange={(event) => setInstant(event.target.checked)} /><span /> Instant mode</label>
         </div>
 
         <div className="scalper-engine-bar" role="group" aria-label="Auto option engine">
           <span className="algo-kicker">AUTO OPTION ENGINE · PAPER</span>
-          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => { const next = event.target.value as EngineStrategy; setEngineStrategy(next); setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 8 criteria (incl. ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically." : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape."); }}>
+          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => { const next = event.target.value as EngineStrategy; setEngineStrategy(next); setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 9 criteria (trend: VWAP + 9/21 EMA + ADX above 25; entry: VWAP + 5/9 EMA + ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically." : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape."); }}>
             <option value="VWAP_EMA">Strategy: VWAP-EMA scalper</option>
             <option value="LEVELS">Strategy: Level scalper</option>
           </select>
@@ -436,7 +452,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             ))}
           </span>
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
-          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 8 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
+          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -492,15 +508,16 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
         </div>
         )}
 
-        <div className="scalper-charts" style={{ gridTemplateColumns: `repeat(${views.length}, minmax(0, 1fr))` }}>
-          {views.includes("CALL") && <div className="scalper-chart">{chartHead(call, callBars, callLots)}<PremiumChart bars={tfBars(callBars)} levels={callLevels} riskReward={callBox} /></div>}
-          {views.includes("SPOT") && (
+        {pinnedElsewhere ? <div className="scalper-pinned-banner">📌 Open trade on {pinnedElsewhere.underlying}: {pinnedElsewhere.label}. <button type="button" onClick={() => onSymbolChange(pinnedElsewhere.underlying)}>Show its chart</button></div> : null}
+        <div className="scalper-charts" style={{ gridTemplateColumns: `repeat(${shownViews.length}, minmax(0, 1fr))` }}>
+          {shownViews.includes("CALL") && <div className="scalper-chart">{chartHead(chartCall, callBars, callLots)}<PremiumChart bars={tfBars(callBars)} levels={callLevels} riskReward={callBox} /></div>}
+          {shownViews.includes("SPOT") && (
             <div className="scalper-chart">
               <div className="scalper-chart-head"><div><b>{symbol} spot · {timeframe} · {exchange}</b><small>LTP <em>{money(spot)}</em> · supports green, resistances red (1m engine levels)</small></div></div>
               <PremiumChart bars={tfBars(spotBars)} levels={spotLevels} />
             </div>
           )}
-          {views.includes("PUT") && <div className="scalper-chart">{chartHead(put, putBars, putLots)}<PremiumChart bars={tfBars(putBars)} levels={putLevels} riskReward={putBox} /></div>}
+          {shownViews.includes("PUT") && <div className="scalper-chart">{chartHead(chartPut, putBars, putLots)}<PremiumChart bars={tfBars(putBars)} levels={putLevels} riskReward={putBox} /></div>}
         </div>
 
         <div className="scalper-cards">
@@ -544,7 +561,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             />
           )) : <div className="algo-empty">{positionsTab === "OPEN" ? "No open scalper positions." : "No closed trades today."}</div>}
         </div>
-        <p className="scalper-footnote">{vwapMode ? "VWAP-EMA entries: all 8 criteria (VWAP, 5/9 EMA trigger, ADX(14) above 20 on the confirmation candle, delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
+        <p className="scalper-footnote">{vwapMode ? "VWAP-EMA entries: all 9 criteria (trend = VWAP + 9/21 EMA + ADX(14) above 25; entry = VWAP, 5/9 EMA trigger, ADX(14) above 20 on the confirmation candle; delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
       </aside>
     </section>
   );

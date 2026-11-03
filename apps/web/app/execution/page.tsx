@@ -37,7 +37,7 @@ type ScalpPlan = {
 };
 type ScalpCalc = {
   rr_choice: "1:1" | "1:2";
-  tape: { side?: "CE" | "PE" | null; close?: number; vwap?: number; ema5?: number; ema9?: number; atr?: number; vwap_slope?: number; vwap_extension_atr?: number; volume_ratio?: number | null; risk_points?: number; reason?: string; adx?: number; plus_di?: number; minus_di?: number };
+  tape: { side?: "CE" | "PE" | null; close?: number; vwap?: number; ema5?: number; ema9?: number; ema21?: number; atr?: number; vwap_slope?: number; vwap_extension_atr?: number; volume_ratio?: number | null; risk_points?: number; reason?: string; adx?: number; plus_di?: number; minus_di?: number };
   trigger?: { time: string; close: number; adx?: { value: number; plus_di: number; minus_di: number; rising: boolean | null } } | null;
   criteria: ScalpCriterion[];
   candidates: ScalpCandidate[];
@@ -80,7 +80,7 @@ const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
 const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
 // The algo page runs one strategy: the 1-minute VWAP / 5-9 EMA index-option scalper.
-const strategy = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape: trade the side of a rising (falling) VWAP when the 5 EMA leads the 9 EMA, after a pullback to the 9 EMA resumes on volume. ADX(14) on that confirmation candle must be above 20 (trend strength behind the move). The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
+const strategy = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape. Trend (spec v1.0): close beyond VWAP, 9 EMA beyond 21 EMA and ADX(14) above 25 with the trade-side DI leading. Entry confirmation: price beyond a rising (falling) VWAP with the 5 EMA leading the 9 EMA, a pullback to the 9 EMA that resumes on volume beyond the prior candle, and ADX(14) above 20 on that confirmation candle. The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
 const RR_CHOICES: Array<{ id: RiskReward; name: string }> = [
   { id: "1:2", name: "Risk:Reward 1:2" },
   { id: "1:1", name: "Risk:Reward 1:1" },
@@ -706,6 +706,15 @@ export default function ExecutionPage() {
 
   // ---- derived ---------------------------------------------------------------------------
   const openPaper = useMemo(() => paperOrders.filter((order) => ["OPEN", "FILLED"].includes(order.status)), [paperOrders]);
+  // A scalper trade pins the desk's chart: when one opens on another index, switch the desk to it once.
+  const pinnedSeen = useRef<string | null>(null);
+  useEffect(() => {
+    const open = scalperPositions[0];
+    if (!open || pinnedSeen.current === open.id) return;
+    pinnedSeen.current = open.id;
+    if (open.underlying !== symbol) switchIndex(open.underlying);
+  }, [scalperPositions, switchIndex, symbol]);
+  const pinnedElsewhere = useMemo(() => { const open = scalperPositions.find((position) => position.underlying !== symbol); return open ? { underlying: open.underlying, label: open.label } : null; }, [scalperPositions, symbol]);
   const paperPnl = openPaper.reduce((sum, order) => sum + (order.pnl ?? 0), 0) + scalperPositions.reduce((sum, position) => sum + position.pnl, 0);
   const livePositions = live?.positions ?? [];
   const livePnl = livePositions.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
@@ -846,7 +855,7 @@ export default function ExecutionPage() {
               <summary>Show calculations</summary>
               <div className="exec-calcs">
                 <span>Close <b>{calc(scalp?.tape.close)}</b></span><span>VWAP <b>{calc(scalp?.tape.vwap)}</b> <small>{scalp?.tape.vwap_slope !== undefined ? `${scalp.tape.vwap_slope >= 0 ? "+" : ""}${calc(scalp.tape.vwap_slope)} pts / 5m` : ""}</small></span>
-                <span>EMA 5 / 9 <b>{calc(scalp?.tape.ema5)} / {calc(scalp?.tape.ema9)}</b></span><span>ATR (1m) <b>{calc(scalp?.tape.atr)}</b></span><span>From VWAP <b>{calc(scalp?.tape.vwap_extension_atr)} ATR</b></span>
+                <span>Trend EMA 9 / 21 <b>{calc(scalp?.tape.ema9)} / {calc(scalp?.tape.ema21)}</b></span><span>Entry EMA 5 / 9 <b>{calc(scalp?.tape.ema5)} / {calc(scalp?.tape.ema9)}</b></span><span>ATR (1m) <b>{calc(scalp?.tape.atr)}</b></span><span>From VWAP <b>{calc(scalp?.tape.vwap_extension_atr)} ATR</b></span>
                 <span>Trigger <b>{scalp?.trigger ? scalp.trigger.time.slice(11, 16) : "--"}</b></span>
                 <span>ADX(14) on trigger <b className={scalp?.trigger?.adx ? (scalp.trigger.adx.value > 20 ? "gain" : "warning") : undefined}>{calc(scalp?.trigger?.adx?.value)}</b> <small>{scalp?.trigger?.adx ? `+DI ${calc(scalp.trigger.adx.plus_di)} / −DI ${calc(scalp.trigger.adx.minus_di)}${scalp.trigger.adx.rising === null ? "" : scalp.trigger.adx.rising ? " · rising" : " · falling"} · needs > 20` : `now ${calc(scalp?.tape.adx)} · needs > 20 on the trigger`}</small></span><span>Futures volume <b>{scalp?.tape.volume_ratio ? `${calc(scalp.tape.volume_ratio)}×` : "--"}</b></span>
                 <span>PCR (OI) <b>{calc(scalp?.pcr?.pcr)}</b> <small>{scalp?.pcr?.pcr_change_5m !== null && scalp?.pcr?.pcr_change_5m !== undefined ? `${scalp.pcr.pcr_change_5m >= 0 ? "+" : ""}${scalp.pcr.pcr_change_5m} / 5m` : ""}</small></span>
@@ -882,7 +891,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

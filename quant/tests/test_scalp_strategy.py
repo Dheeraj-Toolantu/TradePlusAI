@@ -103,7 +103,7 @@ class ConfirmedScalp(unittest.TestCase):
         self.assertEqual(first["needs_premium_candles"], "IDX24800CE")  # pass 1 asks for the premium's candles
         self.assertEqual(result["decision"], "CONFIRMED", result["reason"])
         self.assertTrue(all(c["passed"] for c in result["scalp"]["criteria"]))
-        self.assertEqual(result["scalp"]["score"]["total"], 11)
+        self.assertEqual(result["scalp"]["score"]["total"], 12)
         setup = result["setup"]
         self.assertEqual((setup["side"], setup["contract"]["symbol"], setup["contract"]["type"]), ("BUY", "IDX24800CE", "CE"))
         # expected fill = ask 120.85 + 0.3% slippage → 121.25; structural SL 113.70; target = fill + 2R
@@ -420,12 +420,50 @@ class AdxCriterion(unittest.TestCase):
         self.assertIn("warms up on 28", criteria(result)["adx"]["detail"])
         self.assertNotEqual(result["decision"], "CONFIRMED")
 
-    def test_v5_score_gate_takes_the_eleven_point_card(self):
-        base = {"score": 11.0, "minimum_score": 11.0, "maximum_score": 11.0}
+    def test_v5_score_gate_takes_the_twelve_point_card(self):
+        base = {"score": 12.0, "minimum_score": 12.0, "maximum_score": 12.0}
         gate = lambda payload: next(g for g in evaluate_payload(payload)["gates"] if g["code"] == "SCORE_BELOW_MINIMUM")["passed"]  # noqa: E731
         self.assertTrue(gate(base))
-        self.assertFalse(gate({**base, "score": 10.0}))  # 10/11: ADX (or any criterion) missing
-        self.assertFalse(gate({"score": 11.0, "minimum_score": 8.0}))  # other strategies still top out at 10
+        self.assertFalse(gate({**base, "score": 11.0}))  # 11/12: the trend (or any criterion) missing
+        self.assertFalse(gate({"score": 12.0, "minimum_score": 8.0}))  # other strategies still top out at 10
+
+
+class TrendLayer(unittest.TestCase):
+    """Trend = VWAP + EMA9 / EMA21 + ADX(14) > 25 with the trade-side DI leading (spec v1.0);
+    the entry is confirmed separately with VWAP + EMA5 / EMA9 + ADX on the confirmation candle."""
+
+    def _with(self, config, direction=1):
+        futures = tape(direction, 1.0, base=24800.0 + BASIS)
+        bars = index_of(futures)
+        sym = "IDX24800CE" if direction > 0 else "IDX24800PE"
+        ctx = {"futures_candles": futures, "option_chain": {"spot": bars[-1].close, "expiry": "2026-11-10", "contracts": chain(bars[-1].close)},
+               "options_flow": flow(bars[-1].close, direction=direction), "vix": {"value": 13.2, "regime": "NORMAL"}, "risk_reward": "1:2", "premium_candles": premium_candles(sym)}
+        return S.analyze_scalp("NIFTY", bars, ctx, T0 + timedelta(minutes=len(bars)), config)
+
+    def test_trend_reads_vwap_ema9_ema21_and_adx(self):
+        for direction in (1, -1):
+            _, result, _, _ = run(direction=direction)
+            trend = criteria(result)["trend"]
+            self.assertTrue(trend["passed"], trend["detail"])
+            self.assertIn("21 EMA", trend["detail"])
+            tape_read = result["scalp"]["tape"]
+            self.assertGreater((tape_read["ema9"] - tape_read["ema21"]) * direction, 0)
+            self.assertEqual(criteria(result)["ema"]["name"], "5/9 EMA entry")
+
+    def test_trend_adx_at_or_below_25_blocks(self):
+        _, result, _, _ = run()
+        adx_now = result["scalp"]["tape"]["adx"]
+        blocked = self._with(S.ScalpConfig(trend_adx_min=adx_now + 0.5))  # ADX below the trend threshold
+        self.assertEqual(blocked["decision"], "WAIT_FOR_CONFIRMATION")
+        self.assertFalse(criteria(blocked)["trend"]["passed"])
+        self.assertIn("needs above", criteria(blocked)["trend"]["detail"])
+        self.assertEqual(S.ScalpConfig().trend_adx_min, 25.0)
+
+    def test_side_comes_from_the_9_21_trend_not_the_5_9_stack(self):
+        # A 9/21 conflict (EMA21 period so short it leads EMA9) leaves no trend, so no trade.
+        blocked = self._with(S.ScalpConfig(trend_ema_fast=21, trend_ema_slow=3))
+        self.assertNotEqual(blocked["decision"], "CONFIRMED")
+        self.assertFalse(criteria(blocked)["trend"]["passed"])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,15 @@
 """VWAP-EMA option scalper (index options, 1-minute tape).
 
-The rule set an intraday index-option scalper runs, every rule a hard criterion (11 points, all 11
+The rule set an intraday index-option scalper runs, every rule a hard criterion (12 points, all 12
 needed). CE for a long, PE for a short; the PE side is the exact mirror.
 
+Two layers, as in the VWAP-EMA-ADX specification v1.0: the TREND is read with VWAP + EMA(9) / EMA(21)
++ ADX(14) and +DI / -DI (the spec's signal rule), and the ENTRY is confirmed with VWAP + EMA(5) / EMA(9)
++ ADX(14) on the confirmation candle (pullback to the 9 EMA, close back beyond the 5 EMA and the prior
+candle's high / low). The side is taken from the trend layer only.
+
+  Trend (1)           close beyond VWAP, EMA9 beyond EMA21, ADX(14) above 25 with the trade-side DI
+                      leading (+DI > -DI for CE, -DI > +DI for PE) on the latest completed candle.
   VWAP (2)            the close is on the trade side of the session VWAP (futures-volume weighted),
                       VWAP slopes the same way over the last 5 bars, and price is not stretched more
                       than 1.5 ATR from VWAP (no chasing).
@@ -71,8 +78,11 @@ class CandleLike(Protocol):
 
 @dataclass(frozen=True)
 class ScalpConfig:
-    ema_fast: int = 5
+    ema_fast: int = 5   # entry confirmation: EMA5 / EMA9
     ema_slow: int = 9
+    trend_ema_fast: int = 9   # trend: EMA9 / EMA21 (spec v1.0)
+    trend_ema_slow: int = 21
+    trend_adx_min: float = 25.0  # spec baseline: ADX strictly above 25 for the trend
     atr_period: int = 14
     min_session_bars: int = 15
     vwap_slope_bars: int = 5
@@ -123,9 +133,9 @@ class ScalpConfig:
     tick: float = 0.05
     max_loss_per_trade: float = 1500.0
     max_lots: int = 1
-    minimum_score: float = 11.0
-    maximum_score: float = 11.0
-    criteria_max: dict[str, int] = field(default_factory=lambda: {"vwap": 2, "ema": 2, "adx": 1, "delta": 1, "oi": 2, "pcr": 1, "volume_profile": 1, "vix": 1})
+    minimum_score: float = 12.0
+    maximum_score: float = 12.0
+    criteria_max: dict[str, int] = field(default_factory=lambda: {"trend": 1, "vwap": 2, "ema": 2, "adx": 1, "delta": 1, "oi": 2, "pcr": 1, "volume_profile": 1, "vix": 1})
 
 
 def rr_ratio(choice: object) -> tuple[str, float]:
@@ -300,6 +310,8 @@ def read_tape(candles: list[CandleLike], config: ScalpConfig) -> dict:
     closes = [c.close for c in candles]
     ema5 = ema_series(closes, config.ema_fast)[-len(session):]
     ema9 = ema_series(closes, config.ema_slow)[-len(session):]
+    trend_fast = ema_series(closes, config.trend_ema_fast)[-len(session):]
+    ema21 = ema_series(closes, config.trend_ema_slow)[-len(session):]
     atr = atr_value(candles[-(config.atr_period * 3):], config.atr_period) or 0.0
     vwap, vwap_observable = vwap_series(session)
     # ADX on today's session only: yesterday's close would put the overnight gap into the first
@@ -308,11 +320,12 @@ def read_tape(candles: list[CandleLike], config: ScalpConfig) -> dict:
     last = session[-1]
     if adx[-1] is not None:
         out.update(adx=adx[-1][0], plus_di=adx[-1][1], minus_di=adx[-1][2])
-    out.update(close=last.close, vwap=vwap[-1], ema5=ema5[-1], ema9=ema9[-1], atr=atr, vwap_observable=vwap_observable,
+    out.update(close=last.close, vwap=vwap[-1], ema5=ema5[-1], ema9=ema9[-1], ema21=ema21[-1], atr=atr, vwap_observable=vwap_observable,
                vwap_slope=vwap[-1] - vwap[-1 - config.vwap_slope_bars] if len(vwap) > config.vwap_slope_bars else 0.0)
-    if last.close > vwap[-1] and ema5[-1] > ema9[-1]:
+    # Trend (spec v1.0): VWAP + EMA9 / EMA21 decide the side; ADX and the DIs grade it below.
+    if last.close > vwap[-1] and trend_fast[-1] > ema21[-1]:
         side = "CE"
-    elif last.close < vwap[-1] and ema5[-1] < ema9[-1]:
+    elif last.close < vwap[-1] and trend_fast[-1] < ema21[-1]:
         side = "PE"
     else:
         side = "CE" if last.close > vwap[-1] else "PE" if last.close < vwap[-1] else None
@@ -323,6 +336,12 @@ def read_tape(candles: list[CandleLike], config: ScalpConfig) -> dict:
         return out
     d = 1 if side == "CE" else -1
     out["direction"] = d
+
+    # Trend criterion: VWAP + EMA9/EMA21 + ADX(14) above the trend threshold, trade-side DI leading.
+    last_adx = adx[-1]
+    di_leads = last_adx is not None and (last_adx[1] - last_adx[2]) * d > 0
+    out["trend_ok"] = bool(not out.get("lean_only") and last_adx is not None and last_adx[0] > config.trend_adx_min and di_leads)
+    out["trend_di_leads"] = di_leads
 
     # VWAP criterion
     on_side = (last.close - vwap[-1]) * d > 0
@@ -694,6 +713,21 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
     maxes = config.criteria_max
     criteria = []
 
+    # Trend: VWAP + 9/21 EMA + ADX (the spec's signal rule on the latest completed candle)
+    word = "above" if d > 0 else "below"
+    if tape.get("lean_only"):
+        trend_detail = f"no trend: close {'above' if tape['close'] > tape['vwap'] else 'below'} VWAP but 9 EMA {tape['ema9']:.2f} vs 21 EMA {tape['ema21']:.2f} disagrees"
+    elif tape.get("adx") is None:
+        trend_detail = f"close {word} VWAP, 9 EMA {'>' if d > 0 else '<'} 21 EMA; ADX({config.adx_period}) warms up on {2 * config.adx_period} one-minute candles of today's session"
+    else:
+        di = f"+DI {tape['plus_di']:.1f} / −DI {tape['minus_di']:.1f}"
+        trend_detail = f"close {tape['close']:.2f} {word} VWAP {tape['vwap']:.2f}, 9 EMA {tape['ema9']:.2f} {'>' if d > 0 else '<'} 21 EMA {tape['ema21']:.2f}, ADX {tape['adx']:.1f} ({di})"
+        if tape["adx"] <= config.trend_adx_min:
+            trend_detail += f": ADX needs above {config.trend_adx_min:.0f} for a trend"
+        elif not tape.get("trend_di_leads"):
+            trend_detail += f": {'+DI' if d > 0 else '−DI'} must lead"
+    criteria.append(_criterion("trend", "Trend (VWAP · 9/21 EMA · ADX)", int(bool(tape.get("trend_ok"))), maxes["trend"], trend_detail))
+
     # VWAP (on the future's own price and volume)
     vw_points = 0
     if tape["source"] != "FUTURES":
@@ -718,7 +752,7 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         trig_text = f"trigger at {trigger['time'][11:16]} but futures volume {tape.get('volume_ratio') or 'n/a'}x (needs {config.min_volume_ratio}x)"
     else:
         trig_text = f"pullback to the 9 EMA, resumed at {trigger['time'][11:16]} on {tape['volume_ratio']}x volume"
-    criteria.append(_criterion("ema", "5/9 EMA", ema_points, maxes["ema"], f"{stack_text}; {trig_text}"))
+    criteria.append(_criterion("ema", "5/9 EMA entry", ema_points, maxes["ema"], f"{stack_text}; {trig_text}"))
 
     # ADX on the confirmation candle: trend strength behind the resumption.
     trigger_adx = (trigger or {}).get("adx")
@@ -731,7 +765,7 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         adx_detail = f"ADX({config.adx_period}) {tape['adx']:.1f} now; waiting for a confirmation candle (it needs ADX above {config.adx_min:.0f} on that candle)"
     else:
         adx_detail = f"ADX({config.adx_period}) warms up on {2 * config.adx_period} one-minute candles of today's session (have {tape.get('session_bars', 0)})"
-    criteria.append(_criterion("adx", "ADX", int(adx_ok), maxes["adx"], adx_detail))
+    criteria.append(_criterion("adx", "ADX (entry candle)", int(adx_ok), maxes["adx"], adx_detail))
 
     # Strike selection from OI
     candidates = select_strikes(chain, flow, spot, side, config) if spot > 0 else []
@@ -819,7 +853,7 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
 
 
 def score_card(result: dict) -> dict:
-    """The strategy's own 11-point card for the V5 score gate (all 11 needed)."""
+    """The strategy's own 12-point card for the V5 score gate (all 12 needed)."""
     calc = result.get("scalp") or {}
     card = {item["key"]: item["points"] for item in calc.get("criteria") or []}
     total = sum(card.values())
