@@ -55,7 +55,16 @@ export function optimizeSettings(input: { strategy: StrategyId; symbol: string; 
   const grid: Array<Partial<BacktestSettings>> = [];
   const windows: Array<[string, string]> = [["09:35", "14:45"], ["09:45", "13:30"], ["10:00", "14:30"]];
   const confidences = input.usesConfidence ? [input.settings.minConfidence, 65, 75] : [input.settings.minConfidence];
-  if (input.strategy === "VWAP_EMA_ADX") {
+  if (input.strategy === "VWAP_EMA_ADX_SPEC") {
+    // Spec v1.0 knobs: ADX threshold, stop distance, reward multiple, trades per day, entry window.
+    for (const specAdxThreshold of [20, 25, 30])
+      for (const specRiskPoints of [15, 20, 30])
+        for (const specRewardMultiple of [1.5, 2, 3])
+          for (const maxTradesPerDay of [1, 2, 3])
+            for (const [entryStart, entryEnd] of windows)
+              grid.push({ specAdxThreshold, specRiskPoints, specRewardMultiple, maxTradesPerDay, entryStart, entryEnd });
+  }
+  else if (input.strategy === "VWAP_EMA_ADX") {
     // The scalper manages exits with its own staged trail, so the knobs are the ADX threshold on the
     // confirmation candle, 1:1 vs 1:2, the time stop, trades per day and the entry window.
     for (const adxMin of [15, 20, 25, 30])

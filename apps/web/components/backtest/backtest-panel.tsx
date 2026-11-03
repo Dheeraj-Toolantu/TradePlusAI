@@ -2,14 +2,19 @@
 
 import { Fragment, useMemo, useRef, useState } from "react";
 import { BacktestCandles, type CandleRow } from "./backtest-candles";
-import type { BacktestResult, BacktestSettings, BacktestTrade, StrategyId } from "../../../../services/backtest/src/strategy-backtest";
+import type { BacktestResult, BacktestSettings, BacktestTrade, Segment, StrategyId } from "../../../../services/backtest/src/strategy-backtest";
+import type { DataQuality, SensitivityRow } from "../../../../services/backtest/src/spec-research";
+import type { SpecSignalLog } from "../../../../services/backtest/src/vwap-ema-adx-spec-strategy";
 import type { OptimizerResult, OptimizerRow } from "../../../../services/backtest/src/optimizer";
 
-type Result = BacktestResult & { candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; dailyCandles?: CandleRow[] | null; optimization?: OptimizerResult | null; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
+type Research = { sensitivity: SensitivityRow[]; buyAndHold: SensitivityRow["metrics"]; signalLog: SpecSignalLog[] };
+type Provenance = { strategy: string; strategyLabel: string; strategyVersion: string | null; symbol: string; from: string; to: string; source: string; sessions: number; data: { bars: number; hash: string }; settings: BacktestSettings; generatedAt: string; engine: string };
+type Result = BacktestResult & { research?: Research | null; dataQuality?: DataQuality; provenance?: Provenance; candles: CandleRow[]; candleMinutes?: number; replayMinutes?: Record<string, CandleRow[]> | null; dailyCandles?: CandleRow[] | null; optimization?: OptimizerResult | null; strategyLabel: string; source: string; sessions: number; issues: string[]; elapsedMs: number };
 type Source = "groww" | "yahoo" | "synthetic";
 type Symbol = "NIFTY" | "BANKNIFTY" | "SENSEX";
 
 const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
+  { id: "VWAP_EMA_ADX_SPEC", title: "VWAP–EMA–ADX (spec v1.0)", detail: "Your specification: on completed 5m candles, close beyond session VWAP, EMA9 vs EMA21, ADX(14) > 25 with +DI/−DI agreeing, close beyond the previous candle's high/low. Entry next open; fixed 20-pt SL, 2R target; SL first; EOD 15:15. Sensitivity tests, baselines, segments, provenance." },
   { id: "VWAP_EMA_ADX", title: "VWAP + EMA + ADX scalp", detail: "The live scalper's tape: close beyond a sloping VWAP, 5 EMA > 9 EMA > VWAP, pullback to the 9 EMA resumes on volume, ADX(14) above 20 on that confirmation candle. Staged trail (breakeven at +0.5R, +0.5R locked at +1R, 0.6R trail), 9 EMA exit, 1:1 or 1:2 target." },
   { id: "MTF_AI", title: "AI multi-timeframe", detail: "1D context · 15m direction · 5m pullback · 1m candle trigger, with the AI monitor's entry/stop/target rules." },
   { id: "ORB_PRO", title: "ORB retest Pro", detail: "Non-gap days only (validated on real NIFTY 2024–26) → conviction breakout of the 15-min range → retest that holds → 1m turn above VWAP. Stop beyond the retest low and round numbers; skipped if too wide." },
@@ -21,7 +26,7 @@ const STRATEGIES: Array<{ id: StrategyId; title: string; detail: string }> = [
 ];
 const LOT_SIZE: Record<Symbol, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
 const THETA: Record<Symbol, number> = { NIFTY: 12, BANKNIFTY: 30, SENSEX: 40 };
-const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60, partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15, minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15", adxMin: 20, scalpRiskReward: 2 };
+const DEFAULTS: BacktestSettings = { capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60, partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15, minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15", adxMin: 20, scalpRiskReward: 2, specTimeframe: 5, specAdxThreshold: 25, specRiskPoints: 20, specRewardMultiple: 2, specEmaExit: false, specVwapMode: "STRICT" };
 
 const istToday = () => new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
 const shiftDay = (day: string, days: number) => new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
@@ -32,12 +37,12 @@ const weekday = (day: string) => { const dow = new Date(`${day}T00:00:00Z`).getU
  * does SMC sweep + CHoCH retest: on NIFTY 2018–26 dropping its 45-minute time stop took T1 hits from 41%
  * to 60%.
  */
-const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, SMC_PLUS: 0, TREND_PULLBACK: 45, SMART_COMBO: 45, VWAP_EMA_ADX: 12 };
+const TIME_STOP: Record<StrategyId, number> = { MTF_AI: 15, ORB_RETEST: 30, ORB_PRO: 0, SMC_SWEEP: 45, SMC_PLUS: 0, TREND_PULLBACK: 45, SMART_COMBO: 45, VWAP_EMA_ADX: 12, VWAP_EMA_ADX_SPEC: 0 };
 /**
  * Trend entries are built for a trailing runner; the others default to fixed T1/T2. SMC + 9 EMA: a 1.5R
  * trail with a 45-min time stop was best on real NIFTY and BANKNIFTY data (2018–26).
  */
-const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 1.5, SMC_PLUS: 1.5, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5, VWAP_EMA_ADX: 0 };
+const TRAIL_R: Record<StrategyId, number> = { MTF_AI: 0, ORB_RETEST: 0, ORB_PRO: 1, SMC_SWEEP: 1.5, SMC_PLUS: 1.5, TREND_PULLBACK: 1.5, SMART_COMBO: 1.5, VWAP_EMA_ADX: 0, VWAP_EMA_ADX_SPEC: 0 };
 type Preset = { key: string; label: string; sessions?: number; months?: number };
 const PRESETS: Preset[] = [{ key: "5", label: "5 sessions", sessions: 5 }, { key: "20", label: "20 sessions", sessions: 20 }, { key: "3m", label: "3 months", months: 3 }, { key: "6m", label: "6 months", months: 6 }];
 function lastMonths(months: number) {
@@ -80,7 +85,15 @@ export function BacktestPanel() {
   const update = <K extends keyof BacktestSettings>(key: K, value: BacktestSettings[K]) => setSettings((current) => ({ ...current, [key]: value }));
   const chooseSymbol = (next: Symbol) => { setSymbol(next); setSettings((current) => ({ ...current, lotSize: LOT_SIZE[next], thetaPerDay: THETA[next] })); };
   const choosePreset = (item: Preset) => { setPreset(item.key); setRange(rangeFor(item)); };
-  const chooseStrategy = (next: StrategyId) => { setStrategy(next); setSettings((current) => ({ ...current, timeStopMinutes: TIME_STOP[next], trailR: TRAIL_R[next] })); };
+  const chooseStrategy = (next: StrategyId) => {
+    setStrategy(next);
+    setSettings((current) => ({
+      ...current, timeStopMinutes: TIME_STOP[next], trailR: TRAIL_R[next],
+      // Spec v1.0 has no partial exit, cool-down or loss-streak stop, and reports index points
+      // ("do not treat index-point P&L as option P&L").
+      ...(next === "VWAP_EMA_ADX_SPEC" ? { pnlMode: "POINTS" as const, partialAtT1: false, cooldownMinutes: 0, maxConsecutiveLosses: 20, maxTradesPerDay: 3 } : {}),
+    }));
+  };
   const [optimize, setOptimize] = useState(true);
   const applySettings = (overrides: Partial<BacktestSettings>) => { setSettings((current) => ({ ...current, ...overrides })); window.scrollTo({ top: 0, behavior: "smooth" }); };
   const spanDays = Math.round((Date.parse(range.to) - Date.parse(range.from)) / 86_400_000) + 1;
@@ -136,7 +149,17 @@ export function BacktestPanel() {
             <label>Entry from<input type="time" value={settings.entryStart} onChange={(event) => update("entryStart", event.target.value)} /></label>
             <label>Entry until<input type="time" value={settings.entryEnd} onChange={(event) => update("entryEnd", event.target.value)} /></label>
             <label>Square-off<input type="time" value={settings.squareOff} onChange={(event) => update("squareOff", event.target.value)} /></label>
-            {strategy === "VWAP_EMA_ADX" ? (
+            {strategy === "VWAP_EMA_ADX_SPEC" ? (
+              <>
+                <label>Signal timeframe<select value={settings.specTimeframe} onChange={(event) => update("specTimeframe", (Number(event.target.value) === 1 ? 1 : Number(event.target.value) === 3 ? 3 : 5))}><option value={5}>5 minutes (baseline)</option><option value={3}>3 minutes</option><option value={1}>1 minute</option></select></label>
+                <NumberField label="ADX(14) strictly above" value={settings.specAdxThreshold} step={1} min={0} max={80} onChange={(value) => update("specAdxThreshold", value)} />
+                <NumberField label="Stop (index points)" value={settings.specRiskPoints} step={1} min={1} onChange={(value) => update("specRiskPoints", value)} />
+                <NumberField label="Reward multiple (×R)" value={settings.specRewardMultiple} step={0.5} min={0.25} max={10} onChange={(value) => update("specRewardMultiple", value)} />
+                <label>VWAP without volume<select value={settings.specVwapMode} onChange={(event) => update("specVwapMode", event.target.value === "TIME_WEIGHTED" ? "TIME_WEIGHTED" : "STRICT")}><option value="STRICT">Undefined: no signal (spec)</option><option value="TIME_WEIGHTED">Time-weighted (deviation)</option></select></label>
+                <label className="bt-check"><input type="checkbox" checked={settings.specEmaExit} onChange={(event) => update("specEmaExit", event.target.checked)} /> Exit on the opposite EMA9/EMA21 cross (variant)</label>
+                <small className="bt-hint">Spec v1.0: entry at the next candle&apos;s open, SL / target from that open, SL first when one candle touches both, EOD at the square-off. Time stop, trail and partial exits are not part of the spec and do not apply. Index candles usually carry no volume: with the spec&apos;s strict VWAP such sessions give no signals.</small>
+              </>
+            ) : strategy === "VWAP_EMA_ADX" ? (
               <>
                 <NumberField label="ADX on confirmation candle above" value={settings.adxMin} step={1} min={0} max={60} onChange={(value) => update("adxMin", value)} />
                 <label>Target (from the fill)<select value={settings.scalpRiskReward} onChange={(event) => update("scalpRiskReward", Number(event.target.value) === 1 ? 1 : 2)}><option value={2}>1:2</option><option value={1}>1:1</option></select></label>
@@ -181,8 +204,8 @@ function BacktestResults({ result, onApply }: { result: Result; onApply: (overri
   const showOnChart = (id: number) => { setChartTrade(id); chartPanel.current?.scrollIntoView({ behavior: "smooth", block: "start" }); };
   const synthetic = result.source === "synthetic";
   const exportCsv = () => {
-    const header = ["#", "day", "side", "entry_time", "entry", "stop", "target1", "target2", "exit_time", "exit", "exit_reason", "points", "r_multiple", "pnl", "hold_min", "confidence", "reason"];
-    const rows = result.trades.map((t) => [t.id, t.day, t.side, clockOf(t.entryTime), t.entryPrice, t.stop, t.target1, t.target2, clockOf(t.exitTime), t.exitPrice, t.exitReason, t.points, t.rMultiple, t.pnl, t.holdMinutes, t.confidence ?? "", `"${t.reason.replaceAll('"', "'")}"`]);
+    const header = ["#", "day", "side", "entry_time", "entry", "stop", "target1", "target2", "exit_time", "exit", "exit_reason", "points", "r_multiple", "pnl", "hold_min", "confidence", "adx", "reason"];
+    const rows = result.trades.map((t) => [t.id, t.day, t.side, clockOf(t.entryTime), t.entryPrice, t.stop, t.target1, t.target2, clockOf(t.exitTime), t.exitPrice, t.exitReason, t.points, t.rMultiple, t.pnl, t.holdMinutes, t.confidence ?? "", t.adx ?? "", `"${t.reason.replaceAll('"', "'")}"`]);
     const blob = new Blob([[header, ...rows].map((row) => row.join(",")).join("\n")], { type: "text/csv" });
     const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `backtest-${result.strategy}-${result.symbol}-${result.from}-${result.to}.csv`; link.click();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
@@ -203,7 +226,12 @@ function BacktestResults({ result, onApply }: { result: Result; onApply: (overri
         <Kpi label="Expectancy" value={`${inr(m.expectancy)}`} detail={`${r(m.expectancyR)} per trade`} />
         <Kpi label="Max drawdown" value={inr(-m.maxDrawdown)} detail={`${pct(-m.maxDrawdownPct)} · worst streak ${m.maxConsecutiveLosses} losses`} />
         <Kpi label="Days" value={`${m.profitableDays}/${m.tradingDays}`} detail={`profitable · best ${inr(m.bestDay)} · worst ${inr(m.worstDay)}`} />
+        <Kpi label="Direction" value={`${m.longTrades} / ${m.shortTrades}`} detail={`long (BUY CE) / short (BUY PE) · ${m.tradesPerDay} trades a day`} />
+        <Kpi label="Streaks" value={`${m.maxConsecutiveWins}W / ${m.maxConsecutiveLosses}L`} detail={`largest win ${inr(m.largestWin)} · largest loss ${inr(m.largestLoss)}`} />
+        <Kpi label="Time in market" value={`${m.exposurePct.toFixed(1)}%`} detail={`avg hold ${m.averageHoldMinutes} min of the session minutes tested`} />
       </section>
+
+      {result.research ? <SpecResearch research={result.research} result={result} /> : null}
 
       {result.candles?.length ? (
         <section className="paper-panel bt-chart-panel bt-candles-panel" ref={chartPanel}>
@@ -255,6 +283,9 @@ function BacktestResults({ result, onApply }: { result: Result; onApply: (overri
           </section>
         </>
       )}
+
+      {result.trades.length ? <SegmentsPanel segments={result.segments} /> : null}
+      {result.provenance ? <ProvenancePanel result={result} /> : null}
 
       {result.skipped.length || result.issues.length ? (
         <section className="paper-panel bt-skipped">
@@ -437,6 +468,9 @@ const describeSettings = (settings: Partial<BacktestSettings>) => {
   if (settings.timeStopMinutes !== undefined) parts.push(settings.timeStopMinutes ? `time stop ${settings.timeStopMinutes}m` : "no time stop");
   if (settings.adxMin !== undefined) parts.push(`ADX > ${settings.adxMin}`);
   if (settings.scalpRiskReward !== undefined) parts.push(`1:${settings.scalpRiskReward}`);
+  if (settings.specAdxThreshold !== undefined) parts.push(`ADX > ${settings.specAdxThreshold}`);
+  if (settings.specRiskPoints !== undefined) parts.push(`SL ${settings.specRiskPoints} pts`);
+  if (settings.specRewardMultiple !== undefined) parts.push(`${settings.specRewardMultiple}R`);
   return parts.length ? parts.join(" · ") : "Your current settings";
 };
 
@@ -476,6 +510,91 @@ function OptimizerPanel({ optimization, onApply }: { optimization: OptimizerResu
           </tbody>
         </table>
       </div>
+    </section>
+  );
+}
+
+const pf = (value: number | null) => (value === null ? "∞" : value.toFixed(2));
+const download = (name: string, text: string, type: string) => {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([text], { type }));
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+};
+
+/** Spec v1.0 research: sensitivity rows against the baselines (no ADX filter, intraday buy & hold). */
+function SpecResearch({ research, result }: { research: Research; result: Result }) {
+  const groups = [...new Set(research.sensitivity.map((row) => row.group))];
+  const ist = (epochS: number) => new Date((epochS + 330 * 60) * 1000).toISOString().replace("T", " ").slice(0, 16);
+  const exportSignals = () => download(
+    `signals-${result.strategy}-${result.symbol}-${result.from}-${result.to}.csv`,
+    [["candle_start_ist", "signal", "close", "vwap", "ema9", "ema21", "adx14", "plus_di", "minus_di", "prev_high", "prev_low"].join(","),
+      ...research.signalLog.map((item) => [ist(item.time), item.side > 0 ? "BUY_CE" : "BUY_PE", item.close, item.vwap.toFixed(2), item.ema9.toFixed(2), item.ema21.toFixed(2), item.adx.toFixed(2), item.plusDi.toFixed(2), item.minusDi.toFixed(2), item.prevHigh, item.prevLow].join(","))].join("\n"),
+    "text/csv");
+  const b = research.buyAndHold;
+  return (
+    <section className="paper-panel">
+      <div className="paper-panel-heading"><div><span className="paper-kicker">SENSITIVITY &amp; BASELINES</span><h2>One change at a time, same data</h2></div><button type="button" className="paper-button secondary" onClick={exportSignals} disabled={!research.signalLog.length}>Signal log CSV ({research.signalLog.length})</button></div>
+      <p className="bt-legend-note">Each row changes one setting from yours (marked ●). Look for stable results across neighbouring values, not the single best row; a few trades are not evidence. In-sample tuning belongs to the walk-forward optimizer above.</p>
+      <div className="bt-table-wrap">
+        <table className="bt-table">
+          <thead><tr><th>Test</th><th>Value</th><th className="num">Trades</th><th className="num">Long / short</th><th className="num">Win rate</th><th className="num">PF</th><th className="num">Expectancy</th><th className="num">Net P&amp;L</th><th className="num">Max DD</th></tr></thead>
+          <tbody>
+            {groups.map((group) => research.sensitivity.filter((row) => row.group === group).map((row, index) => (
+              <tr key={`${group}-${row.label}`} className={row.baseline ? "bt-row-current" : ""}>
+                <td>{index === 0 ? group : ""}</td><td>{row.baseline ? "● " : ""}{row.label}</td>
+                <td className="num">{row.metrics.trades}</td><td className="num">{row.metrics.longTrades} / {row.metrics.shortTrades}</td><td className="num">{row.metrics.winRate.toFixed(0)}%</td>
+                <td className="num">{pf(row.metrics.profitFactor)}</td><td className="num">{r(row.metrics.expectancyR)}</td><td className="num">{inr(row.metrics.netPnl)}</td><td className="num">{inr(-row.metrics.maxDrawdown)}</td>
+              </tr>
+            )))}
+            <tr className="bt-row-baseline"><td>Baseline</td><td>Intraday buy &amp; hold (long {result.settings.entryStart} → {result.settings.squareOff})</td><td className="num">{b.trades}</td><td className="num">{b.longTrades} / {b.shortTrades}</td><td className="num">{b.winRate.toFixed(0)}%</td><td className="num">{pf(b.profitFactor)}</td><td className="num" title="No stop, so no R">—</td><td className="num">{inr(b.netPnl)}</td><td className="num">{inr(-b.maxDrawdown)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+const SEGMENT_TITLES: Array<[keyof BacktestResult["segments"], string]> = [["byDirection", "Direction"], ["byAdx", "ADX on the signal candle"], ["byRegime", "Trend / range day"], ["byWeekday", "Weekday"], ["byMonth", "Month"]];
+function SegmentsPanel({ segments }: { segments: BacktestResult["segments"] }) {
+  const shown = SEGMENT_TITLES.filter(([key]) => segments?.[key]?.length);
+  if (!shown.length) return null;
+  return (
+    <section className="paper-panel">
+      <div className="paper-panel-heading"><div><span className="paper-kicker">SEGMENTS</span><h2>Where the result comes from</h2></div></div>
+      <p className="bt-legend-note">Trend day: the session closed at least half its range away from its open (|close − open| ≥ 0.5 × range); otherwise a range day.</p>
+      <div className="bt-segments">
+        {shown.map(([key, title]) => (
+          <table key={key} className="bt-table">
+            <thead><tr><th>{title}</th><th className="num">Trades</th><th className="num">Win</th><th className="num">PF</th><th className="num">R</th><th className="num">P&amp;L</th></tr></thead>
+            <tbody>{segments[key].map((row: Segment) => <tr key={row.key}><td>{row.key}</td><td className="num">{row.trades}</td><td className="num">{row.winRate.toFixed(0)}%</td><td className="num">{pf(row.profitFactor)}</td><td className="num">{r(row.expectancyR)}</td><td className="num">{inr(row.netPnl)}</td></tr>)}</tbody>
+          </table>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** Parameters and data provenance saved with the result (and downloadable as JSON). */
+function ProvenancePanel({ result }: { result: Result }) {
+  const p = result.provenance!;
+  const q = result.dataQuality;
+  const exportReport = () => {
+    const { candles: _candles, replayMinutes: _replay, dailyCandles: _daily, ...report } = result;
+    void _candles; void _replay; void _daily;
+    download(`backtest-report-${result.strategy}-${result.symbol}-${result.from}-${result.to}.json`, JSON.stringify(report, null, 2), "application/json");
+  };
+  return (
+    <section className="paper-panel">
+      <div className="paper-panel-heading"><div><span className="paper-kicker">PROVENANCE</span><h2>Reproduce this result</h2></div><button type="button" className="paper-button secondary" onClick={exportReport}>Download report (JSON)</button></div>
+      <dl className="bt-provenance">
+        <div><dt>Strategy</dt><dd>{p.strategyVersion ?? p.strategyLabel}</dd></div>
+        <div><dt>Data</dt><dd>{p.source} · {p.symbol} · {p.from} → {p.to} · {p.sessions} sessions · {p.data.bars.toLocaleString("en-IN")} 1-minute bars · fingerprint <code>{p.data.hash}</code></dd></div>
+        {q ? <div><dt>Data quality</dt><dd>{q.warnings.length ? q.warnings.join(" ") : "No duplicates, no inconsistent candles, no missing minutes."}</dd></div> : null}
+        <div><dt>Engine</dt><dd>{p.engine} · run {new Date(p.generatedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST</dd></div>
+      </dl>
+      <p className="bt-legend-note">The same data (same fingerprint), settings and code give identical results. The JSON report holds every parameter, metric, segment, sensitivity row and trade.</p>
     </section>
   );
 }

@@ -14,7 +14,7 @@ import { analyzeMultiTimeframe, type Bar } from "../../ai-monitoring/src/mtf-dec
  * estimate; the index-points view is exact for the given candles.
  */
 
-export type StrategyId = "MTF_AI" | "ORB_RETEST" | "ORB_PRO" | "SMC_SWEEP" | "SMC_PLUS" | "TREND_PULLBACK" | "SMART_COMBO" | "VWAP_EMA_ADX";
+export type StrategyId = "MTF_AI" | "ORB_RETEST" | "ORB_PRO" | "SMC_SWEEP" | "SMC_PLUS" | "TREND_PULLBACK" | "SMART_COMBO" | "VWAP_EMA_ADX" | "VWAP_EMA_ADX_SPEC";
 export type PnlMode = "OPTION" | "POINTS";
 
 export type BacktestSettings = {
@@ -53,12 +53,25 @@ export type BacktestSettings = {
   adxMin: number;
   /** VWAP-EMA-ADX scalp: target = fill ± k·R, k = 1 (1:1) or 2 (1:2), re-derived from the fill. */
   scalpRiskReward: 1 | 2;
+  /** Spec v1.0 strategy: signal candle (1, 3 or 5 minutes; baseline 5). */
+  specTimeframe: 1 | 3 | 5;
+  /** Spec v1.0: entry needs ADX(14) strictly above this (baseline 25). */
+  specAdxThreshold: number;
+  /** Spec v1.0: SL distance in index points from the entry candle's open (baseline 20). */
+  specRiskPoints: number;
+  /** Spec v1.0: target = risk points × this (baseline 2). */
+  specRewardMultiple: number;
+  /** Spec v1.0: optional exit on the opposite EMA9/EMA21 crossover (off in the baseline). */
+  specEmaExit: boolean;
+  /** Spec v1.0: VWAP needs volume (STRICT, the spec); TIME_WEIGHTED is a labelled fallback for index history without volume. */
+  specVwapMode: "STRICT" | "TIME_WEIGHTED";
 };
 
 export const DEFAULT_BACKTEST_SETTINGS: BacktestSettings = {
   capital: 100_000, lots: 1, lotSize: 65, pnlMode: "OPTION", delta: 0.5, thetaPerDay: 12, slippagePoints: 1, chargesPerTrade: 60,
   partialAtT1: true, trailR: 0, timeStopMinutes: 15, maxTradesPerDay: 3, maxDailyLoss: 3000, maxConsecutiveLosses: 2, cooldownMinutes: 15,
   minConfidence: 60, entryStart: "09:35", entryEnd: "14:45", squareOff: "15:15", adxMin: 20, scalpRiskReward: 2,
+  specTimeframe: 5, specAdxThreshold: 25, specRiskPoints: 20, specRewardMultiple: 2, specEmaExit: false, specVwapMode: "STRICT",
 };
 
 /** The VWAP-EMA scalper's staged trail, in R (services/paper-trading/src/scalper-trail.ts). */
@@ -67,10 +80,15 @@ const STAGED_EXIT: Record<string, string> = { INITIAL: "STOP_LOSS", BREAKEVEN: "
 
 export type Signal = {
   time: number; side: 1 | -1; stop: number; target1: number; target2?: number | null; confidence?: number; strategy: string; reason: string;
-  /** "VWAP_EMA": manage like the live VWAP-EMA scalper (staged trail, 9 EMA exit, target from the fill). */
-  management?: "VWAP_EMA";
-  /** ADX on the confirmation candle; entries need it above settings.adxMin. */
+  /**
+   * "VWAP_EMA": manage like the live VWAP-EMA scalper (staged trail, 9 EMA exit, target from the fill).
+   * "FIXED_POINTS": spec v1.0 (fixed-point SL / target from the next open, SL first, EOD, optional EMA cross exit).
+   */
+  management?: "VWAP_EMA" | "FIXED_POINTS";
+  /** ADX on the confirmation candle; entries need it above settings.adxMin (spec: settings.specAdxThreshold). */
   adx?: number;
+  /** Spec v1.0 optional exit: true when the 1-minute bar at `index` completes an opposite EMA9/EMA21 cross. */
+  exitCheck?: (index: number) => boolean;
 };
 
 export type TradeLeg = { time: number; price: number; fraction: number; reason: string };
@@ -79,6 +97,8 @@ export type BacktestTrade = {
   signalTime: number; entryTime: number; entryPrice: number; stop: number; target1: number; target2: number;
   exitTime: number; exitPrice: number; exitReason: string; legs: TradeLeg[];
   points: number; rMultiple: number; pnl: number; holdMinutes: number; mfeR: number; maeR: number;
+  /** ADX on the signal / confirmation candle, when the strategy reports it. */
+  adx?: number | null;
   /** Every move of the stop after entry (to breakeven at T1, then trailing), for the chart. */
   stopPath: Array<{ time: number; price: number; reason: "BREAKEVEN" | "TRAIL" }>;
 };
@@ -88,7 +108,13 @@ export type BacktestMetrics = {
   profitFactor: number | null; expectancy: number; expectancyR: number; averageWin: number; averageLoss: number; largestWin: number; largestLoss: number;
   maxDrawdown: number; maxDrawdownPct: number; averageHoldMinutes: number; bestDay: number; worstDay: number; tradingDays: number; profitableDays: number;
   maxConsecutiveLosses: number; totalCharges: number; returnPct: number;
+  longTrades: number; shortTrades: number; maxConsecutiveWins: number;
+  /** Share of the tested session minutes spent in a position. */
+  exposurePct: number;
+  tradesPerDay: number;
 };
+
+export type Segment = { key: string; trades: number; wins: number; winRate: number; netPnl: number; profitFactor: number | null; expectancyR: number };
 
 export type BacktestResult = {
   strategy: StrategyId; symbol: string; from: string; to: string; settings: BacktestSettings;
@@ -101,7 +127,26 @@ export type BacktestResult = {
   skipped: Array<{ day: string; reason: string; count: number }>;
   signalsSeen: number;
   notes: string[];
+  /** Performance by month, weekday, direction, ADX bucket and trend / range day. */
+  segments: { byMonth: Segment[]; byWeekday: Segment[]; byDirection: Segment[]; byAdx: Segment[]; byRegime: Segment[] };
 };
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function segment(trades: BacktestTrade[], keyOf: (trade: BacktestTrade) => string | null, order?: string[]): Segment[] {
+  const groups = new Map<string, BacktestTrade[]>();
+  for (const trade of trades) { const key = keyOf(trade); if (key === null) continue; groups.set(key, [...(groups.get(key) ?? []), trade]); }
+  const keys = order ? order.filter((key) => groups.has(key)) : [...groups.keys()].sort();
+  return keys.map((key) => {
+    const list = groups.get(key)!;
+    const wins = list.filter((trade) => trade.pnl > 0);
+    const profit = wins.reduce((sum, trade) => sum + trade.pnl, 0);
+    const loss = Math.abs(list.filter((trade) => trade.pnl <= 0).reduce((sum, trade) => sum + trade.pnl, 0));
+    return { key, trades: list.length, wins: wins.length, winRate: round2(wins.length / list.length * 100), netPnl: round2(profit - loss),
+      profitFactor: loss > 0 ? round2(profit / loss) : profit > 0 ? null : 0, expectancyR: round2(list.reduce((sum, trade) => sum + trade.rMultiple, 0) / list.length) };
+  });
+}
+const ADX_BUCKETS = ["≤ 20", "20–25", "25–30", "30–40", "> 40"];
+const adxBucket = (adx: number) => (adx <= 20 ? ADX_BUCKETS[0] : adx <= 25 ? ADX_BUCKETS[1] : adx <= 30 ? ADX_BUCKETS[2] : adx <= 40 ? ADX_BUCKETS[3] : ADX_BUCKETS[4]);
 
 const IST_S = 330 * 60;
 // Hot paths (the optimizer replays hundreds of thousands of bars): integer maths plus a per-day cache
@@ -227,7 +272,8 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
       : state.consecutiveLosses >= settings.maxConsecutiveLosses ? "Consecutive-loss stop for the day"
       : state.lastLossAt !== null && (bar.time + 60 - state.lastLossAt) < settings.cooldownMinutes * 60 ? "Cooling down after a loss"
       : (signal.confidence ?? 100) < settings.minConfidence ? "Confidence below threshold"
-      : signal.adx !== undefined && !(signal.adx > settings.adxMin) ? `ADX ${signal.adx.toFixed(1)} on the confirmation candle, not above ${settings.adxMin}`
+      : signal.adx !== undefined && !(signal.adx > (signal.management === "FIXED_POINTS" ? settings.specAdxThreshold : settings.adxMin))
+        ? `ADX ${signal.adx.toFixed(1)} on the ${signal.management === "FIXED_POINTS" ? "signal" : "confirmation"} candle, not above ${signal.management === "FIXED_POINTS" ? settings.specAdxThreshold : settings.adxMin}`
       : null;
     if (blocked) { skip(day, blocked); i += 1; continue; }
     const next = minute[i + 1];
@@ -235,20 +281,24 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
     // A data gap between the decision and the next bar means the fill would be stale.
     if (next.time - signal.time > 120) { skip(day, "Data gap before the fill"); i += 1; continue; }
     const side = signal.side;
+    const fixed = signal.management === "FIXED_POINTS";
     const entry = next.open + side * settings.slippagePoints;
-    const riskPts = (entry - signal.stop) * side;
+    // Spec v1.0 (section 8): SL and target are measured from the entry candle's open; the fill pays slippage.
+    const stopLevel = fixed ? next.open - side * settings.specRiskPoints : signal.stop;
+    const riskPts = (entry - stopLevel) * side;
     if (!(riskPts > 0)) { skip(day, "Price gapped through the stop before the fill"); i += 1; continue; }
     const staged = signal.management === "VWAP_EMA";
     // The VWAP-EMA scalper re-derives its target from the actual fill: fill ± k·R.
-    const target1 = staged ? entry + side * settings.scalpRiskReward * riskPts : signal.target1;
+    const target1 = staged ? entry + side * settings.scalpRiskReward * riskPts
+      : fixed ? next.open + side * settings.specRiskPoints * settings.specRewardMultiple : signal.target1;
     // A fill that already sits near (or past) T1 has lost its reward: a trader would pass, not chase.
-    if ((target1 - entry) * side < 0.5 * riskPts) { skip(day, "Fill too close to T1 (reward under 0.5R)"); i += 1; continue; }
-    const target2 = staged ? target1 : signal.target2 && (signal.target2 - target1) * side > 0 ? signal.target2
+    if (!fixed && (target1 - entry) * side < 0.5 * riskPts) { skip(day, "Fill too close to T1 (reward under 0.5R)"); i += 1; continue; }
+    const target2 = staged || fixed ? target1 : signal.target2 && (signal.target2 - target1) * side > 0 ? signal.target2
       // No T2 from the strategy: 3R, but never short of T1 + 1R (a far T1 would otherwise put T2 inside it).
       : side > 0 ? Math.max(entry + 3 * riskPts, target1 + riskPts) : Math.min(entry - 3 * riskPts, target1 - riskPts);
 
     // Manage the trade bar by bar from the fill bar onward.
-    let stop = signal.stop;
+    let stop = stopLevel;
     let remaining = 1;
     let t1Hit = false;
     const trailing = settings.trailR > 0;
@@ -263,7 +313,27 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
     const legs: TradeLeg[] = [];
     let mfe = 0; let mae = 0;
     let j = i + 1;
-    if (staged) {
+    if (fixed) {
+      // Spec v1.0 (section 9): SL first when a candle touches both, then target, then the optional
+      // EMA9/EMA21 opposite-cross exit at the signal candle's close, then EOD at the close of the bar
+      // that reaches the square-off time. Every exit pays slippage.
+      for (; j < minute.length; j += 1) {
+        const b = minute[j];
+        const end = b.time + 60;
+        if (istDay(b.time) !== day) { const last = minute[j - 1]; legs.push({ time: last.time + 60, price: last.close - side * settings.slippagePoints, fraction: 1, reason: "DATA/SAFETY" }); remaining = 0; j -= 1; break; }
+        const favourable = side > 0 ? b.high - entry : entry - b.low;
+        const adverse = side > 0 ? entry - b.low : b.high - entry;
+        mfe = Math.max(mfe, favourable / riskPts); mae = Math.max(mae, adverse / riskPts);
+        if (side > 0 ? b.low <= stop : b.high >= stop) {
+          const fill = (side > 0 ? Math.min(stop, b.open) : Math.max(stop, b.open)) - side * settings.slippagePoints;
+          legs.push({ time: end, price: fill, fraction: 1, reason: "SL" }); remaining = 0; break;
+        }
+        if (side > 0 ? b.high >= target1 : b.low <= target1) { legs.push({ time: end, price: target1 - side * settings.slippagePoints, fraction: 1, reason: "TARGET" }); remaining = 0; break; }
+        if (settings.specEmaExit && signal.exitCheck?.(j)) { legs.push({ time: end, price: b.close - side * settings.slippagePoints, fraction: 1, reason: "SIGNAL_EXIT" }); remaining = 0; break; }
+        if (istMinute(end) >= squareMin) { legs.push({ time: end, price: b.close - side * settings.slippagePoints, fraction: 1, reason: "EOD" }); remaining = 0; break; }
+      }
+    }
+    else if (staged) {
       // Live VWAP-EMA management: breakeven + charges at +0.5R, lock +0.5R at +1R, trail 0.6R behind
       // the best price beyond +1R (stages move on completed bars only); full exit at the target;
       // after breakeven a 1m close back through the session 9 EMA exits (momentum lost).
@@ -296,7 +366,7 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
         if (istMinute(end) >= squareMin) { legs.push({ time: end, price: b.close - side * settings.slippagePoints, fraction: 1, reason: "SQUARE_OFF" }); remaining = 0; break; }
       }
     }
-    if (!staged) for (; j < minute.length; j += 1) {
+    if (!staged && !fixed) for (; j < minute.length; j += 1) {
       const b = minute[j];
       const end = b.time + 60;
       if (istDay(b.time) !== day) { const last = minute[j - 1]; legs.push({ time: last.time + 60, price: last.close - side * settings.slippagePoints, fraction: remaining, reason: "SESSION_END" }); remaining = 0; j -= 1; break; }
@@ -326,7 +396,7 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
       }
       if (istMinute(end) >= squareMin) { legs.push({ time: end, price: b.close - side * settings.slippagePoints, fraction: remaining, reason: "SQUARE_OFF" }); remaining = 0; break; }
     }
-    if (remaining > 0) { const last = minute.at(-1)!; legs.push({ time: last.time + 60, price: last.close - side * settings.slippagePoints, fraction: remaining, reason: "DATA_END" }); j = minute.length - 1; }
+    if (remaining > 0) { const last = minute.at(-1)!; legs.push({ time: last.time + 60, price: last.close - side * settings.slippagePoints, fraction: remaining, reason: fixed ? "DATA/SAFETY" : "DATA_END" }); j = minute.length - 1; }
 
     const points = legs.reduce((sum, leg) => sum + (leg.price - entry) * side * leg.fraction, 0);
     const exitTime = legs.at(-1)!.time;
@@ -339,7 +409,7 @@ export function runBacktest(input: { strategy: StrategyId; symbol: string; from:
     const finalReason = legs.length > 1 && legs[0].reason === "TARGET_1" ? `T1 + ${legs.at(-1)!.reason.replace("_", " ").toLowerCase()}` : legs[0].reason;
     trades.push({
       id: trades.length + 1, day, strategy: signal.strategy, side: side > 0 ? "LONG" : "SHORT", reason: signal.reason, confidence: signal.confidence ?? null,
-      signalTime: signal.time, entryTime: next.time, entryPrice: round2(entry), stop: round2(signal.stop), target1: round2(target1), target2: round2(target2),
+      signalTime: signal.time, entryTime: next.time, entryPrice: round2(entry), stop: round2(stopLevel), target1: round2(target1), target2: round2(target2), adx: signal.adx ?? null,
       exitTime, exitPrice: round2(exitPrice), exitReason: finalReason, legs: legs.map((leg) => ({ ...leg, price: round2(leg.price) })),
       points: round2(points), rMultiple: round2(points / riskPts), pnl, holdMinutes, mfeR: round2(mfe), maeR: round2(mae), stopPath,
     });
@@ -378,6 +448,28 @@ function summarize(args: { strategy: StrategyId; symbol: string; from: string; t
   const rDistribution = buckets.map((bucket) => ({ bucket, count: 0 }));
   for (const trade of trades) rDistribution[bucketOf(trade.rMultiple)].count += 1;
   const dailyPnls = daily.map((item) => item.pnl);
+  let winStreak = 0; let maxWinStreak = 0;
+  for (const trade of trades) { winStreak = trade.pnl > 0 ? winStreak + 1 : 0; maxWinStreak = Math.max(maxWinStreak, winStreak); }
+  // Time in market against the tested session minutes; trend / range day from the session's own
+  // efficiency (|close − open| / (high − low) of the day; ≥ 0.5 is a trend day).
+  const sessionMinutes = args.minute.filter((bar) => { const day = istDay(bar.time); return day >= args.from && day <= args.to; }).length;
+  const inMarket = trades.reduce((sum, trade) => sum + trade.holdMinutes, 0);
+  const dayShape = new Map<string, { open: number; high: number; low: number; close: number }>();
+  for (const bar of args.minute) {
+    const day = istDay(bar.time);
+    if (day < args.from || day > args.to) continue;
+    const item = dayShape.get(day);
+    if (!item) dayShape.set(day, { open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+    else { item.high = Math.max(item.high, bar.high); item.low = Math.min(item.low, bar.low); item.close = bar.close; }
+  }
+  const regimeOf = (day: string) => { const d = dayShape.get(day); return d && d.high > d.low ? (Math.abs(d.close - d.open) / (d.high - d.low) >= 0.5 ? "Trend day" : "Range day") : null; };
+  const segments = {
+    byMonth: segment(trades, (trade) => trade.day.slice(0, 7)),
+    byWeekday: segment(trades, (trade) => WEEKDAYS[new Date(`${trade.day}T00:00:00Z`).getUTCDay()], WEEKDAYS.slice(1, 6)),
+    byDirection: segment(trades, (trade) => (trade.side === "LONG" ? "Long (BUY CE)" : "Short (BUY PE)"), ["Long (BUY CE)", "Short (BUY PE)"]),
+    byAdx: segment(trades, (trade) => (typeof trade.adx === "number" ? adxBucket(trade.adx) : null), ADX_BUCKETS),
+    byRegime: segment(trades, (trade) => regimeOf(trade.day), ["Trend day", "Range day"]),
+  };
   const capital = Math.max(1, settings.capital);
   const notes = [
     settings.pnlMode === "OPTION"
@@ -396,7 +488,11 @@ function summarize(args: { strategy: StrategyId; symbol: string; from: string; t
       maxDrawdown: round2(maxDrawdown), maxDrawdownPct: round2(maxDrawdown / capital * 100), averageHoldMinutes: trades.length ? Math.round(trades.reduce((sum, trade) => sum + trade.holdMinutes, 0) / trades.length) : 0,
       bestDay: dailyPnls.length ? Math.max(...dailyPnls) : 0, worstDay: dailyPnls.length ? Math.min(...dailyPnls) : 0, tradingDays: daily.length, profitableDays: daily.filter((item) => item.pnl > 0).length,
       maxConsecutiveLosses: maxStreak, totalCharges: round2(trades.length * settings.chargesPerTrade), returnPct: round2(netPnl / capital * 100),
+      longTrades: trades.filter((trade) => trade.side === "LONG").length, shortTrades: trades.filter((trade) => trade.side === "SHORT").length,
+      maxConsecutiveWins: maxWinStreak, exposurePct: sessionMinutes ? round2(inMarket / sessionMinutes * 100) : 0,
+      tradesPerDay: daily.length ? round2(trades.length / daily.length) : 0,
     },
+    segments,
     equity: curve, daily, exitReasons: [...reasons.values()].sort((a, b) => b.count - a.count),
     byHour: [...hours.values()].sort((a, b) => a.hour.localeCompare(b.hour)).map((item) => ({ hour: item.hour, trades: item.trades, pnl: item.pnl, winRate: round2(item.wins / item.trades * 100) })),
     rDistribution, skipped: args.skipped.sort((a, b) => a.day.localeCompare(b.day)), signalsSeen: args.signalsSeen, notes,
