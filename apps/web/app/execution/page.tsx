@@ -9,6 +9,7 @@ import type { NextDaySetup } from "../../components/execution/next-day-panel";
 import type { ChartBar, ChartLevel, RiskRewardBox } from "../../components/scalper/premium-chart";
 import type { VwapScalpSignal } from "../../components/scalper/scalper-desk";
 import type { vwapAutoTraderStatus } from "../../lib/vwap-auto-trader";
+import type { PositionView } from "../../../../services/paper-trading/src/smart-scalper";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -143,6 +144,9 @@ export default function ExecutionPage() {
   useEffect(() => { try { window.localStorage.setItem(STRATEGY_PREFS_KEY, JSON.stringify({ riskReward })); } catch { /* per-viewer convenience */ } }, [riskReward]);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [paperOrders, setPaperOrders] = useState<Order[]>([]);
+  // Smart Scalper positions on every index (auto-executed or placed from the desk), read from the
+  // scalper book itself so they show with their live SL, target and trail.
+  const [scalperPositions, setScalperPositions] = useState<PositionView[]>([]);
   const [history, setHistory] = useState<Order[]>([]);
   const [account, setAccount] = useState<{ available: number | null; source: string } | null>(null);
   const [safety, setSafety] = useState({ safeMode: false, killSwitch: false, reason: "" });
@@ -612,6 +616,26 @@ export default function ExecutionPage() {
       log(`[Auto-execute] ${event?.text ?? "VWAP-EMA trade placed on the Smart Scalper"}`, "entry");
     }
   }, [autoTrader, log]);
+  const loadScalperBook = useCallback(async () => {
+    try {
+      const data = await fetch("/api/scalper?all=1", { cache: "no-store" }).then((response) => response.json());
+      if (Array.isArray(data.positions)) setScalperPositions(data.positions as PositionView[]);
+    } catch { /* keep the last book */ }
+  }, []);
+  useEffect(() => {
+    void loadScalperBook();
+    const timer = setInterval(() => { if (document.visibilityState === "visible") void loadScalperBook(); }, 10_000);
+    return () => clearInterval(timer);
+  }, [loadScalperBook, scalperRefresh]);
+  const exitScalper = useCallback(async (position: PositionView) => {
+    if (!window.confirm(`Exit ${position.label} at the market? Paper order.`)) return;
+    try {
+      const data = await fetch("/api/scalper", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "exit", symbol: position.underlying, ids: [position.id], contracts: chainRef.current }) }).then((response) => response.json());
+      setMessage(data.error ?? data.summary ?? `Exited ${position.label}`);
+      if (!data.error) log(`[Scalper] exit ${position.label}${data.summary ? ` · ${data.summary}` : ""}`, "exit");
+    } catch { setMessage("Scalper exit failed"); }
+    setScalperRefresh((value) => value + 1);
+  }, [log]);
   const autoOn = Boolean(autoTrader?.enabled && autoTrader.indices.includes(symbol));
   const toggleAutoTrader = useCallback(async (enabled: boolean) => {
     try {
@@ -682,7 +706,7 @@ export default function ExecutionPage() {
 
   // ---- derived ---------------------------------------------------------------------------
   const openPaper = useMemo(() => paperOrders.filter((order) => ["OPEN", "FILLED"].includes(order.status)), [paperOrders]);
-  const paperPnl = openPaper.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
+  const paperPnl = openPaper.reduce((sum, order) => sum + (order.pnl ?? 0), 0) + scalperPositions.reduce((sum, position) => sum + position.pnl, 0);
   const livePositions = live?.positions ?? [];
   const livePnl = livePositions.reduce((sum, order) => sum + (order.pnl ?? 0), 0);
   const sessionLabel: string = !analysis?.session ? "--" : !analysis.session.market_open ? "MARKET CLOSED" : analysis.session.entry_permitted ? "ENTRY WINDOW" : analysis.session.window.replaceAll("_", " ");
@@ -862,7 +886,7 @@ export default function ExecutionPage() {
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">
-            {([["LIVE", `Live positions (${livePositions.length})`], ["PAPER", `Paper positions (${openPaper.length})`], ["HISTORY", `History (${history.length})`], ["LOGS", `Logs (${logs.length})`]] as Array<[Tab, string]>).map(([key, text]) => <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}>{text}</button>)}
+            {([["LIVE", `Live positions (${livePositions.length})`], ["PAPER", `Paper positions (${openPaper.length + scalperPositions.length})`], ["HISTORY", `History (${history.length})`], ["LOGS", `Logs (${logs.length})`]] as Array<[Tab, string]>).map(([key, text]) => <button key={key} type="button" role="tab" aria-selected={tab === key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}>{text}</button>)}
             <strong className={(tab === "LIVE" ? livePnl : paperPnl) >= 0 ? "gain" : "loss"}>Unrealised {tab === "LIVE" ? "live" : "paper"} ₹{money(tab === "LIVE" ? livePnl : paperPnl)}</strong>
           </div>
 
@@ -887,8 +911,16 @@ export default function ExecutionPage() {
             </>
           )}
 
-          {tab === "PAPER" && (openPaper.length ? (
+          {tab === "PAPER" && (openPaper.length || scalperPositions.length ? (
             <table className="exec-table"><thead><tr><th>Contract</th><th>Strategy</th><th>Qty</th><th>Entry</th><th>LTP</th><th>SL / Target</th><th>P&amp;L</th><th /></tr></thead><tbody>
+              {scalperPositions.map((position) => <tr key={position.id} className="exec-row-scalper">
+                <td><b>{position.label}</b><small> {position.underlying}</small></td>
+                <td><small>Smart Scalper · {position.kind}{position.trail ? " · VWAP-EMA" : ""}{position.signal ? ` · ADX ${position.signal.adx.toFixed(1)}` : ""}</small></td>
+                <td>{position.quantity}</td><td>₹{money(position.entry)}</td><td>₹{money(position.value)}</td>
+                <td>₹{money(position.stop)} / ₹{money(position.target)}{position.trail ? <small> {position.trail.stage === "INITIAL" ? "initial SL" : position.trail.stage === "BREAKEVEN" ? "SL at breakeven" : position.trail.stage === "LOCKED" ? "+0.5R locked" : "trailing SL"}</small> : position.trailing ? <small> trailing</small> : null}</td>
+                <td className={position.pnl >= 0 ? "gain" : "loss"}>₹{money(position.pnl)}</td>
+                <td><button type="button" className="algo-exit" onClick={() => void exitScalper(position)}>Exit</button></td>
+              </tr>)}
               {openPaper.map((order) => <tr key={order.id}>
                 <td><b>{order.symbol}</b></td><td><small>{order.strategyName ?? order.strategy}</small></td><td>{order.quantity}</td><td>₹{money(order.price)}</td><td>₹{money(order.currentPrice ?? order.price)}</td>
                 <td>₹{money(order.stopLoss)} / ₹{money(order.target)}{order.trailingActivatedAt ? <small> trail ₹{money(order.trailingStop)}</small> : order.trailingDistance && (order.highWaterMark ?? order.price) > order.price ? <small> trail ₹{money(getOrderExitState(order, order.currentPrice).effectiveStop)}</small> : null}</td>

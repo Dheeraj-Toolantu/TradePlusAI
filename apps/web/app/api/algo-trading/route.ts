@@ -282,8 +282,12 @@ export async function GET(request: Request) {
       firestoreConnected: true,
     });
   } catch (error) {
+    ensureVwapAutoTrader(url.origin);
     return NextResponse.json({
       error: error instanceof Error ? error.message : "Algo analysis unavailable",
+      // The auto-trader runs on its own: its status (and any trade it placed) must reach the page
+      // even when this minute's analysis failed.
+      autoTrader: vwapAutoTraderStatus(),
       mode: config.executionMode,
       safeMode: safeModeState.safeMode,
       killSwitch: safeModeState.killSwitch,

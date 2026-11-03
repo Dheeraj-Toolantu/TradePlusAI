@@ -181,6 +181,16 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   // Reload the book on index change and whenever another panel placed a position in it: an open
   // position switches the 10-second scan on, which manages its stop, target and time stop.
   useEffect(() => { fetch(`/api/scalper?symbol=${symbol}`, { cache: "no-store" }).then((response) => response.json()).then((data) => apply(data, true)).catch(() => undefined); }, [apply, symbol, refreshSignal]);
+  // Server-side auto-execution places trades without this tab: while it is on, re-read the book every
+  // 10 s (and on return to the tab) so a new position shows here with its SL, target and trail at once.
+  const autoServer = Boolean(vwapAuto?.enabled);
+  useEffect(() => {
+    if (!autoServer) return;
+    const read = () => { if (document.visibilityState === "visible") fetch(`/api/scalper?symbol=${symbol}`, { cache: "no-store" }).then((response) => response.json()).then((data) => apply(data, true)).catch(() => undefined); };
+    const timer = setInterval(read, 10_000);
+    document.addEventListener("visibilitychange", read);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", read); };
+  }, [apply, autoServer, symbol]);
 
   const scan = useCallback(async () => {
     if (busy.current || !chain.length || !(spot > 0)) return;

@@ -25,6 +25,16 @@ describe("one VWAP-EMA trade at a time", () => {
     expect(scalper.openEngineTrade()).toBeNull();
     expect((await scalper.place("BANKNIFTY", plan(bank), [bank], { setupId: "c" })).placed).toBe(true);
   });
+
+  it("lists every index's positions with their SL and target for the algo page", async () => {
+    const bank = contract("BANKNIFTY26N1054000CE", 54000);
+    const scalper = new SmartScalper({ now: at("10:05"), hydrate: false });
+    await scalper.place("BANKNIFTY", plan(bank), [bank], { setupId: "x" });
+    expect((await scalper.snapshot("NIFTY")).positions).toHaveLength(0); // the desk's NIFTY view
+    const all = await scalper.snapshot();
+    expect(all.positions).toHaveLength(1);
+    expect(all.positions[0]).toMatchObject({ underlying: "BANKNIFTY", stop: 114.1, target: 133.95, trail: { stage: "INITIAL" } });
+  });
 });
 
 function harness(overrides: Partial<AutoTraderDeps> = {}, clock = "10:05") {

@@ -952,7 +952,8 @@ export class SmartScalper {
     });
   }
 
-  snapshot(underlying: string) {
+  /** The book for one index, or every index when `underlying` is omitted. */
+  snapshot(underlying?: string) {
     return this.serial(async () => { await this.hydrate(); this.rollDay(); return { ...this.state(underlying), decision: this.lastDecision, summary: "" }; });
   }
 
