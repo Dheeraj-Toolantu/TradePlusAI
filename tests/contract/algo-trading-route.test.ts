@@ -109,6 +109,17 @@ describe("algo trading execution boundary", () => {
     await expect(response.json()).resolves.toMatchObject({ placed: false, error: expect.stringContaining("index options") });
   });
 
+  it("switches server-side auto-execution on and off per index", async () => {
+    const { resetVwapAutoTrader } = await import("../../apps/web/lib/vwap-auto-trader");
+    resetVwapAutoTrader();
+    const on = await (await POST(requestFor({ action: "AUTO_TRADER", underlying: "NIFTY", enabled: true, riskReward: "1:1" }))).json();
+    expect(on.autoTrader).toMatchObject({ enabled: true, indices: ["NIFTY"], riskReward: "1:1" });
+    const off = await (await POST(requestFor({ action: "AUTO_TRADER", underlying: "NIFTY", enabled: false }))).json();
+    expect(off.autoTrader).toMatchObject({ enabled: false, indices: [] });
+    expect((await POST(requestFor({ action: "AUTO_TRADER", underlying: "RELIANCE", enabled: true }))).status).toBe(400);
+    resetVwapAutoTrader();
+  });
+
   it("never places on the scalper while the kill switch is on", async () => {
     process.env.ALGO_KILL_SWITCH = "true";
     try {

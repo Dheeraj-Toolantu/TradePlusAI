@@ -59,7 +59,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -73,6 +73,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   vwapScalp?: VwapScalpSignal | null;
   /** Place the confirmed VWAP-EMA scalp in this book (the server re-checks every gate). */
   onPlaceVwapScalp?: (origin: "AUTO" | "MANUAL") => Promise<{ placed: boolean; error?: string }>;
+  /** Server-side auto-execution of the VWAP-EMA scalper (the algo page owns it); "Automatic" drives it. */
+  vwapAuto?: { enabled: boolean; status: string; onChange: (enabled: boolean) => void } | null;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -245,9 +247,13 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
       setNotice(result.placed ? `VWAP-EMA scalp ${origin === "AUTO" ? "auto-placed" : "placed"}: BUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · T ₹${money(vwapScalp.plan?.target)}. Stop trails: breakeven at +0.5R, +0.5R locked at +1R, then 0.6R under the best premium.` : `VWAP-EMA scalp not placed: ${result.error ?? "refused"}`);
     } finally { setPlacing(false); }
   }, [instant, onPlaceVwapScalp, placing, vwapScalp]);
+  // VWAP-EMA automatic entries are placed by the server (see lib/vwap-auto-trader.ts), so a closed or
+  // sleeping tab never misses one and a setup is never sent twice. Without the algo page's switch
+  // (vwapAuto), the desk's own Automatic mode still places them from here.
   useEffect(() => {
-    if (vwapMode && auto && vwapScalp?.confirmed && vwapScalp.setupId && !attempted.current.has(vwapScalp.setupId)) void placeVwap("AUTO");
-  }, [auto, placeVwap, vwapMode, vwapScalp]);
+    if (!vwapAuto && vwapMode && auto && vwapScalp?.confirmed && vwapScalp.setupId && !attempted.current.has(vwapScalp.setupId)) void placeVwap("AUTO");
+  }, [auto, placeVwap, vwapAuto, vwapMode, vwapScalp]);
+  const vwapAutomatic = vwapMode && vwapAuto ? vwapAuto.enabled : tradeMode === "AUTOMATIC";
   const vwapReady = Boolean(vwapScalp?.confirmed && vwapScalp.setupId && !attempted.current.has(vwapScalp.setupId));
 
   const exit = useCallback(async (ids: string[] | "ALL") => {
@@ -412,11 +418,15 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
           <span className="scalper-trade-mode" role="radiogroup" aria-label="Trade selection">
             <small>Trade</small>
             {(["AUTOMATIC", "MANUAL"] as const).map((value) => (
-              <button key={value} type="button" role="radio" aria-checked={tradeMode === value} className={tradeMode === value ? "on" : ""} onClick={() => { setTradeMode(value); setNotice(value === "AUTOMATIC" ? "Automatic: the engine enters its own signals within your risk limits." : "Manual: the engine only signals; press Take trade to enter, or use the Buy/Sell cards."); }}>{value === "AUTOMATIC" ? "Automatic" : "Manual"}</button>
+              <button key={value} type="button" role="radio" aria-checked={(vwapMode ? vwapAutomatic : tradeMode === "AUTOMATIC") === (value === "AUTOMATIC")} className={(vwapMode ? vwapAutomatic : tradeMode === "AUTOMATIC") === (value === "AUTOMATIC") ? "on" : ""} onClick={() => {
+                setTradeMode(value);
+                if (vwapMode && vwapAuto) { vwapAuto.onChange(value === "AUTOMATIC"); return; }
+                setNotice(value === "AUTOMATIC" ? "Automatic: the engine enters its own signals within your risk limits." : "Manual: the engine only signals; press Take trade to enter, or use the Buy/Sell cards.");
+              }}>{value === "AUTOMATIC" ? "Automatic" : "Manual"}</button>
             ))}
           </span>
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
-          {engineOn && tradeMode === "MANUAL" && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 8 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
+          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 8 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -433,9 +443,10 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
 
         {vwapMode ? (
           <div className={`scalper-engine ${vwapScalp?.confirmed ? "scalper-engine-live" : ""}`}>
-            <span className={`scalper-mode scalper-mode-${vwapScalp?.confirmed ? "scalp" : "wait"}`}>{engineOn ? `VWAP-EMA · ${vwapScalp?.confirmed ? "CONFIRMED" : "WAITING"} · ${tradeMode === "AUTOMATIC" ? "AUTO" : "MANUAL"}` : "ENGINE OFF"}</span>
+            <span className={`scalper-mode scalper-mode-${vwapScalp?.confirmed ? "scalp" : "wait"}`}>{engineOn || vwapAutomatic ? `VWAP-EMA · ${vwapScalp?.confirmed ? "CONFIRMED" : "WAITING"} · ${vwapAutomatic ? (vwapAuto ? "AUTO (server)" : "AUTO") : "MANUAL"}` : "ENGINE OFF"}</span>
             {vwapScalp?.side ? <span className={vwapScalp.side === "CE" ? "scalper-side gain" : "scalper-side loss"}>{vwapScalp.side === "CE" ? "CE · long" : "PE · short"}</span> : null}
             {vwapScalp ? <span className="scalper-read">criteria {vwapScalp.criteriaMet}/{vwapScalp.criteriaTotal}{vwapScalp.waitingOn.length ? ` · waiting on ${vwapScalp.waitingOn.join(", ")}` : ""}{vwapScalp.selected ? ` · OI pick ${vwapScalp.selected.strike} ${vwapScalp.selected.type}` : ""}</span> : <span className="scalper-read">waiting for the VWAP-EMA engine…</span>}
+            {vwapAuto?.enabled && vwapAuto.status ? <p className="scalper-auto-status">⚡ {vwapAuto.status}</p> : null}
             <p>{notice}</p>
             {vwapScalp?.plan ? (
               <div className="scalper-plan">

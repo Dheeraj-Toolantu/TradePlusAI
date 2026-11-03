@@ -8,6 +8,7 @@ import type { TradePlan } from "../../components/market-intel/market-intel-panel
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
 import type { ChartBar, ChartLevel, RiskRewardBox } from "../../components/scalper/premium-chart";
 import type { VwapScalpSignal } from "../../components/scalper/scalper-desk";
+import type { vwapAutoTraderStatus } from "../../lib/vwap-auto-trader";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
 
@@ -85,6 +86,7 @@ const RR_CHOICES: Array<{ id: RiskReward; name: string }> = [
 ];
 const SCALPER_SETTINGS_KEY = "tradepulse.scalper.settings";
 const STRATEGY_PREFS_KEY = "tradepulse.scalp.prefs";
+type AutoTrader = ReturnType<typeof vwapAutoTraderStatus>;
 type ScalperLimits = { maxTrades?: number; maxLossPerTrade?: number; maxDailyLoss?: number; lots?: number; minRiskReward?: number; mode?: string; maxHoldMinutes?: number };
 function readLocal<T>(key: string, fallback: T): T {
   try { const raw = window.localStorage.getItem(key); return raw ? { ...fallback, ...JSON.parse(raw) } : fallback; } catch { return fallback; }
@@ -132,6 +134,9 @@ export default function ExecutionPage() {
   // Per-viewer preferences: the chosen reward:risk and whether confirmed scalps are auto-placed.
   const [riskReward, setRiskReward] = useState<RiskReward>("1:2");
   const [scalperRefresh, setScalperRefresh] = useState(0);
+  // Server-side auto-execution of the VWAP-EMA scalper (runs with or without this page open).
+  const [autoTrader, setAutoTrader] = useState<AutoTrader | null>(null);
+  const seenPlacement = useRef<string | null>(null);
   const [premiumBars, setPremiumBars] = useState<ChartBar[]>([]);
   const attemptedSetups = useRef(new Set<string>());
   useEffect(() => { const prefs = readLocal(STRATEGY_PREFS_KEY, { riskReward: "1:2" as RiskReward }); setRiskReward(prefs.riskReward === "1:1" ? "1:1" : "1:2"); }, []);
@@ -188,6 +193,7 @@ export default function ExecutionPage() {
       const limits = readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {});
       const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&rr=${encodeURIComponent(riskReward)}${limits.maxLossPerTrade ? `&maxLoss=${limits.maxLossPerTrade}` : ""}${limits.lots ? `&lots=${limits.lots}` : ""}`, { cache: "no-store" }).then((response) => response.json());
       setAnalysis(data.analysis ?? null);
+      if (data.autoTrader) setAutoTrader(data.autoTrader as AutoTrader);
       setAccount(data.account ?? null);
       setSafety({ safeMode: Boolean(data.safeMode), killSwitch: Boolean(data.killSwitch), reason: data.killSwitchReason ?? data.safeModeReason ?? "" });
       if (version === mutationVersion.current) {
@@ -594,6 +600,36 @@ export default function ExecutionPage() {
     document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [analysis, riskReward, symbol]);
 
+  // A trade the server placed while this page was open (or since the last refresh): show it on the desk.
+  useEffect(() => {
+    const placed = autoTrader?.lastPlacedAt ?? null;
+    if (!placed || placed === seenPlacement.current) return;
+    const first = seenPlacement.current === null;
+    seenPlacement.current = placed;
+    setScalperRefresh((value) => value + 1);
+    if (!first) {
+      const event = autoTrader?.events.find((item) => item.status === "PLACED");
+      log(`[Auto-execute] ${event?.text ?? "VWAP-EMA trade placed on the Smart Scalper"}`, "entry");
+    }
+  }, [autoTrader, log]);
+  const autoOn = Boolean(autoTrader?.enabled && autoTrader.indices.includes(symbol));
+  const toggleAutoTrader = useCallback(async (enabled: boolean) => {
+    try {
+      const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "AUTO_TRADER", underlying: symbol, enabled, riskReward, settings: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}) }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) { setMessage(data.error ?? "Auto-execute update failed"); return; }
+      setAutoTrader(data.autoTrader as AutoTrader);
+      const text = enabled
+        ? `Auto-execute ON for ${symbol}: the server places each confirmed VWAP-EMA setup on the Smart Scalper (paper), even with this page closed. One trade at a time: no new entry until the open trade exits at its target, SL or trailing SL.`
+        : `Auto-execute OFF for ${symbol}. Open positions are still managed on the server.`;
+      setMessage(text);
+      log(`[Auto-execute] ${text}`, "info");
+    } catch { setMessage("Auto-execute update failed"); }
+  }, [log, riskReward, symbol]);
+  const autoStatus = !autoTrader ? "" : autoTrader.openTrade
+    ? `Trade open: BUY ${autoTrader.openTrade.label} on ${autoTrader.openTrade.underlying} · SL ₹${money(autoTrader.openTrade.stop)} · T ₹${money(autoTrader.openTrade.target)}${autoTrader.openTrade.stage ? ` (${autoTrader.openTrade.stage.toLowerCase()})` : ""} — no new trade until it exits at its target, SL or trailing SL`
+    : autoOn ? (autoTrader.lastByIndex[symbol]?.text ?? "Watching: checks a few seconds after every 1-minute close") : "";
+
   // ---- place on the Smart Scalper (paper) --------------------------------------------------
   // The server re-runs the scalper and every V5 gate before it places anything; the scalper book's
   // own limits (trade cap, max loss, daily loss, loss streak, one position, 15:15) still apply.
@@ -738,6 +774,11 @@ export default function ExecutionPage() {
                 <button type="button" className="mi-use-plan" onClick={loadStrategySetup}>Load into the order ticket</button>
               </div>
             )}
+            <div className={`exec-auto${autoOn ? " on" : ""}`} role="group" aria-label="Auto-execute on the Smart Scalper">
+              <label className="exec-auto-switch"><input type="checkbox" checked={autoOn} onChange={(event) => void toggleAutoTrader(event.target.checked)} /><span /> <b>Auto-execute on Scalper</b> <small>{symbol} · paper · {riskReward}</small></label>
+              <span className="exec-auto-status">{autoOn || autoTrader?.openTrade ? autoStatus : "Off: confirmed setups wait for you to place them. Turn on to let the server place them automatically, one trade at a time."}</span>
+              {autoTrader?.enabled && autoTrader.indices.some((index) => index !== symbol) ? <small className="mi-note">Also auto-executing: {autoTrader.indices.filter((index) => index !== symbol).join(", ")}</small> : null}
+            </div>
             <div className="exec-score">
               {(scalp?.criteria ?? []).map((item) => (
                 <span key={item.key} className={item.passed ? "pass" : "fail"} title={item.detail}><small>{item.name}</small><b className={item.passed ? "gain" : "warning"}>{item.points} / {item.max}</b></span>
@@ -817,7 +858,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

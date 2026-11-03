@@ -666,6 +666,10 @@ export class SmartScalper {
       const now = this.clock();
       const weekday = new Date(now.getTime() + 330 * 60_000).getUTCDay();
       if (weekday === 0 || weekday === 6 || istMinutes(now) < MARKET_OPEN) return { ...this.state(underlying), placed: false, error: "Scalper entries are open 09:15-15:15 IST on trading days." };
+      // One VWAP-EMA trade at a time on ANY index: the next entry waits until the open trade exits
+      // (target, SL or trailing SL; or a time / momentum / 15:15 / manual exit).
+      const open = this.openEngineTrade();
+      if (open) return { ...this.state(underlying), placed: false, blockedByOpenTrade: true, error: `A trade is already open (BUY ${open.label} on ${open.underlying}, SL ₹${open.stop ?? "--"} · T ₹${open.target ?? "--"}): no new trade until it exits at its target, SL or trailing SL.` };
       const block = this.entryBlock(underlying, settings, input.entryBlockedReason);
       if (block) return { ...this.state(underlying), placed: false, error: `Entry blocked: ${block}` };
       if (!plan.legs.length || !(plan.quantity > 0) || !(plan.stop > 0) || !(plan.target > plan.entry) || !(plan.entry > plan.stop)) return { ...this.state(underlying), placed: false, error: "The scalp plan needs one leg, a quantity, and a stop below and a target above the entry." };
@@ -723,6 +727,17 @@ export class SmartScalper {
       const exited = this.positions.filter((position) => before.has(position.id) && position.status === "EXITED").map((position) => this.view(position));
       return { ...this.state(input.symbol), exited };
     });
+  }
+
+  /** The open engine trade (SCALP / HEDGE, any index), or null: the one-at-a-time rule for VWAP-EMA entries. */
+  openEngineTrade(): PositionView | null {
+    const open = this.positions.find((position) => position.status === "OPEN" && position.kind !== "MANUAL");
+    return open ? this.view(open) : null;
+  }
+
+  /** Same, after loading persisted positions (a fresh server process). */
+  currentEngineTrade() {
+    return this.serial(async () => { await this.hydrate(); return this.openEngineTrade(); });
   }
 
   /** Open positions grouped by underlying, with their leg symbols (for the exit monitor). */
