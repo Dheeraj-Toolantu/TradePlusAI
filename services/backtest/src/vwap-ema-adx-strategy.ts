@@ -1,5 +1,8 @@
 import type { Bar } from "../../ai-monitoring/src/mtf-decision-engine";
 import { istDay, type Signal } from "./strategy-backtest";
+import { adxSeries } from "./indicators";
+
+export { adxSeries };
 
 /**
  * VWAP + 5/9 EMA + ADX scalper, replayed on 1-minute index bars for the backtester.
@@ -50,30 +53,6 @@ function emaSeries(values: number[], period: number) {
   const out: number[] = [];
   const k = 2 / (period + 1);
   values.forEach((value, index) => out.push(index === 0 ? value : (value - out[index - 1]) * k + out[index - 1]));
-  return out;
-}
-
-/** Wilder ADX with +DI / −DI per bar (null until 2 x period bars), as scalp_strategy.adx_series. */
-export function adxSeries(bars: Bar[], period: number): Array<[number, number, number] | null> {
-  const out: Array<[number, number, number] | null> = bars.map(() => null);
-  if (period <= 0 || bars.length < 2 * period) return out;
-  let tr = 0; let pdm = 0; let mdm = 0; let adx: number | null = null;
-  const dx: number[] = [];
-  for (let i = 1; i < bars.length; i += 1) {
-    const cur = bars[i]; const prev = bars[i - 1];
-    const up = cur.high - prev.high; const down = prev.low - cur.low;
-    const t = Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close));
-    const p = up > down && up > 0 ? up : 0;
-    const m = down > up && down > 0 ? down : 0;
-    if (i <= period) { tr += t; pdm += p; mdm += m; if (i < period) continue; }
-    else { tr = tr - tr / period + t; pdm = pdm - pdm / period + p; mdm = mdm - mdm / period + m; }
-    const plus = tr > 0 ? 100 * pdm / tr : 0;
-    const minus = tr > 0 ? 100 * mdm / tr : 0;
-    dx.push(plus + minus > 0 ? 100 * Math.abs(plus - minus) / (plus + minus) : 0);
-    if (adx === null) { if (dx.length < period) continue; adx = dx.reduce((sum, value) => sum + value, 0) / period; }
-    else adx = (adx * (period - 1) + dx[dx.length - 1]) / period;
-    out[i] = [adx, plus, minus];
-  }
   return out;
 }
 
@@ -189,7 +168,7 @@ export function vwapEmaAdxSignalSource(_symbol: string, minute: Bar[]) {
     const [adxValue, plusDi, minusDi] = adx;
     const at = new Date((bar(trigger.k).time + 330 * 60) * 1000).toISOString().slice(11, 16);
     return {
-      time: minute[index].time, side, stop: Math.round(stop * 100) / 100,
+      time: minute[index].time + 60, side, stop: Math.round(stop * 100) / 100, // decided at the bar's close
       // The simulator re-derives the target from the fill (fill ± k·R, k = settings.scalpRiskReward),
       // as the live scalper does; this is the 1:2 plan at the signal close.
       target1: Math.round((close + 2 * risk * d) * 100) / 100, target2: null,

@@ -7,6 +7,7 @@ import { RiskRewardPrimitive, type RiskRewardBox } from "./risk-reward-primitive
 import { SmcOverlayPrimitive, type SmcLayers } from "./smc-overlay-primitive";
 import { computeSmcOverlays } from "./smc-overlays";
 import { regroup, supportResistance, type SrBar, type SrLevel } from "./sr-levels";
+import { adxSeries } from "../../../../services/backtest/src/indicators";
 
 /** Support/resistance timeframes, highest first. `minutes` 0 = built from daily candles. */
 const SR_FRAMES = [
@@ -58,6 +59,18 @@ const EMA_COLOR = "#eebd54";
 /** The 9 EMA the SMC liquidity-sweep strategy confirms its trend with (15m) and measures value against (5m). */
 const EMA9_COLOR = "#7aa2ff";
 const VWAP_COLOR = "#b493f5";
+const EMA5_COLOR = "#f08cb8";
+const EMA21_COLOR = "#5fd4a0";
+const ADX_COLOR = "#e4f1f1";
+const PLUS_DI_COLOR = "#22d59b";
+const MINUS_DI_COLOR = "#fa6b78";
+/** Indicator toggles (EMA 5, EMA 21, the ADX pane), remembered per browser. */
+const INDICATORS_KEY = "tradepulse.backtest.indicators";
+type IndicatorToggles = { ema5: boolean; ema21: boolean; adx: boolean };
+const INDICATORS_DEFAULT: IndicatorToggles = { ema5: false, ema21: false, adx: false };
+function loadIndicators(): IndicatorToggles {
+  try { return { ...INDICATORS_DEFAULT, ...JSON.parse(window.localStorage.getItem(INDICATORS_KEY) ?? "{}") }; } catch { return INDICATORS_DEFAULT; }
+}
 const ENTRY_COLOR = "#e4f1f1";
 
 const istDay = (epochS: number) => new Date((epochS + IST_S) * 1000).toISOString().slice(0, 10);
@@ -108,7 +121,7 @@ const legReason = (reason: string) => LEG_LABEL[reason] ?? reason;
 /** Exit legs are stamped at the END of the 1-minute bar that filled them; markers go on that bar. */
 const fillBar = (exitEpochS: number) => exitEpochS - 60;
 
-type Legend = { bar: Bar; ema9?: number; ema?: number; vwap?: number };
+type Legend = { bar: Bar; ema9?: number; ema?: number; vwap?: number; ema5?: number; ema21?: number; adx?: [number, number, number] | null };
 /** Replay of one session: `cursor` is the number of base candles of that day already printed. */
 type Replay = { day: string; cursor: number; playing: boolean; speed: number };
 const SPEEDS = [1, 3, 10, 30, 60];
@@ -121,6 +134,13 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const [showEma, setShowEma] = useState(true);
   const [showVwap, setShowVwap] = useState(true);
   const [showTrades, setShowTrades] = useState(true);
+  const [indicators, setIndicators] = useState<IndicatorToggles>(INDICATORS_DEFAULT);
+  useEffect(() => { setIndicators(loadIndicators()); }, []);
+  const toggleIndicator = (key: keyof IndicatorToggles) => setIndicators((current) => {
+    const next = { ...current, [key]: !current[key] };
+    try { window.localStorage.setItem(INDICATORS_KEY, JSON.stringify(next)); } catch { /* storage unavailable: keep in memory */ }
+    return next;
+  });
   const [legend, setLegend] = useState<Legend | null>(null);
   const [replay, setReplay] = useState<Replay | null>(null);
   const [replayPick, setReplayPick] = useState("");
@@ -148,6 +168,9 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const ema9Series = useRef<ISeriesApi<"Line"> | null>(null);
   const emaSeries = useRef<ISeriesApi<"Line"> | null>(null);
   const vwapSeries = useRef<ISeriesApi<"Line"> | null>(null);
+  const ema5Series = useRef<ISeriesApi<"Line"> | null>(null);
+  const ema21Series = useRef<ISeriesApi<"Line"> | null>(null);
+  const adxLines = useRef<{ adx: ISeriesApi<"Line">; plus: ISeriesApi<"Line">; minus: ISeriesApi<"Line">; pane: number } | null>(null);
   const markers = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const boxes = useRef<RiskRewardPrimitive | null>(null);
   const smcLayer = useRef<SmcOverlayPrimitive | null>(null);
@@ -177,6 +200,10 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   const ema9Values = useMemo(() => ema(bars, 9), [bars]);
   const emaValues = useMemo(() => ema(bars, 20), [bars]);
   const vwapValues = useMemo(() => vwap(bars), [bars]);
+  const ema5Values = useMemo(() => ema(bars, 5), [bars]);
+  const ema21Values = useMemo(() => ema(bars, 21), [bars]);
+  // ADX(14) with +DI / −DI (Wilder) on the candles on screen, so a replay only sees the past.
+  const adxValues = useMemo(() => (indicators.adx ? adxSeries(bars, 14) : []), [bars, indicators.adx]);
   const hasVolume = useMemo(() => candles.some((row) => row[5] > 0), [candles]);
   const days = useMemo(() => [...new Set(bars.map((bar) => istDay(bar.time)))], [bars]);
   const indexByTime = useMemo(() => new Map(bars.map((bar, index) => [bar.time, index])), [bars]);
@@ -189,8 +216,8 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     }), [sorted, cutoff]);
   const focused = sorted.find((trade) => trade.id === focusId) ?? null;
   const focusIndex = focused ? sorted.indexOf(focused) : -1;
-  const lookup = useRef({ bars, ema9Values, emaValues, vwapValues, indexByTime });
-  lookup.current = { bars, ema9Values, emaValues, vwapValues, indexByTime };
+  const lookup = useRef({ bars, ema9Values, emaValues, vwapValues, ema5Values, ema21Values, adxValues, indexByTime });
+  lookup.current = { bars, ema9Values, emaValues, vwapValues, ema5Values, ema21Values, adxValues, indexByTime };
 
   // Create the chart once (re-created only if the feed gains/loses volume, which adds a pane).
   useEffect(() => {
@@ -209,6 +236,8 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     ema9Series.current = instance.addSeries(LineSeries, { color: EMA9_COLOR, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
     emaSeries.current = instance.addSeries(LineSeries, { color: EMA_COLOR, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
     vwapSeries.current = instance.addSeries(LineSeries, { color: VWAP_COLOR, lineWidth: 2, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+    ema5Series.current = instance.addSeries(LineSeries, { color: EMA5_COLOR, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false });
+    ema21Series.current = instance.addSeries(LineSeries, { color: EMA21_COLOR, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: false });
     volumeSeries.current = hasVolume ? instance.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceLineVisible: false, lastValueVisible: false }, 1) : null;
     if (hasVolume) instance.panes()[1]?.setHeight(84);
     markers.current = createSeriesMarkers(candleSeries.current, [], { zOrder: "top" });
@@ -217,14 +246,14 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     boxes.current = new RiskRewardPrimitive();
     candleSeries.current.attachPrimitive(boxes.current);
     const onMove = (param: MouseEventParams<Time>) => {
-      const { bars: list, ema9Values: e9, emaValues: e, vwapValues: v, indexByTime: map } = lookup.current;
+      const { bars: list, ema9Values: e9, emaValues: e, vwapValues: v, ema5Values: e5, ema21Values: e21, adxValues: a, indexByTime: map } = lookup.current;
       const index = param.time === undefined ? list.length - 1 : map.get((param.time as number) - IST_S);
       if (index === undefined || !list[index]) return;
-      setLegend({ bar: list[index], ema9: e9[index], ema: e[index], vwap: v[index] });
+      setLegend({ bar: list[index], ema9: e9[index], ema: e[index], vwap: v[index], ema5: e5[index], ema21: e21[index], adx: a[index] ?? null });
     };
     instance.subscribeCrosshairMove(onMove);
     chart.current = instance;
-    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; ema9Series.current = null; emaSeries.current = null; vwapSeries.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; srLines.current = []; };
+    return () => { instance.unsubscribeCrosshairMove(onMove); instance.remove(); chart.current = null; candleSeries.current = null; volumeSeries.current = null; ema9Series.current = null; emaSeries.current = null; vwapSeries.current = null; ema5Series.current = null; ema21Series.current = null; adxLines.current = null; markers.current = null; boxes.current = null; smcLayer.current = null; priceLines.current = []; srLines.current = []; };
   }, [hasVolume]);
 
   // Price, volume and indicator data.
@@ -235,8 +264,41 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
     ema9Series.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: ema9Values[index] })));
     emaSeries.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: emaValues[index] })));
     vwapSeries.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: vwapValues[index] })));
-    if (bars.length) setLegend({ bar: bars.at(-1)!, ema9: ema9Values.at(-1), ema: emaValues.at(-1), vwap: vwapValues.at(-1) });
-  }, [bars, ema9Values, emaValues, vwapValues, hasVolume]);
+    ema5Series.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: ema5Values[index] })));
+    ema21Series.current?.setData(bars.map((bar, index) => ({ time: chartTime(bar.time), value: ema21Values[index] })));
+    if (bars.length) setLegend({ bar: bars.at(-1)!, ema9: ema9Values.at(-1), ema: emaValues.at(-1), vwap: vwapValues.at(-1), ema5: ema5Values.at(-1), ema21: ema21Values.at(-1), adx: adxValues.at(-1) ?? null });
+  }, [bars, ema9Values, emaValues, vwapValues, ema5Values, ema21Values, adxValues, hasVolume]);
+
+  // ADX pane: created under the price (and volume) panes when switched on, removed when off.
+  useEffect(() => {
+    const instance = chart.current;
+    if (!instance) return;
+    if (!indicators.adx) {
+      const lines = adxLines.current;
+      if (lines) {
+        instance.removeSeries(lines.adx); instance.removeSeries(lines.plus); instance.removeSeries(lines.minus);
+        if (instance.panes().length > lines.pane) instance.removePane(lines.pane);
+        adxLines.current = null;
+      }
+      return;
+    }
+    if (!adxLines.current) {
+      const pane = hasVolume ? 2 : 1;
+      const base = { lineWidth: 1, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false, priceFormat: { type: "price", precision: 1, minMove: 0.1 } } as const;
+      const adx = instance.addSeries(LineSeries, { ...base, color: ADX_COLOR, lineWidth: 2, title: "ADX 14" }, pane);
+      const plus = instance.addSeries(LineSeries, { ...base, color: PLUS_DI_COLOR, title: "+DI" }, pane);
+      const minus = instance.addSeries(LineSeries, { ...base, color: MINUS_DI_COLOR, title: "−DI" }, pane);
+      adx.createPriceLine({ price: 25, color: "rgba(238,189,84,.7)", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "25" });
+      adx.createPriceLine({ price: 20, color: "rgba(142,173,178,.5)", lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: "20" });
+      instance.panes()[pane]?.setHeight(110);
+      adxLines.current = { adx, plus, minus, pane };
+    }
+    const lines = adxLines.current;
+    const point = (bar: Bar, value: number | undefined) => (value === undefined ? { time: chartTime(bar.time) } : { time: chartTime(bar.time), value });
+    lines.adx.setData(bars.map((bar, index) => point(bar, adxValues[index]?.[0])));
+    lines.plus.setData(bars.map((bar, index) => point(bar, adxValues[index]?.[1])));
+    lines.minus.setData(bars.map((bar, index) => point(bar, adxValues[index]?.[2])));
+  }, [indicators.adx, adxValues, bars, hasVolume]);
 
   // Smart-money overlays, computed from the candles on screen (so a replay only sees the past).
   const anyLayer = layers.fvg || layers.ob || layers.liquidity || layers.structure;
@@ -284,6 +346,8 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
   useEffect(() => { ema9Series.current?.applyOptions({ visible: showEma9 }); }, [showEma9, hasVolume]);
   useEffect(() => { emaSeries.current?.applyOptions({ visible: showEma }); }, [showEma, hasVolume]);
   useEffect(() => { vwapSeries.current?.applyOptions({ visible: showVwap }); }, [showVwap, hasVolume]);
+  useEffect(() => { ema5Series.current?.applyOptions({ visible: indicators.ema5 }); }, [indicators.ema5, hasVolume]);
+  useEffect(() => { ema21Series.current?.applyOptions({ visible: indicators.ema21 }); }, [indicators.ema21, hasVolume]);
 
   // Entry arrows and exit dots at the exact fill prices.
   useEffect(() => {
@@ -463,6 +527,9 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
           <button type="button" className={showEma9 ? "on" : ""} aria-pressed={showEma9} onClick={() => setShowEma9(!showEma9)}><i style={{ background: EMA9_COLOR }} />EMA 9</button>
           <button type="button" className={showEma ? "on" : ""} aria-pressed={showEma} onClick={() => setShowEma(!showEma)}><i style={{ background: EMA_COLOR }} />EMA 20</button>
           <button type="button" className={showVwap ? "on" : ""} aria-pressed={showVwap} onClick={() => setShowVwap(!showVwap)}><i className="dashed" style={{ borderColor: VWAP_COLOR }} />VWAP</button>
+          <button type="button" className={indicators.ema5 ? "on" : ""} aria-pressed={indicators.ema5} onClick={() => toggleIndicator("ema5")}><i style={{ background: EMA5_COLOR }} />EMA 5</button>
+          <button type="button" className={indicators.ema21 ? "on" : ""} aria-pressed={indicators.ema21} onClick={() => toggleIndicator("ema21")}><i style={{ background: EMA21_COLOR }} />EMA 21</button>
+          <button type="button" className={indicators.adx ? "on" : ""} aria-pressed={indicators.adx} onClick={() => toggleIndicator("adx")} title="ADX(14) with +DI / −DI in a pane under the price (dashed line at 25, dotted at 20)"><i style={{ background: ADX_COLOR }} />ADX</button>
           <button type="button" className={showTrades ? "on" : ""} aria-pressed={showTrades} onClick={() => setShowTrades(!showTrades)}>Trades</button>
         </div>
         <fieldset className="bt-smc-layers" aria-label="Smart-money overlays">
@@ -543,6 +610,9 @@ export function BacktestCandles({ symbol, candles, candleMinutes = 1, replayMinu
             {showEma9 && legend.ema9 !== undefined ? <span className="opt" style={{ color: EMA9_COLOR }}>EMA9 {fmt(legend.ema9)}</span> : null}
             {showEma && legend.ema !== undefined ? <span className="opt" style={{ color: EMA_COLOR }}>EMA20 {fmt(legend.ema)}</span> : null}
             {showVwap && legend.vwap !== undefined ? <span className="opt" style={{ color: VWAP_COLOR }}>VWAP {fmt(legend.vwap)}</span> : null}
+            {indicators.ema5 && legend.ema5 !== undefined ? <span className="opt" style={{ color: EMA5_COLOR }}>EMA5 {fmt(legend.ema5)}</span> : null}
+            {indicators.ema21 && legend.ema21 !== undefined ? <span className="opt" style={{ color: EMA21_COLOR }}>EMA21 {fmt(legend.ema21)}</span> : null}
+            {indicators.adx && legend.adx ? <span className="opt">ADX <b>{legend.adx[0].toFixed(1)}</b> <span style={{ color: PLUS_DI_COLOR }}>+DI {legend.adx[1].toFixed(1)}</span> <span style={{ color: MINUS_DI_COLOR }}>−DI {legend.adx[2].toFixed(1)}</span></span> : null}
           </div>
         ) : null}
         <div ref={host} className="bt-candles-canvas" />

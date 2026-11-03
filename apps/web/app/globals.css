@@ -1281,3 +1281,12 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .pos-next { padding: 5px 7px; border-radius: 5px; background: #142024; color: #b9c8cc; }
 .scalper-positions { gap: 8px; max-height: 680px; }
 .bt-hint { grid-column: 1 / -1; color: var(--muted, #8a9ba0); font-size: 11px; line-height: 1.4; }
+/* Backtest: segments, sensitivity rows and provenance. */
+.bt-segments { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px 18px; align-items: start; }
+.bt-table tr.bt-row-current td { background: rgba(48, 212, 202, .07); }
+.bt-table tr.bt-row-baseline td { border-top: 1px solid rgba(65, 116, 125, .4); color: var(--muted, #8eadb2); }
+.bt-provenance { display: grid; gap: 6px; margin: 0; }
+.bt-provenance div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; font-size: 12px; }
+.bt-provenance dt { color: var(--muted, #8eadb2); }
+.bt-provenance dd { margin: 0; overflow-wrap: anywhere; }
+.bt-provenance code { font-family: "DM Mono", monospace; }

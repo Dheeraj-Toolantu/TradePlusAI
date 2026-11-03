@@ -6,7 +6,7 @@ const post = (body: Record<string, unknown>) => POST(new Request("http://localho
 describe("backtest route", () => {
   it("lists strategies and defaults", async () => {
     const body = await (await GET()).json();
-    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "SMC_PLUS", "TREND_PULLBACK", "SMART_COMBO", "VWAP_EMA_ADX"]);
+    expect(body.strategies.map((s: { id: string }) => s.id)).toEqual(["MTF_AI", "ORB_RETEST", "ORB_PRO", "SMC_SWEEP", "SMC_PLUS", "TREND_PULLBACK", "SMART_COMBO", "VWAP_EMA_ADX", "VWAP_EMA_ADX_SPEC"]);
     expect(body.defaults).toMatchObject({ adxMin: 20, scalpRiskReward: 2 });
     expect(body.defaults).toMatchObject({ maxTradesPerDay: 3, squareOff: "15:15" });
   });
@@ -28,6 +28,30 @@ describe("backtest route", () => {
     expect(late.status).toBe(400);
     expect((await late.json()).error).toMatch(/before the square-off/);
     expect((await post({ strategy: "MTF_AI", symbol: "NIFTY", from: "2026-09-21", to: "2026-09-25", source: "synthetic", settings: { entryStart: "13:00", entryEnd: "10:00" } })).status).toBe(400);
+  });
+
+  it("runs the VWAP-EMA-ADX spec v1.0 with research, data quality and provenance", { timeout: 60_000 }, async () => {
+    const response = await post({ strategy: "VWAP_EMA_ADX_SPEC", symbol: "NIFTY", from: "2026-09-21", to: "2026-09-25", source: "synthetic",
+      settings: { specTimeframe: "5", specAdxThreshold: 25, specRiskPoints: 20, specRewardMultiple: 2, specEmaExit: "true", specVwapMode: "TIME_WEIGHTED", pnlMode: "POINTS" } });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.settings).toMatchObject({ specTimeframe: 5, specAdxThreshold: 25, specRiskPoints: 20, specRewardMultiple: 2, specEmaExit: true, specVwapMode: "TIME_WEIGHTED" });
+    expect(body.provenance).toMatchObject({ strategy: "VWAP_EMA_ADX_SPEC", strategyVersion: expect.stringContaining("v1.0"), from: "2026-09-21", to: "2026-09-25" });
+    expect(body.provenance.data.hash).toMatch(/^[0-9a-f]{8}$/);
+    expect(body.dataQuality).toMatchObject({ duplicates: 0, invalidOhlc: 0 });
+    expect(body.research.sensitivity.map((row: { group: string }) => row.group)).toContain("ADX threshold");
+    expect(body.research.buyAndHold.trades).toBeGreaterThan(0);
+    expect(body.notes.some((note: string) => /Signal funnel \(5-minute candles\)/.test(note))).toBe(true);
+    expect(body.segments).toHaveProperty("byAdx");
+    for (const trade of body.trades) {
+      expect(["SL", "TARGET", "EOD", "SIGNAL_EXIT", "DATA/SAFETY"]).toContain(trade.exitReason);
+      expect(trade.adx).toBeGreaterThan(25);
+    }
+    // Same request, same result (reproducibility).
+    const again = await (await post({ strategy: "VWAP_EMA_ADX_SPEC", symbol: "NIFTY", from: "2026-09-21", to: "2026-09-25", source: "synthetic",
+      settings: { specTimeframe: "5", specAdxThreshold: 25, specRiskPoints: 20, specRewardMultiple: 2, specEmaExit: "true", specVwapMode: "TIME_WEIGHTED", pnlMode: "POINTS" } })).json();
+    expect(again.metrics).toEqual(body.metrics);
+    expect(again.provenance.data.hash).toBe(body.provenance.data.hash);
   });
 
   it("runs the VWAP-EMA-ADX scalp with its own settings and funnel", { timeout: 60_000 }, async () => {

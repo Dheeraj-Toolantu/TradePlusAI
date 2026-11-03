@@ -5,6 +5,8 @@ import { trendPullbackSignalSource } from "../../../../../services/backtest/src/
 import { smartSignalSource } from "../../../../../services/backtest/src/smart-strategy";
 import { orbProSignalSource } from "../../../../../services/backtest/src/orb-pro-strategy";
 import { vwapEmaAdxSignalSource } from "../../../../../services/backtest/src/vwap-ema-adx-strategy";
+import { SPEC_STRATEGY_VERSION, vwapEmaAdxSpecSignalSource, type SpecSignalLog } from "../../../../../services/backtest/src/vwap-ema-adx-spec-strategy";
+import { dataFingerprint, intradayBuyAndHold, specSensitivity, validateMinuteBars } from "../../../../../services/backtest/src/spec-research";
 import { optimizeSettings, precomputeSignals } from "../../../../../services/backtest/src/optimizer";
 import { BACKTEST_SYMBOLS, loadBacktestData, validateRange, validateSourceRange, type BacktestSource } from "../../../lib/backtest-data";
 import { runPythonModule } from "../../../lib/python";
@@ -18,6 +20,7 @@ const STRATEGIES: Record<StrategyId, string> = {
   TREND_PULLBACK: "Trend-day VWAP pullback (regime filter, value pullback, trailing runner)",
   SMART_COMBO: "Smart combo (regime-routed trend / ORB / SMC, AI multi-timeframe vote)",
   VWAP_EMA_ADX: "VWAP + 5/9 EMA + ADX scalp (the live scalper's tape rules; ADX above 20 on the confirmation candle)",
+  VWAP_EMA_ADX_SPEC: "VWAP–EMA(9/21)–ADX intraday, spec v1.0 (5m signals, ADX > 25 with DI direction, breakout of the previous candle, fixed-point SL / 2R target)",
 };
 /** Above this many sessions the chart gets 5-minute candles to keep the response small (about 3 months). */
 const MINUTE_CANDLE_SESSIONS = 70;
@@ -49,6 +52,12 @@ function settingsFrom(raw: Record<string, unknown>): BacktestSettings {
     squareOff: hhmm(raw.squareOff, d.squareOff),
     adxMin: clampNumber(raw.adxMin, d.adxMin, 0, 60),
     scalpRiskReward: Number(raw.scalpRiskReward) === 1 ? 1 : 2,
+    specTimeframe: Number(raw.specTimeframe) === 1 ? 1 : Number(raw.specTimeframe) === 3 ? 3 : 5,
+    specAdxThreshold: clampNumber(raw.specAdxThreshold, d.specAdxThreshold, 0, 80),
+    specRiskPoints: clampNumber(raw.specRiskPoints, d.specRiskPoints, 1, 2_000),
+    specRewardMultiple: clampNumber(raw.specRewardMultiple, d.specRewardMultiple, 0.25, 10),
+    specEmaExit: raw.specEmaExit === true || raw.specEmaExit === "true",
+    specVwapMode: raw.specVwapMode === "TIME_WEIGHTED" ? "TIME_WEIGHTED" : "STRICT",
   };
 }
 
@@ -81,6 +90,11 @@ export async function POST(request: Request) {
   // A run that ends today must not treat the 1-minute bar still forming as a completed one.
   const nowS = Math.floor(Date.now() / 1000);
   if (data.minute.length && data.minute.at(-1)!.time + 60 > nowS) data.minute = data.minute.filter((bar) => bar.time + 60 <= nowS);
+  // Input validation (spec v1.0 section 3): sorted, duplicates resolved, inconsistent OHLC dropped,
+  // missing bars counted and never filled. Applies to every strategy.
+  const validated = validateMinuteBars(data.minute, from, to);
+  data.minute = validated.bars;
+  const dataQuality = validated.quality;
   if (!data.sessions) {
     // Lead with the provider's own explanation when there is one (first issue is the missing-days list).
     const cause = data.issues.find((issue) => !issue.startsWith("No 1-minute candles for"));
@@ -100,11 +114,21 @@ export async function POST(request: Request) {
   let funnel: ReturnType<typeof smcSignalSource>["funnel"] | null = null;
   let trendFunnel: ReturnType<typeof trendPullbackSignalSource>["funnel"] | null = null;
   let scalpFunnel: ReturnType<typeof vwapEmaAdxSignalSource>["funnel"] | null = null;
+  let specFunnel: ReturnType<typeof vwapEmaAdxSpecSignalSource>["funnel"] | null = null;
+  let specLog: SpecSignalLog[] = [];
+  // One signal source per spec timeframe (sensitivity tests compare 1 / 3 / 5 minutes on the same data).
+  const specCache = new Map<number, ReturnType<typeof vwapEmaAdxSpecSignalSource>>();
+  const specSources = (timeframe: 1 | 3 | 5) => {
+    let source = specCache.get(timeframe);
+    if (!source) { source = vwapEmaAdxSpecSignalSource(symbol, data.minute, { timeframe, vwapMode: settings.specVwapMode }); specCache.set(timeframe, source); }
+    return source;
+  };
   if (strategy === "MTF_AI") signalAt = mtfSignalSource(symbol, data.minute, data.daily);
   else if (strategy === "SMC_SWEEP" || strategy === "SMC_PLUS") { const smc = smcSignalSource(symbol, data.minute, data.daily, { chochRetest: strategy === "SMC_PLUS" }); funnel = smc.funnel; signalAt = smc; }
   else if (strategy === "TREND_PULLBACK") { const trend = trendPullbackSignalSource(symbol, data.minute, data.daily); trendFunnel = trend.funnel; signalAt = trend; }
   else if (strategy === "ORB_PRO") { const pro = orbProSignalSource(symbol, data.minute, data.daily); orbProFunnel = pro.funnel; signalAt = pro; }
   else if (strategy === "VWAP_EMA_ADX") { const scalp = vwapEmaAdxSignalSource(symbol, data.minute); scalpFunnel = scalp.funnel; signalAt = scalp; }
+  else if (strategy === "VWAP_EMA_ADX_SPEC") { const spec = specSources(settings.specTimeframe); specFunnel = spec.funnel; specLog = spec.log; signalAt = spec; }
   else if (strategy === "SMART_COMBO") {
     // ORB is one of four playbooks here: if the Python replay is unavailable, run without it.
     let orb: Signal[] | null = null;
@@ -123,7 +147,22 @@ export async function POST(request: Request) {
   // Signals do not depend on the simulator's settings: compute them once, then replay cheaply.
   signalAt = precomputeSignals(data.minute, signalAt, from, to);
   const result = runBacktest({ strategy, symbol, from, to, minute: data.minute, signalAt, settings });
-  const optimization = body.optimize ? optimizeSettings({ strategy, symbol, from, to, minute: data.minute, signalAt, settings, usesConfidence: strategy !== "ORB_RETEST" && strategy !== "VWAP_EMA_ADX" }) : null;
+  const optimization = body.optimize ? optimizeSettings({ strategy, symbol, from, to, minute: data.minute, signalAt, settings, usesConfidence: strategy !== "ORB_RETEST" && strategy !== "VWAP_EMA_ADX" && strategy !== "VWAP_EMA_ADX_SPEC" }) : null;
+  // Spec v1.0 research outputs: one-at-a-time sensitivity, the simple baselines and provenance.
+  let research: Record<string, unknown> | null = null;
+  if (strategy === "VWAP_EMA_ADX_SPEC") {
+    const cachedSignals = new Map<number, Parameters<typeof runBacktest>[0]["signalAt"]>([[settings.specTimeframe, signalAt]]);
+    const signalsFor = (timeframe: 1 | 3 | 5) => {
+      let cached = cachedSignals.get(timeframe);
+      if (!cached) { cached = precomputeSignals(data.minute, specSources(timeframe), from, to); cachedSignals.set(timeframe, cached); }
+      return cached;
+    };
+    research = {
+      sensitivity: specSensitivity({ strategy, symbol, from, to, minute: data.minute, settings, signalsFor }),
+      buyAndHold: intradayBuyAndHold({ symbol, from, to, minute: data.minute, settings }),
+      signalLog: specLog,
+    };
+  }
   const notes = [...result.notes];
   if (strategy === "MTF_AI") notes.push("Replays the deterministic multi-timeframe engine the AI monitor relies on. The LLM's discretionary layer, live OI/PCR flow and sentiment cannot be replayed historically.");
   else if (strategy === "SMC_SWEEP" || strategy === "SMC_PLUS") {
@@ -148,6 +187,15 @@ export async function POST(request: Request) {
     }
     notes.push("Smart combo: trend day → trend pullbacks, ORB and sweeps only in the trend's direction; range day → sweep reversals only; undecided → sweeps of daily levels and ORB with the day's direction. The AI multi-timeframe engine votes (an opposite read vetoes, an agreeing one adds confidence). Stops and targets come from the playbook that fired.");
     if (orbNote) notes.push(orbNote);
+  }
+  else if (strategy === "VWAP_EMA_ADX_SPEC") {
+    if (specFunnel) {
+      const f = specFunnel;
+      notes.push(`Signal funnel (${settings.specTimeframe}-minute candles): ${f.candles} completed candles evaluated → ${f.signals} signals (BUY CE / BUY PE before the ADX threshold). Rejected: ${f.warmup} during indicator warm-up (EMA21 / ADX14 need 21 / 28 candles), ${f.noVolume} with no session volume (VWAP undefined${settings.specVwapMode === "STRICT" ? ", no signal allowed by the spec" : ""}), ${f.failVwap ? `${f.failVwap} closing exactly on VWAP, ` : ""}${f.failEma} EMA9/EMA21 against, ${f.failDi} +DI/−DI against, ${f.failBreakout} no breakout of the previous candle${f.incomplete ? `; ${f.incomplete} candles skipped because their last minute is missing` : ""}. The ADX threshold (> ${settings.specAdxThreshold}), entry window and risk limits are applied per trade: see "Skipped".`);
+      if (settings.specVwapMode === "STRICT" && f.noVolume && !f.signals) notes.push("No signals: the history has no volume, so the spec's volume-weighted VWAP is undefined on every candle. Index candles carry volume only where near-month futures volume is attached (recent days). To test the price rules anyway, set VWAP to \"Time-weighted when no volume\" (a labelled deviation from the spec).");
+      else if (settings.specVwapMode === "TIME_WEIGHTED") notes.push("Deviation from the spec: on sessions without volume VWAP is time-weighted (equal-weight typical price). The spec defines VWAP as undefined there.");
+    }
+    notes.push(`${SPEC_STRATEGY_VERSION}. Entry at the next candle's open with ${settings.slippagePoints} pt slippage; SL ${settings.specRiskPoints} pts and target ${settings.specRiskPoints * settings.specRewardMultiple} pts (${settings.specRewardMultiple}R) from that open; SL first when one candle touches both; EOD exit at the close of the 1-minute bar reaching ${settings.squareOff}; ${settings.specEmaExit ? "EMA9/EMA21 opposite-cross exit ON (variant)" : "no EMA-cross exit (baseline)"}; one position at a time, max ${settings.maxTradesPerDay} trades and ₹${settings.maxDailyLoss.toLocaleString("en-IN")} loss a day. BUY CE / BUY PE are signal proxies on the index: ${settings.pnlMode === "POINTS" ? "P&L is index points × quantity, not option P&L" : "option P&L here is a delta/theta estimate, not premium P&L (the spec's options module is separate)"}.`);
   }
   else if (strategy === "VWAP_EMA_ADX") {
     if (scalpFunnel) {
@@ -177,5 +225,12 @@ export async function POST(request: Request) {
   const replayMinutes = candleMinutes === 1 ? null : Object.fromEntries([...tradeDays].map((day) => [day, tested.filter((bar) => istDay(bar.time) === day).map(row)]));
   // Daily candles (up to ~1 year before `to`) for the 1D / 1M support-resistance levels on the chart.
   const dailyCandles = [...data.daily].sort((a, b) => a.time - b.time).filter((bar) => istDay(bar.time) <= to).slice(-260).map(row);
-  return NextResponse.json({ ...result, optimization, candles, candleMinutes, replayMinutes, dailyCandles, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
+  if (dataQuality.warnings.length) notes.push(`Data quality: ${dataQuality.warnings.join(" ")}`);
+  // Provenance (spec v1.0 section 16.10): everything needed to reproduce this result.
+  const provenance = {
+    strategy, strategyLabel: STRATEGIES[strategy], strategyVersion: strategy === "VWAP_EMA_ADX_SPEC" ? SPEC_STRATEGY_VERSION : null, symbol, from, to,
+    source: data.provider, sessions: data.sessions, data: dataFingerprint(data.minute, from, to), settings, generatedAt: new Date().toISOString(),
+    engine: "TradePlusAI walk-forward backtester (1-minute bars, next-bar fills, SL-first)",
+  };
+  return NextResponse.json({ ...result, optimization, research, dataQuality, provenance, candles, candleMinutes, replayMinutes, dailyCandles, strategyLabel: STRATEGIES[strategy], source: data.provider, sessions: data.sessions, issues: data.issues, notes, elapsedMs: Date.now() - started });
 }
