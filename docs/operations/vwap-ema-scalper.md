@@ -87,11 +87,30 @@ Both losses and both R:R figures (net and stressed) are shown before the trade.
 
 ## Trading it on the Scalper (auto or manual)
 
+**Auto-execute on Scalper (server-side).** The algo page's strategy panel has an **Auto-execute on
+Scalper** switch for the selected index. The desk's Automatic/Manual setting in VWAP-EMA mode drives
+the same switch. When it is on, `apps/web/lib/vwap-auto-trader.ts` runs in the Node server:
+- **When it runs:** a few seconds after every 1-minute close, it re-runs the strategy and every V5
+  gate. It uses the same `PLACE_ON_SCALPER` path as the button, and the server reads the live chain
+  itself.
+- **What it places:** a CONFIRMED setup, on the Smart Scalper (paper).
+- **No browser needed:** it works with the page closed or the tab asleep.
+- **Saved switch:** the setting is stored in Firestore (`settings/vwapAutoTrader`) and resumes after a
+  restart.
+
+**One trade at a time.** While a VWAP-EMA trade is open on **any** index:
+- the auto-trader does not run the strategy;
+- `SmartScalper.place()` refuses every new entry, including the manual "Take trade" button and
+  "Place on Scalper".
+
+The next entry is allowed once the open trade exits at its target, SL or trailing SL. The other exits
+(time stop, the 9 EMA momentum exit, max loss, the 15:15 square-off, a manual exit) also close it.
+
 The Scalper desk has a **Strategy** selector. It defaults to *VWAP-EMA scalper*; the other choice is
 *Level scalper*, the desk's original support/resistance engine. With VWAP-EMA selected:
 
-- **Engine on + Automatic.** A CONFIRMED setup is placed in the Smart Scalper's paper book as soon as
-  all 8 criteria and every V5 gate pass.
+- **Automatic.** The server-side auto-trader places each CONFIRMED setup (all 8 criteria and every
+  V5 gate) in the Smart Scalper's paper book. This works with the page closed, one trade at a time.
 - **Engine on + Manual.** "⚡ Take trade" lights up when the setup is confirmed, and you place it with
   a click.
 - **Level engine.** It never enters while VWAP-EMA is selected. It still manages exits.

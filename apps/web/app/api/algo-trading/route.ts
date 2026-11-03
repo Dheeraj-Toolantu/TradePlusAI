@@ -10,6 +10,7 @@ import { getMarketIntel, isIntelSymbol, istDate } from "../../../lib/market-inte
 import { DAILY_RISK_RULES, evaluateDailyRisk } from "../../../lib/daily-risk";
 import { getScalper } from "../../../lib/scalper-instance";
 import { ensureScalperMonitor } from "../../../lib/scalper-monitor";
+import { ensureVwapAutoTrader, setVwapAutoTrader, vwapAutoTraderStatus } from "../../../lib/vwap-auto-trader";
 import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import {
   saveOrderToFirestore,
@@ -263,9 +264,11 @@ export async function GET(request: Request) {
     const normalizedOrders = Array.from(new Map((liveOrders ?? []).map((order) => [order.id, order])).values());
     const normalizedHistory = Array.from(new Map((history ?? []).map((order) => [order.id, order])).values());
 
+    ensureVwapAutoTrader(url.origin);
     return NextResponse.json({
       analysis,
       strategy,
+      autoTrader: vwapAutoTraderStatus(),
       account,
       broker: health && ("value" in health ? health.value : { connected: false, error: health.error.message }),
       mode: config.executionMode,
@@ -294,6 +297,16 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({})) as RecordValue;
   if (String(body.action ?? "").toUpperCase() === "PLACE_ON_SCALPER") return placeOnScalper(body, new URL(request.url).origin);
+  if (String(body.action ?? "").toUpperCase() === "AUTO_TRADER") {
+    // Switch server-side auto-execution of the VWAP-EMA scalper on or off for one index.
+    ensureVwapAutoTrader(new URL(request.url).origin);
+    try {
+      const status = await setVwapAutoTrader({ index: String(body.underlying ?? body.symbol ?? ""), enabled: body.enabled === true, riskReward: rrOf(body.riskReward), settings: body.settings && typeof body.settings === "object" ? body.settings as Partial<ScalperSettings> : undefined });
+      return NextResponse.json({ autoTrader: status });
+    } catch (error) {
+      return NextResponse.json({ error: error instanceof Error ? error.message : "Auto-trader update failed" }, { status: 400 });
+    }
+  }
   const config = readGrowwConfig();
   const requestedMode = String(body.mode ?? config.executionMode).toUpperCase();
 
@@ -479,7 +492,10 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   if (pipeline?.decision !== "CONFIRMED" || !setup?.contract) {
     return NextResponse.json({ placed: false, error: "V5 no-trade gate: the scalp is not confirmed on the server.", reasons: pipeline?.reasons ?? [String(analysis.error ?? "SERVER_PIPELINE_UNAVAILABLE")] }, { status: 403 });
   }
-  const contracts = (Array.isArray(body.contracts) ? body.contracts : []).map((item: RecordValue) => toScalperContract(item)).filter((item) => item.symbol && item.strike > 0);
+  // The page sends its live chain; the server-side auto-trader sends none, so read it here.
+  const rawContracts = Array.isArray(body.contracts) && body.contracts.length ? body.contracts
+    : await fetch(`${origin}/api/option-chain?symbol=${encodeURIComponent(underlying)}&full=1`, { cache: "no-store" }).then((response) => response.json()).then((chain: { contracts?: unknown[] }) => (Array.isArray(chain.contracts) ? chain.contracts : [])).catch(() => []);
+  const contracts = (rawContracts as RecordValue[]).map((item: RecordValue) => toScalperContract(item)).filter((item) => item.symbol && item.strike > 0);
   const live = contracts.find((item) => item.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase() === setup.contract.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase());
   if (!live || !(live.premium > 0) || !(live.lotSize > 0)) return NextResponse.json({ placed: false, error: `${setup.contract.symbol} has no live premium and lot size in the chain yet.` }, { status: 409 });
   const lot = live.lotSize;

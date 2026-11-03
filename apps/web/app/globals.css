@@ -1290,3 +1290,16 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .bt-provenance dt { color: var(--muted, #8eadb2); }
 .bt-provenance dd { margin: 0; overflow-wrap: anywhere; }
 .bt-provenance code { font-family: "DM Mono", monospace; }
+/* Algo page: server-side auto-execution switch. */
+.exec-auto { display: grid; gap: 4px; margin: 10px 0; padding: 10px 12px; border: 1px solid #1d2a2e; border-radius: 8px; background: #0f1719; }
+.exec-auto.on { border-color: #1f5c47; background: rgba(34, 213, 155, .06); }
+.exec-auto-switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.exec-auto-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.exec-auto-switch span { position: relative; width: 34px; height: 18px; border-radius: 9px; background: #2a3a3f; transition: background .15s; }
+.exec-auto-switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #dfe8ea; transition: transform .15s; }
+.exec-auto-switch input:checked + span { background: #22d59b; }
+.exec-auto-switch input:checked + span::after { transform: translateX(16px); }
+.exec-auto-switch input:focus-visible + span { box-shadow: 0 0 0 2px #30d4ca; }
+.exec-auto-switch small { color: #8a9ba0; }
+.exec-auto-status { color: #b9c8cc; font-size: 12px; }
+.scalper-auto-status { color: #22d59b; }
