@@ -1303,3 +1303,11 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .exec-auto-switch small { color: #8a9ba0; }
 .exec-auto-status { color: #b9c8cc; font-size: 12px; }
 .scalper-auto-status { color: #22d59b; }
+/* App navigation (replaces the old dashboard hub). */
+.app-nav { position: sticky; top: 0; z-index: 50; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 6px 14px; border-bottom: 1px solid #173944; background: #06141c; font: 600 12px "Manrope", sans-serif; }
+.app-nav a { padding: 5px 10px; border-radius: 6px; color: #8eadb2; text-decoration: none; }
+.app-nav a:hover { color: #e6f2f3; background: rgba(48, 212, 202, .08); }
+.app-nav a.active { color: #06141c; background: #30d4ca; }
+.app-nav .app-nav-brand { margin-right: 8px; color: #30d4ca; font-weight: 800; letter-spacing: .4px; }
+.app-nav .app-nav-brand:hover { background: transparent; }
+@media (max-width: 640px) { .app-nav { padding: 6px 10px; overflow-x: auto; flex-wrap: nowrap; } .app-nav a { white-space: nowrap; } }

@@ -30,6 +30,9 @@ function toBar(value: RecordValue): ScalperBar {
 export async function GET(request: Request) {
   const url = new URL(request.url);
   ensureScalperMonitor(url.origin);
+  // ?all=1: every index's positions (the algo page lists them all, e.g. an auto-executed BANKNIFTY
+  // trade while the desk shows NIFTY).
+  if (url.searchParams.get("all") === "1") return NextResponse.json({ ...(await scalper.snapshot()), monitor: scalperMonitorStatus() });
   const symbol = (url.searchParams.get("symbol") ?? "NIFTY").toUpperCase();
   return NextResponse.json({ ...(await scalper.snapshot(symbol)), monitor: scalperMonitorStatus() });
 }

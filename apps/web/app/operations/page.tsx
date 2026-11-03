@@ -389,7 +389,7 @@ export default function OperationsPage() {
           <button type="button" onClick={refresh} disabled={loading}>{loading ? "Scanning…" : "Refresh"}</button>
           {data ? <small>Updated {new Date(data.generated_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST</small> : null}
           <RefreshStatus nextAt={nextAt} leader={sync.leader} tabs={sync.tabs} />
-          <a href="/">Back to dashboard</a>
+          <a href="/execution">Back to algo trading</a>
         </div>
       </header>
 
