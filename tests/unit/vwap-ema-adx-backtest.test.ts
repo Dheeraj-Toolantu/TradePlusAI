@@ -39,6 +39,16 @@ describe("VWAP-EMA-ADX backtest signals match the live strategy's tape rules", (
     expect(source.funnel.signals).toBe(1);
   });
 
+  it("takes the side from the 9/21 EMA trend with ADX above 25 (spec v1.0), the entry from the 5/9 EMA trigger", () => {
+    const bars = tape(1);
+    const source = vwapEmaAdxSignalSource("NIFTY", bars);
+    bars.forEach((_, index) => source(index));
+    expect(source.funnel.signals).toBe(1);
+    // Before ADX(14) has warmed up (28 bars) every sided bar fails the trend check.
+    expect(source.funnel.trendWeak).toBeGreaterThan(0);
+    expect(source.funnel.sided - source.funnel.trendWeak).toBeGreaterThanOrEqual(source.funnel.stacked);
+  });
+
   it("each trigger candle signals once, and nothing fires before ADX has warmed up", () => {
     const bars = tape(1);
     const source = vwapEmaAdxSignalSource("NIFTY", bars);

@@ -43,7 +43,7 @@ class PipelineEvidence:
     score: float | None = None
     minimum_score: float = 8.0
     # The strategy's own card size (the engine sets it; 10 unless a strategy scores out of more,
-    # e.g. the VWAP-EMA scalper's 11-point card). A missing value means 10.
+    # e.g. the VWAP-EMA scalper's 12-point card). A missing value means 10.
     maximum_score: float | None = None
     option_quote_fresh: bool | None = None
     liquidity_score: float | None = None

@@ -793,6 +793,10 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .scalper-views { display: inline-flex; gap: 3px; padding: 3px; border-radius: 999px; background: #151c1f; }
 .scalper-views button { padding: 5px 14px; color: #8a9ba0; border: 0; border-radius: 999px; background: transparent; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
 .scalper-views button.on { color: #fff; background: #2c3a40; }
+.scalper-views button:disabled { cursor: not-allowed; }
+.scalper-pinned { padding: 4px 10px; border-radius: 999px; color: #ffd27a; background: rgba(255, 196, 61, .12); font: 700 11px "Manrope", sans-serif; }
+.scalper-pinned-banner { margin: 6px 0; padding: 8px 12px; border-radius: 10px; color: #ffd27a; background: rgba(255, 196, 61, .1); font-size: 12px; }
+.scalper-pinned-banner button { margin-left: 8px; padding: 3px 10px; border: 1px solid #ffd27a; border-radius: 999px; color: #ffd27a; background: transparent; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
 .scalper-controls-button { padding: 6px 10px; color: #dfe8ea; border: 1px solid #2a3a40; border-radius: 6px; background: #151c1f; font: 600 12px "Manrope", sans-serif; cursor: pointer; }
 .scalper-switch { display: inline-flex; align-items: center; gap: 6px; color: #dfe8ea; font-weight: 600; cursor: pointer; }
 .scalper-switch input { position: absolute; opacity: 0; pointer-events: none; }
