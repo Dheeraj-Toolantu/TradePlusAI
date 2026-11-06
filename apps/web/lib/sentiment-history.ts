@@ -1,6 +1,7 @@
 import { collection, doc, getDoc, getDocs, limit, orderBy, query, setDoc, where } from "firebase/firestore";
 import { db } from "./firebase";
 import type { IndexSentiment } from "./index-sentiment";
+import { oiReading, readAllOi, type OiBaseline, type OiReading, type OiTotals } from "./oi-history";
 
 /**
  * Sentiment history in Firestore.
@@ -8,6 +9,8 @@ import type { IndexSentiment } from "./index-sentiment";
  * - `sentimentSnapshots/{id}`: every index (NIFTY 50, BANK NIFTY, SENSEX) and commodity (crude oil,
  *   natural gas, gold, silver, copper) score, label and price. One per 15-minute IST slot (id
  *   `20261021-0915`), plus one as soon as a reversal is seen (id `20261021-0922-reversal`).
+ *   Each index also carries `oi`: call writers' and put writers' open interest (nearest expiry,
+ *   ±6% of spot), PCR, and the % change in each since the previous snapshot and the day's first.
  * - `sentimentReversals/{id}`: one document per reversal.
  * - `sentimentState/latest`: the last direction of every instrument, so a restart neither misses
  *   nor double-counts a reversal.
@@ -32,7 +35,11 @@ export type Reversal = {
   from: string; to: string; previous_score: number | null; score: number | null; previous_change_pct: number | null; change_pct: number | null;
   price: number | null; previous_at: string; at: string; scan_at: string;
 };
-export type HistoryState = { lastSlot: string | null; lastScanAt: string | null; instruments: Record<string, InstrumentState> };
+export type HistoryState = { lastSlot: string | null; lastScanAt: string | null; instruments: Record<string, InstrumentState>; oi?: Record<string, OiBaseline> };
+/** Reads every index's option-writer OI when a snapshot is saved; tests inject their own. */
+export type OiReader = () => Promise<Record<string, OiTotals>>;
+const OI_TIMEOUT_MS = 20_000;
+const defaultOiReader: OiReader = () => (process.env.VITEST ? Promise.resolve({}) : readAllOi());
 export type RecordResult = { recorded: boolean; snapshotId: string | null; reasons: Array<"SCHEDULED" | "REVERSAL">; reversals: Reversal[]; scanAt: string | null; error?: string };
 
 const round = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? null : Number(value.toFixed(digits)));
@@ -134,10 +141,10 @@ async function loadState(): Promise<HistoryState> {
   if (store.__tradepulseSentimentHistory) return store.__tradepulseSentimentHistory;
   const snapshot = await withTimeout(getDoc(doc(db, STATE, "latest")), "read of sentimentState/latest");
   const data = snapshot.exists() ? (snapshot.data() as Partial<HistoryState>) : {};
-  return { lastSlot: data.lastSlot ?? null, lastScanAt: data.lastScanAt ?? null, instruments: data.instruments ?? {} };
+  return { lastSlot: data.lastSlot ?? null, lastScanAt: data.lastScanAt ?? null, instruments: data.instruments ?? {}, oi: data.oi ?? {} };
 }
 
-async function record(scan: IndexSentiment, now: Date): Promise<RecordResult> {
+async function record(scan: IndexSentiment, now: Date, readOi: OiReader): Promise<RecordResult> {
   const state = await loadState();
   const scanAt = scan.generated_at;
   const instruments = instrumentsOf(scan);
@@ -147,17 +154,27 @@ async function record(scan: IndexSentiment, now: Date): Promise<RecordResult> {
   const reasons: RecordResult["reasons"] = [];
   if (slot !== state.lastSlot) reasons.push("SCHEDULED");
   if (reversals.length) reasons.push("REVERSAL");
-  const nextState: HistoryState = { lastSlot: reasons.includes("SCHEDULED") ? slot : state.lastSlot, lastScanAt: scanAt, instruments: next };
+  const nextState: HistoryState = { lastSlot: reasons.includes("SCHEDULED") ? slot : state.lastSlot, lastScanAt: scanAt, instruments: next, oi: state.oi ?? {} };
   if (!reasons.length) {
     store.__tradepulseSentimentHistory = nextState;
     return { recorded: false, snapshotId: null, reasons, reversals, scanAt };
   }
   const snapshotId = reasons.includes("SCHEDULED") ? slot : `${slotId(now, 1)}-reversal`;
   const recordedAt = now.toISOString();
+  // Option-writer OI per index, only when a snapshot is actually saved (one chain call per index).
+  // A failed or slow OI read never blocks the snapshot: that index is just saved without OI.
+  const totals = await withTimeout(readOi(), "OI read", OI_TIMEOUT_MS).catch(() => ({} as Record<string, OiTotals>));
+  const oi: Record<string, OiReading> = {};
+  const baselines = { ...(state.oi ?? {}) };
+  for (const [id, value] of Object.entries(totals)) {
+    const { reading, next: baseline } = oiReading(value, baselines[id], istDate(now));
+    oi[id] = reading; baselines[id] = baseline;
+  }
+  nextState.oi = baselines;
   await withTimeout(setDoc(doc(db, SNAPSHOTS, snapshotId), firestoreSafe({
     id: snapshotId, slot, date: istDate(now), time: istTime(now), recordedAt, scanAt, reasons,
     reversals: reversals.map((item) => ({ instrument: item.instrument, type: item.type, from: item.from, to: item.to })),
-    indices: Object.fromEntries(instruments.filter((item) => item.kind === "INDEX").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra }])),
+    indices: Object.fromEntries(instruments.filter((item) => item.kind === "INDEX").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra, ...(oi[item.id] ? { oi: oi[item.id] } : {}) }])),
     commodities: Object.fromEntries(instruments.filter((item) => item.kind === "COMMODITY").map((item) => [item.id, { name: item.name, score: item.score, label: item.label, price: item.price, change_pct: item.change_pct, ...item.extra }])),
   }), { merge: true }), `write of snapshot ${snapshotId}`);
   for (const reversal of reversals) {
@@ -172,8 +189,8 @@ async function record(scan: IndexSentiment, now: Date): Promise<RecordResult> {
  * Store a snapshot if this 15-minute slot has none yet or the latest scan shows a reversal.
  * Meant to be called about once a minute (the API server does); calls in between are cheap no-ops.
  */
-export function recordSentiment(scan: IndexSentiment, now = new Date()): Promise<RecordResult> {
-  store.__tradepulseSentimentRecording ??= record(scan, now)
+export function recordSentiment(scan: IndexSentiment, now = new Date(), readOi: OiReader = defaultOiReader): Promise<RecordResult> {
+  store.__tradepulseSentimentRecording ??= record(scan, now, readOi)
     .then((result) => { noteRecorder(result); return result; }, (error: unknown) => { noteRecorder(error); throw error; })
     .finally(() => { store.__tradepulseSentimentRecording = null; });
   return store.__tradepulseSentimentRecording;
@@ -207,7 +224,7 @@ export type StoredConstituent = { symbol: string; name: string; weight: number |
 export type StoredSnapshot = {
   id: string; slot: string; date?: string; time?: string; recordedAt: string; scanAt: string; reasons: Array<"SCHEDULED" | "REVERSAL">;
   reversals: Array<{ instrument: string; type: Reversal["type"]; from: string; to: string }>;
-  indices: Record<string, HistoryReading & { zone?: string; bullish_pct?: number | null; bearish_pct?: number | null; advances?: number; declines?: number; constituents?: StoredConstituent[] }>;
+  indices: Record<string, HistoryReading & { zone?: string; bullish_pct?: number | null; bearish_pct?: number | null; advances?: number; declines?: number; constituents?: StoredConstituent[]; oi?: OiReading }>;
   commodities: Record<string, HistoryReading & { unit?: string; india_impact?: number | null; india_label?: string }>;
 };
 export type StoredReversal = Reversal & { date?: string; time?: string; recordedAt: string; snapshotId: string };
