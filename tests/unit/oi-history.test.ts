@@ -83,3 +83,16 @@ describe("option-writer OI for the sentiment history", () => {
     expect(averageOiSamples({ NIFTY: list }, "2026-11-06T04:00:30Z", now).NIFTY).toMatchObject({ call_oi: 400, samples: 1 });
   });
 });
+
+describe("sentiment chart time axis", () => {
+  it("labels on 5-minute boundaries when there is room, wider steps when there is not", async () => {
+    const { timeTicks } = await import("../../apps/web/components/sentiment-chart");
+    const start = Date.parse("2026-11-06T03:47:00Z"); // 09:17 IST
+    const hour = timeTicks(start, start + 60 * 60_000, 14);
+    expect(hour[0]).toBe(Date.parse("2026-11-06T03:50:00Z")); // 09:20 IST
+    expect(hour[1] - hour[0]).toBe(5 * 60_000);
+    const day = timeTicks(start, start + 6 * 60 * 60_000, 20);
+    expect((day[1] - day[0]) % (5 * 60_000)).toBe(0);
+    expect(day[1] - day[0]).toBeGreaterThan(5 * 60_000);
+  });
+});
