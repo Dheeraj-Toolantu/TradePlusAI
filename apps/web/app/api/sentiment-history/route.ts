@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { recentHistory, recorderStatus } from "../../../lib/sentiment-history";
 import { recordLatestSentiment } from "../../../lib/sentiment-recorder";
 
-// POST: store the latest index + commodity sentiment in Firestore if this 15-minute slot has no
+// POST: store the latest index + commodity sentiment in Firestore if this 5-minute slot has no
 // snapshot yet or a reversal appeared. The API server calls it every minute; a scheduler can too.
 export async function POST() {
   try {

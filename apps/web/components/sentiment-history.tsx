@@ -4,6 +4,7 @@ import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } fro
 import type { HistoryReading, RecorderStatus, StoredReversal, StoredSnapshot } from "../lib/sentiment-history";
 import type { OiReading } from "../lib/oi-history";
 import { SentimentChart, seriesColor } from "./sentiment-chart";
+import { OiChart } from "./oi-chart";
 
 type History = { snapshots: StoredSnapshot[]; reversals: StoredReversal[]; warnings?: string[]; recorder?: RecorderStatus };
 type Row = { snapshot: StoredSnapshot; reading: HistoryReading & Record<string, unknown>; kind: "INDEX" | "COMMODITY" };
@@ -31,7 +32,7 @@ export const FETCH_TIMEOUT_MS = 30_000;
 export async function fetchHistory(day: string, fetcher: typeof fetch = fetch): Promise<History> {
   let response: Response;
   try {
-    response = await fetcher(`/api/sentiment-history?${day ? `date=${day}` : "limit=48"}`, { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    response = await fetcher(`/api/sentiment-history?${day ? `date=${day}` : "limit=96"}`, { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   } catch (failure) {
     const name = (failure as { name?: string })?.name;
     throw new Error(name === "TimeoutError" || name === "AbortError" ? "Sentiment history timed out. The server took longer than 30s." : "Couldn't reach the server for sentiment history.");
@@ -66,7 +67,7 @@ function OiCell({ oi, side }: { oi: OiReading | null; side: "CE" | "PE" }) {
   const change = side === "CE" ? oi.call_change_pct : oi.put_change_pct;
   const day = side === "CE" ? oi.call_change_day_pct : oi.put_change_day_pct;
   return (
-    <td title={`${side === "CE" ? "Call" : "Put"} writers' OI ${total.toLocaleString("en-IN")} · since the day's first snapshot ${day === null ? "--" : `${signed(day, 2)}%`} · expiry ${oi.expiry}`}>
+    <td title={`${side === "CE" ? "Call" : "Put"} writers' OI ${total.toLocaleString("en-IN")} · since the day's first snapshot ${day === null ? "--" : `${signed(day, 2)}%`} · expiry ${oi.expiry} · average of ${oi.samples ?? 1} three-minute sample(s)`}>
       <b>{oiUnits(total)}</b><small className={writerTone(side, change)}>{change === null ? "first reading" : `${signed(change, 2)}%`}{day !== null ? ` · day ${signed(day, 1)}%` : ""}</small>
     </td>
   );
@@ -89,7 +90,7 @@ function Reason({ snapshot, id }: { snapshot: StoredSnapshot; id?: string }) {
   const flips = (snapshot.reversals ?? []).filter((item) => !id || item.instrument === id);
   return (
     <span className="smh-reason">
-      {reasonsOf(snapshot).includes("SCHEDULED") ? <i className="smh-tag">15 min</i> : null}
+      {reasonsOf(snapshot).includes("SCHEDULED") ? <i className="smh-tag">5 min</i> : null}
       {flips.map((item) => <i key={item.instrument + item.type} className={`smh-tag ${up(item.to) ? "smh-up" : "smh-down"}`} title={`${item.instrument} ${lower(item.type)} ${item.from} → ${item.to}`}>{id ? "" : `${item.instrument} `}{item.type === "SENTIMENT" ? "sentiment" : "price"} → {lower(item.to)}</i>)}
       {reasonsOf(snapshot).includes("REVERSAL") && !flips.length && id ? <i className="smh-tag">reversal (other)</i> : null}
     </span>
@@ -118,7 +119,7 @@ function Constituents({ reading }: { reading: Row["reading"] }) {
   );
 }
 
-/** Everything saved to Firestore: every 15-minute snapshot (date, time, score, price, breadth, share prices) and the reversals. */
+/** Everything saved to Firestore: every 5-minute snapshot (date, time, score, price, breadth, share prices) and the reversals. */
 export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
   const [date, setDate] = useState<string>(LATEST);
   const [instrument, setInstrument] = useState<string>(OI_VIEW);
@@ -127,6 +128,7 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const [shown, setShown] = useState<string[]>(DEFAULT_SHOWN);
+  const [oiIndex, setOiIndex] = useState<string>("NIFTY");
   const dayRef = useRef<string>(LATEST);
 
   const load = useCallback(async (day: string) => {
@@ -201,12 +203,12 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
     <section className="isa-panel smh">
       <div className="ce-head">
         <h3>Sentiment history</h3>
-        <span className="isa-muted">{latest ? `Last saved ${dateOf(latest)} ${timeOf(latest)} IST` : "Saved to Firestore every 15 min and on every reversal"}</span>
+        <span className="isa-muted">{latest ? `Last saved ${dateOf(latest)} ${timeOf(latest)} IST` : "Saved to Firestore every 5 min and on every reversal (OI sampled every 3 min)"}</span>
       </div>
 
       <div className="smh-tools">
         <label>Day <input type="date" value={date} max={today()} onChange={(event) => { setDate(event.target.value); setOpen(null); }} /></label>
-        <button type="button" className={date === LATEST ? "active" : ""} onClick={() => setDate(LATEST)}>Latest 48</button>
+        <button type="button" className={date === LATEST ? "active" : ""} onClick={() => setDate(LATEST)}>Latest 96</button>
         <button type="button" className={date === today() ? "active" : ""} onClick={() => setDate(today())}>Today</button>
         <select value={instrument} onChange={(event) => { setInstrument(event.target.value); setOpen(null); }} aria-label="Instrument">
           <option value={OI_VIEW}>OI writers + crude oil, gold, silver</option>
@@ -237,6 +239,18 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
             ) : null}
           </div>
           {chartSeries.length ? <SentimentChart snapshots={snapshots} series={chartSeries} /> : <p className="isa-muted">Pick at least one line above.</p>}
+        </div>
+      ) : null}
+
+      {instrument === OI_VIEW && snapshots.length && anyOi ? (
+        <div className="smc-block">
+          <div className="smc-head">
+            <h4 className="smh-sub">Option writers&apos; OI every 5 minutes (average of 3-minute samples)</h4>
+            <div className="smc-legend" role="group" aria-label="Index">
+              {oiIndices.map((id) => <button type="button" key={id} className={oiIndex === id ? "on" : ""} aria-pressed={oiIndex === id} onClick={() => setOiIndex(id)}>{snapshots.map((snapshot) => snapshot.indices?.[id]?.name).find(Boolean) ?? id}</button>)}
+            </div>
+          </div>
+          <OiChart snapshots={snapshots} index={oiIndex} name={snapshots.map((snapshot) => snapshot.indices?.[oiIndex]?.name).find(Boolean) ?? oiIndex} />
         </div>
       ) : null}
 
@@ -278,7 +292,7 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
               ))}
             </tbody>
           </table>
-          <small className="isa-muted">Call / put writers OI = total open interest on the nearest expiry within ±6% of spot (option writers hold the short side). Δ % is the change since the previous saved snapshot; "day" since the day&apos;s first. Put writers adding or call writers covering reads bullish; call writers adding or put writers covering reads bearish.</small>
+          <small className="isa-muted">Call / put writers OI = total open interest on the nearest expiry within ±6% of spot (option writers hold the short side). OI is sampled every 3 minutes; each 5-minute row is the average of its samples (hover a cell for the count). Δ % is the change since the previous saved snapshot; "day" since the day&apos;s first. Put writers adding or call writers covering reads bullish; call writers adding or put writers covering reads bearish.</small>
         </div>
       ) : null}
 
@@ -366,7 +380,7 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
           ))}
         </ul>
       ) : <p className="isa-muted">No reversals {date ? `on ${date}` : "recorded yet"}.</p>}
-      <small className="isa-muted">A reversal is a sentiment flip (score crossing from +10 or more to -10 or less, or back) or a price flip (day change from +0.2% or more to -0.2% or less, or back). Rows marked with a reversal tag were saved the moment it happened; the rest every 15 minutes.</small>
+      <small className="isa-muted">A reversal is a sentiment flip (score crossing from +10 or more to -10 or less, or back) or a price flip (day change from +0.2% or more to -0.2% or less, or back). Rows marked with a reversal tag were saved the moment it happened; the rest every 5 minutes.</small>
     </section>
   );
 });

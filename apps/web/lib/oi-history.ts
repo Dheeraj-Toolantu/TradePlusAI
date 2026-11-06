@@ -2,13 +2,15 @@
  * Option-writer OI for the sentiment history: total call OI (call writers' open shorts) and put
  * OI (put writers') on the nearest expiry, within ±6% of spot, as the market-intel engine reads it.
  *
- * % changes are worked out against the previous snapshot and against the day's first one, from the
- * totals kept in the history state, so no extra Groww call is needed for them. One option-chain
- * call per index per snapshot, through the shared Groww cache.
+ * The server samples it every 3 minutes; each 5-minute snapshot stores the average of the samples
+ * taken since the previous one. % changes are worked out on those averages against the previous
+ * snapshot and the day's first, from the totals kept in the history state.
  */
 export type OiTotals = { expiry: string; call_oi: number; put_oi: number; pcr: number | null; spot: number | null; at: string };
 export type OiBaseline = { date: string; call_oi: number; put_oi: number; open_call_oi: number; open_put_oi: number; at: string };
 export type OiReading = OiTotals & {
+  /** How many 3-minute samples the snapshot's average is made of. */
+  samples: number;
   call_change_pct: number | null; put_change_pct: number | null; call_change_day_pct: number | null; put_change_day_pct: number | null;
   call_writers: WriterAction; put_writers: WriterAction; signal: string;
 };
@@ -38,7 +40,7 @@ export function writerSignal(call: WriterAction, put: WriterAction): string {
 }
 
 /** Combine this reading with the stored baseline: % changes, writer actions, and the next baseline. */
-export function oiReading(totals: OiTotals, baseline: OiBaseline | undefined, date: string): { reading: OiReading; next: OiBaseline } {
+export function oiReading(totals: OiTotals & { samples?: number }, baseline: OiBaseline | undefined, date: string): { reading: OiReading; next: OiBaseline } {
   const sameDay = baseline?.date === date;
   const callPct = sameDay ? change(totals.call_oi, baseline?.call_oi) : null;
   const putPct = sameDay ? change(totals.put_oi, baseline?.put_oi) : null;
@@ -47,7 +49,7 @@ export function oiReading(totals: OiTotals, baseline: OiBaseline | undefined, da
   const callWriters = action(callPct); const putWriters = action(putPct);
   return {
     reading: {
-      ...totals, call_change_pct: callPct, put_change_pct: putPct,
+      ...totals, samples: totals.samples ?? 1, call_change_pct: callPct, put_change_pct: putPct,
       call_change_day_pct: sameDay ? change(totals.call_oi, openCall) : null, put_change_day_pct: sameDay ? change(totals.put_oi, openPut) : null,
       call_writers: callWriters, put_writers: putWriters, signal: writerSignal(callWriters, putWriters),
     },

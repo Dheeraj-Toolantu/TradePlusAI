@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { firestoreFake } from "../setup/firestore-fake";
 import { oiReading, readAllOi, writerSignal, type OiTotals } from "../../apps/web/lib/oi-history";
-import { recordSentiment, resetSentimentHistoryCache } from "../../apps/web/lib/sentiment-history";
+import { averageOiSamples, recordSentiment, resetSentimentHistoryCache, sampleOi } from "../../apps/web/lib/sentiment-history";
 import { oiUnits } from "../../apps/web/components/sentiment-history";
 import type { IndexSentiment } from "../../apps/web/lib/index-sentiment";
 
@@ -60,5 +60,26 @@ describe("option-writer OI for the sentiment history", () => {
     // A failing OI read never blocks the snapshot.
     const failed = await recordSentiment(scan("2026-11-06T04:15:00Z"), new Date("2026-11-06T04:16:00Z"), async () => { throw new Error("chain down"); });
     expect(failed.recorded).toBe(true);
+  });
+
+  it("samples OI every 3 minutes and saves the 5-minute average with the snapshot", async () => {
+    await recordSentiment(scan("2026-11-06T03:45:00Z"), new Date("2026-11-06T03:46:00Z"), async () => ({ NIFTY: totals(1_000_000, 1_000_000) })); // 09:16 slot 0915
+    // Two 3-minute samples inside the next window, each saved raw.
+    await sampleOi(new Date("2026-11-06T03:48:00Z"), async () => ({ NIFTY: totals(1_100_000, 1_200_000) }));
+    await sampleOi(new Date("2026-11-06T03:51:00Z"), async () => ({ NIFTY: totals(1_300_000, 1_400_000) }));
+    expect(firestoreFake.documents("oiSamples").map((item: Record<string, any>) => item.id).sort()).toEqual(["NIFTY-20261106-0918", "NIFTY-20261106-0921"]);
+    const neverCalled = async () => { throw new Error("should use the samples"); };
+    const result = await recordSentiment(scan("2026-11-06T03:50:00Z"), new Date("2026-11-06T03:51:30Z"), neverCalled); // 09:21 slot 0920
+    expect(result.snapshotId).toBe("20261106-0920");
+    const saved = (firestoreFake.documents("sentimentSnapshots") as Array<Record<string, any>>).find((doc) => doc.id === "20261106-0920")!;
+    expect(saved.indices.NIFTY.oi).toMatchObject({ call_oi: 1_200_000, put_oi: 1_300_000, samples: 2, call_change_pct: 20, put_change_pct: 30 });
+  });
+
+  it("averages only the samples since the previous snapshot", () => {
+    const now = new Date("2026-11-06T04:00:00Z");
+    const list = [totals(100, 100, "2026-11-06T03:54:00Z"), totals(200, 300, "2026-11-06T03:57:00Z"), totals(400, 500, "2026-11-06T04:00:00Z")];
+    expect(averageOiSamples({ NIFTY: list }, "2026-11-06T03:55:00Z", now).NIFTY).toMatchObject({ call_oi: 300, put_oi: 400, samples: 2, pcr: 1.333 });
+    // Nothing newer than the last snapshot: the latest sample alone.
+    expect(averageOiSamples({ NIFTY: list }, "2026-11-06T04:00:30Z", now).NIFTY).toMatchObject({ call_oi: 400, samples: 1 });
   });
 });
