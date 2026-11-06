@@ -17,7 +17,7 @@ import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option
 // needs the header and the trade desk shell. Every panel is memoised, so a quote tick re-renders
 // only the parts that read the moved price.
 const MarketIntelPanel = dynamic(() => import("../../components/market-intel/market-intel-panel").then((module) => module.MarketIntelPanel), { ssr: false, loading: () => <div className="algo-empty">Loading trade desk…</div> });
-const OptionStrategyPanel = dynamic(() => import("../../components/market-intel/option-strategy-panel").then((module) => module.OptionStrategyPanel), { ssr: false });
+const HedgeStrategyPanel = dynamic(() => import("../../components/market-intel/hedge-strategy-panel").then((module) => module.HedgeStrategyPanel), { ssr: false });
 const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitoring-panel").then((module) => module.AIMonitoringPanel), { ssr: false });
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
 const NextDayPanel = dynamic(() => import("../../components/execution/next-day-panel").then((module) => module.NextDayPanel), { ssr: false });
@@ -782,7 +782,7 @@ export default function ExecutionPage() {
       <div className="exec-content">
         <p className="exec-message" role="status">{message}</p>
         <MarketIntelPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadPlan} />
-        <WhenVisible><OptionStrategyPanel symbol={symbol} onSymbolChange={switchIndex} vix={quotes["INDIA VIX"] ?? null} trend={strategyTrend} /></WhenVisible>
+        <WhenVisible><HedgeStrategyPanel symbol={symbol} onSymbolChange={switchIndex} vix={quotes["INDIA VIX"] ?? null} trend={strategyTrend} /></WhenVisible>
         <AIMonitoringPanel symbol={symbol} strategyId={strategy.id} buildContext={aiContext} onLoadAdvice={loadAdvice} />
 
         <WhenVisible minHeight={160}><NextDayPanel symbol={symbol} onSymbolChange={switchIndex} onUsePlan={loadNextDayPlan} /></WhenVisible>
