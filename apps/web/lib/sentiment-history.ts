@@ -1,7 +1,7 @@
 import { collection, doc, getDoc, getDocs, limit, orderBy, query, setDoc, where } from "firebase/firestore";
 import { db } from "./firebase";
 import type { IndexSentiment } from "./index-sentiment";
-import { oiReading, readAllOi, type OiBaseline, type OiReading, type OiTotals } from "./oi-history";
+import { oiReading, readAllOi, withoutStrikes, type OiBaseline, type OiReading, type OiTotals } from "./oi-history";
 
 /**
  * Sentiment history in Firestore.
@@ -28,6 +28,14 @@ export const SLOT_MINUTES = 5;
 /** Option-writer OI is sampled this often; each 5-minute snapshot stores the average of its samples. */
 export const OI_SAMPLE_MINUTES = 3;
 export const OI_SAMPLES = "oiSamples";
+/** Strike-wise OI per 3-minute sample: `oiStrikes/{index}-{yyyymmdd-hhmm}`, read by `key` = "NIFTY|2026-11-06". */
+export const OI_STRIKES = "oiStrikes";
+export const strikeKey = (index: string, date: string) => `${index}|${date}`;
+/**
+ * The day's strike samples per key, held in this process once read from Firestore; the sampler
+ * appends what it writes, so the OI page's polling never re-reads the whole day from Firestore.
+ */
+export const strikeCache = () => ((globalThis as typeof globalThis & { __tradepulseOiStrikes?: Map<string, Array<Record<string, unknown> & { at: string }>> }).__tradepulseOiStrikes ??= new Map());
 export const SENTIMENT_BAND = 10;
 export const PRICE_BAND_PCT = 0.2;
 
@@ -162,9 +170,17 @@ export async function sampleOi(now = new Date(), read: OiReader = defaultOiReade
   const buffer = oiStore();
   const at = now.toISOString();
   for (const [id, value] of Object.entries(totals)) {
-    const sample = { ...value, at };
+    const sample = { ...withoutStrikes(value), at };
     buffer.samples[id] = [...(buffer.samples[id] ?? []).filter((item) => now.getTime() - Date.parse(item.at) < SAMPLE_KEEP_MS), sample];
-    await withTimeout(setDoc(doc(db, OI_SAMPLES, `${id}-${slotId(now, 1)}`), firestoreSafe({ id: `${id}-${slotId(now, 1)}`, index: id, date: istDate(now), time: istTime(now), recordedAt: at, ...sample })), "write of an OI sample").catch(() => undefined);
+    const docId = `${id}-${slotId(now, 1)}`;
+    const base = { id: docId, index: id, date: istDate(now), time: istTime(now), recordedAt: at };
+    await withTimeout(setDoc(doc(db, OI_SAMPLES, docId), firestoreSafe({ ...base, ...sample })), "write of an OI sample").catch(() => undefined);
+    // The strike-wise chain for the OI analysis page (≈ 60 strikes, a few KB).
+    if (value.strikes?.length) {
+      const row = firestoreSafe({ ...base, ...sample, key: strikeKey(id, base.date), strikes: value.strikes });
+      await withTimeout(setDoc(doc(db, OI_STRIKES, docId), row), "write of an OI strike sample").catch(() => undefined);
+      strikeCache().get(row.key)?.push(row);
+    }
   }
   return totals;
 }
@@ -209,7 +225,7 @@ async function record(scan: IndexSentiment, now: Date, readOi: OiReader): Promis
   const totals: Record<string, OiTotals & { samples?: number }> = averageOiSamples(buffer.samples, buffer.lastSnapshotAt, now);
   if (Object.keys(totals).length < 3) {
     const fresh = await withTimeout(readOi(), "OI read", OI_TIMEOUT_MS).catch(() => ({} as Record<string, OiTotals>));
-    for (const [id, value] of Object.entries(fresh)) totals[id] ??= { ...value, samples: 1 };
+    for (const [id, value] of Object.entries(fresh)) totals[id] ??= { ...withoutStrikes(value), samples: 1 };
   }
   buffer.lastSnapshotAt = recordedAt;
   const oi: Record<string, OiReading> = {};

@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 
 const LINKS: Array<[string, string]> = [
   ["/execution", "Auto algo trading"],
-  ["/operations", "Sentiment"],
+  ["/operations", "Sentiment"], ["/oi", "OI analysis"],
   ["/validation", "Backtesting"],
   ["/technical-analysis", "Technical analysis"],
   ["/intelligence", "AI insights"],

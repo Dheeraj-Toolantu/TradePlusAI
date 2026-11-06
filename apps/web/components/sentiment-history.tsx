@@ -4,7 +4,6 @@ import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } fro
 import type { HistoryReading, RecorderStatus, StoredReversal, StoredSnapshot } from "../lib/sentiment-history";
 import type { OiReading } from "../lib/oi-history";
 import { SentimentChart, seriesColor } from "./sentiment-chart";
-import { OiChart } from "./oi-chart";
 
 type History = { snapshots: StoredSnapshot[]; reversals: StoredReversal[]; warnings?: string[]; recorder?: RecorderStatus };
 type Row = { snapshot: StoredSnapshot; reading: HistoryReading & Record<string, unknown>; kind: "INDEX" | "COMMODITY" };
@@ -168,6 +167,9 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
   const oiIndices = useMemo(() => OI_INDICES.filter((id) => snapshots.some((snapshot) => snapshot.indices?.[id])), [snapshots]);
   const oiCommodities = useMemo(() => OI_COMMODITIES.filter((id) => snapshots.some((snapshot) => snapshot.commodities?.[id])), [snapshots]);
   const anyOi = snapshots.some((snapshot) => OI_INDICES.some((id) => oiOf(snapshot, id)));
+  // The OI pane under the score lines: the chosen index on the overview, the index itself on its own view.
+  const chartOiIndex = !anyOi ? null : instrument === "ALL" || instrument === OI_VIEW ? (oiIndex || null) : OI_INDICES.includes(instrument) ? instrument : null;
+  const chartOiName = chartOiIndex ? snapshots.map((snapshot) => snapshot.indices?.[chartOiIndex]?.name).find(Boolean) ?? chartOiIndex : undefined;
   const isIndex = rows[0]?.kind === "INDEX";
 
   const exportCsv = () => {
@@ -238,19 +240,15 @@ export const SentimentHistoryPanel = memo(function SentimentHistoryPanel() {
               </div>
             ) : null}
           </div>
-          {chartSeries.length ? <SentimentChart snapshots={snapshots} series={chartSeries} /> : <p className="isa-muted">Pick at least one line above.</p>}
-        </div>
-      ) : null}
-
-      {instrument === OI_VIEW && snapshots.length && anyOi ? (
-        <div className="smc-block">
-          <div className="smc-head">
-            <h4 className="smh-sub">Option writers&apos; OI every 5 minutes (average of 3-minute samples)</h4>
-            <div className="smc-legend" role="group" aria-label="Index">
-              {oiIndices.map((id) => <button type="button" key={id} className={oiIndex === id ? "on" : ""} aria-pressed={oiIndex === id} onClick={() => setOiIndex(id)}>{snapshots.map((snapshot) => snapshot.indices?.[id]?.name).find(Boolean) ?? id}</button>)}
+          {anyOi ? (
+            <div className="smc-legend smc-oi-pick" role="group" aria-label="OI pane">
+              <small className="isa-muted">OI pane (5-min average of 3-min samples):</small>
+              {instrument === "ALL" || instrument === OI_VIEW
+                ? [...oiIndices.map((id) => [id, snapshots.map((snapshot) => snapshot.indices?.[id]?.name).find(Boolean) ?? id] as const), ["", "Off"] as const].map(([id, name]) => <button type="button" key={id || "off"} className={oiIndex === id ? "on" : ""} aria-pressed={oiIndex === id} onClick={() => setOiIndex(id)}>{name}</button>)
+                : <small>{chartOiIndex ? `${chartOiName} call vs put writers` : "not an index"}</small>}
             </div>
-          </div>
-          <OiChart snapshots={snapshots} index={oiIndex} name={snapshots.map((snapshot) => snapshot.indices?.[oiIndex]?.name).find(Boolean) ?? oiIndex} />
+          ) : null}
+          {chartSeries.length ? <SentimentChart snapshots={snapshots} series={chartSeries} oiIndex={chartOiIndex} oiName={chartOiName} /> : <p className="isa-muted">Pick at least one line above.</p>}
         </div>
       ) : null}
 

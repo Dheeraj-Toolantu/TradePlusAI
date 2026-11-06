@@ -6,7 +6,9 @@
  * taken since the previous one. % changes are worked out on those averages against the previous
  * snapshot and the day's first, from the totals kept in the history state.
  */
-export type OiTotals = { expiry: string; call_oi: number; put_oi: number; pcr: number | null; spot: number | null; at: string };
+/** One strike's open interest (and last price) on the nearest expiry. */
+export type StrikeOi = { strike: number; ce_oi: number; pe_oi: number; ce_ltp: number | null; pe_ltp: number | null };
+export type OiTotals = { expiry: string; call_oi: number; put_oi: number; pcr: number | null; spot: number | null; at: string; strikes?: StrikeOi[] };
 export type OiBaseline = { date: string; call_oi: number; put_oi: number; open_call_oi: number; open_put_oi: number; at: string };
 export type OiReading = OiTotals & {
   /** How many 3-minute samples the snapshot's average is made of. */
@@ -66,8 +68,12 @@ export async function readOiTotals(symbol: string): Promise<OiTotals> {
   const call = rows.reduce((sum, row) => sum + (row.ce?.oi ?? 0), 0);
   const put = rows.reduce((sum, row) => sum + (row.pe?.oi ?? 0), 0);
   if (!(call > 0) && !(put > 0)) throw new Error(`The ${symbol} option chain returned no open interest`);
-  return { expiry, call_oi: call, put_oi: put, pcr: call > 0 ? round(put / call, 3) : null, spot: spot > 0 ? spot : null, at: new Date().toISOString() };
+  const strikes = rows.map((row) => ({ strike: row.strike, ce_oi: row.ce?.oi ?? 0, pe_oi: row.pe?.oi ?? 0, ce_ltp: row.ce?.ltp ?? null, pe_ltp: row.pe?.ltp ?? null }));
+  return { expiry, call_oi: call, put_oi: put, pcr: call > 0 ? round(put / call, 3) : null, spot: spot > 0 ? spot : null, at: new Date().toISOString(), strikes };
 }
+
+/** Totals without the strike rows (what the sentiment snapshots store). */
+export const withoutStrikes = (value: OiTotals): OiTotals => { const { strikes: _strikes, ...rest } = value; void _strikes; return rest; };
 
 /** Every index's OI; an index that fails is left out (the snapshot is still saved). */
 export async function readAllOi(read: (symbol: string) => Promise<OiTotals> = readOiTotals, ids: readonly string[] = OI_INDICES): Promise<Record<string, OiTotals>> {
