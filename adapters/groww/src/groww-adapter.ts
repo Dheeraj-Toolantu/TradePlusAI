@@ -18,6 +18,32 @@ const growwResponseRequests = new Map<string, Promise<unknown>>();
 let growwApiCooldownUntil = 0;
 let growwApiCooldownMessage = "";
 const GET_CACHE_TTL_MS = 5_000;
+/** While the market is shut nothing moves: reuse market-data bodies for 5 minutes. */
+const CLOSED_MARKET_TTL_MS = 5 * 60_000;
+/** Candle history only changes once a minute; option chains every few seconds at most. */
+const HISTORY_TTL_MS = 20_000;
+const CHAIN_TTL_MS = 10_000;
+/** A rate-limited call answers with the last good body for up to this long instead of failing. */
+const STALE_FALLBACK_MS = 15 * 60_000;
+/** The last good body per market-data path, kept for STALE_FALLBACK_MS. */
+const growwStaleCache = new Map<string, { at: number; body: unknown }>();
+
+/** NSE / BSE trade 09:15–15:30 IST on weekdays; a 15-minute margin each side for pre-open and closing data. */
+export function marketOpenIst(ms = Date.now()) {
+  const d = new Date(ms + 330 * 60_000);
+  const day = d.getUTCDay();
+  const minute = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return day >= 1 && day <= 5 && minute >= 9 * 60 && minute <= 15 * 60 + 45;
+}
+
+/** How long a GET body is reused: longer for candles and chains, much longer while the market is shut. */
+export function marketDataTtl(path: string, requested: number | undefined, ms = Date.now()) {
+  if (!isMarketDataPath(path)) return requested ?? GET_CACHE_TTL_MS;
+  if (!marketOpenIst(ms)) return Math.max(requested ?? 0, CLOSED_MARKET_TTL_MS);
+  if (path.startsWith("/v1/historical/")) return Math.max(requested ?? 0, HISTORY_TTL_MS);
+  if (path.startsWith("/v1/option-chain/")) return Math.max(requested ?? 0, CHAIN_TTL_MS);
+  return requested ?? GET_CACHE_TTL_MS;
+}
 const RATE_LIMIT_COOLDOWN_MS = 30_000;
 const MAX_RATE_LIMIT_COOLDOWN_MS = 120_000;
 
@@ -74,7 +100,8 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
     async request(path, init) {
       const cacheKey = `${baseUrl}${path}`;
       const cacheable = init.method.toUpperCase() === "GET";
-      const ttl = init.cacheTtlMs ?? GET_CACHE_TTL_MS;
+      const ttl = marketDataTtl(path, init.cacheTtlMs);
+      const stale = () => { const item = cacheable ? growwStaleCache.get(cacheKey) : undefined; return item && Date.now() - item.at < STALE_FALLBACK_MS ? item : undefined; };
       if (cacheable) {
         const cached = growwResponseCache.get(cacheKey);
         if (cached && cached.expiresAt > Date.now()) return cached.body;
@@ -82,13 +109,16 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
         if (pending) return pending;
       }
       if (growwApiCooldownUntil > Date.now()) {
-        const cached = cacheable ? growwResponseCache.get(cacheKey) : undefined;
-        if (cached && cached.expiresAt > Date.now()) return cached.body;
+        // Rate-limited: answer with the last good body rather than blanking every panel.
+        const fallback = stale();
+        if (fallback) return fallback.body;
         throw new RateLimitError(growwApiCooldownMessage, growwApiCooldownUntil - Date.now());
       }
       const requestOptions = (bearer: string) => ({ method: init.method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${bearer}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: init.body === undefined ? undefined : JSON.stringify(init.body), cache: "no-store" as const });
       const requestPromise = (async () => {
-        if (cacheable && isMarketDataPath(path)) await limiter.acquire();
+        if (cacheable && isMarketDataPath(path)) {
+          try { await limiter.acquire(); } catch (error) { const fallback = stale(); if (fallback) return fallback.body; throw error; }
+        }
         let bearer = await accessToken();
         let response = await fetch(`${baseUrl}${path}`, requestOptions(bearer));
         if (response.status === 401 && apiKey && apiSecret) {
@@ -103,11 +133,17 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
             const cooldown = cooldownFor(response);
             growwApiCooldownUntil = Date.now() + cooldown;
             growwApiCooldownMessage = `Groww rate limit reached; pausing market-data calls for ${Math.round(cooldown / 1000)} s (${message})`;
+            const fallback = stale();
+            if (fallback) return fallback.body;
             throw new RateLimitError(growwApiCooldownMessage, cooldown);
           }
           throw new Error(message);
         }
         if (cacheable && ttl > 0) growwResponseCache.set(cacheKey, { expiresAt: Date.now() + ttl, body });
+        if (cacheable && isMarketDataPath(path)) {
+          growwStaleCache.set(cacheKey, { at: Date.now(), body });
+          if (growwStaleCache.size > 2000) growwStaleCache.delete(growwStaleCache.keys().next().value as string);
+        }
         return body;
       })();
       if (cacheable) growwResponseRequests.set(cacheKey, requestPromise);

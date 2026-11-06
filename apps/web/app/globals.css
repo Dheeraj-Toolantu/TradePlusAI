@@ -1315,3 +1315,16 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 .app-nav .app-nav-brand { margin-right: 8px; color: #30d4ca; font-weight: 800; letter-spacing: .4px; }
 .app-nav .app-nav-brand:hover { background: transparent; }
 @media (max-width: 640px) { .app-nav { padding: 6px 10px; overflow-x: auto; flex-wrap: nowrap; } .app-nav a { white-space: nowrap; } }
+
+/* Hedge builder (option buys only) */
+.hedge-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.hedge-controls label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.hedge-controls select { padding: 5px 8px; color: #e8f1f2; border: 1px solid #2b4d5c; border-radius: 4px; background: #102433; font-size: 11px; }
+.hedge-payoff { width: 100%; height: auto; max-height: 180px; margin: 6px 0; border: 1px solid #1d3542; border-radius: 6px; background: #0b1a22; }
+.hedge-ranking { margin-top: 4px; }
+.hedge-controls input { width: 72px; padding: 5px 8px; color: #e8f1f2; border: 1px solid #2b4d5c; border-radius: 4px; background: #102433; font-size: 11px; }
+.hedge-controls em { font-style: normal; }
+.hedge-scenarios th.hedge-target { color: #ffd27a; }
+@media (max-width: 720px) { .hedge-scenarios { display: block; overflow-x: auto; } }
+.hedge-ranking tbody tr:hover { background: rgba(48, 212, 202, .06); }
+@media (max-width: 720px) { .hedge-ranking { display: block; overflow-x: auto; } }
