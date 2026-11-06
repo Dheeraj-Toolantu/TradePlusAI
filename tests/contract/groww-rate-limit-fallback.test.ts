@@ -1,3 +1,7 @@
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGrowwTransport, marketDataTtl, marketOpenIst } from "../../adapters/groww/src/groww-adapter";
 
@@ -30,5 +34,27 @@ describe("Groww market data under a rate limit", () => {
     expect(marketDataTtl("/v1/historical/candle/range?x", undefined, MARKET_HOURS)).toBe(20_000);
     expect(marketDataTtl("/v1/option-chain/exchange/NSE", undefined, MARKET_HOURS)).toBe(10_000);
     expect(marketDataTtl("/v1/order/status/x", undefined, PRE_MARKET)).toBe(5_000);
+  });
+
+  it("shares one access token between processes through the token file", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "tp-token-"));
+    const file = path.join(dir, "token.json");
+    const base = "https://shared-token.test";
+    const valid = `x.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.y`;
+    // Another process already generated a token for this key.
+    writeFileSync(file, JSON.stringify({ key: createHash("sha256").update(`${base}:key-a`).digest("hex"), token: valid }));
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => { calls.push(`${String(input)} ${(init?.headers as Record<string, string>)?.Authorization ?? ""}`); return new Response(JSON.stringify({ payload: { ltp: 1 } }), { status: 200, headers: { "content-type": "application/json" } }); }) as typeof fetch;
+    const transport = createGrowwTransport({ GROWW_API_KEY: "key-a", GROWW_API_SECRET: "secret", GROWW_API_BASE_URL: base, GROWW_TOKEN_CACHE_FILE: file });
+    await transport.request("/v1/user/profile", { method: "GET" });
+    expect(calls.some((call) => call.includes("token/api/access"))).toBe(false);
+    expect(calls[0]).toContain(`Bearer ${valid}`);
+
+    // A fresh key generates once and writes the token for the others, owner-only.
+    const other = path.join(dir, "other.json");
+    globalThis.fetch = (async (input: string | URL | Request) => new Response(JSON.stringify(String(input).includes("token/api/access") ? { payload: { token: valid } } : { payload: {} }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+    await createGrowwTransport({ GROWW_API_KEY: "key-b", GROWW_API_SECRET: "secret", GROWW_API_BASE_URL: base, GROWW_TOKEN_CACHE_FILE: other }).request("/v1/portfolio/positions", { method: "GET" });
+    expect(JSON.parse(readFileSync(other, "utf8")).token).toBe(valid);
+    if (process.platform !== "win32") expect(statSync(other).mode & 0o077).toBe(0);
   });
 });

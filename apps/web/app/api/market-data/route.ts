@@ -52,7 +52,11 @@ export async function GET(request: Request) {
     return NextResponse.json({ quotes, updatedAt: new Date().toISOString(), delayed: true, provider, source: "Yahoo Finance delayed market data" });
   } catch (error) {
     if (provider === "groww") {
-      return NextResponse.json({ quotes: [], updatedAt: new Date().toISOString(), delayed: false, provider: "groww", source: "Groww real-time market data unavailable", error: error instanceof Error ? error.message : "Groww market data unavailable" }, { status: 503 });
+      // Groww throttled or unreachable: the header still gets index levels, from delayed Yahoo
+      // quotes, clearly marked delayed (strategies never trade on these; they read Groww directly).
+      const message = error instanceof Error ? error.message : "Groww market data unavailable";
+      const quotes = (await Promise.all(selected.map(fetchQuote))).filter((quote) => !String(quote.source).startsWith("Fallback"));
+      return NextResponse.json({ quotes, updatedAt: new Date().toISOString(), delayed: true, provider: quotes.length ? "yahoo" : "groww", requestedProvider: "groww", source: quotes.length ? "Yahoo Finance delayed (Groww unavailable)" : "Groww real-time market data unavailable", error: message }, { status: quotes.length ? 200 : 503 });
     }
     const quotes = await Promise.all(selected.map(fetchQuote));
     return NextResponse.json({ quotes, updatedAt: new Date().toISOString(), delayed: true, provider: "yahoo", requestedProvider: provider, source: `Yahoo Finance fallback${error instanceof Error ? `: ${error.message}` : ""}` });

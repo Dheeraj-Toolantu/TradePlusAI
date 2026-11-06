@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { QuoteHub } from "../../apps/api/src/quote-hub";
-import { createLtpFetcher, exchangeSymbol } from "../../adapters/groww/src/groww-ltp";
+import { SINGLE_FALLBACK_MAX, createLtpFetcher, exchangeSymbol } from "../../adapters/groww/src/groww-ltp";
 import { RateLimitError, createRateLimiter, isRateLimitError } from "../../adapters/groww/src/groww-rate-limiter";
 
 const manualTimers = () => {
@@ -120,5 +120,30 @@ describe("shared quote hub", () => {
     await timers.flush();
     expect(states).toEqual(["live", "rate-limited"]);
     expect(hub.snapshot({ cash: ["NIFTY"], fno: [] }).cash[0].price).toBe(100);
+  });
+
+  it("keeps index quotes live when the option quotes fail", async () => {
+    const timers = manualTimers();
+    const hub = new QuoteHub(async (symbols, segment) => {
+      if (segment === "FNO") throw new RateLimitError("Groww rate limit reached", 30_000);
+      return new Map(symbols.map((symbol) => [symbol, 24_900]));
+    }, { intervalMs: 1000, setTimer: timers.setTimer, clearTimer: timers.clearTimer });
+    const states: string[] = [];
+    hub.subscribe((_changed, status) => states.push(status.state));
+    hub.setSubscription("a", { cash: ["NIFTY"], fno: ["NIFTY26N1024900CE"] });
+    await timers.flush();
+    expect(states).toEqual(["live"]);
+    expect(hub.snapshot({ cash: ["NIFTY"], fno: [] }).cash[0].price).toBe(24_900);
+  });
+});
+
+describe("LTP fallback budget", () => {
+  it("falls back to at most a few per-symbol quotes when the batch is refused", async () => {
+    const paths: string[] = [];
+    const fetchLtp = createLtpFetcher({ request: async (path) => { paths.push(path); if (path.includes("/ltp?")) throw new Error("Groww API 400: bad request"); return { payload: { ltp: 101 } }; } });
+    const symbols = Array.from({ length: 40 }, (_, index) => `NIFTY26N10${24_000 + index * 50}CE`);
+    const prices = await fetchLtp(symbols, "FNO");
+    expect(paths.filter((path) => path.includes("/quote?"))).toHaveLength(SINGLE_FALLBACK_MAX);
+    expect(prices.size).toBe(SINGLE_FALLBACK_MAX);
   });
 });

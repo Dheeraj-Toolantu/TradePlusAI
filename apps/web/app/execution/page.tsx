@@ -154,6 +154,7 @@ export default function ExecutionPage() {
   const [busy, setBusy] = useState(false);
   const [quotes, setQuotes] = useState<Record<string, number>>({});
   const [streamStatus, setStreamStatus] = useState("connecting");
+  const [streamDetail, setStreamDetail] = useState("");
   const [candles, setCandles] = useState<Candle[]>([]);
   const [chain, setChain] = useState<OptionCandidate[]>([]);
   const [chainStatus, setChainStatus] = useState("Loading option chain…");
@@ -344,8 +345,10 @@ export default function ExecutionPage() {
       if (document.visibilityState !== "visible") return;
       try {
         const data = await fetch(`/api/market-data?provider=groww&symbols=${encodeURIComponent(TICKER.join(","))}`, { cache: "no-store" }).then((response) => response.json());
-        if (Array.isArray(data.quotes) && data.quotes.length) { applyMarkets(data.quotes); setStreamStatus("polling"); }
-        else if (data.error) setStreamStatus(/429|rate/i.test(String(data.error)) ? "rate-limited" : "unavailable");
+        const limited = /429|rate|budget/i.test(String(data.error ?? ""));
+        if (data.error) setStreamDetail(String(data.error).slice(0, 240));
+        if (Array.isArray(data.quotes) && data.quotes.length) { applyMarkets(data.quotes); setStreamStatus(data.delayed ? (limited ? "delayed · Groww rate-limited" : "delayed") : "polling"); }
+        else if (data.error) setStreamStatus(limited ? "rate-limited" : "unavailable");
       } catch { /* keep the last prices */ }
     };
     const startPolling = () => {
@@ -387,7 +390,9 @@ export default function ExecutionPage() {
         try { payload = JSON.parse(event.data); } catch { return; }
         if (payload.type === "status" && payload.state) {
           setStreamStatus(payload.state);
-          if (payload.state === "live") stopPolling();
+          setStreamDetail(typeof (payload as { detail?: unknown }).detail === "string" ? String((payload as { detail?: string }).detail) : "");
+          // Throttled or failing socket feed: keep the header filled from the slower HTTP route.
+          if (payload.state === "live") stopPolling(); else if (payload.state === "rate-limited" || payload.state === "unavailable") startPolling();
           return;
         }
         if (payload.type === "markets" && Array.isArray(payload.quotes)) {
@@ -773,7 +778,7 @@ export default function ExecutionPage() {
           {safety.safeMode && <span className="exec-badge exec-badge-danger" title={safety.reason}>SAFE MODE</span>}
           <span className="exec-badge">{sessionLabel}</span>
           <IstClock />
-          <span className={streamStatus === "live" ? "exec-badge gain" : "exec-badge warning"}>Quotes {streamStatus}</span>
+          <span className={streamStatus === "live" ? "exec-badge gain" : "exec-badge warning"} title={streamDetail || undefined}>Quotes {streamStatus}</span>
           <button type="button" className="exec-badge exec-badge-button" onClick={() => void clearCache()} disabled={cacheClearing}>{cacheClearing ? "Clearing…" : "Clear cache"}</button>
           <span className="exec-badge">Margin {account?.available !== null && account?.available !== undefined ? `₹${money(account.available)}` : "--"}</span>
         </div>
