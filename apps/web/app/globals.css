@@ -1328,3 +1328,10 @@ nav a:hover { background: rgba(15, 40, 48, 0.92); color: white; }
 @media (max-width: 720px) { .hedge-scenarios { display: block; overflow-x: auto; } }
 .hedge-ranking tbody tr:hover { background: rgba(48, 212, 202, .06); }
 @media (max-width: 720px) { .hedge-ranking { display: block; overflow-x: auto; } }
+
+/* Sentiment history: option-writer OI view */
+.smh-oi th.smh-group { text-align: center; border-bottom: 1px solid #2b4d5c; }
+.smh-oi td small, .smh-oi th small { display: block; }
+.oi-chart svg { width: 100%; height: auto; max-height: 260px; }
+.oi-chart-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 11px; color: #c5d6da; }
+.oi-chart-legend i { display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; }

@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { BrokerAdapter, BrokerOrderRequest, BrokerOrderState, BrokerPosition, BrokerQuote, BrokerResult } from "../../../packages/broker-contracts/src/broker-adapter";
 import { toGrowwOrder, validateReferenceId } from "./groww-request-policy";
 import { RateLimitError, growwMarketDataLimiter, isMarketDataPath } from "./groww-rate-limiter";
@@ -9,14 +12,46 @@ export type GrowwTransport = { request(path: string, init: { method: string; bod
 type GrowwPayload = { status?: string; payload?: Record<string, unknown> };
 type CachedGrowwToken = { key: string; token: string };
 
-let cachedGrowwToken: CachedGrowwToken | undefined;
-let growwTokenRequest: { key: string; promise: Promise<string> } | undefined;
-let growwTokenCooldownUntil = 0;
-let growwTokenCooldownMessage = "";
-const growwResponseCache = new Map<string, { expiresAt: number; body: unknown }>();
-const growwResponseRequests = new Map<string, Promise<unknown>>();
-let growwApiCooldownUntil = 0;
-let growwApiCooldownMessage = "";
+/**
+ * Transport state, one per process. Next.js bundles every API route separately, so module-level
+ * variables gave each route its own access token, response cache and 429 cooldown: every route
+ * generated a fresh token and spent the shared Groww budget on its own. globalThis is shared.
+ */
+type TransportState = {
+  token: CachedGrowwToken | undefined; tokenRequest: { key: string; promise: Promise<string> } | undefined;
+  tokenCooldownUntil: number; tokenCooldownMessage: string;
+  cache: Map<string, { expiresAt: number; body: unknown }>; inflight: Map<string, Promise<unknown>>;
+  apiCooldownUntil: number; apiCooldownMessage: string; stale: Map<string, { at: number; body: unknown }>;
+};
+const G = ((globalThis as typeof globalThis & { __tradepulseGrowwTransport?: TransportState }).__tradepulseGrowwTransport ??= {
+  token: undefined, tokenRequest: undefined, tokenCooldownUntil: 0, tokenCooldownMessage: "",
+  cache: new Map(), inflight: new Map(), apiCooldownUntil: 0, apiCooldownMessage: "", stale: new Map(),
+});
+
+/**
+ * The generated access token is also kept in a small file (owner-only permissions, in the OS temp
+ * folder) so the web app, the quote socket server and dev restarts reuse one token instead of each
+ * asking Groww's token API for a new one, which that API throttles. A token-API 429 cooldown is
+ * shared the same way. GROWW_TOKEN_CACHE_FILE overrides the path; "off" disables it.
+ */
+type TokenFile = { key: string; token?: string; cooldownUntil?: number; message?: string };
+function tokenFilePath(key: string, environment: NodeJS.ProcessEnv) {
+  const configured = environment.GROWW_TOKEN_CACHE_FILE ?? process.env.GROWW_TOKEN_CACHE_FILE;
+  if (configured === "off" || (!configured && process.env.VITEST)) return null;
+  return configured || path.join(tmpdir(), `tradepulse-groww-${createHash("sha256").update(key).digest("hex").slice(0, 16)}.json`);
+}
+function readTokenFile(file: string | null, key: string): TokenFile | null {
+  if (!file) return null;
+  try { const data = JSON.parse(readFileSync(file, "utf8")) as TokenFile; return data.key === createHash("sha256").update(key).digest("hex") ? data : null; } catch { return null; }
+}
+function writeTokenFile(file: string | null, key: string, patch: Omit<TokenFile, "key">) {
+  if (!file) return;
+  try {
+    const hashed = createHash("sha256").update(key).digest("hex");
+    const current = readTokenFile(file, key) ?? { key: hashed };
+    writeFileSync(file, JSON.stringify({ ...current, ...patch, key: hashed }), { mode: 0o600 });
+  } catch { /* the file is an optimisation only */ }
+}
 const GET_CACHE_TTL_MS = 5_000;
 /** While the market is shut nothing moves: reuse market-data bodies for 5 minutes. */
 const CLOSED_MARKET_TTL_MS = 5 * 60_000;
@@ -26,7 +61,6 @@ const CHAIN_TTL_MS = 10_000;
 /** A rate-limited call answers with the last good body for up to this long instead of failing. */
 const STALE_FALLBACK_MS = 15 * 60_000;
 /** The last good body per market-data path, kept for STALE_FALLBACK_MS. */
-const growwStaleCache = new Map<string, { at: number; body: unknown }>();
 
 /** NSE / BSE trade 09:15–15:30 IST on weekdays; a 15-minute margin each side for pre-open and closing data. */
 export function marketOpenIst(ms = Date.now()) {
@@ -59,6 +93,7 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
   const apiSecret = environment.GROWW_API_SECRET;
   const baseUrl = environment.GROWW_API_BASE_URL ?? "https://api.groww.in";
   const tokenCacheKey = `${baseUrl}:${apiKey ?? ""}`;
+  const tokenFile = tokenFilePath(tokenCacheKey, environment);
   function tokenExpired(value: string): boolean {
     try {
       const encodedPayload = value.split(".")[1];
@@ -70,12 +105,16 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
     }
   }
   async function accessToken(forceRefresh = false): Promise<string> {
-    if (forceRefresh) cachedGrowwToken = undefined;
-    if (cachedGrowwToken?.key === tokenCacheKey && !tokenExpired(cachedGrowwToken.token)) return cachedGrowwToken.token;
+    if (forceRefresh) G.token = undefined;
+    if (G.token?.key === tokenCacheKey && !tokenExpired(G.token.token)) return G.token.token;
     if (!forceRefresh && token && !tokenExpired(token)) return token;
     if (!apiKey || !apiSecret) throw new Error("GROWW_ACCESS_TOKEN is not configured; set it or configure GROWW_API_KEY and GROWW_API_SECRET");
-    if (growwTokenCooldownUntil > Date.now()) throw new Error(growwTokenCooldownMessage);
-    if (growwTokenRequest?.key === tokenCacheKey) return growwTokenRequest.promise;
+    const shared = readTokenFile(tokenFile, tokenCacheKey);
+    // Another process (or an earlier run) already has a valid token: use it rather than asking again.
+    if (!forceRefresh && shared?.token && !tokenExpired(shared.token)) { G.token = { key: tokenCacheKey, token: shared.token }; return shared.token; }
+    if (shared?.cooldownUntil && shared.cooldownUntil > G.tokenCooldownUntil) { G.tokenCooldownUntil = shared.cooldownUntil; G.tokenCooldownMessage = shared.message ?? "Groww token API rate limit"; }
+    if (G.tokenCooldownUntil > Date.now()) throw new RateLimitError(`${G.tokenCooldownMessage} (retrying in ${Math.ceil((G.tokenCooldownUntil - Date.now()) / 1000)} s)`, G.tokenCooldownUntil - Date.now());
+    if (G.tokenRequest?.key === tokenCacheKey) return G.tokenRequest.promise;
     const promise = (async () => {
       const timestamp = Math.floor(Date.now() / 1000).toString();
       const checksum = createHash("sha256").update(`${apiSecret}${timestamp}`, "utf8").digest("hex");
@@ -83,17 +122,23 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         const message = `Groww token API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`;
-        if (response.status === 429) { growwTokenCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; growwTokenCooldownMessage = message; }
+        if (response.status === 429) {
+          const cooldown = cooldownFor(response);
+          G.tokenCooldownUntil = Date.now() + cooldown; G.tokenCooldownMessage = `Groww token API rate limit: ${message}`;
+          writeTokenFile(tokenFile, tokenCacheKey, { cooldownUntil: G.tokenCooldownUntil, message: G.tokenCooldownMessage });
+          throw new RateLimitError(G.tokenCooldownMessage, cooldown);
+        }
         throw new Error(message);
       }
       const generated = String((body as GrowwPayload)?.payload?.token ?? (body as { token?: string }).token ?? "");
       if (!generated) throw new Error("Groww token API returned no access token");
-      cachedGrowwToken = { key: tokenCacheKey, token: generated };
+      G.token = { key: tokenCacheKey, token: generated };
       token = generated;
+      writeTokenFile(tokenFile, tokenCacheKey, { token: generated, cooldownUntil: 0, message: "" });
       return generated;
     })();
-    growwTokenRequest = { key: tokenCacheKey, promise };
-    try { return await promise; } finally { if (growwTokenRequest?.promise === promise) growwTokenRequest = undefined; }
+    G.tokenRequest = { key: tokenCacheKey, promise };
+    try { return await promise; } finally { if (G.tokenRequest?.promise === promise) G.tokenRequest = undefined; }
   }
   const limiter = growwMarketDataLimiter(environment);
   return {
@@ -101,18 +146,20 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
       const cacheKey = `${baseUrl}${path}`;
       const cacheable = init.method.toUpperCase() === "GET";
       const ttl = marketDataTtl(path, init.cacheTtlMs);
-      const stale = () => { const item = cacheable ? growwStaleCache.get(cacheKey) : undefined; return item && Date.now() - item.at < STALE_FALLBACK_MS ? item : undefined; };
+      const stale = () => { const item = cacheable ? G.stale.get(cacheKey) : undefined; return item && Date.now() - item.at < STALE_FALLBACK_MS ? item : undefined; };
       if (cacheable) {
-        const cached = growwResponseCache.get(cacheKey);
+        const cached = G.cache.get(cacheKey);
         if (cached && cached.expiresAt > Date.now()) return cached.body;
-        const pending = growwResponseRequests.get(cacheKey);
+        const pending = G.inflight.get(cacheKey);
         if (pending) return pending;
       }
-      if (growwApiCooldownUntil > Date.now()) {
+      // The cooldown covers market data only: Groww limits orders and portfolio calls separately.
+      const marketData = isMarketDataPath(path);
+      if (marketData && G.apiCooldownUntil > Date.now()) {
         // Rate-limited: answer with the last good body rather than blanking every panel.
         const fallback = stale();
         if (fallback) return fallback.body;
-        throw new RateLimitError(growwApiCooldownMessage, growwApiCooldownUntil - Date.now());
+        throw new RateLimitError(G.apiCooldownMessage, G.apiCooldownUntil - Date.now());
       }
       const requestOptions = (bearer: string) => ({ method: init.method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${bearer}`, "X-API-VERSION": environment.GROWW_API_VERSION ?? "1.0" }, body: init.body === undefined ? undefined : JSON.stringify(init.body), cache: "no-store" as const });
       const requestPromise = (async () => {
@@ -129,26 +176,27 @@ export function createGrowwTransport(environment: NodeJS.ProcessEnv = process.en
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
           const message = `Groww API ${response.status}: ${JSON.stringify(body).slice(0, 300)}`;
+          if (response.status === 429 && !marketData) throw new RateLimitError(`Groww rate limit reached (${message})`, cooldownFor(response));
           if (response.status === 429) {
             const cooldown = cooldownFor(response);
-            growwApiCooldownUntil = Date.now() + cooldown;
-            growwApiCooldownMessage = `Groww rate limit reached; pausing market-data calls for ${Math.round(cooldown / 1000)} s (${message})`;
+            G.apiCooldownUntil = Date.now() + cooldown;
+            G.apiCooldownMessage = `Groww rate limit reached; pausing market-data calls for ${Math.round(cooldown / 1000)} s (${message})`;
             const fallback = stale();
             if (fallback) return fallback.body;
-            throw new RateLimitError(growwApiCooldownMessage, cooldown);
+            throw new RateLimitError(G.apiCooldownMessage, cooldown);
           }
           throw new Error(message);
         }
-        if (cacheable && ttl > 0) growwResponseCache.set(cacheKey, { expiresAt: Date.now() + ttl, body });
+        if (cacheable && ttl > 0) G.cache.set(cacheKey, { expiresAt: Date.now() + ttl, body });
         if (cacheable && isMarketDataPath(path)) {
-          growwStaleCache.set(cacheKey, { at: Date.now(), body });
-          if (growwStaleCache.size > 2000) growwStaleCache.delete(growwStaleCache.keys().next().value as string);
+          G.stale.set(cacheKey, { at: Date.now(), body });
+          if (G.stale.size > 2000) G.stale.delete(G.stale.keys().next().value as string);
         }
         return body;
       })();
-      if (cacheable) growwResponseRequests.set(cacheKey, requestPromise);
+      if (cacheable) G.inflight.set(cacheKey, requestPromise);
       try { return await requestPromise; }
-      finally { if (cacheable && growwResponseRequests.get(cacheKey) === requestPromise) growwResponseRequests.delete(cacheKey); }
+      finally { if (cacheable && G.inflight.get(cacheKey) === requestPromise) G.inflight.delete(cacheKey); }
     },
   };
 }

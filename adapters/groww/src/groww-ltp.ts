@@ -6,6 +6,12 @@ export type GrowwSegment = "CASH" | "FNO";
 const BATCH_SIZE = 50; // Groww's per-request instrument cap for LTP
 const BATCH_RETRY_MS = 5 * 60_000;
 const TICK_CACHE_MS = 1_000;
+/**
+ * Per-symbol quotes are the fallback when the batch endpoint is refused. A chain of 40+ options
+ * polled one quote at a time every 1.5 s is far beyond Groww's budget, so the fallback covers only
+ * the first few symbols of each request (the index quotes come first); the rest wait for the batch.
+ */
+export const SINGLE_FALLBACK_MAX = 8;
 
 /** Exchange-qualified symbol (e.g. NSE_NIFTY, BSE_SENSEX, NSE_NIFTY25O0725000CE). */
 export function exchangeSymbol(symbol: string, segment: GrowwSegment): string {
@@ -67,7 +73,7 @@ export function createLtpFetcher(transport: GrowwTransport) {
           batchBlockedUntil = Date.now() + BATCH_RETRY_MS;
         }
       }
-      const results = await Promise.allSettled(chunk.map(async (symbol) => [symbol, await single(symbol, segment)] as const));
+      const results = await Promise.allSettled(chunk.slice(0, SINGLE_FALLBACK_MAX).map(async (symbol) => [symbol, await single(symbol, segment)] as const));
       const limited = results.find((result) => result.status === "rejected" && isRateLimitError(result.reason));
       if (limited && limited.status === "rejected") throw limited.reason;
       for (const result of results) if (result.status === "fulfilled" && result.value[1] !== null) prices.set(result.value[0], result.value[1]);

@@ -17,10 +17,11 @@ const scan = (at: string, nifty: number | null, niftyChange: number, crude: numb
 describe("sentiment history", () => {
   beforeEach(() => resetSentimentHistoryCache());
 
-  it("slots time into 15-minute IST buckets", () => {
-    expect(slotId(new Date("2026-10-21T03:52:00Z"))).toBe("20261021-0915");
+  it("slots time into 5-minute IST buckets", () => {
+    expect(slotId(new Date("2026-10-21T03:52:00Z"))).toBe("20261021-0920");
     expect(slotId(new Date("2026-10-21T03:52:00Z"), 1)).toBe("20261021-0922");
-    expect(slotId(new Date("2026-10-21T18:40:00Z"))).toBe("20261022-0000");
+    expect(slotId(new Date("2026-10-21T03:52:00Z"), 15)).toBe("20261021-0915");
+    expect(slotId(new Date("2026-10-21T18:40:00Z"))).toBe("20261022-0010");
   });
 
   it("uses a band so a score wobbling around zero is not a flip", () => {
@@ -38,7 +39,7 @@ describe("sentiment history", () => {
     expect(next.NIFTY).toMatchObject({ sentiment: "BEARISH", price: "DOWN", score: -11 });
   });
 
-  it("stores one snapshot per 15-minute slot and another on a reversal", async () => {
+  it("stores one snapshot per 5-minute slot and another on a reversal", async () => {
     const first = await recordSentiment(scan("2026-10-21T03:45:00Z", 15, 0.3), new Date("2026-10-21T03:46:00Z")); // 09:16 IST
     expect(first).toMatchObject({ recorded: true, snapshotId: "20261021-0915", reasons: ["SCHEDULED"] });
     const saved = firestoreFake.documents("sentimentSnapshots")[0] as Record<string, any>;
@@ -46,22 +47,22 @@ describe("sentiment history", () => {
     expect(saved.commodities.CRUDEOIL).toMatchObject({ score: 20, india_impact: -20, unit: "$/bbl" });
 
     // Same slot, same scan: nothing to do.
-    expect((await recordSentiment(scan("2026-10-21T03:45:00Z", 15, 0.3), new Date("2026-10-21T03:50:00Z"))).recorded).toBe(false);
+    expect((await recordSentiment(scan("2026-10-21T03:45:00Z", 15, 0.3), new Date("2026-10-21T03:47:00Z"))).recorded).toBe(false);
     // Same slot, new scan, no reversal: nothing either.
-    expect((await recordSentiment(scan("2026-10-21T03:51:00Z", 4, 0.1), new Date("2026-10-21T03:52:00Z"))).recorded).toBe(false);
+    expect((await recordSentiment(scan("2026-10-21T03:47:30Z", 4, 0.1), new Date("2026-10-21T03:48:00Z"))).recorded).toBe(false);
 
     // NIFTY turns bearish and red within the slot: an immediate reversal snapshot.
-    const flipped = await recordSentiment(scan("2026-10-21T03:55:00Z", -11, -0.34), new Date("2026-10-21T03:56:00Z")); // 09:26 IST
+    const flipped = await recordSentiment(scan("2026-10-21T03:48:30Z", -11, -0.34), new Date("2026-10-21T03:49:00Z")); // 09:19 IST
     expect(flipped.reasons).toEqual(["REVERSAL"]);
-    expect(flipped.snapshotId).toBe("20261021-0926-reversal");
+    expect(flipped.snapshotId).toBe("20261021-0919-reversal");
     expect(firestoreFake.documents("sentimentReversals").map((item: Record<string, any>) => `${item.instrument}:${item.type}:${item.from}->${item.to}`).sort())
       .toEqual(["NIFTY:PRICE:UP->DOWN", "NIFTY:SENTIMENT:BULLISH->BEARISH"]);
 
     // Next slot: scheduled snapshot again. A restart reads the state back from Firestore.
     resetSentimentHistoryCache();
-    const next = await recordSentiment(scan("2026-10-21T03:55:00Z", -11, -0.34), new Date("2026-10-21T04:01:00Z")); // 09:31 IST
+    const next = await recordSentiment(scan("2026-10-21T03:48:30Z", -11, -0.34), new Date("2026-10-21T04:01:00Z")); // 09:31 IST
     expect(next).toMatchObject({ recorded: true, snapshotId: "20261021-0930", reasons: ["SCHEDULED"], reversals: [] });
-    expect(firestoreFake.documents("sentimentSnapshots").map((item) => item.id).sort()).toEqual(["20261021-0915", "20261021-0926-reversal", "20261021-0930"]);
+    expect(firestoreFake.documents("sentimentSnapshots").map((item) => item.id).sort()).toEqual(["20261021-0915", "20261021-0919-reversal", "20261021-0930"]);
   });
 
   it("detects a commodity reversal too", async () => {

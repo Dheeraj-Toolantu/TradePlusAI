@@ -89,10 +89,15 @@ export class QuoteHub {
     try {
       const cashSymbols = this.union("cash");
       const fnoSymbols = this.union("fno");
-      const [cash, fno] = await Promise.all([
+      // Index (cash) quotes must not go blank because the option (FNO) request failed, or the reverse.
+      const [cashResult, fnoResult] = await Promise.allSettled([
         cashSymbols.length ? this.fetchLtp(cashSymbols, "CASH") : Promise.resolve(new Map<string, number>()),
         fnoSymbols.length ? this.fetchLtp(fnoSymbols, "FNO") : Promise.resolve(new Map<string, number>()),
       ]);
+      if (cashResult.status === "rejected" && (fnoResult.status === "rejected" || !fnoSymbols.length)) throw cashResult.reason;
+      if (fnoResult.status === "rejected" && !cashSymbols.length) throw fnoResult.reason;
+      const cash = cashResult.status === "fulfilled" ? cashResult.value : new Map<string, number>();
+      const fno = fnoResult.status === "fulfilled" ? fnoResult.value : new Map<string, number>();
       const now = new Date().toISOString();
       const changed = { cash: this.apply("CASH", cash, now), fno: this.apply("FNO", fno, now) };
       this.failures = 0;

@@ -73,7 +73,7 @@ function legOf(raw: unknown): ChainLeg | undefined {
   return { ltp, oi, volume: num(side.volume) ?? 0, iv: num(greeks.iv ?? side.iv), delta: num(greeks.delta ?? side.delta), trading_symbol: String(side.trading_symbol ?? "") };
 }
 
-async function contractMeta(symbol: IntelSymbol) {
+export async function contractMeta(symbol: IntelSymbol) {
   const catalog = await loadGrowwInstrumentCatalog();
   const today = istDate();
   const options = catalog.getAll().filter((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && Boolean(instrument.expiryDate) && instrument.expiryDate! >= today);
@@ -83,7 +83,7 @@ async function contractMeta(symbol: IntelSymbol) {
   return { expiry, lotSize };
 }
 
-async function fetchChain(symbol: IntelSymbol, expiry: string) {
+export async function fetchChain(symbol: IntelSymbol, expiry: string) {
   const exchange = symbol === "SENSEX" ? "BSE" : "NSE";
   const body = await createGrowwTransport().request(`/v1/option-chain/exchange/${exchange}/underlying/${encodeURIComponent(symbol)}?expiry_date=${encodeURIComponent(expiry)}`, { method: "GET" });
   const payload = payloadOf(body);
