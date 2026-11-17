@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { GrowwAdapter, createGrowwTransport } from "../../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../../adapters/groww/src/groww-instruments";
+import { isCommodity } from "../../../../lib/underlyings";
+import { derivativesFor, nearestFuture } from "../../../../lib/underlying-catalog";
 
 const symbols: Record<string, string> = { NIFTY: "NIFTY", BANKNIFTY: "BANKNIFTY", SENSEX: "SENSEX" };
 const intervals: Record<string, number> = { "1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "1h": 60, "4h": 240, "1D": 1440, "1W": 10080, "1M": 43200 };
@@ -81,7 +83,25 @@ async function attachFuturesVolume(symbol: string, candles: HistoricalCandle[], 
   return { contract: future.tradingSymbol, futures };
 }
 
+/**
+ * MCX commodities have no cash instrument: their chart and tape are the nearest unexpired future's
+ * own OHLCV (true volume, so VWAP is real), with exchange, segment and trading symbol taken from
+ * Groww's instrument catalog. It is returned as both the candles and the "futures" candles.
+ */
+async function fetchCommodityHistory(symbol: string, timeframe: string, period: HistoryPeriod, selectedDate: string) {
+  const growwPeriod: HistoryPeriod = timeframe === "1m" ? "day" : timeframe === "3m" || timeframe === "5m" ? "week" : timeframe === "10m" || timeframe === "15m" ? "month" : period;
+  const { start, end } = rangeFor(growwPeriod, selectedDate);
+  const future = nearestFuture(await derivativesFor(symbol), selectedDate);
+  if (!future) throw new Error(`Groww's instrument list has no unexpired ${symbol} future.`);
+  const responseInterval = timeframe === "1M" ? "1W" : timeframe;
+  const response = await createGrowwTransport().request(`/v1/historical/candle/range?exchange=${encodeURIComponent(future.exchange)}&segment=${encodeURIComponent(future.segment)}&trading_symbol=${encodeURIComponent(future.tradingSymbol)}&start_time=${encodeURIComponent(toGrowwDate(start))}&end_time=${encodeURIComponent(toGrowwDate(end))}&interval_in_minutes=${intervals[responseInterval]}`, { method: "GET" });
+  const candles = parseCandles(response);
+  const volumeSource = candles.some((candle) => candle.volume !== null && candle.volume > 0) ? `MCX_FUTURE:${future.tradingSymbol}` : null;
+  return { candles: timeframe === "1M" ? aggregateMonthly(candles) : candles, volumeSource, futuresCandles: candles.map((candle) => ({ ...candle })), contract: future.tradingSymbol };
+}
+
 async function fetchGrowwHistory(symbol: string, timeframe: string, period: HistoryPeriod, selectedDate: string, withFuturesVolume = false) {
+  if (isCommodity(symbol)) return fetchCommodityHistory(symbol, timeframe, period, selectedDate);
   const growwPeriod: HistoryPeriod = timeframe === "1m" ? "day" : timeframe === "3m" || timeframe === "5m" ? "week" : timeframe === "10m" || timeframe === "15m" ? "month" : period;
   const { start, end } = rangeFor(growwPeriod, selectedDate);
   const transport = createGrowwTransport();
@@ -157,6 +177,8 @@ async function computeHistory(request: Request) {
         const { candles, volumeSource, futuresCandles } = await fetchGrowwHistory(symbol, timeframe, period, selectedDate, withFuturesVolume);
         return NextResponse.json({ candles, ...(futuresCandles ? { futuresCandles } : {}), provider: "groww", source: `Groww historical candles (${period}, ${selectedDate})`, volumeAvailable: volumeSource !== null, volumeSource, delayed: false, symbol, timeframe, period, date: selectedDate });
       } catch (error) {
+        // No delayed stand-in for MCX: Yahoo has no MCX contracts, and a foreign benchmark is not this market.
+        if (isCommodity(symbol)) return NextResponse.json({ candles: [], provider: "groww", source: "Groww MCX history unavailable", delayed: false, symbol, timeframe, period, date: selectedDate, error: error instanceof Error ? error.message : "MCX history unavailable" }, { status: 503 });
         const candles = await fetchYahooHistory(symbol, timeframe, period, selectedDate);
         return NextResponse.json({ candles, provider: "yahoo", requestedProvider: "groww", source: `Yahoo Finance fallback after Groww failure${error instanceof Error ? `: ${error.message}` : ""}`, volumeAvailable: candles.some((candle) => candle.volume !== null && candle.volume > 0), delayed: true, symbol, timeframe, period, date: selectedDate });
       }

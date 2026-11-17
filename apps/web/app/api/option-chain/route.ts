@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
-import { loadGrowwInstrumentCatalog } from "../../../../../adapters/groww/src/groww-instruments";
+import { derivativesFor, nearestOptionExpiry } from "../../../lib/underlying-catalog";
 import { safeMarketDataError } from "../../../lib/market-data-errors";
 
 function payloadOf(value: unknown) { return ((value as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>; }
@@ -68,15 +68,16 @@ export async function GET(request: Request) {
   // full=1 returns every strike within ±3% sorted by strike (strategy builder needs both wings).
   const full = params.get("full") === "1";
   try {
-    const catalog = await loadGrowwInstrumentCatalog();
-    const instruments = catalog.getAll().filter((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && Boolean(instrument.expiryDate));
-    const expiry = instruments.map((instrument) => instrument.expiryDate as string).filter((value) => value >= new Date().toISOString().slice(0, 10)).sort()[0];
+    // NSE / BSE index options or MCX commodity options, as Groww's instrument catalog lists them.
+    const derivatives = await derivativesFor(symbol);
+    const instruments = derivatives.options.filter((instrument) => Boolean(instrument.expiryDate));
+    const expiry = nearestOptionExpiry(derivatives);
     if (!expiry) throw new Error(`No future option expiry available for ${symbol}.`);
     const meta = new Map<string, { lotSize: number; tickSize: number; freezeQuantity: number }>();
     for (const instrument of instruments) if (instrument.expiryDate === expiry) meta.set(instrument.tradingSymbol, { lotSize: Number(instrument.lotSize ?? 0), tickSize: Number(instrument.tickSize ?? 0), freezeQuantity: Number(instrument.freezeQuantity ?? 0) });
 
     const transport = createGrowwTransport();
-    const exchange = symbol === "SENSEX" ? "BSE" : "NSE";
+    const exchange = derivatives.exchange;
     const chainBody = await transport.request(`/v1/option-chain/exchange/${exchange}/underlying/${encodeURIComponent(symbol)}?expiry_date=${encodeURIComponent(expiry)}`, { method: "GET" });
     const chainPayload = payloadOf(chainBody);
     const spot = num(chainPayload.underlying_ltp ?? chainPayload.underlyingLtp);
@@ -96,7 +97,7 @@ export async function GET(request: Request) {
     }
     if (full) rows.sort((left, right) => Number(left.strike) - Number(right.strike));
     else rows.sort((left, right) => Number(right.score) - Number(left.score));
-    return NextResponse.json({ symbol, expiry, spot, contracts: full ? rows : rows.slice(0, 16), source: "Groww option chain (Greeks, OI, volume)", updatedAt: new Date().toISOString() });
+    return NextResponse.json({ symbol, exchange, segment: derivatives.segment, expiry, spot, contracts: full ? rows : rows.slice(0, 16), source: "Groww option chain (Greeks, OI, volume)", updatedAt: new Date().toISOString() });
   } catch (error) {
     return NextResponse.json({ contracts: [], error: safeMarketDataError(error, "Option chain unavailable") }, { status: 503 });
   }

@@ -1,6 +1,7 @@
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { db } from "./firebase";
 import { getScalper } from "./scalper-instance";
+import { entryOpen, entryWindowLabel } from "./underlyings";
 import type { PositionView, ScalperSettings } from "../../../services/paper-trading/src/smart-scalper";
 
 /**
@@ -16,7 +17,7 @@ import type { PositionView, ScalperSettings } from "../../../services/paper-trad
  * trade has exited (target, SL or trailing SL, or a time / momentum / 15:15 / manual exit).
  *
  * Everything the placement path already enforces still applies: the kill switch, SAFE_MODE, daily
- * risk, broker health, the trade cap, the loss cool-down, 09:15-15:15 IST. Paper only.
+ * risk, broker health, the trade cap, the loss cool-down, each underlying's session (09:15-15:15 IST index options, 09:20-22:45 IST MCX). Paper only.
  */
 
 export type AutoStrategy = "VWAP_EMA_SCALP" | "NIFTY_SNIPER";
@@ -37,14 +38,13 @@ type State = {
   lastRunAt: string | null; nextRunAt: string | null; lastPlacedAt: string | null; openTrade: PositionView | null; events: AutoTraderEvent[]; lastByIndex: Record<string, AutoTraderEvent>;
 };
 
-const INDICES = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+// Index options and MCX commodity options; each is traded inside its own session (lib/underlyings).
+const INDICES = new Set(["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "GOLD"]);
 const STRATEGY_INDICES: Record<AutoStrategy, Set<string>> = { VWAP_EMA_SCALP: INDICES, NIFTY_SNIPER: new Set(["NIFTY"]) };
 const strategyOf = (value: unknown): AutoStrategy => (value === "NIFTY_SNIPER" ? "NIFTY_SNIPER" : "VWAP_EMA_SCALP");
 const CONFIG_DOC = ["settings", "vwapAutoTrader"] as const;
 /** Seconds after each minute's close: the 1-minute candle has to be complete in the feed. */
 const AFTER_CLOSE_MS = 6_000;
-const OPEN_MIN = 9 * 60 + 15;
-const LAST_ENTRY_MIN = 15 * 60 + 15;
 const EMPTY: AutoTraderConfig = { enabled: false, strategy: "VWAP_EMA_SCALP", indices: [], riskReward: "1:2", settings: {}, updatedAt: null };
 
 const holder = globalThis as typeof globalThis & { __tradepulseVwapAutoTrader?: State };
@@ -71,7 +71,6 @@ function defaultDeps(): AutoTraderDeps {
 }
 const deps = () => (state.deps ??= defaultDeps());
 
-const istMinute = (ms: number) => { const d = new Date(ms + 330 * 60_000); return { weekday: d.getUTCDay(), minutes: d.getUTCHours() * 60 + d.getUTCMinutes() }; };
 function record(event: Omit<AutoTraderEvent, "at">) {
   const full = { ...event, at: new Date(deps().now()).toISOString() };
   state.lastByIndex[event.index] = full;
@@ -102,11 +101,11 @@ export async function vwapAutoTraderTick() {
     const { config } = state;
     state.lastRunAt = new Date(deps().now()).toISOString();
     if (!config.enabled || !config.indices.length) return { skipped: "off" as const };
-    const clock = istMinute(deps().now());
-    if (clock.weekday === 0 || clock.weekday === 6 || clock.minutes < OPEN_MIN || clock.minutes >= LAST_ENTRY_MIN) {
-      for (const index of config.indices) record({ index, status: "BLOCKED", text: "Market closed for new entries (09:15-15:15 IST on trading days)" });
-      return { skipped: "hours" as const };
-    }
+    // Each underlying has its own entry window (index options 09:15-15:15, MCX 09:20-22:45).
+    const now = deps().now();
+    const tradable = config.indices.filter((index) => entryOpen(index, now));
+    for (const index of config.indices.filter((item) => !tradable.includes(item))) record({ index, status: "BLOCKED", text: `Market closed for new entries (${entryWindowLabel(index)} on trading days)` });
+    if (!tradable.length) return { skipped: "hours" as const };
     const before = state.openTrade;
     const open = await deps().openTrade();
     state.openTrade = open;
@@ -116,7 +115,7 @@ export async function vwapAutoTraderTick() {
       record({ index: open.underlying, status: "IN_TRADE", text: `BUY ${open.label} open (SL ₹${open.stop ?? "--"} · T ₹${open.target ?? "--"}): no new trade until it exits at its target, SL or trailing SL` });
       return { skipped: "in-trade" as const };
     }
-    for (const index of config.indices) {
+    for (const index of tradable) {
       const result = await deps().place({ underlying: index, riskReward: config.riskReward, settings: config.settings, strategy: config.strategy }).catch((error: unknown) => ({ status: 0, body: { error: error instanceof Error ? error.message : "request failed" } as Record<string, unknown> }));
       const body = result.body;
       if (result.status === 200 && body.placed) {
@@ -164,7 +163,7 @@ export async function setVwapAutoTrader(input: { index: string; enabled: boolean
   const index = input.index.toUpperCase();
   // One strategy drives the auto-trader at a time; switching it applies to every watched index.
   const strategy = input.strategy ? strategyOf(input.strategy) : state.config.strategy;
-  if (!INDICES.has(index)) throw new Error("Auto-execution trades index options (NIFTY, BANKNIFTY, SENSEX).");
+  if (!INDICES.has(index)) throw new Error("Auto-execution trades NIFTY, BANKNIFTY, SENSEX, CRUDEOIL and GOLD options.");
   if (input.enabled && !STRATEGY_INDICES[strategy].has(index)) throw new Error(`${AUTO_STRATEGY_NAMES[strategy]} trades ${[...STRATEGY_INDICES[strategy]].join(", ")} only.`);
   const switched = strategy !== state.config.strategy;
   const current = state.config.indices.filter((item) => STRATEGY_INDICES[strategy].has(item));

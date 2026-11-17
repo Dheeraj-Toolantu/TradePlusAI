@@ -1,11 +1,13 @@
 import { GrowwAdapter, createGrowwTransport } from "../../../adapters/groww/src/groww-adapter";
-import { loadGrowwInstrumentCatalog } from "../../../adapters/groww/src/groww-instruments";
+import { isCommodity } from "./underlyings";
+import { derivativesFor, nearestOptionExpiry } from "./underlying-catalog";
 import { runPythonModule } from "./python";
 import { getMacroQuotes } from "./macro";
 import { getSentiment, sentimentForIntel } from "./sentiment";
 import { baselineSnapshot, recordSnapshot, snapshotHistorySeconds, type ChainLeg, type ChainRow } from "./oi-snapshot-store";
 
-export const INTEL_SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
+// Index options (NSE / BSE) and MCX commodity options; contracts come from the Groww catalog.
+export const INTEL_SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "GOLD"] as const;
 export type IntelSymbol = (typeof INTEL_SYMBOLS)[number];
 export type MarketIntel = Record<string, unknown> & {
   symbol: string;
@@ -74,17 +76,15 @@ function legOf(raw: unknown): ChainLeg | undefined {
 }
 
 export async function contractMeta(symbol: IntelSymbol) {
-  const catalog = await loadGrowwInstrumentCatalog();
-  const today = istDate();
-  const options = catalog.getAll().filter((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && Boolean(instrument.expiryDate) && instrument.expiryDate! >= today);
-  const expiry = options.map((instrument) => instrument.expiryDate as string).sort()[0];
+  const derivatives = await derivativesFor(symbol);
+  const expiry = nearestOptionExpiry(derivatives, istDate());
   if (!expiry) throw new Error(`No future option expiry is available for ${symbol}.`);
-  const lotSize = Number(options.find((instrument) => instrument.expiryDate === expiry && Number(instrument.lotSize) > 0)?.lotSize ?? 0);
-  return { expiry, lotSize };
+  const lotSize = Number(derivatives.options.find((instrument) => instrument.expiryDate === expiry && Number(instrument.lotSize) > 0)?.lotSize ?? 0);
+  return { expiry, lotSize, exchange: derivatives.exchange };
 }
 
 export async function fetchChain(symbol: IntelSymbol, expiry: string) {
-  const exchange = symbol === "SENSEX" ? "BSE" : "NSE";
+  const exchange = isCommodity(symbol) ? (await derivativesFor(symbol)).exchange : symbol === "SENSEX" ? "BSE" : "NSE";
   const body = await createGrowwTransport().request(`/v1/option-chain/exchange/${exchange}/underlying/${encodeURIComponent(symbol)}?expiry_date=${encodeURIComponent(expiry)}`, { method: "GET" });
   const payload = payloadOf(body);
   const spot = num(payload.underlying_ltp ?? payload.underlyingLtp) ?? 0;
@@ -126,6 +126,9 @@ async function fetchCandles1m(symbol: IntelSymbol, origin: string) {
 }
 
 async function fetchQuotes(symbol: IntelSymbol) {
+  // India VIX measures NIFTY option volatility; it says nothing about crude or gold. A commodity's
+  // spot is its option chain's underlying price (the future), so no cash quote is requested.
+  if (isCommodity(symbol)) return { vix: null, spot: null };
   const result = await new GrowwAdapter(createGrowwTransport()).getQuotes(["INDIA VIX", symbol]);
   if ("error" in result) return { vix: null, spot: null };
   const vix = result.value.find((quote) => quote.symbol === "INDIA VIX");
@@ -145,7 +148,9 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
   const now = Date.now();
   const baseline = baselineSnapshot(symbol, expiry, now);
   if (chain.rows.length) recordSnapshot(symbol, { takenAt: now, spot, expiry, rows: chain.rows });
-  const [rawSentiment, macro] = await Promise.all([getSentiment().catch(() => null), getMacroQuotes().catch(() => null)]);
+  // Index-market sentiment and the pre-open macro read describe NIFTY / SENSEX, not commodities.
+  const commodity = isCommodity(symbol);
+  const [rawSentiment, macro] = commodity ? [null, null] : await Promise.all([getSentiment().catch(() => null), getMacroQuotes().catch(() => null)]);
   const sentiment = sentimentForIntel(rawSentiment);
   const result = await runPythonModule<MarketIntel>("tradepulse_quant.market_intel.engine", {
     symbol,
@@ -164,7 +169,7 @@ async function compute(symbol: IntelSymbol, options: IntelOptions): Promise<Mark
     sentiment,
     macro,
   });
-  return { ...result, baseline_history_seconds: snapshotHistorySeconds(symbol, expiry, now), source: "Groww option chain + 1m/5m candles + India VIX", fetched_at: new Date(now).toISOString() };
+  return { ...result, baseline_history_seconds: snapshotHistorySeconds(symbol, expiry, now), source: commodity ? "Groww MCX option chain + nearest-future 1m/5m candles (India VIX not applicable)" : "Groww option chain + 1m/5m candles + India VIX", fetched_at: new Date(now).toISOString() };
 }
 
 /**

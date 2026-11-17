@@ -1,6 +1,9 @@
 import { createGrowwTransport } from "../../../adapters/groww/src/groww-adapter";
 import type { ScalperBar, ScalperContract } from "../../../services/paper-trading/src/smart-scalper";
 import { getScalper } from "./scalper-instance";
+import { loadGrowwInstrumentCatalog } from "../../../adapters/groww/src/groww-instruments";
+import { isCommodity } from "./underlyings";
+import { contractBySymbol, derivativesFor, nearestFuture } from "./underlying-catalog";
 
 /**
  * Server-side exit monitor for the paper Smart Scalper.
@@ -15,7 +18,8 @@ import { getScalper } from "./scalper-instance";
  */
 
 export type MonitorDeps = {
-  optionQuote(symbol: string, exchange: "NSE" | "BSE"): Promise<number | null>;
+  /** Live premium of one option leg (NSE / BSE FNO or MCX: exchange and segment from the catalog). */
+  optionQuote(symbol: string, underlying: string): Promise<number | null>;
   spot(underlying: string): Promise<number | null>;
   bars(underlying: string): Promise<ScalperBar[]>;
   now(): number;
@@ -34,8 +38,20 @@ const priceOf = (body: unknown) => { const payload = payloadOf(body); const pric
 function defaultDeps(): MonitorDeps {
   const transport = createGrowwTransport();
   return {
-    optionQuote: async (symbol, exchange) => priceOf(await transport.request(`/v1/live-data/quote?exchange=${exchange}&segment=FNO&trading_symbol=${encodeURIComponent(symbol)}`, { method: "GET" }).catch(() => null)),
-    spot: async (underlying) => priceOf(await transport.request(`/v1/live-data/quote?exchange=${underlying === "SENSEX" ? "BSE" : "NSE"}&segment=CASH&trading_symbol=${encodeURIComponent(underlying)}`, { method: "GET" }).catch(() => null)),
+    optionQuote: async (symbol, underlying) => {
+      const instrument = await loadGrowwInstrumentCatalog().then((catalog) => contractBySymbol(catalog, symbol)).catch(() => null);
+      const exchange = instrument?.exchange ?? (underlying === "SENSEX" ? "BSE" : "NSE");
+      return priceOf(await transport.request(`/v1/live-data/quote?exchange=${encodeURIComponent(exchange)}&segment=${encodeURIComponent(instrument?.segment ?? "FNO")}&trading_symbol=${encodeURIComponent(symbol)}`, { method: "GET" }).catch(() => null));
+    },
+    spot: async (underlying) => {
+      // A commodity's "spot" is its nearest future (MCX options are options on futures).
+      if (isCommodity(underlying)) {
+        const future = await derivativesFor(underlying).then((d) => nearestFuture(d)).catch(() => null);
+        if (!future) return null;
+        return priceOf(await transport.request(`/v1/live-data/quote?exchange=${encodeURIComponent(future.exchange)}&segment=${encodeURIComponent(future.segment)}&trading_symbol=${encodeURIComponent(future.tradingSymbol)}`, { method: "GET" }).catch(() => null));
+      }
+      return priceOf(await transport.request(`/v1/live-data/quote?exchange=${underlying === "SENSEX" ? "BSE" : "NSE"}&segment=CASH&trading_symbol=${encodeURIComponent(underlying)}`, { method: "GET" }).catch(() => null));
+    },
     bars: async (underlying) => {
       const cached = barsCache.get(underlying);
       if (cached && Date.now() - cached.at < BARS_TTL_MS) return cached.bars;
@@ -65,11 +81,10 @@ export async function scalperMonitorTick(deps: MonitorDeps = state.deps ?? defau
     state.managed = book.reduce((sum, item) => sum + item.symbols.length, 0);
     let exits = 0;
     for (const { underlying, symbols } of book) {
-      const exchange = underlying === "SENSEX" ? "BSE" : "NSE";
       const [spot, bars, quotes] = await Promise.all([
         deps.spot(underlying).catch(() => null),
         deps.bars(underlying).catch(() => [] as ScalperBar[]),
-        Promise.all(symbols.map(async (symbol) => [symbol, await deps.optionQuote(symbol, exchange).catch(() => null)] as const)),
+        Promise.all(symbols.map(async (symbol) => [symbol, await deps.optionQuote(symbol, underlying).catch(() => null)] as const)),
       ]);
       const contracts = quotes.filter(([, price]) => price !== null && price > 0).map(([symbol, price]) => quoteContract(symbol, price!));
       // Without a fresh option quote nothing is marked; time-based exits (square-off, time stop) still run.

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createGrowwTransport } from "../../../../../../adapters/groww/src/groww-adapter";
 import { loadGrowwInstrumentCatalog } from "../../../../../../adapters/groww/src/groww-instruments";
+import { contractBySymbol } from "../../../../lib/underlying-catalog";
 import { safeMarketDataError } from "../../../../lib/market-data-errors";
 
 // Intraday premium candles for one option contract (the scalper desk's CALL/PUT charts).
@@ -11,15 +12,17 @@ export async function GET(request: Request) {
   const params = new URL(request.url).searchParams;
   const symbol = (params.get("symbol") ?? "").toUpperCase();
   const timeframe = params.get("timeframe") ?? "1m";
-  if (!/^[A-Z0-9-]{6,40}$/.test(symbol) || !INTERVALS[timeframe]) return NextResponse.json({ error: "Unsupported contract or timeframe" }, { status: 400 });
+  if (!/^[A-Z0-9][A-Z0-9 _.&-]{4,48}$/.test(symbol) || !INTERVALS[timeframe]) return NextResponse.json({ error: "Unsupported contract or timeframe" }, { status: 400 });
   try {
     const catalog = await loadGrowwInstrumentCatalog();
-    const instrument = catalog.getByTradingSymbol("NSE", symbol) ?? catalog.getByTradingSymbol("BSE", symbol);
+    // NSE / BSE index options or MCX commodity options: exchange and segment from the catalog row.
+    const instrument = contractBySymbol(catalog, symbol);
     const exchange = instrument?.exchange ?? (symbol.startsWith("SENSEX") || symbol.startsWith("BANKEX") ? "BSE" : "NSE");
+    const segment = instrument?.segment ?? "FNO";
     // Today's session plus the previous two days, so the first minutes of a session still show context.
     const end = new Date();
     const start = new Date(end.getTime() - (timeframe === "1m" ? 1 : 3) * 86_400_000);
-    const response = await createGrowwTransport().request(`/v1/historical/candle/range?exchange=${exchange}&segment=FNO&trading_symbol=${encodeURIComponent(instrument?.tradingSymbol ?? symbol)}&start_time=${encodeURIComponent(toGrowwDate(start))}&end_time=${encodeURIComponent(toGrowwDate(end))}&interval_in_minutes=${INTERVALS[timeframe]}`, { method: "GET" });
+    const response = await createGrowwTransport().request(`/v1/historical/candle/range?exchange=${exchange}&segment=${encodeURIComponent(segment)}&trading_symbol=${encodeURIComponent(instrument?.tradingSymbol ?? symbol)}&start_time=${encodeURIComponent(toGrowwDate(start))}&end_time=${encodeURIComponent(toGrowwDate(end))}&interval_in_minutes=${INTERVALS[timeframe]}`, { method: "GET" });
     const payload = ((response as { payload?: Record<string, unknown> })?.payload ?? response) as Record<string, unknown>;
     const rows = (payload?.candles ?? []) as unknown[];
     const candles = rows.flatMap((row) => {
@@ -27,7 +30,7 @@ export async function GET(request: Request) {
       const [time, open, high, low, close, volume] = row.map(Number);
       return [time, open, high, low, close].every(Number.isFinite) ? [{ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 }] : [];
     });
-    return NextResponse.json({ symbol, exchange, timeframe, candles, source: "Groww FNO historical candles" });
+    return NextResponse.json({ symbol, exchange, timeframe, candles, source: `Groww ${segment} historical candles` });
   } catch (error) {
     return NextResponse.json({ symbol, timeframe, candles: [], error: safeMarketDataError(error, "Option history unavailable") }, { status: 503 });
   }

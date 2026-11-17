@@ -55,7 +55,7 @@ type Intel = {
   trade_plan: TradePlan;
 };
 
-const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
+const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "GOLD"] as const;
 const POLL_MS = 30_000;
 const fmt = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: digits, minimumFractionDigits: 0 }));
 const signed = (value: number | null | undefined, digits = 0) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : `${value > 0 ? "+" : ""}${fmt(value, digits)}`);

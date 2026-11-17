@@ -62,6 +62,7 @@ DEFAULT_RR = "1:2"
 FALLBACK_LOT = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20}
 IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 TRADING_MINUTES_PER_DAY = 375.0
+MCX_TRADING_MINUTES_PER_DAY = 870.0  # 09:00-23:30 IST
 
 BULLISH_FLOW = {("PE", "SHORT_BUILDUP"), ("CE", "SHORT_COVERING"), ("CE", "LONG_BUILDUP")}
 BEARISH_FLOW = {("CE", "SHORT_BUILDUP"), ("PE", "SHORT_COVERING"), ("PE", "LONG_BUILDUP")}
@@ -133,6 +134,7 @@ class ScalpConfig:
     tick: float = 0.05
     max_loss_per_trade: float = 1500.0
     max_lots: int = 1
+    market: str = "NSE"  # "MCX": commodity options (no India VIX criterion, longer session)
     minimum_score: float = 12.0
     maximum_score: float = 12.0
     criteria_max: dict[str, int] = field(default_factory=lambda: {"trend": 1, "vwap": 2, "ema": 2, "adx": 1, "delta": 1, "oi": 2, "pcr": 1, "volume_profile": 1, "vix": 1})
@@ -603,7 +605,7 @@ def premium_plan(selected: dict, spot: float, tape: dict, rr: float, symbol: str
     gamma = greeks["gamma"] if greeks else 0.0
     theta = selected.get("theta")
     theta_day = abs(float(theta)) if theta not in (None, 0) else abs(greeks["theta"]) if greeks else 0.0
-    drag = theta_day * config.hold_minutes / TRADING_MINUTES_PER_DAY
+    drag = theta_day * config.hold_minutes / (MCX_TRADING_MINUTES_PER_DAY if config.market == "MCX" else TRADING_MINUTES_PER_DAY)
     tick = selected.get("tick_size") or config.tick
     slip = config.slippage_pct
     entry = _tick_round(ask * (1.0 + slip), tick, "up")  # the expected fill
@@ -639,6 +641,9 @@ def premium_plan(selected: dict, spot: float, tape: dict, rr: float, symbol: str
                           "slippage_at_target": round(slip_target, 2), "slippage_at_stop": round(slip_stop, 2),
                           "entry_slippage": round((entry - ask) * lot, 2), "half_spread": round(half_spread, 2)},
         "slippage_pct": slip, "stop_gap": round(stop_gap, 2),
+        # Charges use the NSE index-option schedule; for MCX that is an approximation (MCX levies
+        # CTT and its own transaction charges instead), so treat MCX net R:R as indicative.
+        "cost_model": "NSE_INDEX_OPTIONS" if config.market != "MCX" else "NSE_INDEX_OPTIONS_APPROXIMATION_FOR_MCX",
         "valid": True, "reason": "",
     }
     if risk_unit <= 0 or stop < tick or reward_unit <= 0:
@@ -682,6 +687,7 @@ def config_for(context: dict) -> ScalpConfig:
         max_loss_per_trade=loss if loss and loss > 0 else base.max_loss_per_trade,
         max_lots=max(1, int(lots)) if lots and lots >= 1 else base.max_lots,
         slippage_pct=slip if slip is not None and 0 <= slip < 0.05 else base.slippage_pct,
+        market="MCX" if str(context.get("market", "")).upper() == "MCX" else "NSE",
     )
 
 
@@ -811,9 +817,13 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
         vp_points, vp_detail, profile = read_profile(premium_rows, config)
     calc["profile"] = profile
     criteria.append(_criterion("volume_profile", "Volume profile", vp_points, maxes["volume_profile"], vp_detail))
-    vix_points, vix_detail, vix_info = read_vix(context.get("vix"), config)
-    calc["vix"] = vix_info
-    criteria.append(_criterion("vix", "India VIX", vix_points, maxes["vix"], vix_detail))
+    if config.market == "MCX":
+        # India VIX describes NIFTY options, not crude oil or gold: the criterion does not apply.
+        calc["vix"] = {"value": None, "regime": None, "applicable": False}
+    else:
+        vix_points, vix_detail, vix_info = read_vix(context.get("vix"), config)
+        calc["vix"] = vix_info
+        criteria.append(_criterion("vix", "India VIX", vix_points, maxes["vix"], vix_detail))
     calc["criteria"] = criteria
 
     result: dict = {**base, "side": "BUY" if d > 0 else "SELL", "scalp": calc}
@@ -822,7 +832,8 @@ def analyze_scalp(symbol: str, candles: list[CandleLike], context: dict, now: da
 
     failing = [c for c in criteria if not c["passed"]]
     score = sum(c["points"] for c in criteria)
-    calc["score"] = {"total": score, "minimum": config.minimum_score, "maximum": config.maximum_score}
+    card_max = float(sum(c["max"] for c in criteria))  # 12, or 11 on MCX (no VIX criterion)
+    calc["score"] = {"total": score, "minimum": card_max, "maximum": card_max}
     if failing:
         return {**result, "decision": "WAIT_FOR_CONFIRMATION", "reason": f"{len(criteria) - len(failing)}/{len(criteria)} criteria met; waiting on " + ", ".join(c["name"] for c in failing)}
     if not plan or not plan.get("valid"):
@@ -857,4 +868,6 @@ def score_card(result: dict) -> dict:
     calc = result.get("scalp") or {}
     card = {item["key"]: item["points"] for item in calc.get("criteria") or []}
     total = sum(card.values())
-    return {**card, "total": float(total), "minimum": float(ScalpConfig().minimum_score), "maximum": float(ScalpConfig().maximum_score)}
+    score = calc.get("score") or {}
+    maximum = float(score.get("maximum") or ScalpConfig().maximum_score)
+    return {**card, "total": float(total), "minimum": float(score.get("minimum") or maximum), "maximum": maximum}

@@ -12,6 +12,8 @@ import { getScalper } from "../../../lib/scalper-instance";
 import { ensureScalperMonitor } from "../../../lib/scalper-monitor";
 import { ensureVwapAutoTrader, setVwapAutoTrader, vwapAutoTraderStatus } from "../../../lib/vwap-auto-trader";
 import { journalSniper } from "../../../lib/sniper-journal";
+import { isCommodity } from "../../../lib/underlyings";
+import { contractBySymbol, derivativesIn } from "../../../lib/underlying-catalog";
 import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import {
   saveOrderToFirestore,
@@ -23,7 +25,7 @@ import {
 
 let paperOrders: Array<OrderRecord> = [];
 let firestoreHydrated = false;
-const supported = ["NIFTY", "BANKNIFTY", "SENSEX", "RELIANCE", "TCS", "INFY", "HDFCBANK"];
+const supported = ["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "GOLD", "RELIANCE", "TCS", "INFY", "HDFCBANK"];
 // VWAP_EMA_SCALP: the 1-minute VWAP / 5-9 EMA option scalper (quant/.../scalp_strategy.py).
 const SCALP = "VWAP_EMA_SCALP";
 // NIFTY_SNIPER: NIFTY Sniper AI (quant/.../sniper_strategy.py, docs/nifty-sniper/): 15m regime, 5m
@@ -32,14 +34,15 @@ const SNIPER = "NIFTY_SNIPER";
 const scalperStrategies = new Set([SCALP, SNIPER]);
 const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", SCALP, SNIPER]);
 const strategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK", SCALP, SNIPER]);
-const scalpIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+// Index options (NSE / BSE) and MCX commodity options (crude oil, gold).
+const scalpIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "GOLD"]);
 const sniperIndices = new Set(["NIFTY"]);
 // The sniper's own daily locks (spec 13.1), on top of the scalper book's limits.
 const SNIPER_LIMITS = { maxTrades: 3, maxConsecutiveLosses: 2 };
 const SNIPER_PREMIUM = { stop: 0.75, target: 2.0 };
 const strategyOf = (value: unknown) => (String(value ?? "").toUpperCase() === SNIPER ? SNIPER : SCALP);
 const indexError = (strategy: string, symbol: string) =>
-  strategy === SNIPER ? (sniperIndices.has(symbol) ? null : "NIFTY Sniper AI trades NIFTY options only in version 1.") : (scalpIndices.has(symbol) ? null : "The VWAP-EMA scalper trades index options (NIFTY, BANKNIFTY, SENSEX).");
+  strategy === SNIPER ? (sniperIndices.has(symbol) ? null : "NIFTY Sniper AI trades NIFTY options only in version 1.") : (scalpIndices.has(symbol) ? null : "The VWAP-EMA scalper trades NIFTY, BANKNIFTY, SENSEX, CRUDEOIL and GOLD options.");
 // The trader's reward:risk for the scalp: 1:1 or 1:2 on the index move (2 is the default).
 const rrOf = (value: unknown) => (String(value ?? "").replace(/\s/g, "") === "1:1" ? "1:1" : "1:2");
 // Tick rounding may shave up to 3% off the chosen ratio on the premium (same as the engine).
@@ -80,11 +83,18 @@ async function hydrateFromFirestore() {
   }
 }
 
+/** Exchange and segment of an option contract (NSE / BSE FNO or MCX), from the catalog row. */
+async function quotePath(symbol: string) {
+  const instrument = await loadGrowwInstrumentCatalog().then((catalog) => contractBySymbol(catalog, symbol)).catch(() => null);
+  const exchange = instrument?.exchange ?? (/^(SENSEX|BANKEX)/.test(symbol) ? "BSE" : "NSE");
+  return `/v1/live-data/quote?exchange=${encodeURIComponent(exchange)}&segment=${encodeURIComponent(instrument?.segment ?? "FNO")}&trading_symbol=${encodeURIComponent(symbol)}`;
+}
+
 async function fnoQuote(symbol: string) {
   const config = readGrowwConfig();
   if (!config.accessTokenConfigured && !config.apiKeySecretConfigured) return null;
   try {
-    const body = await createGrowwTransport().request(`/v1/live-data/quote?exchange=NSE&segment=FNO&trading_symbol=${encodeURIComponent(symbol)}`, { method: "GET" });
+    const body = await createGrowwTransport().request(await quotePath(symbol), { method: "GET" });
     const price = Number(payloadOf(body).ltp ?? payloadOf(body).last_price ?? payloadOf(body).lastPrice);
     return Number.isFinite(price) && price > 0 ? price : null;
   } catch { return null; }
@@ -97,7 +107,7 @@ async function markedPaperOrders() {
   const transport = createGrowwTransport();
   return Promise.all(paperOrders.map(async (order) => {
     try {
-      const body = await transport.request(`/v1/live-data/quote?exchange=NSE&segment=FNO&trading_symbol=${encodeURIComponent(String(order.symbol))}`, { method: "GET" });
+      const body = await transport.request(await quotePath(String(order.symbol)), { method: "GET" });
       const payload = payloadOf(body);
       const currentPrice = Number(payload.ltp ?? payload.last_price ?? payload.lastPrice);
       if (!Number.isFinite(currentPrice) || currentPrice <= 0) throw new Error("Quote unavailable");
@@ -205,7 +215,7 @@ async function runEngine(symbol: string, provider: string, origin: string, strat
       optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>;
     } catch { optionEvidence = {}; }
   }
-  const payload: RecordValue = { symbol, strategy, candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence, interval_minutes: scalping ? 1 : 5 };
+  const payload: RecordValue = { symbol, strategy, market: isCommodity(symbol) ? "MCX" : "NSE", candles: history.candles ?? [], daily_candles: Array.isArray(daily.candles) ? daily.candles : [], volume_source: history.volumeSource ?? null, risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence, interval_minutes: scalping ? 1 : 5 };
   if (!scalping) return runPythonEngine(payload);
   // Pass 1 reads the tape and picks the strike from the OI data; pass 2 adds that premium's own
   // 1-minute candles for its volume profile.
@@ -235,7 +245,7 @@ async function operationalEvidence(symbol: string, brokerHealthy: boolean, safet
   ]);
   // Fail closed: an unreadable order book must not look like "no trades today".
   const dailyRisk = orders === null ? { allowed: false, detail: "Blocked: the order book could not be read, so today's trades and losses are unknown" } : evaluateDailyRisk(orders, symbol, PAPER_CAPITAL);
-  const contractMetadata = catalog === null ? false : catalog.getAll().some((instrument) => instrument.segment === "FNO" && instrument.underlyingSymbol === symbol && (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && String(instrument.expiryDate ?? "") >= today && Number(instrument.lotSize) > 0);
+  const contractMetadata = catalog === null ? false : (() => { try { return derivativesIn(catalog, symbol).options; } catch { return []; } })().some((instrument) => (instrument.instrumentType === "CE" || instrument.instrumentType === "PE") && String(instrument.expiryDate ?? "") >= today && Number(instrument.lotSize) > 0);
   return {
     broker_healthy: brokerHealthy,
     safe_mode: safety.safeMode,
@@ -253,11 +263,11 @@ async function operationalEvidence(symbol: string, brokerHealthy: boolean, safet
 async function validateLiveContract(body: RecordValue): Promise<string | null> {
   const symbol = String(body.symbol ?? "");
   const underlying = String(body.underlying ?? "").toUpperCase();
-  const exchange = underlying === "SENSEX" ? "BSE" : "NSE";
   const catalog = await loadGrowwInstrumentCatalog();
   const instrument = catalog.getByGrowwSymbol(String(body.growwSymbol ?? ""))
-    ?? catalog.getByTradingSymbol(exchange, symbol);
-  if (!instrument || instrument.tradingSymbol !== symbol || instrument.segment !== "FNO") return "Contract is not present in the live Groww contract master.";
+    ?? contractBySymbol(catalog, symbol);
+  const expectedSegment = isCommodity(underlying) ? (() => { try { return derivativesIn(catalog, underlying).segment; } catch { return null; } })() : "FNO";
+  if (!instrument || instrument.tradingSymbol !== symbol || !expectedSegment || instrument.segment !== expectedSegment) return "Contract is not present in the live Groww contract master.";
   if (instrument.instrumentType !== String(body.optionType ?? "").toUpperCase()) return "Option type does not match the live contract master.";
   if (instrument.expiryDate !== String(body.expiry ?? "") || Number(instrument.strikePrice) !== Number(body.strike)) return "Expiry or strike does not match the live contract master.";
   if (Number(instrument.lotSize) !== Number(body.lotSize) || Number(instrument.tickSize) !== Number(body.tickSize) || Number(instrument.freezeQuantity) !== Number(body.freezeQuantity)) return "Lot, tick, or freeze quantity does not match the live contract master.";

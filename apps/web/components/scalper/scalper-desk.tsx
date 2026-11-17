@@ -4,6 +4,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, type RiskRewardBox } from "./premium-chart";
 import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 import { PositionCard } from "./position-card";
+import { ALGO_UNDERLYINGS, entryWindowLabel, isCommodity, squareOffLabel, underlyingName } from "../../lib/underlyings";
 
 export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; lotSize?: number; tickSize?: number };
 type MonitorStatus = { running: boolean; intervalMs: number; lastTickAt: string | null; lastError: string | null; managedLegs: number; exits: number };
@@ -33,7 +34,6 @@ const SNIPER_TRAIL_TEXT: Record<string, string> = { INITIAL: "initial SL (-25%)"
 const engineFor = (strategy: SignalStrategy): EngineStrategy => (strategy === "NIFTY_SNIPER" ? "SNIPER" : "VWAP_EMA");
 const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.parse(iso) : NaN; return Number.isFinite(value) ? Math.floor(value / 1000) : null; };
 
-const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TIMEFRAMES = [1, 3, 5] as const;
 const SETTINGS_KEY = "tradepulse.scalper.settings";
 const PREFS_KEY = "tradepulse.scalper.prefs";
@@ -549,7 +549,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
           {optionCard("CALL", call, callOffset, setCallOffset, callLots, setCallLots)}
           <div className="scalper-center">
             <div className="scalper-index">
-              <select aria-label="Index" value={symbol} onChange={(event) => onSymbolChange(event.target.value)}>{INDICES.map((item) => <option key={item} value={item}>{item}</option>)}</select>
+              <select aria-label="Index" value={symbol} onChange={(event) => onSymbolChange(event.target.value)}>{ALGO_UNDERLYINGS.map((item) => <option key={item} value={item}>{underlyingName(item)}{isCommodity(item) ? " (MCX)" : ""}</option>)}</select>
               <span className="scalper-expiry">{expiryLabel(expiry)}</span>
             </div>
             <small>{symbol} P&amp;L</small>
@@ -586,7 +586,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             />
           )) : <div className="algo-empty">{positionsTab === "OPEN" ? "No open scalper positions." : "No closed trades today."}</div>}
         </div>
-        <p className="scalper-footnote">{vwapMode ? "VWAP-EMA entries: all 9 criteria (trend = VWAP + 9/21 EMA + ADX(14) above 25; entry = VWAP, 5/9 EMA trigger, ADX(14) above 20 on the confirmation candle; delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
+        <p className="scalper-footnote">{`${underlyingName(symbol)}${isCommodity(symbol) ? " (MCX options on futures)" : ""}: entries ${entryWindowLabel(symbol)}, square-off ${squareOffLabel(symbol)} IST. `}{vwapMode ? "VWAP-EMA entries: all 9 criteria (trend = VWAP + 9/21 EMA + ADX(14) above 25; entry = VWAP, 5/9 EMA trigger, ADX(14) above 20 on the confirmation candle; delta 0.40-0.60, OI, PCR, premium volume profile, India VIX) and every V5 gate, re-checked on the server. The strike is picked from OI. SL and target come from the index stop via delta and gamma; the SL trails to breakeven + charges at +0.5R, locks +0.5R at +1R, then trails 0.6R; a 1m close back through the 9 EMA exits. " : ""}Level engine entries: CE only when the 1m candle tags a support and rejects it; PE only at a resistance (where the put premium is at its own support). Each trade needs {settings.minRiskReward}R of room to the next level and risks at most ₹{settings.maxLossPerTrade.toLocaleString("en-IN")}. Volatile tape, rich IV or expiry afternoon switch it to a debit-spread hedge. Sell only closes a long; no naked writing. Paper only.</p>
       </aside>
     </section>
   );

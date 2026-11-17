@@ -103,10 +103,10 @@ describe("algo trading execution boundary", () => {
     await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining("2R") });
   });
 
-  it("only places index scalps on the scalper", async () => {
+  it("only places index and MCX commodity scalps on the scalper", async () => {
     const response = await POST(requestFor({ action: "PLACE_ON_SCALPER", underlying: "RELIANCE", riskReward: "1:2" }));
     expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({ placed: false, error: expect.stringContaining("index options") });
+    await expect(response.json()).resolves.toMatchObject({ placed: false, error: expect.stringContaining("CRUDEOIL and GOLD options") });
   });
 
   it("switches server-side auto-execution on and off per index", async () => {
