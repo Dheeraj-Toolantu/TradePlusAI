@@ -1,8 +1,9 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchJsonShared } from "../../lib/shared-fetch";
+import { WhenVisible } from "../../components/when-visible";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
@@ -13,6 +14,7 @@ import type { vwapAutoTraderStatus } from "../../lib/vwap-auto-trader";
 import type { PositionView } from "../../../../services/paper-trading/src/smart-scalper";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
 import type { OptionAdvice } from "../../../../services/ai-monitoring/src/option-advisor";
+import "./execution.css";
 
 // Heavy, below-the-fold or on-demand panels load in their own chunks so the first paint only
 // needs the header and the trade desk shell. Every panel is memoised, so a quote tick re-renders
@@ -117,23 +119,6 @@ const IstClock = memo(function IstClock() {
   }, []);
   return <span className="exec-badge">IST {clock || "--:--:--"}</span>;
 });
-
-/**
- * Mounts a display-only panel when it comes near the viewport (its data loads only then) and
- * keeps it mounted afterwards. Panels that trade or monitor on their own are never wrapped.
- */
-function WhenVisible({ children, minHeight = 240 }: { children: ReactNode; minHeight?: number }) {
-  const [shown, setShown] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (shown || !ref.current) return;
-    if (typeof IntersectionObserver === "undefined") { setShown(true); return; }
-    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) setShown(true); }, { rootMargin: "600px 0px" });
-    observer.observe(ref.current);
-    return () => observer.disconnect();
-  }, [shown]);
-  return shown ? <>{children}</> : <div ref={ref} className="algo-empty" style={{ minHeight }} aria-hidden="true" />;
-}
 
 export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");

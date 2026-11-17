@@ -1,19 +1,25 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { Fragment, memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EventChips, IndexCorporatePanel, StockEvents } from "../../components/corporate-events";
-import { RetailCrowdDesk } from "../../components/retail-crowd-desk";
-import { TelegramLiveFeed } from "../../components/telegram-live-feed";
-import { TelegramOptionsDesk } from "../../components/telegram-options";
-import { TelegramChannelAnalysis } from "../../components/telegram-channel-analysis";
-import { CommoditySentimentDesk } from "../../components/commodity-sentiment";
-import { SentimentHistoryPanel } from "../../components/sentiment-history";
 import { AlertCenter, AlertToasts, useSentimentAlerts } from "../../components/sentiment-alerts";
 import { useLiveFeeds } from "../../components/use-live-feeds";
 import { JOINED, useTabSync } from "../../components/use-tab-sync";
 import { mergeTelegram } from "../../lib/telegram-merge";
 import type { TelegramLive } from "../../lib/telegram-live";
 import type { ConstituentSentiment, IndexId, IndexSentiment, IndexSentimentReading, Lens } from "../../lib/index-sentiment";
+import "./operations.css";
+import { WhenVisible } from "../../components/when-visible";
+
+// Below-the-fold desks load in their own chunks, and only when scrolled near (the history panel
+// also carries the chart library and its own data fetch; the channel analysis fetches its own too).
+const CommoditySentimentDesk = dynamic(() => import("../../components/commodity-sentiment").then((m) => m.CommoditySentimentDesk), { ssr: false });
+const SentimentHistoryPanel = dynamic(() => import("../../components/sentiment-history").then((m) => m.SentimentHistoryPanel), { ssr: false });
+const RetailCrowdDesk = dynamic(() => import("../../components/retail-crowd-desk").then((m) => m.RetailCrowdDesk), { ssr: false });
+const TelegramOptionsDesk = dynamic(() => import("../../components/telegram-options").then((m) => m.TelegramOptionsDesk), { ssr: false });
+const TelegramChannelAnalysis = dynamic(() => import("../../components/telegram-channel-analysis").then((m) => m.TelegramChannelAnalysis), { ssr: false });
+const TelegramLiveFeed = dynamic(() => import("../../components/telegram-live-feed").then((m) => m.TelegramLiveFeed), { ssr: false });
 
 const LENSES: Array<{ key: Lens; title: string; weight: string }> = [
   { key: "price", title: "Price action", weight: "25%" },
@@ -405,11 +411,11 @@ export default function OperationsPage() {
             {data.indices.map((index) => <IndexCard key={index.id} reading={index} active={index.id === selected} onSelect={toggle} />)}
           </section>
           {data.commodities ? <CommoditySentimentDesk data={data.commodities} /> : null}
-          <SentimentHistoryPanel />
-          {data.retail_desk ? <RetailCrowdDesk desk={data.retail_desk} /> : null}
-          {data.telegram_options ? <TelegramOptionsDesk options={data.telegram_options} /> : null}
-          <TelegramChannelAnalysis />
-          <TelegramLiveFeed live={telegram} connection={connection} error={telegramError} />
+          <WhenVisible minHeight={320}><SentimentHistoryPanel /></WhenVisible>
+          {data.retail_desk ? <WhenVisible><RetailCrowdDesk desk={data.retail_desk} /></WhenVisible> : null}
+          {data.telegram_options ? <WhenVisible><TelegramOptionsDesk options={data.telegram_options} /></WhenVisible> : null}
+          <WhenVisible><TelegramChannelAnalysis /></WhenVisible>
+          <WhenVisible><TelegramLiveFeed live={telegram} connection={connection} error={telegramError} /></WhenVisible>
           {reading ? <IndexDetail reading={reading} /> : <p className="isa-muted">Select an index to see its constituents.</p>}
           <section className="isa-panel isa-sources">
             <h3>Data sources</h3>

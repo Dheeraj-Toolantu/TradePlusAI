@@ -1,7 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { BacktestPanel } from "../../components/backtest/backtest-panel";
+import dynamic from "next/dynamic";
+import "./validation.css";
+
+// The backtest panel carries the chart library and the SMC overlay code: its own chunk, so the tabs
+// and the paper lab paint without waiting for it.
+const BacktestPanel = dynamic(() => import("../../components/backtest/backtest-panel").then((m) => m.BacktestPanel), { ssr: false, loading: () => <p className="algo-empty">Loading the backtest workspace…</p> });
 
 type PaperStatus = {
   mode: string;
