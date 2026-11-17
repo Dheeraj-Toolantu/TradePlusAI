@@ -1,5 +1,6 @@
 import { getActiveOrdersFromFirestore, saveOrderToFirestore, type OrderRecord } from "../../../apps/web/lib/firestore-orders";
 import { SNIPER_TRAIL, VWAP_EMA_TRAIL, sniperTrail } from "./scalper-trail";
+import { isCommodity, sessionFor } from "../../../apps/web/lib/underlyings";
 
 /**
  * Smart scalper (paper only).
@@ -196,8 +197,18 @@ export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLoss
 const STRATEGY_ID = "SMART_SCALPER";
 const SCALP_WINDOW = [9 * 60 + 20, 14 * 60 + 55] as const;
 const HEDGE_WINDOW = [9 * 60 + 45, 14 * 60 + 30] as const;
-const MARKET_OPEN = 9 * 60 + 15;
-const SQUARE_OFF = 15 * 60 + 15;
+/**
+ * Sessions are per underlying (apps/web/lib/underlyings.ts): index options 09:15 to the 15:15
+ * square-off; MCX commodity options 09:00 to a 23:00 square-off, entries until 22:45.
+ */
+const openOf = (underlying: string) => sessionFor(underlying).open;
+const squareOffOf = (underlying: string) => sessionFor(underlying).squareOff;
+/** The level engine's scalp / hedge windows: the index windows, or the commodity entry window. */
+const windowOf = (underlying: string, mode: "SCALP" | "HEDGE") => {
+  if (!isCommodity(underlying)) return mode === "HEDGE" ? HEDGE_WINDOW : SCALP_WINDOW;
+  const session = sessionFor(underlying);
+  return [session.entryStart, session.entryEnd] as const;
+};
 const LOSS_COOLDOWN_MINUTES = 5;
 const MAX_CONSECUTIVE_LOSSES = 3;
 /** NIFTY Sniper AI: a sniper trade that has not reached 1.25x within this many minutes is closed (research default). */
@@ -586,7 +597,7 @@ export class SmartScalper {
     const sides: Array<"CE" | "PE"> = read.trend === "UP" ? ["CE"] : read.trend === "DOWN" ? ["PE"] : read.regime === "VOLATILE" && mode === "HEDGE" ? [] : ["CE", "PE"];
     if (!sides.length) return { mode: "WAIT", side: null, read, reasons: [...reasons, "Volatile with no direction: standing aside"], gates: [], plan: null, daysToExpiry };
     const setups = sides.map((side) => findSpotSetup(input.bars, read, side, settings.minRiskReward)).filter((item): item is SpotSetup => item !== null);
-    const window = mode === "HEDGE" ? HEDGE_WINDOW : SCALP_WINDOW;
+    const window = windowOf(input.symbol, mode);
     const timeGate: Gate = { label: `${mode === "HEDGE" ? "Hedge" : "Scalp"} entry window ${hhmm(window[0])}-${hhmm(window[1])} IST`, passed: minutes >= window[0] && minutes <= window[1] };
     if (!setups.length) {
       const nearest = sides.map((side) => side === "CE" ? (read.supports[0] ? `support ${read.supports[0].price}` : null) : (read.resistances[0] ? `resistance ${read.resistances[0].price}` : null)).filter(Boolean).join(" / ");
@@ -634,7 +645,7 @@ export class SmartScalper {
     if (external) return external;
     const daily = this.dailyBlock(settings);
     if (daily) return daily;
-    if (istMinutes(this.clock()) >= SQUARE_OFF) return "after the 15:15 IST square-off";
+    if (istMinutes(this.clock()) >= squareOffOf(symbol)) return `after the ${hhmm(squareOffOf(symbol))} IST square-off`;
     if (this.positions.some((position) => position.status === "OPEN" && position.kind !== "MANUAL" && position.underlying === symbol)) return "an engine position is already open (one at a time)";
     return undefined;
   }
@@ -677,7 +688,7 @@ export class SmartScalper {
       if (this.consumedSetups.has(input.setupId)) return { ...this.state(underlying), placed: false, error: "This setup was already placed on the scalper." };
       const now = this.clock();
       const weekday = new Date(now.getTime() + 330 * 60_000).getUTCDay();
-      if (weekday === 0 || weekday === 6 || istMinutes(now) < MARKET_OPEN) return { ...this.state(underlying), placed: false, error: "Scalper entries are open 09:15-15:15 IST on trading days." };
+      if (weekday === 0 || weekday === 6 || istMinutes(now) < openOf(underlying) || istMinutes(now) >= squareOffOf(underlying)) return { ...this.state(underlying), placed: false, error: `Scalper entries for ${underlying} are open ${hhmm(openOf(underlying))}-${hhmm(squareOffOf(underlying))} IST on trading days.` };
       // One VWAP-EMA trade at a time on ANY index: the next entry waits until the open trade exits
       // (target, SL or trailing SL; or a time / momentum / 15:15 / manual exit).
       const open = this.openEngineTrade();
@@ -846,7 +857,8 @@ export class SmartScalper {
       const value = this.netValue(position);
       const pnl = (value - position.entry) * this.quantity(position);
       let reason: string | null = null;
-      if (minutes >= SQUARE_OFF) reason = "SQUARE_OFF_15_15";
+      // Each position squares off at its own market's time (15:15 index options, 23:00 MCX).
+      if (minutes >= squareOffOf(position.underlying)) reason = `SQUARE_OFF_${hhmm(squareOffOf(position.underlying)).replace(":", "_")}`;
       else if (pnl <= -settings.maxLossPerTrade) reason = "MAX_LOSS_PER_TRADE";
       if (!reason && position.kind !== "MANUAL" && position.underlying === input.symbol) {
         const risk = position.initialRisk ?? 0;
@@ -939,7 +951,7 @@ export class SmartScalper {
       this.rollDay();
       const now = this.clock();
       const weekday = new Date(now.getTime() + 330 * 60_000).getUTCDay();
-      if (weekday === 0 || weekday === 6 || istMinutes(now) < MARKET_OPEN || istMinutes(now) >= SQUARE_OFF) return { ...this.state(underlying), error: "Scalper entries are open 09:15-15:15 IST on trading days." };
+      if (weekday === 0 || weekday === 6 || istMinutes(now) < openOf(underlying) || istMinutes(now) >= squareOffOf(underlying)) return { ...this.state(underlying), error: `Scalper entries for ${underlying} are open ${hhmm(openOf(underlying))}-${hhmm(squareOffOf(underlying))} IST on trading days.` };
       const qty = Math.max(1, Math.floor(lots)) * Math.max(1, contract.lotSize);
       const fill = this.fill(contract.ask > 0 ? contract.ask : contract.premium, "BUY", contract.tickSize || 0.05);
       const existing = this.positions.find((position) => position.status === "OPEN" && position.legs.length === 1 && norm(position.legs[0].symbol) === norm(contract.symbol) && position.legs[0].side === "BUY");

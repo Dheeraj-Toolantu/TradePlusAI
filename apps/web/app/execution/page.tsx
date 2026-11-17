@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchJsonShared } from "../../lib/shared-fetch";
 import { WhenVisible } from "../../components/when-visible";
+import { entryWindowLabel, isCommodity, squareOffLabel, underlyingName } from "../../lib/underlyings";
 import { formatMarketCalculationValue, getOrderExitState } from "../../lib/option-chain-state";
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
@@ -80,7 +81,6 @@ type LiveStatus = { enabled: boolean; disabledReasons: string[]; limits?: { maxD
 type Tab = "LIVE" | "PAPER" | "HISTORY" | "LOGS";
 type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
 
-const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
 const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
 // The algo page runs one strategy at a time, chosen by the trader: the 1-minute VWAP / 5-9 EMA
@@ -269,10 +269,13 @@ export default function ExecutionPage() {
   }, [symbol]);
 
   // ---- live quotes: one socket per index, subscriptions updated in place ------------
+  // The quote socket streams NSE / BSE instruments only. For an MCX commodity it keeps the index
+  // ticker, and the commodity's premiums refresh with the option-chain poll instead (an MCX symbol in
+  // the NSE batch request would only fail it).
   const subscription = useMemo(() => ({
-    underlying: symbol,
+    underlying: isCommodity(symbol) ? "NIFTY" : symbol,
     marketSymbols: TICKER,
-    optionSymbols: Array.from(new Set(chain.map((item) => norm(item.symbol)))).sort(),
+    optionSymbols: isCommodity(symbol) ? [] : Array.from(new Set(chain.map((item) => norm(item.symbol)))).sort(),
     tradeSymbols: Array.from(new Set(paperOrders.map((order) => norm(order.symbol)))).sort(),
   }), [chain, paperOrders, symbol]);
   const socketRef = useRef<WebSocket | null>(null);
@@ -802,7 +805,7 @@ export default function ExecutionPage() {
     <main className="exec-page">
       <header className="exec-header">
         <div className="exec-brand"><b>TradePulse</b><small>Index options desk</small></div>
-        <div className="algo-ticker" aria-label="Live index quotes">{TICKER.map((item) => <span key={item}><b>{item}</b><small>{quotes[item] ? money(quotes[item]) : "--"}</small></span>)}</div>
+        <div className="algo-ticker" aria-label="Live index quotes">{TICKER.map((item) => <span key={item}><b>{item}</b><small>{quotes[item] ? money(quotes[item]) : "--"}</small></span>)}{isCommodity(symbol) ? <span title="Nearest MCX future (the option chain's underlying)"><b>{underlyingName(symbol)} FUT</b><small>{spot ? money(spot) : "--"}</small></span> : null}</div>
         <div className="exec-badges">
           <span className={live?.enabled ? "exec-badge exec-badge-live" : "exec-badge"} title={live?.enabled ? "Live trading armed on the server" : (live?.disabledReasons ?? []).join("\n")}>{live?.enabled ? "LIVE ARMED" : "PAPER ONLY"}</span>
           {safety.killSwitch && <span className="exec-badge exec-badge-danger" title={safety.reason}>KILL SWITCH</span>}
@@ -838,6 +841,7 @@ export default function ExecutionPage() {
               </div>
             </div>
             <p className="mi-note">{strategy.description}</p>
+            {isCommodity(symbol) ? <p className="mi-note"><b>{underlyingName(symbol)} · MCX options on futures.</b> Contracts, lot and tick sizes come from Groww&apos;s instrument list; the chart and VWAP read the nearest future. Entries {entryWindowLabel(symbol)}, square-off {squareOffLabel(symbol)} IST. India VIX does not apply (that criterion and gate are off), premiums refresh with the option chain rather than tick by tick, and charges use the NSE schedule as an approximation.</p> : null}
             {sniperSelected && symbol !== "NIFTY" ? <p className="warning">NIFTY Sniper AI trades NIFTY only (v1). <button type="button" onClick={() => switchIndex("NIFTY")}>Switch to NIFTY</button></p> : null}
             {sniperSelected && analysis?.setup?.contract ? (
               <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol} × {analysis.setup.quantity ?? "--"}</b><span>{analysis.setup.family?.replaceAll("_", " ").toLowerCase()} · score {analysis.setup.score} ({analysis.setup.band?.replaceAll("_", " ").toLowerCase()}) · premium entry ~₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} (−25%) · 1.5x ₹{money(analysis.setup.partial_target)} · 2x target ₹{money(analysis.setup.target)} · max loss ₹{money(analysis.setup.planned_max_loss)} planned / ₹{money(analysis.setup.max_loss)} stressed · index invalidation {money(analysis.setup.spot?.stop)} · stop and target are recomputed from the actual fill</span></div>

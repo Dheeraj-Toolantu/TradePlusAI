@@ -94,6 +94,6 @@ describe("server-side auto-execution", () => {
     expect(await vwapAutoTraderTick()).toEqual({ placed: null });
     expect(vwapAutoTraderStatus()).toMatchObject({ enabled: true, indices: ["SENSEX"], riskReward: "1:1" });
     expect(await setVwapAutoTrader({ index: "SENSEX", enabled: false })).toMatchObject({ enabled: false, indices: [] });
-    await expect(setVwapAutoTrader({ index: "RELIANCE", enabled: true })).rejects.toThrow(/index options/);
+    await expect(setVwapAutoTrader({ index: "RELIANCE", enabled: true })).rejects.toThrow(/CRUDEOIL and GOLD options/);
   });
 });

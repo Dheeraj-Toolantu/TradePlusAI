@@ -66,6 +66,8 @@ class PipelineEvidence:
     premium_target_detail: str | None = None
     regime_gate: bool | None = True
     option_flow_gate: bool | None = True
+    # Only the engine switches this off, for MCX commodities (India VIX does not describe them).
+    vix_gate: bool | None = True
 
 
 class NoTradeEngine:
@@ -105,12 +107,13 @@ class NoTradeEngine:
             require("ORS_NOT_CONFIRMED", evidence.ors_confirmed, "option relative strength must confirm direction")
             require("OI_PCR_NOT_SUPPORTIVE", evidence.oi_pcr_supportive, "OI/PCR evidence must support direction")
 
-        valid_vix = evidence.vix_regime in {"LOW", "NORMAL", "HIGH"}
-        gates.append(GateEvidence("VIX_BLOCKED", valid_vix, "extreme or missing VIX regime blocks entry"))
-        if evidence.vix_regime is None:
-            reasons.append("MISSING_VIX_REGIME")
-        elif not valid_vix:
-            reasons.append("VIX_BLOCKED")
+        if evidence.vix_gate is not False:
+            valid_vix = evidence.vix_regime in {"LOW", "NORMAL", "HIGH"}
+            gates.append(GateEvidence("VIX_BLOCKED", valid_vix, "extreme or missing VIX regime blocks entry"))
+            if evidence.vix_regime is None:
+                reasons.append("MISSING_VIX_REGIME")
+            elif not valid_vix:
+                reasons.append("VIX_BLOCKED")
 
         if evidence.regime_gate is not False:
             valid_regime = evidence.regime in {"TRENDING_BULL", "TRENDING_BEAR"}

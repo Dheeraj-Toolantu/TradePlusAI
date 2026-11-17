@@ -409,16 +409,26 @@ def _gap_for(candles: list[Candle], config: StrategyConfiguration, daily_candles
     day", and because it included today's candles the verdict could change during the session.
     """
     session, previous = _split_sessions(candles)
-    if not (session and previous):
+    if not session:
         return None
     today = _parse_timestamp(session[0].timestamp).date()
-    atr_value = _daily_atr(_daily_bars(candles, daily_candles, today), config.atr_period)
+    bars = _daily_bars(candles, daily_candles, today)
+    atr_value = _daily_atr(bars, config.atr_period)
     if not atr_value:
+        return None
+    # The previous session's range: from the intraday candles when they reach back that far, else
+    # from the last completed exchange daily bar. One-minute feeds only carry today, so without this
+    # fallback the gap state was always missing and the V5 gap gate blocked every scalp.
+    if previous:
+        previous_high, previous_low = max(candle.high for candle in previous), min(candle.low for candle in previous)
+    elif bars:
+        previous_high, previous_low = bars[-1].high, bars[-1].low
+    else:
         return None
     return evaluate_gap_day(
         opening_price=session[0].open,
-        previous_high=max(candle.high for candle in previous),
-        previous_low=min(candle.low for candle in previous),
+        previous_high=previous_high,
+        previous_low=previous_low,
         atr_value=atr_value,
         post_opening_lows=[candle.low for candle in session[1:]],
         post_opening_highs=[candle.high for candle in session[1:]],
@@ -661,8 +671,19 @@ def _sniper_evidence(result: dict, evidence: dict, calculations: dict, setup_can
         calculations["gap"] = {**calculations["gap"], "status": gap.state, "reason": _GAP_REASONS.get(gap.state)}
 
 
+# MCX commodity session (IST). MCX trades 09:00 to 23:30 (later on some days); new entries are
+# allowed 09:20-22:45 and engine positions are squared off at 23:00, before the exchange closes.
+MCX_TRADING_WINDOWS = {"market_open": 9 * 60, "or_complete": 9 * 60 + 15, "entry_start": 9 * 60 + 20, "entry_end": 22 * 60 + 45, "mandatory_square_off": 23 * 60}
+
+
+def market_configuration(market: str) -> StrategyConfiguration:
+    """Session windows for the market being evaluated (set by the engine, never by caller evidence)."""
+    return StrategyConfiguration(trading_windows=dict(MCX_TRADING_WINDOWS)) if market == "MCX" else StrategyConfiguration()
+
+
 def analyze_payload(payload: dict) -> dict:
     candles = _candles_from(payload.get("candles", []))
+    market = "MCX" if str(payload.get("market", "")).upper() == "MCX" else "NSE"
     daily_candles = _candles_from(payload.get("daily_candles")) or None
     symbol = str(payload.get("symbol", "UNKNOWN"))
     strategy = str(payload.get("strategy", "ORB_RETEST"))
@@ -693,6 +714,7 @@ def analyze_payload(payload: dict) -> dict:
             "max_loss_per_trade": payload.get("max_loss_per_trade"),
             "max_lots": payload.get("max_lots"),
             "slippage_pct": payload.get("slippage_pct"),
+            "market": market,
             "futures_candles": completed_candles(_candles_from(payload.get("futures_candles")), now, interval) or None,
             "premium_candles": {"symbol": premium.get("symbol"), "candles": completed_candles(_candles_from(premium.get("candles")), now, 1)} if premium else None,
         }
@@ -702,9 +724,14 @@ def analyze_payload(payload: dict) -> dict:
     # such as broker health, SAFE_MODE, and kill-switch state. A caller can never overwrite
     # observed data-quality, session, regime, gap, breakout, or retest evidence with this merge.
     volume_source = payload.get("volume_source") if isinstance(payload.get("volume_source"), str) else None
-    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, option_evidence, daily_candles, volume_source)
+    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, market_configuration(market), now, option_evidence, daily_candles, volume_source)
+    session_info["market"] = market
     if strategy == scalp_strategy.STRATEGY_ID:
         _scalp_evidence(result, evidence, calculations)
+    # India VIX measures NIFTY option volatility, not crude oil or gold: the VIX gate does not apply
+    # to MCX (the scalper drops its VIX criterion too). Always set here, so caller evidence can
+    # never switch the gate off for an index. Every other gate still applies to commodities.
+    evidence["vix_gate"] = market != "MCX"
     if strategy == sniper_strategy.STRATEGY_ID:
         _sniper_evidence(result, evidence, calculations, setup_candles, daily_candles)
     result["calculations"] = calculations
