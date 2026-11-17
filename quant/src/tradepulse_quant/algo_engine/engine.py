@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Literal
 
-from . import indicators, scalp_strategy
+from . import indicators, scalp_strategy, sniper_strategy
 from .configuration import StrategyConfiguration
 from .data_quality_gate import DataQualityGate
 from .gap_engine import evaluate_gap_day
@@ -453,6 +453,9 @@ def completed_candles(candles: list[Candle], now: datetime, minutes: int = CANDL
 
 
 def analyze(symbol: str, candles: list[Candle], risk_per_trade: float = 1000.0, strategy: str = "ORB_RETEST", daily_candles: list[Candle] | None = None, expiry_day: bool = False, context: dict | None = None, now: datetime | None = None) -> dict:
+    if strategy == sniper_strategy.STRATEGY_ID:
+        # The sniper reads 5m structure from its own context and 1m only for the trigger.
+        return sniper_strategy.analyze_sniper(symbol, candles, {**(context or {}), "daily_candles": daily_candles}, now or datetime.now(MARKET_TIMEZONE))
     if len(candles) < 21:
         return {"symbol": symbol, "strategy": strategy, "decision": "NO_TRADE", "reason": "At least 21 candles are required", "confidence": 0, "setup": None}
     if strategy == "ORB_RETEST":
@@ -618,6 +621,46 @@ def _scalp_evidence(result: dict, evidence: dict, calculations: dict) -> None:
     calculations["scalp"] = calc
 
 
+def _sniper_evidence(result: dict, evidence: dict, calculations: dict, setup_candles: list[Candle], daily_candles: list[Candle] | None) -> None:
+    """Swap the generic ORB evidence for NIFTY Sniper AI's own (spec 10.3 hard filters).
+
+    Every operational V5 gate (data quality, session, VIX, gap, liquidity, R:R, daily risk, broker,
+    contract master, SAFE_MODE, kill switch) still applies on top of the sniper's own hard filters.
+    The sniper classifies its own 15m regime and scores OI as one component (it never triggers an
+    entry on its own), so the generic ADX-regime and option-flow gates are replaced, not skipped.
+    """
+    sniper = result.get("sniper") or {}
+    filters = {item["code"]: item["passed"] for item in sniper.get("hard_filters") or []}
+    score = sniper.get("score") or {}
+    selected = sniper.get("selected") or {}
+    feas = sniper.get("feasibility") or {}
+    gap = _gap_for(setup_candles, StrategyConfiguration(), daily_candles) if setup_candles else None
+    evidence.update({
+        "setup_side": (result.get("setup") or {}).get("side") or result.get("side"),
+        "breakout_valid": bool(filters.get("SETUP_CONFIRMED")),
+        "retest_confirmed": bool(filters.get("ENTRY_TRIGGER")) and bool(filters.get("NOT_CHASING")),
+        "score": score.get("total"),
+        "minimum_score": score.get("minimum", sniper_strategy.SniperConfig().minimum_sniper_score),
+        "maximum_score": 100.0,
+        "liquidity_score": selected.get("liquidity_score"),
+        "regime_gate": False,
+        "option_flow_gate": False,
+        "regime": (sniper.get("regime") or {}).get("regime"),
+        "vix_regime": evidence.get("vix_regime") or (sniper.get("vix") or {}).get("regime"),
+        "gap_state": gap.state if gap else evidence.get("gap_state"),
+        "risk_reward": feas.get("risk_reward"),
+        "minimum_risk_reward": 2.0,
+        "premium_target_reachable": bool(feas.get("valid")) if feas else None,
+        "premium_target_detail": feas.get("reason") or "2x feasibility gate",
+    })
+    if result.get("decision") == "DATA_INVALID":
+        evidence["data_quality_ok"] = False
+    calculations["score"] = {**calculations["score"], **{k: score.get(k) for k in ("total", "minimum", "maximum", "band")}, "card": sniper_strategy.STRATEGY_ID}
+    calculations["sniper"] = sniper
+    if gap:
+        calculations["gap"] = {**calculations["gap"], "status": gap.state, "reason": _GAP_REASONS.get(gap.state)}
+
+
 def analyze_payload(payload: dict) -> dict:
     candles = _candles_from(payload.get("candles", []))
     daily_candles = _candles_from(payload.get("daily_candles")) or None
@@ -628,6 +671,18 @@ def analyze_payload(payload: dict) -> dict:
     candles = completed_candles(candles, now, interval)
     option_evidence = payload.get("option_evidence")
     context = None
+    setup_candles: list[Candle] = []
+    if strategy == sniper_strategy.STRATEGY_ID:
+        setup_candles = completed_candles(_candles_from(payload.get("setup_candles")), now, 5)
+        context = {
+            "setup_candles": setup_candles,
+            "option_chain": payload.get("option_chain"),
+            "options_flow": payload.get("options_flow"),
+            "vix": payload.get("vix"),
+            "max_loss_per_trade": payload.get("max_loss_per_trade"),
+            "max_lots": payload.get("max_lots"),
+            "slippage_pct": payload.get("slippage_pct"),
+        }
     if strategy == scalp_strategy.STRATEGY_ID:
         premium = payload.get("premium_candles") if isinstance(payload.get("premium_candles"), dict) else {}
         context = {
@@ -650,6 +705,8 @@ def analyze_payload(payload: dict) -> dict:
     evidence, calculations, session_info = _observe(symbol, candles, strategy, result, StrategyConfiguration(), now, option_evidence, daily_candles, volume_source)
     if strategy == scalp_strategy.STRATEGY_ID:
         _scalp_evidence(result, evidence, calculations)
+    if strategy == sniper_strategy.STRATEGY_ID:
+        _sniper_evidence(result, evidence, calculations, setup_candles, daily_candles)
     result["calculations"] = calculations
     result["session"] = session_info
     caller_evidence = payload.get("pipeline") or {}

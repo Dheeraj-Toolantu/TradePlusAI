@@ -60,7 +60,7 @@ describe("server-side auto-execution", () => {
     expect(status).toMatchObject({ enabled: true, indices: ["NIFTY"], riskReward: "1:2" });
     expect(h.saved()).toMatchObject({ enabled: true, indices: ["NIFTY"] });
     await vwapAutoTraderTick();
-    expect(h.place).toHaveBeenCalledWith({ underlying: "NIFTY", riskReward: "1:2", settings: {} });
+    expect(h.place).toHaveBeenCalledWith({ underlying: "NIFTY", riskReward: "1:2", settings: {}, strategy: "VWAP_EMA_SCALP" });
     expect(vwapAutoTraderStatus().lastByIndex.NIFTY).toMatchObject({ status: "WAITING", text: expect.stringContaining("RETEST_NOT_CONFIRMED") });
   });
 

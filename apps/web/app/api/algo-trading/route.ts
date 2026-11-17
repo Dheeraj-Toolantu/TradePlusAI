@@ -11,6 +11,7 @@ import { DAILY_RISK_RULES, evaluateDailyRisk } from "../../../lib/daily-risk";
 import { getScalper } from "../../../lib/scalper-instance";
 import { ensureScalperMonitor } from "../../../lib/scalper-monitor";
 import { ensureVwapAutoTrader, setVwapAutoTrader, vwapAutoTraderStatus } from "../../../lib/vwap-auto-trader";
+import { journalSniper } from "../../../lib/sniper-journal";
 import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import {
   saveOrderToFirestore,
@@ -25,9 +26,20 @@ let firestoreHydrated = false;
 const supported = ["NIFTY", "BANKNIFTY", "SENSEX", "RELIANCE", "TCS", "INFY", "HDFCBANK"];
 // VWAP_EMA_SCALP: the 1-minute VWAP / 5-9 EMA option scalper (quant/.../scalp_strategy.py).
 const SCALP = "VWAP_EMA_SCALP";
-const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", SCALP]);
-const strategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK", SCALP]);
+// NIFTY_SNIPER: NIFTY Sniper AI (quant/.../sniper_strategy.py, docs/nifty-sniper/): 15m regime, 5m
+// liquidity / SMC setup, 1m trigger, 2x-premium objective with a 25% premium stop. NIFTY only (v1).
+const SNIPER = "NIFTY_SNIPER";
+const scalperStrategies = new Set([SCALP, SNIPER]);
+const paperStrategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", SCALP, SNIPER]);
+const strategies = new Set(["ORB_RETEST", "VWAP_REVERSAL", "RANGE_DEFINED_RISK", SCALP, SNIPER]);
 const scalpIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+const sniperIndices = new Set(["NIFTY"]);
+// The sniper's own daily locks (spec 13.1), on top of the scalper book's limits.
+const SNIPER_LIMITS = { maxTrades: 3, maxConsecutiveLosses: 2 };
+const SNIPER_PREMIUM = { stop: 0.75, target: 2.0 };
+const strategyOf = (value: unknown) => (String(value ?? "").toUpperCase() === SNIPER ? SNIPER : SCALP);
+const indexError = (strategy: string, symbol: string) =>
+  strategy === SNIPER ? (sniperIndices.has(symbol) ? null : "NIFTY Sniper AI trades NIFTY options only in version 1.") : (scalpIndices.has(symbol) ? null : "The VWAP-EMA scalper trades index options (NIFTY, BANKNIFTY, SENSEX).");
 // The trader's reward:risk for the scalp: 1:1 or 1:2 on the index move (2 is the default).
 const rrOf = (value: unknown) => (String(value ?? "").replace(/\s/g, "") === "1:1" ? "1:1" : "1:2");
 // Tick rounding may shave up to 3% off the chosen ratio on the premium (same as the engine).
@@ -143,7 +155,32 @@ async function scalpInputs(origin: string, intel: Record<string, unknown> | null
   };
 }
 
+async function runSniper(symbol: string, provider: string, origin: string, evidence: Record<string, unknown>, scalp: ScalpOptions) {
+  // 1m tape (execution trigger), 5m over the week (setup structure, PDH/PDL, 15m regime) and daily
+  // bars, each with near-month futures volume attached (index candles carry none).
+  const history = (timeframe: string, period: string) => fetch(`${origin}/api/market-data/history?provider=${provider}&symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&period=${period}&volume=futures&date=${istDate()}`, { cache: "no-store" })
+    .then(async (response) => ({ ok: response.ok, body: await response.json().catch(() => ({})) as Record<string, unknown> }));
+  const [one, five, daily] = await Promise.all([history("1m", "day"), history("5m", "week"), history("1D", "month").catch(() => ({ ok: false, body: {} as Record<string, unknown> }))]);
+  if (!one.ok || !five.ok) throw new Error(String(one.body.error ?? five.body.error ?? "Market history unavailable"));
+  // Never evaluate on delayed (Yahoo fallback) candles: that is DATA_INVALID, not a signal.
+  if (one.body.delayed || five.body.delayed) throw new Error("Live 1-minute / 5-minute candles are unavailable (only delayed data); NIFTY Sniper AI will not evaluate on stale prices.");
+  let intel: Record<string, unknown> | null = null;
+  let optionEvidence: Record<string, unknown> = {};
+  if (isIntelSymbol(symbol)) {
+    try { intel = await getMarketIntel(symbol, { origin }) as Record<string, unknown>; optionEvidence = (intel.v5_option_evidence ?? {}) as Record<string, unknown>; } catch { intel = null; }
+  }
+  const payload: RecordValue = {
+    symbol, strategy: SNIPER, interval_minutes: 1, candles: one.body.candles ?? [], setup_candles: five.body.candles ?? [],
+    daily_candles: Array.isArray(daily.body.candles) ? daily.body.candles : [], volume_source: five.body.volumeSource ?? null,
+    risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence,
+    max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null, slippage_pct: SCALPER_SLIPPAGE,
+    ...(await scalpInputs(origin, intel ?? { symbol })),
+  };
+  return runPythonEngine(payload);
+}
+
 async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, scalp: ScalpOptions = {}) {
+  if (strategy === SNIPER) return runSniper(symbol, provider, origin, evidence, scalp);
   const scalping = strategy === SCALP;
   // Index candles carry near-month futures volume (index volume is always zero); the scalper reads
   // the 1-minute tape, the other strategies 5-minute candles. Daily candles give the true ATR14
@@ -244,7 +281,7 @@ export async function GET(request: Request) {
 
   if (!supported.includes(symbol)) return NextResponse.json({ error: "Unsupported symbol" }, { status: 400 });
   if (!strategies.has(strategy)) return NextResponse.json({ error: "Unsupported strategy" }, { status: 400 });
-  if (strategy === SCALP && !scalpIndices.has(symbol)) return NextResponse.json({ error: "The VWAP-EMA scalper trades index options (NIFTY, BANKNIFTY, SENSEX)." }, { status: 400 });
+  if (scalperStrategies.has(strategy) && indexError(strategy, symbol)) return NextResponse.json({ error: indexError(strategy, symbol) }, { status: 400 });
   if (provider !== "groww") return NextResponse.json({ error: "Groww is the only supported market-data and execution provider for the algo trading page." }, { status: 400 });
 
   const safeModeState = readSafeModeState();
@@ -305,7 +342,7 @@ export async function POST(request: Request) {
     // Switch server-side auto-execution of the VWAP-EMA scalper on or off for one index.
     ensureVwapAutoTrader(new URL(request.url).origin);
     try {
-      const status = await setVwapAutoTrader({ index: String(body.underlying ?? body.symbol ?? ""), enabled: body.enabled === true, riskReward: rrOf(body.riskReward), settings: body.settings && typeof body.settings === "object" ? body.settings as Partial<ScalperSettings> : undefined });
+      const status = await setVwapAutoTrader({ index: String(body.underlying ?? body.symbol ?? ""), enabled: body.enabled === true, riskReward: rrOf(body.riskReward), settings: body.settings && typeof body.settings === "object" ? body.settings as Partial<ScalperSettings> : undefined, strategy: body.strategy === undefined ? undefined : strategyOf(body.strategy) });
       return NextResponse.json({ autoTrader: status });
     } catch (error) {
       return NextResponse.json({ error: error instanceof Error ? error.message : "Auto-trader update failed" }, { status: 400 });
@@ -400,7 +437,7 @@ export async function POST(request: Request) {
     }
     // The scalper selects the strike from the OI data itself; only that contract may be bought.
     const selected = (serverAnalysis.setup as { contract?: { symbol?: string } } | undefined)?.contract?.symbol;
-    if (strategy === SCALP && selected !== String(body.symbol ?? "")) {
+    if (scalperStrategies.has(strategy) && selected !== String(body.symbol ?? "")) {
       return NextResponse.json({ error: `The scalper selected ${selected ?? "no contract"}; ${String(body.symbol ?? "this contract")} is not the confirmed strike.` }, { status: 409 });
     }
   }
@@ -414,7 +451,7 @@ export async function POST(request: Request) {
   const risk = Math.abs(entryPrice - stopLoss);
   const reward = Math.abs(target - entryPrice);
   // The scalper trades the 1:1 or 1:2 the trader chose; every other strategy keeps the 2R minimum.
-  const minimumRr = strategy === SCALP ? scalpMinimumRr(body.riskReward) : 2.0;
+  const minimumRr = strategy === SCALP ? scalpMinimumRr(body.riskReward) : strategy === SNIPER ? (SNIPER_PREMIUM.target - 1) / (1 - SNIPER_PREMIUM.stop) * 0.97 : 2.0;
   if (!risk || reward / risk < minimumRr) {
     return NextResponse.json({ error: `Paper entry requires the V5 minimum expected reward of ${minimumRr}R.` }, { status: 400 });
   }
@@ -478,7 +515,9 @@ type ScalpSetup = {
  */
 async function placeOnScalper(body: RecordValue, origin: string) {
   const underlying = String(body.underlying ?? body.symbol ?? "").toUpperCase();
-  if (!scalpIndices.has(underlying)) return NextResponse.json({ placed: false, error: "The VWAP-EMA scalper trades index options (NIFTY, BANKNIFTY, SENSEX)." }, { status: 400 });
+  const strategy = strategyOf(body.strategy);
+  const sniper = strategy === SNIPER;
+  if (indexError(strategy, underlying)) return NextResponse.json({ placed: false, error: indexError(strategy, underlying) }, { status: 400 });
   const settings = (body.settings && typeof body.settings === "object" ? body.settings : {}) as Partial<ScalperSettings>;
   const safety = readSafeModeState();
   const entryBlockedReason = safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : safety.safeMode ? `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` : undefined;
@@ -488,13 +527,15 @@ async function placeOnScalper(body: RecordValue, origin: string) {
     const health = await withTimeout(new GrowwAdapter(createGrowwTransport()).healthCheck(), 5000, "Groww health check");
     brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
   } catch { brokerHealthy = false; }
-  const analysis = await runEngine(underlying, "groww", origin, SCALP, await operationalEvidence(underlying, brokerHealthy, safety), {
+  const analysis = await runEngine(underlying, "groww", origin, strategy, await operationalEvidence(underlying, brokerHealthy, safety), {
     riskReward: rrOf(body.riskReward), maxLossPerTrade: Number(settings.maxLossPerTrade) || undefined, maxLots: Number(settings.lots) || undefined,
   }).catch((error: unknown) => ({ error: error instanceof Error ? error.message : "Strategy engine unavailable" }) as RecordValue);
   const pipeline = analysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
   const setup = analysis.setup as ScalpSetup | null | undefined;
   if (pipeline?.decision !== "CONFIRMED" || !setup?.contract) {
-    return NextResponse.json({ placed: false, error: "V5 no-trade gate: the scalp is not confirmed on the server.", reasons: pipeline?.reasons ?? [String(analysis.error ?? "SERVER_PIPELINE_UNAVAILABLE")] }, { status: 403 });
+    const reasons = pipeline?.reasons ?? [String(analysis.error ?? "SERVER_PIPELINE_UNAVAILABLE")];
+    if (sniper) void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: false, reasons });
+    return NextResponse.json({ placed: false, error: `V5 no-trade gate: the ${sniper ? "NIFTY Sniper setup" : "scalp"} is not confirmed on the server.`, reasons, strategyReason: analysis.strategy_reason ?? null }, { status: 403 });
   }
   // The page sends its live chain; the server-side auto-trader sends none, so read it here.
   const rawContracts = Array.isArray(body.contracts) && body.contracts.length ? body.contracts
@@ -503,6 +544,13 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   const live = contracts.find((item) => item.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase() === setup.contract.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase());
   if (!live || !(live.premium > 0) || !(live.lotSize > 0)) return NextResponse.json({ placed: false, error: `${setup.contract.symbol} has no live premium and lot size in the chain yet.` }, { status: 409 });
   const lot = live.lotSize;
+  if (sniper) {
+    const plan = sniperPlan(setup as SniperSetup, live, lot);
+    const result = await getScalper().place(underlying, plan, contracts, { setupId: setup.setup_id, settings, entryBlockedReason, ruleLimits: SNIPER_LIMITS });
+    if (result.placed) ensureScalperMonitor(origin);
+    void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: Boolean(result.placed), reasons: result.placed ? [] : [String((result as { error?: string }).error ?? "refused")], position: (result as { position?: unknown }).position });
+    return NextResponse.json({ ...result, setup, strategy: SNIPER }, { status: result.placed ? 200 : 409 });
+  }
   const plan: ScalperPlan = {
     kind: "SCALP", side: setup.contract.type,
     legs: [{ symbol: live.symbol, contract: live.contract, strike: live.strike, side: "BUY", price: setup.entry, valuation: valueOption(live, setup.spot.entry) }],
@@ -520,6 +568,28 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   // Exits are managed on the server from here on, whether or not a browser stays open.
   if (result.placed) ensureScalperMonitor(origin);
   return NextResponse.json({ ...result, setup }, { status: result.placed ? 200 : 409 });
+}
+
+type SniperSetup = ScalpSetup & {
+  family: string; score: number; band: string; partial_target: number; stop_percent: number; target_multiple: number;
+  greeks?: { delta: number; gamma: number; theta_per_day: number; iv: number | null };
+};
+
+/** NIFTY Sniper AI plan: premium stop / 2x target re-derived from the ACTUAL fill by the scalper. */
+function sniperPlan(setup: SniperSetup, live: ScalperContract, lot: number): ScalperPlan {
+  const rr = (SNIPER_PREMIUM.target - 1) / (1 - SNIPER_PREMIUM.stop);
+  return {
+    kind: "SCALP", side: setup.contract.type,
+    legs: [{ symbol: live.symbol, contract: live.contract, strike: live.strike, side: "BUY", price: setup.entry, valuation: valueOption(live, setup.spot.entry) }],
+    lots: setup.lots, quantity: setup.lots * lot, entry: setup.entry, stop: setup.stop_loss, target: setup.target,
+    riskPerLot: Math.round((setup.entry - setup.stop_loss) * lot * 100) / 100, rewardPerLot: Math.round((setup.target - setup.entry) * lot * 100) / 100,
+    riskReward: Math.round(rr * 100) / 100,
+    // The index invalidation (beyond the swept extreme / protected swing) exits the trade; the target is the premium.
+    spot: { entry: setup.spot.entry, stop: setup.spot.stop, target: setup.spot.target },
+    reason: `NIFTY Sniper AI · ${setup.family.replace(/_/g, " ").toLowerCase()} · score ${setup.score} (${setup.band}) · ${SNIPER_PREMIUM.target}x target / ${Math.round((1 - SNIPER_PREMIUM.stop) * 100)}% stop on the fill · index invalidation ${setup.spot.stop}`,
+    trail: { rule: "SNIPER", costPerUnit: Number(setup.cost_per_unit) || 0 },
+    risk: { maxEntry: setup.max_entry, maxTarget: 0, minRiskReward: Math.round(rr * 0.97 * 100) / 100, stopGap: setup.stop_gap, feesAtStopPerLot: setup.fees_at_stop_per_lot, lotSize: lot, premiumMultiples: SNIPER_PREMIUM },
+  };
 }
 
 export async function DELETE(request: Request) {

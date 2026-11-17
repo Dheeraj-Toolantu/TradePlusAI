@@ -4,7 +4,8 @@ import { getScalper } from "./scalper-instance";
 import type { PositionView, ScalperSettings } from "../../../services/paper-trading/src/smart-scalper";
 
 /**
- * Server-side auto-execution of the VWAP-EMA-ADX scalper onto the paper Smart Scalper.
+ * Server-side auto-execution of the selected strategy onto the paper Smart Scalper: the VWAP-EMA-ADX
+ * scalper (VWAP_EMA_SCALP, NIFTY / BANKNIFTY / SENSEX) or NIFTY Sniper AI (NIFTY_SNIPER, NIFTY only).
  *
  * When it is switched on for an index, the Node server re-runs the strategy and every V5 gate a few
  * seconds after each 1-minute close (POST /api/algo-trading PLACE_ON_SCALPER, the same path as the
@@ -18,11 +19,13 @@ import type { PositionView, ScalperSettings } from "../../../services/paper-trad
  * risk, broker health, the trade cap, the loss cool-down, 09:15-15:15 IST. Paper only.
  */
 
-export type AutoTraderConfig = { enabled: boolean; indices: string[]; riskReward: "1:1" | "1:2"; settings: Partial<ScalperSettings>; updatedAt: string | null };
+export type AutoStrategy = "VWAP_EMA_SCALP" | "NIFTY_SNIPER";
+export const AUTO_STRATEGY_NAMES: Record<AutoStrategy, string> = { VWAP_EMA_SCALP: "VWAP-EMA", NIFTY_SNIPER: "NIFTY Sniper AI" };
+export type AutoTraderConfig = { enabled: boolean; strategy: AutoStrategy; indices: string[]; riskReward: "1:1" | "1:2"; settings: Partial<ScalperSettings>; updatedAt: string | null };
 export type AutoTraderEvent = { at: string; index: string; status: "PLACED" | "WAITING" | "BLOCKED" | "IN_TRADE" | "CLOSED" | "ERROR"; text: string };
 export type AutoTraderDeps = {
   /** Run the strategy and place a confirmed setup; mirrors POST /api/algo-trading PLACE_ON_SCALPER. */
-  place(input: { underlying: string; riskReward: string; settings: Partial<ScalperSettings> }): Promise<{ status: number; body: Record<string, unknown> }>;
+  place(input: { underlying: string; riskReward: string; settings: Partial<ScalperSettings>; strategy: AutoStrategy }): Promise<{ status: number; body: Record<string, unknown> }>;
   openTrade(): Promise<PositionView | null>;
   now(): number;
   load(): Promise<Partial<AutoTraderConfig> | null>;
@@ -35,12 +38,14 @@ type State = {
 };
 
 const INDICES = new Set(["NIFTY", "BANKNIFTY", "SENSEX"]);
+const STRATEGY_INDICES: Record<AutoStrategy, Set<string>> = { VWAP_EMA_SCALP: INDICES, NIFTY_SNIPER: new Set(["NIFTY"]) };
+const strategyOf = (value: unknown): AutoStrategy => (value === "NIFTY_SNIPER" ? "NIFTY_SNIPER" : "VWAP_EMA_SCALP");
 const CONFIG_DOC = ["settings", "vwapAutoTrader"] as const;
 /** Seconds after each minute's close: the 1-minute candle has to be complete in the feed. */
 const AFTER_CLOSE_MS = 6_000;
 const OPEN_MIN = 9 * 60 + 15;
 const LAST_ENTRY_MIN = 15 * 60 + 15;
-const EMPTY: AutoTraderConfig = { enabled: false, indices: [], riskReward: "1:2", settings: {}, updatedAt: null };
+const EMPTY: AutoTraderConfig = { enabled: false, strategy: "VWAP_EMA_SCALP", indices: [], riskReward: "1:2", settings: {}, updatedAt: null };
 
 const holder = globalThis as typeof globalThis & { __tradepulseVwapAutoTrader?: State };
 const state = (holder.__tradepulseVwapAutoTrader ??= {
@@ -54,7 +59,7 @@ function defaultDeps(): AutoTraderDeps {
       // contracts are omitted: the route reads the live chain itself.
       const response = await fetch(`${state.origin}/api/algo-trading`, {
         method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store", signal: AbortSignal.timeout(55_000),
-        body: JSON.stringify({ action: "PLACE_ON_SCALPER", underlying: input.underlying, riskReward: input.riskReward, settings: input.settings, origin: "AUTO_TRADER" }),
+        body: JSON.stringify({ action: "PLACE_ON_SCALPER", underlying: input.underlying, riskReward: input.riskReward, settings: input.settings, strategy: input.strategy, origin: "AUTO_TRADER" }),
       });
       return { status: response.status, body: await response.json().catch(() => ({})) as Record<string, unknown> };
     },
@@ -76,8 +81,10 @@ function record(event: Omit<AutoTraderEvent, "at">) {
 }
 
 const sanitize = (raw: Partial<AutoTraderConfig> | null | undefined): AutoTraderConfig => {
-  const indices = [...new Set((Array.isArray(raw?.indices) ? raw!.indices : []).map((item) => String(item).toUpperCase()).filter((item) => INDICES.has(item)))];
-  return { enabled: Boolean(raw?.enabled) && indices.length > 0, indices, riskReward: raw?.riskReward === "1:1" ? "1:1" : "1:2", settings: raw?.settings && typeof raw.settings === "object" ? raw.settings : {}, updatedAt: raw?.updatedAt ?? null };
+  const strategy = strategyOf(raw?.strategy);
+  const allowed = STRATEGY_INDICES[strategy];
+  const indices = [...new Set((Array.isArray(raw?.indices) ? raw!.indices : []).map((item) => String(item).toUpperCase()).filter((item) => allowed.has(item)))];
+  return { enabled: Boolean(raw?.enabled) && indices.length > 0, strategy, indices, riskReward: raw?.riskReward === "1:1" ? "1:1" : "1:2", settings: raw?.settings && typeof raw.settings === "object" ? raw.settings : {}, updatedAt: raw?.updatedAt ?? null };
 };
 
 async function ensureLoaded() {
@@ -103,13 +110,14 @@ export async function vwapAutoTraderTick() {
     const before = state.openTrade;
     const open = await deps().openTrade();
     state.openTrade = open;
-    if (before && !open) record({ index: before.underlying, status: "CLOSED", text: `${before.label} exited: the next VWAP-EMA entry is allowed` });
+    const name = AUTO_STRATEGY_NAMES[config.strategy];
+    if (before && !open) record({ index: before.underlying, status: "CLOSED", text: `${before.label} exited: the next ${name} entry is allowed` });
     if (open) {
       record({ index: open.underlying, status: "IN_TRADE", text: `BUY ${open.label} open (SL ₹${open.stop ?? "--"} · T ₹${open.target ?? "--"}): no new trade until it exits at its target, SL or trailing SL` });
       return { skipped: "in-trade" as const };
     }
     for (const index of config.indices) {
-      const result = await deps().place({ underlying: index, riskReward: config.riskReward, settings: config.settings }).catch((error: unknown) => ({ status: 0, body: { error: error instanceof Error ? error.message : "request failed" } as Record<string, unknown> }));
+      const result = await deps().place({ underlying: index, riskReward: config.riskReward, settings: config.settings, strategy: config.strategy }).catch((error: unknown) => ({ status: 0, body: { error: error instanceof Error ? error.message : "request failed" } as Record<string, unknown> }));
       const body = result.body;
       if (result.status === 200 && body.placed) {
         state.lastPlacedAt = new Date(deps().now()).toISOString();
@@ -121,7 +129,7 @@ export async function vwapAutoTraderTick() {
       const error = String(body.error ?? `HTTP ${result.status}`);
       if (body.blockedByOpenTrade) { record({ index, status: "IN_TRADE", text: error }); return { placed: null }; }
       if (result.status === 0) record({ index, status: "ERROR", text: error });
-      else if (error.startsWith("V5 no-trade gate")) record({ index, status: "WAITING", text: `Waiting for a confirmed setup${reasons ? `: ${reasons}` : ""}` });
+      else if (error.startsWith("V5 no-trade gate")) record({ index, status: "WAITING", text: `${name}: waiting for a confirmed setup${body.strategyReason && config.strategy === "NIFTY_SNIPER" ? ` (${String(body.strategyReason).slice(0, 160)})` : reasons ? `: ${reasons}` : ""}` });
       else record({ index, status: "BLOCKED", text: `${error}${reasons ? ` (${reasons})` : ""}` });
     }
     return { placed: null };
@@ -151,13 +159,19 @@ export function ensureVwapAutoTrader(origin?: string, injected?: AutoTraderDeps)
 }
 
 /** Switch auto-execution on or off for one index (the others keep their state), and save it. */
-export async function setVwapAutoTrader(input: { index: string; enabled: boolean; riskReward?: string; settings?: Partial<ScalperSettings> }) {
+export async function setVwapAutoTrader(input: { index: string; enabled: boolean; riskReward?: string; settings?: Partial<ScalperSettings>; strategy?: AutoStrategy }) {
   await ensureLoaded();
   const index = input.index.toUpperCase();
+  // One strategy drives the auto-trader at a time; switching it applies to every watched index.
+  const strategy = input.strategy ? strategyOf(input.strategy) : state.config.strategy;
   if (!INDICES.has(index)) throw new Error("Auto-execution trades index options (NIFTY, BANKNIFTY, SENSEX).");
-  const indices = input.enabled ? [...new Set([...state.config.indices, index])] : state.config.indices.filter((item) => item !== index);
-  state.config = sanitize({ ...state.config, indices, enabled: indices.length > 0, riskReward: (input.riskReward ?? state.config.riskReward) as AutoTraderConfig["riskReward"], settings: input.settings ?? state.config.settings, updatedAt: new Date(deps().now()).toISOString() });
-  record({ index, status: input.enabled ? "WAITING" : "BLOCKED", text: input.enabled ? `Auto-execution on: a confirmed VWAP-EMA setup on ${index} is placed on the Smart Scalper` : `Auto-execution off for ${index}` });
+  if (input.enabled && !STRATEGY_INDICES[strategy].has(index)) throw new Error(`${AUTO_STRATEGY_NAMES[strategy]} trades ${[...STRATEGY_INDICES[strategy]].join(", ")} only.`);
+  const switched = strategy !== state.config.strategy;
+  const current = state.config.indices.filter((item) => STRATEGY_INDICES[strategy].has(item));
+  const indices = input.enabled ? [...new Set([...current, index])] : current.filter((item) => item !== index);
+  state.config = sanitize({ ...state.config, strategy, indices, enabled: indices.length > 0, riskReward: (input.riskReward ?? state.config.riskReward) as AutoTraderConfig["riskReward"], settings: input.settings ?? state.config.settings, updatedAt: new Date(deps().now()).toISOString() });
+  const name = AUTO_STRATEGY_NAMES[strategy];
+  record({ index, status: input.enabled ? "WAITING" : "BLOCKED", text: input.enabled ? `Auto-execution on: a confirmed ${name} setup on ${index} is placed on the Smart Scalper${switched ? ` (strategy switched to ${name})` : ""}` : `Auto-execution off for ${index}` });
   await deps().save(state.config).catch(() => undefined);
   return vwapAutoTraderStatus();
 }

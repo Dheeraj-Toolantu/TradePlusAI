@@ -9,8 +9,13 @@ export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry
 type MonitorStatus = { running: boolean; intervalMs: number; lastTickAt: string | null; lastError: string | null; managedLegs: number; exits: number };
 type ScalperState = { positions: PositionView[]; closed: PositionView[]; unrealizedPnl: number; realizedPnl: number; tradesToday: number; decision?: ScalperDecision; summary?: string; error?: string; signalReady?: boolean; monitor?: MonitorStatus };
 type View = "CALL" | "SPOT" | "PUT";
-/** The algo page's VWAP-EMA scalper read, handed to the desk so it can trade it. */
+/** The algo page's strategy read (VWAP-EMA scalper or NIFTY Sniper AI), handed to the desk so it can trade it. */
+export type SignalStrategy = "VWAP_EMA_SCALP" | "NIFTY_SNIPER";
 export type VwapScalpSignal = {
+  /** Which algo-page strategy produced the read (VWAP-EMA when absent). */
+  strategy?: SignalStrategy;
+  /** Sniper: the setup family, score band and lifecycle state, for display. */
+  detail?: string;
   confirmed: boolean;
   setupId: string | null;
   side: "CE" | "PE" | null;
@@ -22,8 +27,10 @@ export type VwapScalpSignal = {
   waitingOn: string[];
   reason: string;
 };
-type EngineStrategy = "VWAP_EMA" | "LEVELS";
+type EngineStrategy = "VWAP_EMA" | "SNIPER" | "LEVELS";
 const TRAIL_TEXT: Record<string, string> = { INITIAL: "initial SL", BREAKEVEN: "breakeven (charges covered)", LOCKED: "+0.5R locked", TRAILING: "trailing 0.6R" };
+const SNIPER_TRAIL_TEXT: Record<string, string> = { INITIAL: "initial SL (-25%)", BREAKEVEN: "breakeven (charges covered)", LOCKED: "1.2x locked", TRAILING: "trailing 0.2x" };
+const engineFor = (strategy: SignalStrategy): EngineStrategy => (strategy === "NIFTY_SNIPER" ? "SNIPER" : "VWAP_EMA");
 const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.parse(iso) : NaN; return Number.isFinite(value) ? Math.floor(value / 1000) : null; };
 
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
@@ -59,7 +66,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -77,6 +84,9 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   vwapAuto?: { enabled: boolean; status: string; onChange: (enabled: boolean) => void } | null;
   /** An open scalper trade on another index: the desk offers to show its chart. */
   pinnedElsewhere?: { underlying: string; label: string } | null;
+  /** The algo page's selected strategy; choosing one here selects it there too. */
+  signalStrategy?: SignalStrategy;
+  onSignalStrategyChange?: (next: SignalStrategy) => void;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -87,7 +97,10 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   const [engineOn, setEngineOn] = useState(false);
   // Which strategy the engine trades: the VWAP-EMA scalper (all 9 criteria) or the level scalper.
   const [engineStrategy, setEngineStrategy] = useState<EngineStrategy>("VWAP_EMA");
-  const vwapMode = engineStrategy === "VWAP_EMA";
+  // Signal mode: entries come from the algo page's strategy (VWAP-EMA or NIFTY Sniper), placed via onPlaceVwapScalp.
+  const vwapMode = engineStrategy !== "LEVELS";
+  const sniperMode = engineStrategy === "SNIPER";
+  const signalName = sniperMode ? "NIFTY Sniper" : "VWAP-EMA";
   const auto = engineOn && tradeMode === "AUTOMATIC";
   const [showControls, setShowControls] = useState(false);
   const [callOffset, setCallOffset] = useState(0);
@@ -109,7 +122,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
     setSettings(load(SETTINGS_KEY, DEFAULT_SETTINGS));
     const prefs = load(PREFS_KEY, { views: ["CALL", "PUT"] as View[], timeframe: 1, instant: true, tradeMode: "MANUAL" as "AUTOMATIC" | "MANUAL", engineStrategy: "VWAP_EMA" as EngineStrategy });
     setTradeMode(prefs.tradeMode === "AUTOMATIC" ? "AUTOMATIC" : "MANUAL");
-    setEngineStrategy(prefs.engineStrategy === "LEVELS" ? "LEVELS" : "VWAP_EMA");
+    setEngineStrategy(prefs.engineStrategy === "LEVELS" ? "LEVELS" : prefs.engineStrategy === "SNIPER" ? "SNIPER" : "VWAP_EMA");
     setViews(prefs.views);
     setTimeframe(TIMEFRAMES.includes(prefs.timeframe as 1) ? prefs.timeframe as 1 : 1);
     setInstant(prefs.instant);
@@ -117,6 +130,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   useEffect(() => { save(SETTINGS_KEY, settings); }, [settings]);
   useEffect(() => { save(PREFS_KEY, { views, timeframe, instant, tradeMode, engineStrategy }); }, [views, timeframe, instant, tradeMode, engineStrategy]);
   useEffect(() => { onAutoChange?.(auto); }, [auto, onAutoChange]);
+  // Keep the desk on the algo page's strategy (unless the level scalper is chosen here).
+  useEffect(() => { setEngineStrategy((current) => (current === "LEVELS" ? current : engineFor(signalStrategy))); }, [signalStrategy]);
 
   // ---- strike ladder ------------------------------------------------------------------
   const strikes = useMemo(() => [...new Set(chain.map((row) => row.strike))].sort((a, b) => a - b), [chain]);
@@ -264,14 +279,15 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   const [placing, setPlacing] = useState(false);
   const placeVwap = useCallback(async (origin: "AUTO" | "MANUAL") => {
     if (!onPlaceVwapScalp || !vwapScalp?.confirmed || !vwapScalp.setupId || placing) return;
-    if (origin === "MANUAL" && !instant && !window.confirm(`Take the VWAP-EMA scalp?\nBUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · Target ₹${money(vwapScalp.plan?.target)} (${vwapScalp.plan?.rrChoice})\nPaper order.`)) return;
+    if (origin === "MANUAL" && !instant && !window.confirm(`Take the ${signalName} trade?\nBUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · Target ₹${money(vwapScalp.plan?.target)} (${vwapScalp.plan?.rrChoice})\nPaper order.`)) return;
     attempted.current.add(vwapScalp.setupId);
     setPlacing(true);
     try {
       const result = await onPlaceVwapScalp(origin);
-      setNotice(result.placed ? `VWAP-EMA scalp ${origin === "AUTO" ? "auto-placed" : "placed"}: BUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · T ₹${money(vwapScalp.plan?.target)}. Stop trails: breakeven at +0.5R, +0.5R locked at +1R, then 0.6R under the best premium.` : `VWAP-EMA scalp not placed: ${result.error ?? "refused"}`);
+      const trailText = sniperMode ? "Stop trails: breakeven + charges at 1.25x, 1.2x locked at 1.5x, then 0.2x under the best premium from 1.75x; exits at 2x." : "Stop trails: breakeven at +0.5R, +0.5R locked at +1R, then 0.6R under the best premium.";
+      setNotice(result.placed ? `${signalName} ${origin === "AUTO" ? "auto-placed" : "placed"}: BUY ${vwapScalp.selected?.symbol} · SL ₹${money(vwapScalp.plan?.stop)} · T ₹${money(vwapScalp.plan?.target)}. ${trailText}` : `${signalName} not placed: ${result.error ?? "refused"}`);
     } finally { setPlacing(false); }
-  }, [instant, onPlaceVwapScalp, placing, vwapScalp]);
+  }, [instant, onPlaceVwapScalp, placing, signalName, sniperMode, vwapScalp]);
   // VWAP-EMA automatic entries are placed by the server (see lib/vwap-auto-trader.ts), so a closed or
   // sleeping tab never misses one and a setup is never sent twice. Without the algo page's switch
   // (vwapAuto), the desk's own Automatic mode still places them from here.
@@ -357,7 +373,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   // VWAP-EMA plan on the contract it picked.
   const boxFor = useCallback((contractSymbol: string | undefined): RiskRewardBox | null => {
     const position = livePositions.find((item) => item.legs.length === 1 && norm(item.legs[0].symbol) === norm(contractSymbol) && item.stop !== null && item.target !== null);
-    if (position) return { entry: position.entry, stop: position.stop!, target: position.target!, fromTime: epochOf(position.openedAt), quantity: position.quantity, label: `${position.kind} ${position.trail ? "VWAP-EMA" : ""}`.trim(), stopTitle: position.trail ? `SL · ${TRAIL_TEXT[position.trail.stage]}` : position.trailing ? "Trail SL" : "SL" };
+    if (position) return { entry: position.entry, stop: position.stop!, target: position.target!, fromTime: epochOf(position.openedAt), quantity: position.quantity, label: `${position.kind} ${position.trail ? (position.trail.rule === "SNIPER" ? "NIFTY Sniper" : "VWAP-EMA") : ""}`.trim(), stopTitle: position.trail ? `SL · ${(position.trail.rule === "SNIPER" ? SNIPER_TRAIL_TEXT : TRAIL_TEXT)[position.trail.stage]}` : position.trailing ? "Trail SL" : "SL" };
     if (vwapMode && vwapScalp?.plan && vwapScalp.selected && norm(vwapScalp.selected.symbol) === norm(contractSymbol) && vwapScalp.plan.stop < vwapScalp.plan.entry && vwapScalp.plan.target > vwapScalp.plan.entry) {
       return { entry: vwapScalp.plan.entry, stop: vwapScalp.plan.stop, target: vwapScalp.plan.target, fromTime: epochOf(vwapScalp.triggerTime), quantity: vwapScalp.plan.quantity, label: vwapScalp.confirmed ? `Signal ${vwapScalp.plan.rrChoice}` : `Plan ${vwapScalp.plan.rrChoice} (not confirmed)` };
     }
@@ -436,8 +452,16 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
 
         <div className="scalper-engine-bar" role="group" aria-label="Auto option engine">
           <span className="algo-kicker">AUTO OPTION ENGINE · PAPER</span>
-          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => { const next = event.target.value as EngineStrategy; setEngineStrategy(next); setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 9 criteria (trend: VWAP + 9/21 EMA + ADX above 25; entry: VWAP + 5/9 EMA + ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically." : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape."); }}>
+          <select aria-label="Engine strategy" className="scalper-strategy" value={engineStrategy} onChange={(event) => {
+            const next = event.target.value as EngineStrategy;
+            setEngineStrategy(next);
+            if (next !== "LEVELS") onSignalStrategyChange?.(next === "SNIPER" ? "NIFTY_SNIPER" : "VWAP_EMA_SCALP");
+            setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 9 criteria (trend: VWAP + 9/21 EMA + ADX above 25; entry: VWAP + 5/9 EMA + ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically."
+              : next === "SNIPER" ? "NIFTY Sniper AI (NIFTY only): liquidity reversal, breakout expansion or trend continuation on 5m structure, 15m regime and a 1m trigger. Enters only on a score of 85+/100 with every hard filter and V5 gate passing; buys the CE/PE, stop 25% below the actual fill, 2x target, staged trail. Most sessions it returns NO TRADE — that is by design."
+              : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape.");
+          }}>
             <option value="VWAP_EMA">Strategy: VWAP-EMA scalper</option>
+            <option value="SNIPER">Strategy: NIFTY Sniper AI</option>
             <option value="LEVELS">Strategy: Level scalper</option>
           </select>
           <label className="scalper-switch scalper-switch-auto"><input type="checkbox" checked={engineOn} onChange={(event) => { setEngineOn(event.target.checked); setNotice(event.target.checked ? `Engine on (${tradeMode === "AUTOMATIC" ? "automatic: it places its own trades" : "manual: it signals, you take the trade"}). Scanning the 1m tape.` : "Engine off: open positions are still managed."); }} /><span /> Engine</label>
@@ -452,7 +476,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             ))}
           </span>
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
-          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? "Place the confirmed VWAP-EMA scalp (server re-checks every gate)" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
+          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? `Place the confirmed ${signalName} trade (server re-checks every gate)` : sniperMode ? "Waiting for a score of 85+ with every hard filter passing" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -469,16 +493,17 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
 
         {vwapMode ? (
           <div className={`scalper-engine ${vwapScalp?.confirmed ? "scalper-engine-live" : ""}`}>
-            <span className={`scalper-mode scalper-mode-${vwapScalp?.confirmed ? "scalp" : "wait"}`}>{engineOn || vwapAutomatic ? `VWAP-EMA · ${vwapScalp?.confirmed ? "CONFIRMED" : "WAITING"} · ${vwapAutomatic ? (vwapAuto ? "AUTO (server)" : "AUTO") : "MANUAL"}` : "ENGINE OFF"}</span>
+            <span className={`scalper-mode scalper-mode-${vwapScalp?.confirmed ? "scalp" : "wait"}`}>{engineOn || vwapAutomatic ? `${signalName} · ${vwapScalp?.confirmed ? "CONFIRMED" : "WAITING"} · ${vwapAutomatic ? (vwapAuto ? "AUTO (server)" : "AUTO") : "MANUAL"}` : "ENGINE OFF"}</span>
             {vwapScalp?.side ? <span className={vwapScalp.side === "CE" ? "scalper-side gain" : "scalper-side loss"}>{vwapScalp.side === "CE" ? "CE · long" : "PE · short"}</span> : null}
-            {vwapScalp ? <span className="scalper-read">criteria {vwapScalp.criteriaMet}/{vwapScalp.criteriaTotal}{vwapScalp.waitingOn.length ? ` · waiting on ${vwapScalp.waitingOn.join(", ")}` : ""}{vwapScalp.selected ? ` · OI pick ${vwapScalp.selected.strike} ${vwapScalp.selected.type}` : ""}</span> : <span className="scalper-read">waiting for the VWAP-EMA engine…</span>}
+            {vwapScalp ? <span className="scalper-read">{sniperMode ? `score ${vwapScalp.criteriaMet}/${vwapScalp.criteriaTotal}` : `criteria ${vwapScalp.criteriaMet}/${vwapScalp.criteriaTotal}`}{vwapScalp.detail ? ` · ${vwapScalp.detail}` : ""}{vwapScalp.waitingOn.length ? ` · waiting on ${vwapScalp.waitingOn.join(", ")}` : ""}{vwapScalp.selected ? ` · ${sniperMode ? "contract" : "OI pick"} ${vwapScalp.selected.strike} ${vwapScalp.selected.type}` : ""}</span> : <span className="scalper-read">waiting for the {signalName} engine…</span>}
+            {sniperMode && symbol !== "NIFTY" ? <p className="scalper-auto-status">NIFTY Sniper AI trades NIFTY only (v1). <button type="button" className="scalper-link" onClick={() => onSymbolChange("NIFTY")}>Switch to NIFTY</button></p> : null}
             {vwapAuto?.enabled && vwapAuto.status ? <p className="scalper-auto-status">⚡ {vwapAuto.status}</p> : null}
             <p>{notice}</p>
             {vwapScalp?.plan ? (
               <div className="scalper-plan">
                 <b>{vwapScalp.confirmed ? "Signal" : "Plan (not confirmed)"} · BUY {vwapScalp.selected?.symbol} · {vwapScalp.plan.rrChoice}{vwapScalp.plan.riskReward ? ` = ${vwapScalp.plan.riskReward}R on the premium` : ""}{vwapScalp.plan.netRiskReward ? ` (${vwapScalp.plan.netRiskReward}R after charges)` : ""}</b>
                 <span>Entry ₹{money(vwapScalp.plan.entry)} · SL ₹{money(vwapScalp.plan.stop)} · Target ₹{money(vwapScalp.plan.target)}{vwapScalp.plan.quantity ? ` · ${vwapScalp.plan.quantity} qty` : ""}</span>
-                <span>Trailing: SL to breakeven + charges at +0.5R · lock +0.5R at +1R · then 0.6R under the best premium · exit if a 1m candle closes back through the 9 EMA</span>
+                <span>{sniperMode ? "Trailing: SL to breakeven + charges at 1.25x · lock 1.2x at 1.5x · trail 0.2x under the best premium from 1.75x · exit at 2x, on the index invalidation, after 90 min below 1.25x, or at 15:15. 2x is an objective, never a promise." : "Trailing: SL to breakeven + charges at +0.5R · lock +0.5R at +1R · then 0.6R under the best premium · exit if a 1m candle closes back through the 9 EMA"}</span>
                 <span>On placing: re-planned on the actual fill (refused if it drifts past tolerance or the R:R drops); sized on the stressed loss (stop gap + slippage on both legs). Exits run on the server.</span>
               </div>
             ) : null}
