@@ -2,7 +2,7 @@
 
 import { memo } from "react";
 import type { PositionView } from "../../../../services/paper-trading/src/smart-scalper";
-import { nextTrailStep } from "../../../../services/paper-trading/src/scalper-trail";
+import { nextSniperTrailStep, nextTrailStep } from "../../../../services/paper-trading/src/scalper-trail";
 
 const money = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits }));
 const rupees = (value: number) => `${value >= 0 ? "+" : "−"}₹${money(Math.abs(value))}`;
@@ -48,13 +48,19 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
   const atStop = position.stop !== null ? (position.stop - position.entry) * qty : null;
   const atTarget = position.target !== null ? (position.target - position.entry) * qty : null;
   const stage = position.trail?.stage ?? (position.trailing ? "TRAILING" : "INITIAL");
-  const next = !closed && position.trail ? nextTrailStep({ entry: position.entry, risk: position.trail.risk, costPerUnit: position.trail.costPerUnit, stage: position.trail.stage, highWater: best }) : null;
+  const next = !closed && position.trail
+    ? position.trail.rule === "SNIPER"
+      ? nextSniperTrailStep({ entry: position.entry, costPerUnit: position.trail.costPerUnit, stage: position.trail.stage, highWater: best })
+      : nextTrailStep({ entry: position.entry, risk: position.trail.risk, costPerUnit: position.trail.costPerUnit, stage: position.trail.stage, highWater: best })
+    : null;
   const opened = Date.parse(position.openedAt);
   const ended = closed && position.exitAt ? Date.parse(position.exitAt) : now;
   const held = Number.isFinite(opened) ? ended - opened : 0;
   // The time stop: a scalp that has not reached +0.5R within the hold limit is closed.
-  const timeLeft = !closed && position.kind === "SCALP" && risk ? maxHoldMinutes * 60_000 - held : null;
-  const reachedHalfR = risk ? best - position.entry >= risk * 0.5 : false;
+  // NIFTY Sniper: its own 90-minute stop for a trade that has not reached 1.25x.
+  const sniper = position.trail?.rule === "SNIPER";
+  const timeLeft = !closed && position.kind === "SCALP" && risk ? (sniper ? 90 : maxHoldMinutes) * 60_000 - held : null;
+  const reachedHalfR = sniper ? best >= position.entry * 1.25 : risk ? best - position.entry >= risk * 0.5 : false;
 
   // Ladder: from the lowest of (initial stop, worst, ltp) to the highest of (target, best, ltp).
   const marks = [initialStop, position.stop, position.entry, position.target, ltp, best, worst].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
@@ -75,9 +81,9 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
 
       <div className="pos-meta">
         <span>{qty} qty</span>
-        <span>{position.kind}{position.trail ? " · VWAP-EMA" : ""}</span>
+        <span>{position.kind}{position.trail ? (position.trail.rule === "SNIPER" ? " · NIFTY Sniper" : " · VWAP-EMA") : ""}</span>
         <span title={closed ? "Time in trade" : "Time in trade (live)"}>⏱ {clock(held)}</span>
-        {timeLeft !== null && !reachedHalfR ? <span className={timeLeft < 120_000 ? "warn" : ""} title={`Closed at ${maxHoldMinutes} min unless the premium reaches +0.5R`}>time stop {timeLeft > 0 ? clock(timeLeft) : "due"}</span> : null}
+        {timeLeft !== null && !reachedHalfR ? <span className={timeLeft < 120_000 ? "warn" : ""} title={sniper ? "Closed at 90 min unless the premium reaches 1.25x" : `Closed at ${maxHoldMinutes} min unless the premium reaches +0.5R`}>time stop {timeLeft > 0 ? clock(timeLeft) : "due"}</span> : null}
         <span>in {ist(position.openedAt)}{closed && position.exitAt ? ` · out ${ist(position.exitAt)}` : ""}</span>
       </div>
 

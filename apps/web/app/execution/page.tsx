@@ -7,7 +7,8 @@ import { formatMarketCalculationValue, getOrderExitState } from "../../lib/optio
 import type { TradePlan } from "../../components/market-intel/market-intel-panel";
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
 import type { ChartBar, ChartLevel, RiskRewardBox } from "../../components/scalper/premium-chart";
-import type { VwapScalpSignal } from "../../components/scalper/scalper-desk";
+import type { SignalStrategy, VwapScalpSignal } from "../../components/scalper/scalper-desk";
+import type { SniperRead } from "../../components/execution/sniper-panel";
 import type { vwapAutoTraderStatus } from "../../lib/vwap-auto-trader";
 import type { PositionView } from "../../../../services/paper-trading/src/smart-scalper";
 import type { LiveTicketDraft } from "../../components/live/live-order-dialog";
@@ -22,6 +23,7 @@ const AIMonitoringPanel = dynamic(() => import("../../components/ai/ai-monitorin
 const LiveOrderDialog = dynamic(() => import("../../components/live/live-order-dialog").then((module) => module.LiveOrderDialog), { ssr: false });
 const NextDayPanel = dynamic(() => import("../../components/execution/next-day-panel").then((module) => module.NextDayPanel), { ssr: false });
 const ScalperDesk = dynamic(() => import("../../components/scalper/scalper-desk").then((module) => module.ScalperDesk), { ssr: false, loading: () => <div className="algo-empty">Loading scalper…</div> });
+const SniperPanel = dynamic(() => import("../../components/execution/sniper-panel").then((module) => module.SniperPanel), { ssr: false });
 const PremiumChart = dynamic(() => import("../../components/scalper/premium-chart").then((module) => module.PremiumChart), { ssr: false });
 
 type PipelineGate = { code: string; passed: boolean; detail: string };
@@ -49,11 +51,11 @@ type ScalpCalc = {
   vix?: { value: number | null; regime: string | null };
   score?: { total: number; minimum: number; maximum: number };
 };
-type StrategySetup = { side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; net_risk_reward?: number; planned_max_loss?: number; max_entry?: number; stressed_risk_reward?: number; rr_choice?: string; lots?: number; quantity?: number; max_loss?: number; setup_id?: string; trigger_time?: string | null; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: ScalpContract; spot?: { entry: number; stop: number; target: number } };
+type StrategySetup = { family?: string; score?: number; band?: string; partial_target?: number; side: string; entry: number; stop_loss: number; target: number; risk_reward?: number; net_risk_reward?: number; planned_max_loss?: number; max_entry?: number; stressed_risk_reward?: number; rr_choice?: string; lots?: number; quantity?: number; max_loss?: number; setup_id?: string; trigger_time?: string | null; target_method?: string; stop_method?: string; size_multiplier?: number; gap_day?: boolean; instrument?: "OPTION_PREMIUM"; contract?: ScalpContract; spot?: { entry: number; stop: number; target: number } };
 type Analysis = {
   decision: string; reason?: string;
   setup?: StrategySetup;
-  calculations?: { underlying?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string; scalp?: ScalpCalc };
+  calculations?: { underlying?: Record<string, number | string | null>; gap?: Record<string, number | string | null>; score?: Record<string, number | string | boolean | null>; risk?: Record<string, number | string | null>; option?: Record<string, number | string | null>; regime?: string; scalp?: ScalpCalc; sniper?: SniperRead };
   session?: { time_ist: string; trading_day: boolean; window: string; market_open: boolean; entry_permitted: boolean };
   pipeline?: { decision: string; reasons: string[]; gates: PipelineGate[] };
   strategy_decision?: string;
@@ -79,8 +81,11 @@ type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
 const INDICES = ["NIFTY", "BANKNIFTY", "SENSEX"] as const;
 const TICKER = ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX"];
 const FALLBACK_LOT: Record<string, number> = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // used only if the contract master is unreachable
-// The algo page runs one strategy: the 1-minute VWAP / 5-9 EMA index-option scalper.
-const strategy = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape. Trend (spec v1.0): close beyond VWAP, 9 EMA beyond 21 EMA and ADX(14) above 25 with the trade-side DI leading. Entry confirmation: price beyond a rising (falling) VWAP with the 5 EMA leading the 9 EMA, a pullback to the 9 EMA that resumes on volume beyond the prior candle, and ADX(14) above 20 on that confirmation candle. The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
+// The algo page runs one strategy at a time, chosen by the trader: the 1-minute VWAP / 5-9 EMA
+// index-option scalper, or NIFTY Sniper AI (docs/nifty-sniper/). Either one trades on the Scalper.
+const VWAP_STRATEGY = { id: "VWAP_EMA_SCALP", name: "VWAP-EMA Scalper", description: "1-minute index tape. Trend (spec v1.0): close beyond VWAP, 9 EMA beyond 21 EMA and ADX(14) above 25 with the trade-side DI leading. Entry confirmation: price beyond a rising (falling) VWAP with the 5 EMA leading the 9 EMA, a pullback to the 9 EMA that resumes on volume beyond the prior candle, and ADX(14) above 20 on that confirmation candle. The strike is picked from the OI data (delta 0.40-0.60, OI, volume, build-up); OI writers, PCR, the premium's own volume profile and India VIX must all agree. The stop sits beyond the pullback in index points and is mapped onto the premium with delta and gamma, for the 1:1 or 1:2 you choose." } as const;
+const SNIPER_STRATEGY = { id: "NIFTY_SNIPER", name: "NIFTY Sniper AI", description: "NIFTY only · rules-first, explainable intraday option buying. 15-minute regime, 5-minute setup (liquidity sweep → reclaim → displacement → MSS; breakout expansion; or trend continuation into an FVG / order block / VWAP), 1-minute trigger. A 100-point score (liquidity 20, MSS/BOS 15, displacement+FVG 15, OI 15, VWAP/EMA 10, volume 10, Greeks/IV 5, 2x feasibility 10) must reach 85 AND every hard filter must pass. Buys the CE (bullish) or PE (bearish) with delta 0.45-0.65; stop 25% below the actual fill, 2x target, staged trail (breakeven at 1.25x, 1.2x locked at 1.5x, trail from 1.75x); 3 entries and 2 consecutive losses per day at most. 2x is an objective, not a promise — most sessions return NO TRADE." } as const;
+const STRATEGIES: Record<SignalStrategy, { id: SignalStrategy; name: string; description: string }> = { VWAP_EMA_SCALP: VWAP_STRATEGY, NIFTY_SNIPER: SNIPER_STRATEGY };
 const RR_CHOICES: Array<{ id: RiskReward; name: string }> = [
   { id: "1:2", name: "Risk:Reward 1:2" },
   { id: "1:1", name: "Risk:Reward 1:1" },
@@ -134,14 +139,22 @@ export default function ExecutionPage() {
   const [symbol, setSymbol] = useState<string>("NIFTY");
   // Per-viewer preferences: the chosen reward:risk and whether confirmed scalps are auto-placed.
   const [riskReward, setRiskReward] = useState<RiskReward>("1:2");
+  // The strategy this page reads and the Scalper trades (VWAP-EMA scalper or NIFTY Sniper AI).
+  const [strategyId, setStrategyId] = useState<SignalStrategy>("VWAP_EMA_SCALP");
+  const strategy = STRATEGIES[strategyId];
+  const sniperSelected = strategyId === "NIFTY_SNIPER";
   const [scalperRefresh, setScalperRefresh] = useState(0);
   // Server-side auto-execution of the VWAP-EMA scalper (runs with or without this page open).
   const [autoTrader, setAutoTrader] = useState<AutoTrader | null>(null);
   const seenPlacement = useRef<string | null>(null);
   const [premiumBars, setPremiumBars] = useState<ChartBar[]>([]);
   const attemptedSetups = useRef(new Set<string>());
-  useEffect(() => { const prefs = readLocal(STRATEGY_PREFS_KEY, { riskReward: "1:2" as RiskReward }); setRiskReward(prefs.riskReward === "1:1" ? "1:1" : "1:2"); }, []);
-  useEffect(() => { try { window.localStorage.setItem(STRATEGY_PREFS_KEY, JSON.stringify({ riskReward })); } catch { /* per-viewer convenience */ } }, [riskReward]);
+  useEffect(() => {
+    const prefs = readLocal(STRATEGY_PREFS_KEY, { riskReward: "1:2" as RiskReward, strategy: "VWAP_EMA_SCALP" as SignalStrategy });
+    setRiskReward(prefs.riskReward === "1:1" ? "1:1" : "1:2");
+    if (prefs.strategy === "NIFTY_SNIPER") { setStrategyId("NIFTY_SNIPER"); setSymbol("NIFTY"); }
+  }, []);
+  useEffect(() => { try { window.localStorage.setItem(STRATEGY_PREFS_KEY, JSON.stringify({ riskReward, strategy: strategyId })); } catch { /* per-viewer convenience */ } }, [riskReward, strategyId]);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [paperOrders, setPaperOrders] = useState<Order[]>([]);
   // Smart Scalper positions on every index (auto-executed or placed from the desk), read from the
@@ -209,7 +222,7 @@ export default function ExecutionPage() {
       if (data.error) setMessage(data.error);
     } catch { setMessage("Strategy engine unavailable; retrying on the next refresh."); }
     finally { if (!quiet) setBusy(false); }
-  }, [riskReward, symbol]);
+  }, [riskReward, strategy.id, symbol]);
 
   const refreshLive = useCallback(async () => {
     try { setLive(await fetch("/api/live-orders", { cache: "no-store" }).then((response) => response.json())); } catch { /* status is advisory */ }
@@ -603,11 +616,13 @@ export default function ExecutionPage() {
     setStopLoss(String(setup.stop_loss));
     setTarget(String(setup.target));
     setTrailing("");
-    setTicketSource(`${strategy.name} ${setup.rr_choice ?? riskReward}`);
+    setTicketSource(sniperSelected ? `${strategy.name} ${setup.family ?? ""}`.trim() : `${strategy.name} ${setup.rr_choice ?? riskReward}`);
     setTicketOrigin("ALGO");
-    setMessage(`${strategy.name} setup loaded: BUY ${picked.symbol} near ₹${setup.entry} · SL ₹${setup.stop_loss} · target ₹${setup.target} (${setup.rr_choice ?? riskReward} on the index, ${setup.risk_reward}R on the premium). The server re-checks every V5 gate when you place it.`);
+    setMessage(sniperSelected
+      ? `${strategy.name} setup loaded: BUY ${picked.symbol} near ₹${setup.entry} · SL ₹${setup.stop_loss} (−25%) · 2x target ₹${setup.target} · score ${setup.score ?? "--"}. The server re-checks every gate when you place it.`
+      : `${strategy.name} setup loaded: BUY ${picked.symbol} near ₹${setup.entry} · SL ₹${setup.stop_loss} · target ₹${setup.target} (${setup.rr_choice ?? riskReward} on the index, ${setup.risk_reward}R on the premium). The server re-checks every V5 gate when you place it.`);
     document.getElementById("order-ticket")?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [analysis, riskReward, symbol]);
+  }, [analysis, riskReward, sniperSelected, strategy.name, symbol]);
 
   // A trade the server placed while this page was open (or since the last refresh): show it on the desk.
   useEffect(() => {
@@ -618,7 +633,7 @@ export default function ExecutionPage() {
     setScalperRefresh((value) => value + 1);
     if (!first) {
       const event = autoTrader?.events.find((item) => item.status === "PLACED");
-      log(`[Auto-execute] ${event?.text ?? "VWAP-EMA trade placed on the Smart Scalper"}`, "entry");
+      log(`[Auto-execute] ${event?.text ?? "Trade placed on the Smart Scalper"}`, "entry");
     }
   }, [autoTrader, log]);
   const loadScalperBook = useCallback(async () => {
@@ -641,20 +656,22 @@ export default function ExecutionPage() {
     } catch { setMessage("Scalper exit failed"); }
     setScalperRefresh((value) => value + 1);
   }, [log]);
-  const autoOn = Boolean(autoTrader?.enabled && autoTrader.indices.includes(symbol));
+  // Auto-execute is on for this view only when the server runs THIS strategy on THIS index.
+  const autoOn = Boolean(autoTrader?.enabled && autoTrader.indices.includes(symbol) && (autoTrader.strategy ?? "VWAP_EMA_SCALP") === strategyId);
+  const autoOtherStrategy = Boolean(autoTrader?.enabled && (autoTrader.strategy ?? "VWAP_EMA_SCALP") !== strategyId);
   const toggleAutoTrader = useCallback(async (enabled: boolean) => {
     try {
-      const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "AUTO_TRADER", underlying: symbol, enabled, riskReward, settings: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}) }) });
+      const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "AUTO_TRADER", underlying: symbol, enabled, riskReward, strategy: strategyId, settings: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}) }) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) { setMessage(data.error ?? "Auto-execute update failed"); return; }
       setAutoTrader(data.autoTrader as AutoTrader);
       const text = enabled
-        ? `Auto-execute ON for ${symbol}: the server places each confirmed VWAP-EMA setup on the Smart Scalper (paper), even with this page closed. One trade at a time: no new entry until the open trade exits at its target, SL or trailing SL.`
+        ? `Auto-execute ON for ${symbol}: the server places each confirmed ${strategy.name} setup on the Smart Scalper (paper), even with this page closed. One trade at a time: no new entry until the open trade exits at its target, SL or trailing SL.${sniperSelected ? " NIFTY Sniper also stops after 3 entries or 2 losses in a row today." : ""}`
         : `Auto-execute OFF for ${symbol}. Open positions are still managed on the server.`;
       setMessage(text);
       log(`[Auto-execute] ${text}`, "info");
     } catch { setMessage("Auto-execute update failed"); }
-  }, [log, riskReward, symbol]);
+  }, [log, riskReward, sniperSelected, strategy.name, strategyId, symbol]);
   const autoStatus = !autoTrader ? "" : autoTrader.openTrade
     ? `Trade open: BUY ${autoTrader.openTrade.label} on ${autoTrader.openTrade.underlying} · SL ₹${money(autoTrader.openTrade.stop)} · T ₹${money(autoTrader.openTrade.target)}${autoTrader.openTrade.stage ? ` (${autoTrader.openTrade.stage.toLowerCase()})` : ""} — no new trade until it exits at its target, SL or trailing SL`
     : autoOn ? (autoTrader.lastByIndex[symbol]?.text ?? "Watching: checks a few seconds after every 1-minute close") : "";
@@ -664,11 +681,11 @@ export default function ExecutionPage() {
   // own limits (trade cap, max loss, daily loss, loss streak, one position, 15:15) still apply.
   const placeOnScalper = useCallback(async (reason: "AUTO" | "MANUAL"): Promise<{ placed: boolean; error?: string }> => {
     const setup = analysis?.setup;
-    if (!setup?.setup_id || analysis?.pipeline?.decision !== "CONFIRMED") return { placed: false, error: "No confirmed VWAP-EMA setup" };
+    if (!setup?.setup_id || analysis?.pipeline?.decision !== "CONFIRMED") return { placed: false, error: `No confirmed ${strategy.name} setup` };
     attemptedSetups.current.add(setup.setup_id);
     try {
       const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-        action: "PLACE_ON_SCALPER", underlying: symbol, riskReward, settings: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}), contracts: chainRef.current,
+        action: "PLACE_ON_SCALPER", underlying: symbol, riskReward, strategy: strategyId, settings: readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {}), contracts: chainRef.current,
       }) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !data.placed) {
@@ -682,11 +699,11 @@ export default function ExecutionPage() {
       log(`[${strategy.name}] ${data.summary ?? "placed on the scalper"}`, "entry");
       return { placed: true };
     } catch { setMessage("Place on scalper request failed"); return { placed: false, error: "request failed" }; }
-  }, [analysis, log, riskReward, symbol]);
+  }, [analysis, log, riskReward, strategy.name, strategyId, symbol]);
 
   // The selected premium's 1-minute candles (the scalper's volume-profile series), folded with
   // the live premium from the chain socket.
-  const scalpSymbol = analysis?.calculations?.scalp?.selected?.symbol ?? analysis?.setup?.contract?.symbol ?? "";
+  const scalpSymbol = analysis?.calculations?.scalp?.selected?.symbol ?? analysis?.calculations?.sniper?.selected?.symbol ?? analysis?.setup?.contract?.symbol ?? "";
   useEffect(() => {
     if (!scalpSymbol) { setPremiumBars([]); return; }
     let cancelled = false;
@@ -708,6 +725,13 @@ export default function ExecutionPage() {
   }, [scalpPremium]);
 
   const switchIndex = useCallback((next: string) => { setSymbol(next); setContract(null); setResults([]); setQuery(""); }, []);
+  // Choosing a strategy here (or on the Scalper) switches what is analysed and what Automatic trades.
+  const selectStrategy = useCallback((next: SignalStrategy) => {
+    setStrategyId(next);
+    setAnalysis(null);
+    if (next === "NIFTY_SNIPER" && symbol !== "NIFTY") switchIndex("NIFTY");
+    setMessage(next === "NIFTY_SNIPER" ? "NIFTY Sniper AI selected (paper): turn Auto-execute on (or Trade: Automatic on the Scalper) to let the server place confirmed setups. It returns NO TRADE on most sessions by design." : "VWAP-EMA Scalper selected.");
+  }, [switchIndex, symbol]);
 
   // ---- derived ---------------------------------------------------------------------------
   const openPaper = useMemo(() => paperOrders.filter((order) => ["OPEN", "FILLED"].includes(order.status)), [paperOrders]);
@@ -733,16 +757,38 @@ export default function ExecutionPage() {
   const scalpPlan = scalp?.plan ?? null;
   const scalpSide = scalp?.selected?.type ?? scalp?.tape.side ?? null;
   // Pipeline gate codes are shared with the other strategies; name them for this one.
-  const GATE_LABELS: Record<string, string> = { BREAKOUT_INVALID: "VWAP", RETEST_NOT_CONFIRMED: "5/9 EMA trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "charges vs reward", RR_BELOW_MINIMUM: `R:R ${scalp?.rr_choice ?? riskReward}` };
+  const sniperRead = analysis?.calculations?.sniper;
+  const GATE_LABELS: Record<string, string> = sniperSelected
+    ? { BREAKOUT_INVALID: "setup", RETEST_NOT_CONFIRMED: "1m trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "2x feasibility", RR_BELOW_MINIMUM: "R:R", SCORE_BELOW_MINIMUM: "score ≥ 85" }
+    : { BREAKOUT_INVALID: "VWAP", RETEST_NOT_CONFIRMED: "5/9 EMA trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "charges vs reward", RR_BELOW_MINIMUM: `R:R ${scalp?.rr_choice ?? riskReward}` };
   // The risk-reward drawing on the selected premium: the confirmed setup, else the plan in progress.
   const rrBox: RiskRewardBox | null = useMemo(() => {
     const setup = analysis?.setup;
-    if (setup?.contract && setup.entry && setup.stop_loss && setup.target) return { entry: setup.entry, stop: setup.stop_loss, target: setup.target, fromTime: epochOf(setup.trigger_time), quantity: setup.quantity, label: `BUY ${setup.contract.type} ${setup.rr_choice ?? riskReward}` };
+    if (setup?.contract && setup.entry && setup.stop_loss && setup.target) return { entry: setup.entry, stop: setup.stop_loss, target: setup.target, fromTime: epochOf(setup.trigger_time), quantity: setup.quantity, label: `BUY ${setup.contract.type} ${setup.family ? "2x" : setup.rr_choice ?? riskReward}` };
     if (scalpPlan?.entry && scalpPlan.stop_loss && scalpPlan.target && scalpPlan.stop_loss < scalpPlan.entry && scalpPlan.target > scalpPlan.entry) return { entry: scalpPlan.entry, stop: scalpPlan.stop_loss, target: scalpPlan.target, fromTime: epochOf(scalp?.trigger?.time), quantity: scalpPlan.quantity, label: `Plan ${riskReward} (not confirmed)` };
     return null;
   }, [analysis?.setup, riskReward, scalp?.trigger?.time, scalpPlan]);
   // The scalper read handed to the Smart Scalper desk, which trades it (auto or manual).
   const vwapScalp: VwapScalpSignal | null = useMemo(() => {
+    if (sniperSelected) {
+      if (!sniperRead) return null;
+      const setup = analysis?.setup;
+      const confirmed = analysis?.pipeline?.decision === "CONFIRMED" && Boolean(setup?.contract && setup.setup_id);
+      const picked = sniperRead.selected ? { symbol: sniperRead.selected.symbol, strike: sniperRead.selected.strike, type: sniperRead.selected.type } : null;
+      const feas = sniperRead.feasibility;
+      const planned = confirmed && setup ? { entry: setup.entry, stop: setup.stop_loss, target: setup.target, quantity: setup.quantity, rrChoice: "2x", riskReward: setup.risk_reward }
+        : feas ? { entry: feas.entry, stop: feas.stop_loss, target: feas.target, quantity: feas.quantity, rrChoice: "2x", riskReward: undefined } : null;
+      const failedFilters = (sniperRead.hard_filters ?? []).filter((item) => !item.passed).map((item) => item.code.toLowerCase().replaceAll("_", " "));
+      const failedGates = (analysis?.pipeline?.gates ?? []).filter((gate) => !gate.passed).map((gate) => GATE_LABELS[gate.code] ?? gate.code.toLowerCase().replaceAll("_", " "));
+      return {
+        strategy: "NIFTY_SNIPER", confirmed, setupId: confirmed ? setup?.setup_id ?? null : null, side: sniperRead.direction === "CALL" ? "CE" : sniperRead.direction === "PUT" ? "PE" : null,
+        selected: picked, plan: planned, triggerTime: setup?.trigger_time ?? sniperRead.trigger?.time ?? null,
+        criteriaMet: Math.round(sniperRead.score?.total ?? 0), criteriaTotal: 100,
+        detail: [sniperRead.state, sniperRead.family?.replaceAll("_", " ").toLowerCase(), sniperRead.score?.band?.replaceAll("_", " ").toLowerCase()].filter(Boolean).join(" · "),
+        waitingOn: failedFilters.length ? failedFilters.slice(0, 4) : failedGates.slice(0, 4),
+        reason: String(analysis?.strategy_reason ?? analysis?.reason ?? ""),
+      };
+    }
     if (!scalp) return null;
     const setup = analysis?.setup;
     const confirmed = analysis?.pipeline?.decision === "CONFIRMED" && Boolean(setup?.contract && setup.setup_id);
@@ -756,7 +802,7 @@ export default function ExecutionPage() {
       waitingOn: [...scalp.criteria.filter((item) => !item.passed).map((item) => item.name), ...(scalp.criteria.every((item) => item.passed) ? failedGates : [])],
       reason: String(analysis?.strategy_reason ?? scalp.tape.reason ?? ""),
     };
-  }, [analysis, riskReward, scalp, scalpPlan]);
+  }, [analysis, riskReward, scalp, scalpPlan, sniperRead, sniperSelected]);
   const profileLevels: ChartLevel[] = useMemo(() => scalp?.profile ? [
     { price: scalp.profile.poc, color: "#f0c36b", title: "POC", dashed: true },
     { price: scalp.profile.vah, color: "#8fa3a8", title: "VAH", dashed: true },
@@ -795,15 +841,22 @@ export default function ExecutionPage() {
         <div className="exec-grid">
           <article className="mi-card exec-strategy">
             <div className="algo-panel-head">
-              <div><span className="algo-kicker">V5 RULE ENGINE · VWAP-EMA SCALPER · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
+              <div><span className="algo-kicker">V5 RULE ENGINE · {strategy.name.toUpperCase()} · {symbol}</span><h2>{strategy.name}: <span className={analysis?.pipeline?.decision === "CONFIRMED" ? "gain" : "warning"}>{analysis?.pipeline?.decision ?? analysis?.decision ?? "WAITING"}</span></h2></div>
               <div className="exec-strategy-controls">
-                <select aria-label="Risk reward" value={riskReward} onChange={(event) => setRiskReward(event.target.value as RiskReward)} title="Target as a multiple of the stop distance on the index; the premium target follows from delta and gamma">{RR_CHOICES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-                <button type="button" className="exec-auto-place" onClick={() => document.querySelector(".scalper")?.scrollIntoView({ behavior: "smooth", block: "start" })} title="Automatic placing runs on the Scalper: Strategy VWAP-EMA, Engine on, Trade Automatic">Auto-trade on the Scalper ↓</button>
+                <select aria-label="Strategy" value={strategyId} onChange={(event) => selectStrategy(event.target.value as SignalStrategy)} title="The strategy this page analyses and the Scalper trades">
+                  <option value="VWAP_EMA_SCALP">Strategy: VWAP-EMA Scalper</option>
+                  <option value="NIFTY_SNIPER">Strategy: NIFTY Sniper AI</option>
+                </select>
+                {!sniperSelected ? <select aria-label="Risk reward" value={riskReward} onChange={(event) => setRiskReward(event.target.value as RiskReward)} title="Target as a multiple of the stop distance on the index; the premium target follows from delta and gamma">{RR_CHOICES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select> : null}
+                <button type="button" className="exec-auto-place" onClick={() => document.querySelector(".scalper")?.scrollIntoView({ behavior: "smooth", block: "start" })} title={`Automatic placing runs on the Scalper: Strategy ${strategy.name}, Engine on, Trade Automatic`}>Auto-trade on the Scalper ↓</button>
                 <button type="button" onClick={() => void refresh()} disabled={busy}>{busy ? "…" : "Refresh"}</button>
               </div>
             </div>
             <p className="mi-note">{strategy.description}</p>
-            {analysis?.setup?.contract ? (
+            {sniperSelected && symbol !== "NIFTY" ? <p className="warning">NIFTY Sniper AI trades NIFTY only (v1). <button type="button" onClick={() => switchIndex("NIFTY")}>Switch to NIFTY</button></p> : null}
+            {sniperSelected && analysis?.setup?.contract ? (
+              <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol} × {analysis.setup.quantity ?? "--"}</b><span>{analysis.setup.family?.replaceAll("_", " ").toLowerCase()} · score {analysis.setup.score} ({analysis.setup.band?.replaceAll("_", " ").toLowerCase()}) · premium entry ~₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} (−25%) · 1.5x ₹{money(analysis.setup.partial_target)} · 2x target ₹{money(analysis.setup.target)} · max loss ₹{money(analysis.setup.planned_max_loss)} planned / ₹{money(analysis.setup.max_loss)} stressed · index invalidation {money(analysis.setup.spot?.stop)} · stop and target are recomputed from the actual fill</span></div>
+            ) : !sniperSelected && analysis?.setup?.contract ? (
               <div className="exec-setup"><b className={analysis.setup.contract.type === "PE" ? "loss" : "gain"}>BUY {analysis.setup.contract.symbol} × {analysis.setup.quantity ?? "--"}</b><span>Premium entry ₹{money(analysis.setup.entry)} · SL ₹{money(analysis.setup.stop_loss)} · target ₹{money(analysis.setup.target)} · {analysis.setup.rr_choice} on the index = {analysis.setup.risk_reward}R on the premium ({analysis.setup.net_risk_reward}R after charges) · max loss ₹{money(analysis.setup.planned_max_loss)} planned / ₹{money(analysis.setup.max_loss)} stressed · refused if filled above ₹{money(analysis.setup.max_entry)}</span></div>
             ) : null}
             {analysis?.setup?.contract && analysis.pipeline?.decision === "CONFIRMED" && (
@@ -813,10 +866,13 @@ export default function ExecutionPage() {
               </div>
             )}
             <div className={`exec-auto${autoOn ? " on" : ""}`} role="group" aria-label="Auto-execute on the Smart Scalper">
-              <label className="exec-auto-switch"><input type="checkbox" checked={autoOn} onChange={(event) => void toggleAutoTrader(event.target.checked)} /><span /> <b>Auto-execute on Scalper</b> <small>{symbol} · paper · {riskReward}</small></label>
+              <label className="exec-auto-switch"><input type="checkbox" checked={autoOn} onChange={(event) => void toggleAutoTrader(event.target.checked)} /><span /> <b>Auto-execute on Scalper</b> <small>{strategy.name} · {symbol} · paper{sniperSelected ? " · 25% SL / 2x" : ` · ${riskReward}`}</small></label>
               <span className="exec-auto-status">{autoOn || autoTrader?.openTrade ? autoStatus : "Off: confirmed setups wait for you to place them. Turn on to let the server place them automatically, one trade at a time."}</span>
-              {autoTrader?.enabled && autoTrader.indices.some((index) => index !== symbol) ? <small className="mi-note">Also auto-executing: {autoTrader.indices.filter((index) => index !== symbol).join(", ")}</small> : null}
+              {autoTrader?.enabled && !autoOtherStrategy && autoTrader.indices.some((index) => index !== symbol) ? <small className="mi-note">Also auto-executing: {autoTrader.indices.filter((index) => index !== symbol).join(", ")}</small> : null}
+              {autoOtherStrategy ? <small className="mi-note">The server is auto-executing {autoTrader?.strategy === "NIFTY_SNIPER" ? "NIFTY Sniper AI" : "VWAP-EMA"} on {autoTrader?.indices.join(", ")}. Turning it on here switches the auto-trader to {strategy.name}.</small> : null}
             </div>
+            {sniperSelected ? <SniperPanel sniper={sniperRead} decision={analysis?.pipeline?.decision} /> : null}
+            {!sniperSelected ? <>
             <div className="exec-score">
               {(scalp?.criteria ?? []).map((item) => (
                 <span key={item.key} className={item.passed ? "pass" : "fail"} title={item.detail}><small>{item.name}</small><b className={item.passed ? "gain" : "warning"}>{item.points} / {item.max}</b></span>
@@ -845,6 +901,7 @@ export default function ExecutionPage() {
                 {!scalpPlan.valid && scalpPlan.reason ? <small className="warning">{scalpPlan.reason}</small> : null}
               </div>
             )}
+            </> : null}
             {scalpSymbol ? (
               <div className="exec-premium-chart">
                 <small className="mi-note">{scalpSymbol} · 1-minute premium{scalp?.profile ? ` · POC ₹${money(scalp.profile.poc)} · value area ₹${money(scalp.profile.val)}–₹${money(scalp.profile.vah)}` : ""}{rrBox ? ` · ${rrBox.label}` : ""}</small>
@@ -856,7 +913,7 @@ export default function ExecutionPage() {
               <p className="mi-note"><b>Rule gates {analysis.pipeline.gates.filter((gate) => gate.passed).length}/{analysis.pipeline.gates.length} passing</b>: every gate must pass; one red gate blocks the trade. Auto-place and the server re-check use the same gates.</p>
             ) : null}
             <div className="exec-gates">{(analysis?.pipeline?.gates ?? []).map((gate) => <span key={gate.code} className={gate.passed ? "pass" : "fail"} title={gate.detail}>{gate.passed ? "✓" : "✗"} {GATE_LABELS[gate.code] ?? gate.code.replace(/_(BLOCKED|NOT_CONFIRMED|NOT_SUPPORTIVE|BELOW_MINIMUM|UNRESOLVED|MISSING|REQUIRED|UNHEALTHY|STALE|INVALID|NOT_READY)$/, "").replaceAll("_", " ").toLowerCase()}</span>)}</div>
-            <details className="mi-management">
+            {!sniperSelected ? <details className="mi-management">
               <summary>Show calculations</summary>
               <div className="exec-calcs">
                 <span>Close <b>{calc(scalp?.tape.close)}</b></span><span>VWAP <b>{calc(scalp?.tape.vwap)}</b> <small>{scalp?.tape.vwap_slope !== undefined ? `${scalp.tape.vwap_slope >= 0 ? "+" : ""}${calc(scalp.tape.vwap_slope)} pts / 5m` : ""}</small></span>
@@ -870,7 +927,7 @@ export default function ExecutionPage() {
                 <span>Premium POC / VAH / VAL <b>{scalp?.profile ? `${money(scalp.profile.poc)} / ${money(scalp.profile.vah)} / ${money(scalp.profile.val)}` : "--"}</b></span>
                 <span>Gap day <b>{calc(analysis?.calculations?.gap?.status)}</b></span>{analysis?.session && "expiry_day" in analysis.session && (analysis.session as { expiry_day?: boolean }).expiry_day ? <span>Expiry day <b className="warning">gamma is high: the premium stop and target move fast</b></span> : null}
               </div>
-            </details>
+            </details> : null}
           </article>
 
           <article className="mi-card exec-ticket" id="order-ticket">
@@ -896,7 +953,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">
@@ -929,9 +986,9 @@ export default function ExecutionPage() {
             <table className="exec-table"><thead><tr><th>Contract</th><th>Strategy</th><th>Qty</th><th>Entry</th><th>LTP</th><th>SL / Target</th><th>P&amp;L</th><th /></tr></thead><tbody>
               {scalperPositions.map((position) => <tr key={position.id} className="exec-row-scalper">
                 <td><b>{position.label}</b><small> {position.underlying}</small></td>
-                <td><small>Smart Scalper · {position.kind}{position.trail ? " · VWAP-EMA" : ""}{position.signal ? ` · ADX ${position.signal.adx.toFixed(1)}` : ""}</small></td>
+                <td><small>Smart Scalper · {position.kind}{position.trail ? (position.trail.rule === "SNIPER" ? " · NIFTY Sniper" : " · VWAP-EMA") : ""}{position.signal ? ` · ADX ${position.signal.adx.toFixed(1)}` : ""}</small></td>
                 <td>{position.quantity}</td><td>₹{money(position.entry)}</td><td>₹{money(position.value)}</td>
-                <td>₹{money(position.stop)} / ₹{money(position.target)}{position.trail ? <small> {position.trail.stage === "INITIAL" ? "initial SL" : position.trail.stage === "BREAKEVEN" ? "SL at breakeven" : position.trail.stage === "LOCKED" ? "+0.5R locked" : "trailing SL"}</small> : position.trailing ? <small> trailing</small> : null}</td>
+                <td>₹{money(position.stop)} / ₹{money(position.target)}{position.trail ? <small> {position.trail.stage === "INITIAL" ? "initial SL" : position.trail.stage === "BREAKEVEN" ? "SL at breakeven" : position.trail.stage === "LOCKED" ? (position.trail.rule === "SNIPER" ? "1.2x locked" : "+0.5R locked") : "trailing SL"}</small> : position.trailing ? <small> trailing</small> : null}</td>
                 <td className={position.pnl >= 0 ? "gain" : "loss"}>₹{money(position.pnl)}</td>
                 <td><button type="button" className="algo-exit" onClick={() => void exitScalper(position)}>Exit</button></td>
               </tr>)}
