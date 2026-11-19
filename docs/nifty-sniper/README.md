@@ -84,6 +84,14 @@ npx vitest run tests/unit/nifty-sniper.test.ts tests/unit/vwap-auto-trader.test.
     adding side's net build ≥ 0.3%, most intervals adding, the latest interval still adding; the
     covering side's OI down ≥ 0.1% over the window and not rising in the latest interval
     (`require_opposite_covering`, on by default).
+  * *Family-based*: breakouts and trend continuations use the confirmed reads above. A liquidity
+    reversal is bought at the turn, before writers reposition, so it uses an early read: the last
+    3 premium minutes on rising volume, mostly buying, latest candle up; and the opposing writers
+    starting to cover (OI falling in the latest interval, not up over the window).
+* **IV check (hard filter).** The option's IV against NIFTY's realised volatility (the higher of
+  the last 10 daily closes and today's 5m bars). Above 1.5x blocks (IV crush risk); 1.2-1.5x is
+  allowed but scores lower. Without realised vol it falls back to India VIX (HIGH / EXTREME
+  blocks); with neither it fails closed.
     With fewer than 3 fresh samples it falls back to market-intel's single 5-minute OI change
     (labelled a 5-min reading); with neither it fails closed.
 * **Hard filters.** Setup confirmed, signal fresh, 1m trigger, not chasing, entry window
@@ -93,7 +101,8 @@ npx vitest run tests/unit/nifty-sniper.test.ts tests/unit/vwap-auto-trader.test.
   SAFE_MODE).
 * **Execution (paper).** Stop = 0.75 × and target = 2.0 × the **actual fill** (re-derived in
   `SmartScalper.place`); a fill > 2% above the plan is refused; size = floor(per-trade budget /
-  stressed loss per lot), never rounded up. Trail: breakeven + charges at 1.25x, 1.2x locked at
+  stressed loss per lot), never rounded up. Partial booking: with 2+ lots, half (rounded down) is
+  sold at 1.5x the fill and the rest keeps trailing; a single lot is not split. Trail: breakeven + charges at 1.25x, 1.2x locked at
   1.5x, 0.2 × entry under the best premium from 1.75x, exit at 2x. Also exits on the index
   invalidation (beyond the swept extreme / protected swing), after 90 min below 1.25x, on the
   per-trade max loss and at 15:15. Locks: 3 sniper entries and 2 consecutive sniper losses per

@@ -118,9 +118,20 @@ def oi_history(pe_steps=(20000, 25000, 30000), ce_steps=(-6000, -5000, -4000), e
     return samples
 
 
+def daily_candles(move_pct: float = 0.8, days: int = 15) -> list[C]:
+    """Prior sessions' daily bars alternating +/- move_pct (realised vol ~ move_pct * sqrt(252))."""
+    out, price = [], 24000.0
+    for i in range(days):
+        day = TODAY - timedelta(days=days - i)
+        close = price * (1 + (move_pct if i % 2 else -move_pct) / 100)
+        out.append(C(day.replace(hour=9, minute=15).isoformat(), price, max(price, close) + 20, min(price, close) - 20, close, 0.0))
+        price = close
+    return out
+
+
 def context(**overrides) -> dict:
     base = {"setup_candles": previous_day() + today_five(), "option_chain": chain(), "options_flow": FLOW, "vix": VIX, "max_loss_per_trade": 1500,
-            "premium_candles": premium_candles(), "oi_history": oi_history()}
+            "premium_candles": premium_candles(), "oi_history": oi_history(), "daily_candles": daily_candles()}
     return {**base, **overrides}
 
 
@@ -258,7 +269,7 @@ def test_engine_pipeline_wires_the_sniper_evidence(monkeypatch):
     payload = {
         "symbol": "NIFTY", "strategy": sn.STRATEGY_ID, "interval_minutes": 1, "candles": as_dict(one_minute(NOW.replace(second=0))),
         "setup_candles": as_dict(previous_day() + today_five()), "option_chain": chain(), "options_flow": FLOW, "vix": VIX, "max_loss_per_trade": 1500,
-        "premium_candles": premium_candles(), "oi_history": oi_history(),
+        "premium_candles": premium_candles(), "oi_history": oi_history(), "daily_candles": as_dict(daily_candles()),
         "option_evidence": {"option_quote_fresh": True},
         "pipeline": {"broker_healthy": True, "daily_risk_allowed": True, "contract_metadata_available": True, "reconciliation_ok": True, "execution_ready": True},
     }
@@ -288,6 +299,9 @@ def test_entry_window_is_open_from_0915_to_1515():
     assert filters["ENTRY_WINDOW"] is True
 
 
+SEL = {"symbol": SELECTED}
+
+
 def test_call_needs_rising_buying_volume_in_the_selected_premium():
     ok = run()
     flow = ok["sniper"]["order_flow"]["premium_volume"]
@@ -300,6 +314,9 @@ def test_call_needs_rising_buying_volume_in_the_selected_premium():
     assert selling["sniper"]["order_flow"]["premium_volume"]["buy_share"] < 0.55 and selling["decision"] != "CONFIRMED"
     filters = {f["code"]: f["passed"] for f in selling["sniper"]["hard_filters"]}
     assert filters["PREMIUM_VOLUME_RISING"] is False
+    # Strict (breakout / continuation) mode reads 5 minutes and needs the premium up over them.
+    strict = sn.premium_volume_flow(premium_candles(), SEL, "CE", NOW, sn.SniperConfig())
+    assert strict["passed"] and strict["mode"] == "CONFIRMED"
 
 
 def test_missing_premium_candles_fail_closed_and_are_requested():
@@ -311,25 +328,26 @@ def test_missing_premium_candles_fail_closed_and_are_requested():
     assert "needs_premium_candles" not in run()
 
 
+def strict_writers(history, side="CE", config=None):
+    """Breakout / continuation (CONFIRMED) mode of the writer-OI check."""
+    return sn.writer_oi_flow(history, None, side, 24004.0, NOW, config or sn.SniperConfig())
+
+
 def test_call_needs_put_writers_oi_change_rising_and_outpacing_call_writers():
-    assert run()["sniper"]["order_flow"]["writer_oi"]["passed"]
-    covering = run(oi_history=oi_history(pe_steps=(20000, -15000, -10000)))
-    assert not covering["sniper"]["order_flow"]["writer_oi"]["passed"] and covering["decision"] != "CONFIRMED"
-    stalled = run(oi_history=oi_history(pe_steps=(30000, 25000, -2000)))
-    assert "stalled" in stalled["sniper"]["order_flow"]["writer_oi"]["reason"] and stalled["decision"] != "CONFIRMED"
-    calls_heavier = run(oi_history=oi_history(ce_steps=(40000, 40000, 40000)))
-    assert not calls_heavier["sniper"]["order_flow"]["writer_oi"]["passed"]
+    assert strict_writers(oi_history())["passed"]
+    assert not strict_writers(oi_history(pe_steps=(20000, -15000, -10000)))["passed"]
+    assert "stalled" in strict_writers(oi_history(pe_steps=(30000, 25000, -2000)))["reason"]
+    assert not strict_writers(oi_history(ce_steps=(40000, 40000, 40000)))["passed"]
 
 
 def test_strong_call_needs_call_writers_covering_too():
-    strong = run()["sniper"]["order_flow"]["writer_oi"]
+    strong = strict_writers(oi_history())
     assert strong["passed"] and strong["opposite_covering"] and "strong CALL move" in strong["reason"]
-    # Put writers adding but call writers also adding (a range, not a strong move): no trade.
-    both_adding = run(oi_history=oi_history(ce_steps=(3000, 2000, 1000)))
-    flow = both_adding["sniper"]["order_flow"]["writer_oi"]
-    assert not flow["passed"] and not flow["opposite_covering"] and both_adding["decision"] != "CONFIRMED"
+    # Put writers adding but call writers also adding (a range, not a strong move).
+    both_adding = strict_writers(oi_history(ce_steps=(3000, 2000, 1000)))
+    assert not both_adding["passed"] and not both_adding["opposite_covering"]
     # Call writers covered earlier but are adding again in the latest interval: not covering now.
-    resumed = run(oi_history=oi_history(ce_steps=(-9000, -6000, 2000)))["sniper"]["order_flow"]["writer_oi"]
+    resumed = strict_writers(oi_history(ce_steps=(-9000, -6000, 2000)))
     assert not resumed["passed"] and "adding again" in resumed["reason"]
     # The covering rule can be switched off: then put writers adding faster is enough.
     relaxed = sn.writer_oi_flow(oi_history(ce_steps=(3000, 2000, 1000)), None, "CE", 24004.0, NOW, replace(sn.SniperConfig(), require_opposite_covering=False))
@@ -354,3 +372,49 @@ def test_writer_oi_falls_back_to_the_five_minute_change_then_fails_closed():
     none = sn.writer_oi_flow(None, None, "CE", 24004.0, NOW, sn.SniperConfig())
     assert none["status"] == "UNAVAILABLE" and not none["passed"]
     assert run(oi_history=None, options_flow={**FLOW})["decision"] != "CONFIRMED"
+
+
+# ---------------------------------------------------------------- family-based flow, IV check
+
+def test_reversal_uses_the_early_flow_read():
+    result = run()
+    assert result["setup"]["family"] == "LIQUIDITY_REVERSAL" and result["sniper"]["order_flow"]["mode"] == "EARLY"
+    flows = result["sniper"]["order_flow"]
+    assert flows["premium_volume"]["mode"] == "EARLY" and flows["writer_oi"]["mode"] == "EARLY"
+    # At the turn put writers need not be adding yet: call writers starting to cover is enough ...
+    turn = run(oi_history=oi_history(pe_steps=(-5000, -2000, 1000), ce_steps=(4000, -3000, -6000)))
+    assert turn["sniper"]["order_flow"]["writer_oi"]["passed"] and turn["decision"] == "CONFIRMED", turn["reason"]
+    # ... which the strict (breakout) mode would refuse.
+    assert not strict_writers(oi_history(pe_steps=(-5000, -2000, 1000), ce_steps=(4000, -3000, -6000)))["passed"]
+    # Call writers still adding: no reversal entry.
+    adding = run(oi_history=oi_history(ce_steps=(3000, 2000, 1000)))
+    assert not adding["sniper"]["order_flow"]["writer_oi"]["passed"] and adding["decision"] != "CONFIRMED"
+    # Early premium read: the last 3 minutes need rising volume and buyers stepping in.
+    assert not run(premium_candles=premium_candles(recent_up=False))["sniper"]["order_flow"]["premium_volume"]["passed"]
+
+
+def test_breakout_and_continuation_use_the_strict_read():
+    config = sn.SniperConfig()
+    assert "BREAKOUT_EXPANSION" not in config.early_flow_families and "TREND_CONTINUATION" not in config.early_flow_families
+
+
+def test_iv_against_realised_volatility():
+    fair = run()["sniper"]["iv_check"]
+    assert fair["status"] == "OK" and fair["passed"] and not fair["rich"] and fair["ratio"] <= 1.2
+    # Quiet market (0.4% days, and today quiet too): 14% IV is far above what NIFTY is moving.
+    quiet = run(daily_candles=daily_candles(0.3))
+    iv = quiet["sniper"]["iv_check"]
+    assert not iv["passed"] and "too rich" in iv["reason"] and quiet["decision"] != "CONFIRMED"
+    filters = {f["code"]: f["passed"] for f in quiet["sniper"]["hard_filters"]}
+    assert filters["IV_NOT_RICH"] is False
+    # Rich but allowed: passes, scores lower than fair.
+    rich = sn.iv_check({"greeks": {"iv": 17.5}}, None, daily_candles(), [], None, NOW, sn.SniperConfig())
+    assert rich["passed"] and rich["rich"]
+
+
+def test_iv_check_falls_back_to_vix_then_fails_closed():
+    vix_only = sn.iv_check({"greeks": {"iv": 14.0}}, None, None, [], {"regime": "NORMAL"}, NOW, sn.SniperConfig())
+    assert vix_only["status"] == "VIX_ONLY" and vix_only["passed"]
+    assert not sn.iv_check({"greeks": {"iv": 14.0}}, None, None, [], {"regime": "HIGH"}, NOW, sn.SniperConfig())["passed"]
+    none = sn.iv_check(None, None, None, [], None, NOW, sn.SniperConfig())
+    assert none["status"] == "UNAVAILABLE" and not none["passed"]

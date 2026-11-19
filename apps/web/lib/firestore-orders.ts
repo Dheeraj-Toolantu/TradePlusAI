@@ -68,6 +68,11 @@ export type OrderRecord = {
   smartStage?: string;
   smartRisk?: number;
   targetRuns?: number;
+  /** Partial booking: sell partialQuantity at partialPrice (partialMultiple x the fill) once. */
+  partialPrice?: number;
+  partialQuantity?: number;
+  partialDone?: boolean;
+  partialMultiple?: number;
   charges?: number;
   exitError?: string;
   reconcileWarning?: string;

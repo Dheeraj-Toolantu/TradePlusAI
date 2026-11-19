@@ -40,7 +40,8 @@ const scalpIndices = new Set(["NIFTY", "BANKNIFTY", "SENSEX", "CRUDEOIL", "GOLD"
 const sniperIndices = new Set(["NIFTY"]);
 // The sniper's own daily locks (spec 13.1), on top of the scalper book's limits.
 const SNIPER_LIMITS = { maxTrades: 3, maxConsecutiveLosses: 2 };
-const SNIPER_PREMIUM = { stop: 0.75, target: 2.0 };
+// Stop 0.75x and target 2x the actual fill; half the lots (with 2+ lots) are booked at 1.5x.
+const SNIPER_PREMIUM = { stop: 0.75, target: 2.0, partial: 1.5 };
 const strategyOf = (value: unknown) => (String(value ?? "").toUpperCase() === SNIPER ? SNIPER : SCALP);
 const indexError = (strategy: string, symbol: string) =>
   strategy === SNIPER ? (sniperIndices.has(symbol) ? null : "NIFTY Sniper AI trades NIFTY options only in version 1.") : (scalpIndices.has(symbol) ? null : "The VWAP-EMA scalper trades NIFTY, BANKNIFTY, SENSEX, CRUDEOIL and GOLD options.");

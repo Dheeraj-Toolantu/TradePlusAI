@@ -31,7 +31,9 @@ export type SniperRead = {
   feasibility?: Feasibility | null; trigger?: { ok: boolean; time?: string; reason: string; age_seconds?: number }; extension_atr?: number | null;
   alternatives?: Array<{ family: string; direction: string; state: string; score: number }>;
   /** Order flow in the selected option: buying volume in its premium, and the supportive writers' OI change. */
-  order_flow?: { premium_volume?: FlowCheck; writer_oi?: FlowCheck };
+  order_flow?: { premium_volume?: FlowCheck; writer_oi?: FlowCheck; mode?: "EARLY" | "CONFIRMED" };
+  /** The option's implied volatility against NIFTY's realised volatility. */
+  iv_check?: FlowCheck & { ratio?: number | null };
 };
 type FlowCheck = { status: string; passed: boolean; reason: string; who?: string };
 
@@ -42,7 +44,7 @@ const LABELS: Record<string, string> = {
 const FILTERS: Record<string, string> = {
   SETUP_CONFIRMED: "setup confirmed", SIGNAL_FRESH: "signal fresh", ENTRY_TRIGGER: "1m trigger", NOT_CHASING: "not chasing", ENTRY_WINDOW: "entry window",
   REGIME_TRADABLE: "regime", CONTRACT_SELECTED: "contract", SPREAD_OK: "spread", FEASIBILITY_2X: "2x feasibility", OI_AVAILABLE: "OI", SCORE_MINIMUM: "score ≥ 85",
-  PREMIUM_VOLUME_RISING: "premium buying volume", WRITER_OI_RISING: "writer OI (add / cover)",
+  PREMIUM_VOLUME_RISING: "premium buying volume", WRITER_OI_RISING: "writer OI (add / cover)", IV_NOT_RICH: "IV not rich",
 };
 const title = (value: string | undefined) => (value ?? "").replaceAll("_", " ").toLowerCase().replace(/^./, (c) => c.toUpperCase());
 const n = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { maximumFractionDigits: digits }));
@@ -106,9 +108,11 @@ export const SniperPanel = memo(function SniperPanel({ sniper, decision }: { sni
           <div className="exec-gates">{sniper.hard_filters.map((f) => <span key={f.code} className={f.passed ? "pass" : "fail"} title={f.detail}>{f.passed ? "✓" : "✗"} {FILTERS[f.code] ?? f.code.toLowerCase()}</span>)}</div>
           {sniper.order_flow ? (
             <ul className="exec-criteria" aria-label="Order flow in the selected option">
+              <li>{sniper.order_flow.mode === "EARLY" ? "Reversal: early read (buyers stepping in, opposing writers starting to cover)" : "Breakout / continuation: confirmed read (volume and writer build sustained)"}</li>
               {([["Premium volume", sniper.order_flow.premium_volume], [sniper.direction === "PUT" ? "Call writers adding, put writers covering" : "Put writers adding, call writers covering", sniper.order_flow.writer_oi]] as Array<[string, FlowCheck | undefined]>).map(([label, check]) => check ? (
                 <li key={label}><b className={check.passed ? "gain" : "loss"}>{check.passed ? "✓" : "✗"}</b>{label}{check.status === "SNAPSHOT" ? " (5-min reading)" : check.status === "UNAVAILABLE" ? " (unavailable)" : ""}: {check.reason}</li>
               ) : null)}
+              {sniper.iv_check ? <li><b className={sniper.iv_check.passed ? "gain" : "loss"}>{sniper.iv_check.passed ? "✓" : "✗"}</b>IV vs realised: {sniper.iv_check.reason}</li> : null}
             </ul>
           ) : null}
         </>
