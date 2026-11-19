@@ -14,7 +14,7 @@ export const STAGE_TEXT: Record<string, string> = { INITIAL: "Initial SL", BREAK
 const EXIT_TEXT: Record<string, string> = {
   TARGET: "Target hit", SPOT_TARGET: "Index target hit", STOP_LOSS: "Stop loss hit", BREAKEVEN_STOP: "Breakeven stop", LOCKED_PROFIT_STOP: "Locked-profit stop",
   TRAILING_STOP: "Trailing stop", EMA9_LOST: "Momentum lost (9 EMA)", SPOT_LEVEL_BROKEN: "Index level broken", SCALP_TIME_STOP: "Time stop",
-  MAX_LOSS_PER_TRADE: "Max loss per trade", SQUARE_OFF_15_15: "15:15 square-off", MANUAL: "Manual exit", RUNNER_STOP: "Runner stop (ran past target)",
+  MAX_LOSS_PER_TRADE: "Max loss per trade", SQUARE_OFF_15_15: "15:15 square-off", MANUAL: "Manual exit", RUNNER_STOP: "Runner stop (ran past target)", PARTIAL_1_5X: "Partial booked at 1.5x",
 };
 const STAGE_RANK = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
 const MODE_TEXT: Record<TrailMode, string> = { SMART: "Smart auto trail", RULE: "Strategy rule", FIXED: "Fixed distance", OFF: "Off" };
@@ -215,6 +215,15 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
           {mode === "FIXED" && controls.points ? <> · ₹{money(controls.points)} under the best premium: SL <b>₹{money(Math.max(position.stop ?? 0, best - controls.points))}</b></> : null}
           {mode === "OFF" ? " · the SL moves only when you move it" : null}
           {resumeAbove !== null && mode !== "OFF" ? <> · your SL holds until the premium beats ₹{money(resumeAbove)}</> : null}
+        </p>
+      ) : null}
+      {!closed && position.partial ? (
+        <p className="pos-trail-mode">
+          Partial booking: {position.partial.quantity > 0
+            ? position.partial.done
+              ? <>booked {position.partial.quantity} qty at ₹{money(position.partial.price)}{position.partial.multiple ? ` (${position.partial.multiple}x)` : ""}; the rest keeps trailing</>
+              : <>sells <b>{position.partial.quantity} qty</b> at ₹{money(position.partial.price)}{position.partial.multiple ? ` (${position.partial.multiple}x the fill)` : ""}, the rest trails</>
+            : <>needs 2+ lots (a lot cannot be split); at ₹{money(position.partial.price)} the trail locks profit instead</>}
         </p>
       ) : null}
       {!closed && onModify ? <RiskControls key={position.id} position={position} onModify={onModify} /> : null}

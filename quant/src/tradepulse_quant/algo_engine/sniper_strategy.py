@@ -124,8 +124,10 @@ class SniperConfig:
     signal_expiry_seconds: int = 180         # the 1m trigger must be this fresh
     max_feed_lag_seconds: int = 150          # last completed 1m candle must have closed this recently
     # --- session ----------------------------------------------------------------------------
-    entry_start_min: int = 9 * 60 + 25       # no entries in the first 10 minutes
-    entry_cutoff_min: int = 14 * 60 + 30     # a 2x objective needs time; no entries after 14:30
+    entry_start_min: int = 9 * 60 + 15       # entries from the 09:15 open ...
+    entry_cutoff_min: int = 15 * 60 + 15     # ... to the 15:15 square-off; feasibility scales to the time left
+    min_session_bars_5m: int = 1             # completed 5m candles today before a setup is read (09:20)
+    min_minutes_to_square_off: int = 5       # never enter in the last few minutes before 15:15
     hold_minutes: float = 60.0               # intended holding horizon for the feasibility model
     # --- options ----------------------------------------------------------------------------
     preferred_delta_min: float = 0.45
@@ -137,6 +139,38 @@ class SniperConfig:
     minimum_volume: float = 1.0
     minimum_open_interest: float = 1.0
     min_premium: float = 15.0
+    # --- order flow in the SELECTED option (hard filters) -----------------------------------
+    # CALL: buying volume in the selected CE premium rising AND put writers' OI change rising.
+    # PUT:  buying volume in the selected PE premium rising (index sellers in control) AND call
+    #       writers' OI change rising.
+    require_premium_volume: bool = True
+    premium_volume_recent_bars: int = 5      # the last 5 completed 1m premium candles ...
+    premium_volume_prior_bars: int = 20      # ... against the 20 before them
+    premium_volume_min_bars: int = 10
+    premium_volume_min_ratio: float = 1.2    # recent average volume >= 1.2x the prior average
+    premium_buy_share_min: float = 0.55      # >= 55% of the recent volume traded on rising-premium candles
+    premium_max_lag_seconds: int = 180       # the premium's last completed candle must be this fresh
+    require_writer_oi: bool = True
+    writer_oi_strikes: int = 3               # strikes each side of ATM whose OI is summed
+    writer_oi_samples: int = 4               # the last 4 stored OI samples (3 intervals, ~9 min at 3 min)
+    writer_oi_min_change_pct: float = 0.3    # net writer OI build over the window, % of the starting OI
+    writer_oi_max_age_seconds: int = 600     # the newest stored OI sample must be this fresh
+    # Strong move: the opposite writers must be COVERING (OI decreasing) while the supportive ones add.
+    # CALL: call writers' OI falling near ATM; PUT: put writers' OI falling near ATM.
+    require_opposite_covering: bool = True
+    opposite_min_cover_pct: float = 0.1      # net fall over the window, % of their starting OI
+    # Family-based flow: breakouts and trend continuations need the move CONFIRMED (strict checks
+    # above); a liquidity reversal is bought at the turn, before writers reposition, so it only needs
+    # the EARLY signs: buyers stepping into the premium over the last 3 minutes and the opposing
+    # writers starting to cover.
+    early_flow_families: tuple = ("LIQUIDITY_REVERSAL",)
+    premium_early_bars: int = 3
+    # --- implied vs realised volatility (option buyers lose to IV crush when IV is rich) ---------
+    require_iv_check: bool = True
+    max_iv_rv_ratio: float = 1.5             # block when the option's IV is above 1.5x realised volatility
+    rich_iv_rv_ratio: float = 1.2            # 1.2-1.5x: allowed, scored lower
+    rv_daily_lookback: int = 10              # realised vol from the last 10 daily closes ...
+    rv_intraday_min_bars: int = 6            # ... or today's 5m bars, whichever is higher (a fast day)
     # --- feasibility / probability -----------------------------------------------------------
     target_multiple: float = 2.0
     partial_multiple: float = 1.5
@@ -148,6 +182,7 @@ class SniperConfig:
     # --- risk -------------------------------------------------------------------------------
     max_loss_per_trade: float = 1000.0       # 1% of a ₹1,00,000 reference capital
     max_lots: int = 1
+    fixed_lots: int = 0                      # the trader's chosen sniper lots (1-10); 0 = size to the ₹ budget
     # --- scoring ----------------------------------------------------------------------------
     minimum_sniper_score: float = 85.0
     require_oi: bool = False
@@ -190,9 +225,18 @@ def _tick(value: float, tick: float, how: str = "near") -> float:
     return round(steps * tick, 2)
 
 
+class _CandleView:
+    def __init__(self, row: dict) -> None:
+        self.timestamp = row.get("timestamp") or row.get("time")
+        self.open, self.high, self.low, self.close = (_num(row.get(k)) or 0.0 for k in ("open", "high", "low", "close"))
+        self.volume = _num(row.get("volume")) or 0.0
+
+
 def to_bars(candles: list[CandleLike] | None, minutes: int) -> list[Bar]:
     out = []
-    for candle in candles or []:
+    for raw in candles or []:
+        # Candle objects from the engine, or plain dicts from a direct caller.
+        candle = _CandleView(raw) if isinstance(raw, dict) else raw
         start = _parse(candle.timestamp)
         if start is None or not (candle.high >= candle.low > 0):
             continue
@@ -726,7 +770,11 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
     vega = greeks.get("vega") if greeks else None
     theta = selected.get("theta")
     theta_day = abs(float(theta)) if theta not in (None, 0) else abs(greeks["theta"]) if greeks else 0.0
-    drag = theta_day * config.hold_minutes / 375.0
+    # Late in the day the trade has only until the 15:15 square-off: the hold (and so the expected
+    # move and the theta drag) shrinks to the time left instead of blocking the entry outright.
+    minutes_left = SQUARE_OFF_MIN - (now.hour * 60 + now.minute)
+    hold = max(min(config.hold_minutes, float(minutes_left)), 1.0)
+    drag = theta_day * hold / 375.0
     half_spread = min(max(((selected.get("ask") or market) - (selected.get("bid") or market)) / 2.0, 0.0), market * config.max_estimated_half_spread_pct)
     fees = premium_math.PremiumConfig(slippage_pct=0.0)
     cost_target = premium_math.round_trip_costs(entry, target, lot, 0.0, fees)["total"] + (half_spread + config.slippage_pct * target) * lot
@@ -741,14 +789,15 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
         return (-delta + math.sqrt(delta * delta + 2.0 * gamma * gain)) / gamma
 
     need_2x, need_15x = move_for(target), move_for(partial)
-    expected = config.expected_move_atr_multiple * atr5 * math.sqrt(max(config.hold_minutes / 5.0, 1.0)) if atr5 > 0 else None
+    expected = config.expected_move_atr_multiple * atr5 * math.sqrt(max(hold / 5.0, 1.0)) if atr5 > 0 else None
     ratio = (need_2x / expected) if need_2x is not None and expected else None
     risk_unit = entry - stop
     planned_lot = risk_unit * lot + cost_stop
     stressed_lot = planned_lot + max(2 * tick, 0.10 * risk_unit) * lot
-    lots = min(config.max_lots, int(config.max_loss_per_trade // stressed_lot)) if stressed_lot > 0 else 0
+    # The trader's chosen lots are taken as they are (the max loss shown is what they risk); otherwise
+    # size to the per-trade budget, never rounded up.
+    lots = config.fixed_lots if config.fixed_lots > 0 else min(config.max_lots, int(config.max_loss_per_trade // stressed_lot)) if stressed_lot > 0 else 0
     cost_share = cost_target / ((target - entry) * lot) if target > entry else 1.0
-    minutes_left = SQUARE_OFF_MIN - (now.hour * 60 + now.minute)
     out = {
         "market_premium": _r(market), "entry": entry, "stop_loss": stop, "target": target, "partial_target": partial, "lot_size": lot,
         "stop_percent": config.stop_percent, "target_multiple": config.target_multiple,
@@ -756,7 +805,7 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
                    "time_to_expiry_years": _r(years, 6), "source": "CHAIN_DELTA + BLACK_SCHOLES_GAMMA" if greeks else "CHAIN_DELTA_ONLY"},
         "theta_drag": _r(drag), "costs_per_lot": {"at_target": _r(cost_target), "at_stop": _r(cost_stop)}, "cost_share": _r(cost_share, 3),
         "index_move_needed": {"1_5x": _r(need_15x), "2x": _r(need_2x)}, "expected_move": _r(expected), "feasibility_ratio": _r(ratio, 3),
-        "hold_minutes": config.hold_minutes, "minutes_to_square_off": minutes_left,
+        "hold_minutes": round(hold), "minutes_to_square_off": minutes_left,
         "risk_per_lot": _r(planned_lot), "stressed_risk_per_lot": _r(stressed_lot), "lots": lots, "quantity": lots * lot,
         "planned_max_loss": _r(planned_lot * lots), "max_loss": _r(stressed_lot * lots), "risk_reward": _r((target - entry) / risk_unit) if risk_unit > 0 else None,
         "fees_at_stop_per_lot": _r(premium_math.round_trip_costs(entry, stop, lot, 0.0, fees)["total"]), "stop_gap": _r(max(2 * tick, 0.10 * risk_unit)),
@@ -771,16 +820,211 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
     if ratio is None:
         problems.append("index move for 2x is not estimable")
     elif ratio > config.max_feasibility_ratio:
-        problems.append(f"2x needs {need_2x:.0f} index pts vs ~{expected:.0f} expected in {config.hold_minutes:.0f} min (ratio {ratio:.2f} > {config.max_feasibility_ratio})")
+        problems.append(f"2x needs {need_2x:.0f} index pts vs ~{expected:.0f} expected in {hold:.0f} min (ratio {ratio:.2f} > {config.max_feasibility_ratio})")
     if cost_share > config.max_cost_share:
         problems.append(f"charges take {cost_share * 100:.0f}% of the 2x reward (max {config.max_cost_share * 100:.0f}%)")
-    if minutes_left < config.hold_minutes / 2:
+    if minutes_left < config.min_minutes_to_square_off:
         problems.append(f"only {minutes_left} min to the 15:15 square-off")
     if lots < 1:
         problems.append(f"one lot risks ₹{stressed_lot:.0f} stressed, above the ₹{config.max_loss_per_trade:.0f} per-trade budget")
     if problems:
         out.update(valid=False, reason="; ".join(problems))
     return out
+
+
+# ------------------------------------------------------------------------------- order flow
+
+def premium_volume_flow(premium: dict | None, selected: dict | None, side: str, now: datetime, config: SniperConfig, early: bool = False) -> dict:
+    """Is buying volume rising in the SELECTED option's own premium?
+
+    Reads the contract's completed 1-minute candles today. Volume is rising when the last
+    ``premium_volume_recent_bars`` candles average at least ``premium_volume_min_ratio`` x the
+    ``premium_volume_prior_bars`` before them; it is BUYING volume when at least
+    ``premium_buy_share_min`` of that recent volume traded on candles where the premium rose, and
+    the premium itself is up over the window. For a PUT the rising put premium is the index
+    sellers in control. Missing, foreign or stale premium candles are UNAVAILABLE (fail closed).
+
+    ``early`` (a liquidity reversal, bought at the turn): only the last ``premium_early_bars``
+    candles are read, and the premium need not be up over them yet; it is enough that volume is
+    rising, buyers took most of it and the latest candle closed up (buyers stepping in).
+    """
+    who = "call buyers" if side == "CE" else "put buyers (index sellers)"
+    base = {"key": "premium_volume", "side": side, "who": who, "symbol": (selected or {}).get("symbol"), "passed": False, "mode": "EARLY" if early else "CONFIRMED"}
+    if not selected:
+        return {**base, "status": "UNAVAILABLE", "reason": "no contract selected"}
+    if not premium or not premium.get("candles") or str(premium.get("symbol") or "").upper() != str(selected.get("symbol") or "").upper():
+        return {**base, "status": "UNAVAILABLE", "reason": f"1m premium candles for {selected.get('symbol')} unavailable"}
+    bars = [b for b in to_bars(premium.get("candles"), 1) if b.start.date() == now.date() and b.end <= now]
+    if len(bars) < config.premium_volume_min_bars:
+        return {**base, "status": "UNAVAILABLE", "reason": f"{selected['symbol']}: {len(bars)} completed 1m premium candles today (needs {config.premium_volume_min_bars})"}
+    lag = (now - bars[-1].end).total_seconds()
+    if lag > config.premium_max_lag_seconds:
+        return {**base, "status": "UNAVAILABLE", "reason": f"{selected['symbol']} premium candles are stale: last closed {lag:.0f}s ago"}
+    window = config.premium_early_bars if early else config.premium_volume_recent_bars
+    recent = bars[-window:]
+    prior = [b.volume for b in bars[-(window + config.premium_volume_prior_bars):-window] if b.volume > 0]
+    recent_volume = sum(b.volume for b in recent)
+    if recent_volume <= 0 or not prior:
+        return {**base, "status": "UNAVAILABLE", "reason": f"{selected['symbol']} premium candles carry no traded volume"}
+    ratio = (recent_volume / len(recent)) / (sum(prior) / len(prior))
+    first = len(bars) - len(recent)
+    buy_volume = 0.0
+    for offset, bar in enumerate(recent):
+        prev_close = bars[first + offset - 1].close if first + offset >= 1 else bar.open
+        if bar.close > bar.open or (bar.close == bar.open and bar.close > prev_close):
+            buy_volume += bar.volume
+    buy_share = buy_volume / recent_volume
+    price_change = recent[-1].close - recent[0].open
+    half = max(len(recent) // 2, 1)
+    accelerating = sum(b.volume for b in recent[-half:]) >= sum(b.volume for b in recent[:half])
+    rising = ratio >= config.premium_volume_min_ratio
+    buying = buy_share >= config.premium_buy_share_min
+    up = recent[-1].close > recent[-1].open if early else price_change > 0
+    passed = rising and buying and up
+    parts = [f"volume {ratio:.2f}x the prior {len(prior)}-min average ({'rising' if rising else f'needs {config.premium_volume_min_ratio}x'})",
+             f"{buy_share * 100:.0f}% on rising-premium candles ({'buyers in control' if buying else f'needs {config.premium_buy_share_min * 100:.0f}%'})",
+             (f"latest candle {'up: buyers stepping in' if up else 'not up yet'}" if early else f"premium {price_change:+.2f} over {len(recent)} min")]
+    if early:
+        parts.insert(0, f"early read for a reversal (last {len(recent)} min)")
+    if accelerating:
+        parts.append("still accelerating")
+    return {**base, "status": "OK", "passed": passed, "relative_volume": _r(ratio), "buy_share": _r(buy_share, 3), "price_change": _r(price_change),
+            "accelerating": accelerating, "recent_volume": _r(recent_volume), "as_of": bars[-1].end.isoformat(),
+            "reason": f"{selected['symbol']} {who}: " + "; ".join(parts)}
+
+
+def _near_strikes(strikes: list[float], spot: float, count: int) -> list[float]:
+    ordered = sorted(set(strikes))
+    if not ordered:
+        return []
+    atm = min(range(len(ordered)), key=lambda i: abs(ordered[i] - spot))
+    return ordered[max(atm - count, 0):atm + count + 1]
+
+
+def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spot: float, now: datetime, config: SniperConfig, early: bool = False) -> dict:
+    """Is the supportive writers' OI rising while the opposite writers cover (a strong move)?
+
+    CALL: put writers (PE OI near ATM) must be adding, interval after interval, AND call writers (CE
+    OI near ATM) must be covering: their OI falling over the window and not rising in the latest
+    interval. PUT: call writers adding AND put writers covering. Reads the server's stored 3-minute
+    strike OI samples (the last ``writer_oi_samples``); without enough of them it falls back to
+    market-intel's single 5-minute OI change (status SNAPSHOT). Neither: UNAVAILABLE.
+
+    ``early`` (a liquidity reversal): the supportive writers have not repositioned yet at the turn, so
+    only the opposing writers must have STARTED covering: their OI falling in the latest interval
+    and not up over the window.
+    """
+    writer, other = ("pe", "ce") if side == "CE" else ("ce", "pe")
+    who = "put writers" if side == "CE" else "call writers"
+    opposite = "call writers" if side == "CE" else "put writers"
+    base = {"key": "writer_oi", "side": side, "who": who, "opposite": opposite, "passed": False, "mode": "EARLY" if early else "CONFIRMED"}
+    samples = []
+    for row in history or []:
+        stamp = _parse(row.get("at"))
+        strikes = row.get("strikes") or []
+        if stamp and stamp.astimezone(IST).date() == now.date() and stamp <= now and strikes:
+            samples.append((stamp, strikes))
+    samples.sort(key=lambda item: item[0])
+    samples = samples[-config.writer_oi_samples:]
+    if len(samples) >= 3 and (now - samples[-1][0]).total_seconds() <= config.writer_oi_max_age_seconds:
+        near = _near_strikes([float(r.get("strike") or 0) for r in samples[-1][1]], spot, config.writer_oi_strikes)
+
+        def total(strikes: list[dict], key: str) -> float:
+            values = {float(r.get("strike") or 0): _num(r.get(f"{key}_oi")) or 0.0 for r in strikes}
+            return sum(values.get(k, 0.0) for k in near)
+
+        series = [total(rows, writer) for _, rows in samples]
+        other_series = [total(rows, other) for _, rows in samples]
+        changes = [b - a for a, b in zip(series, series[1:])]
+        net, other_net = series[-1] - series[0], other_series[-1] - other_series[0]
+        pct = net / series[0] * 100 if series[0] > 0 else None
+        positive = sum(1 for c in changes if c > 0)
+        building = pct is not None and pct >= config.writer_oi_min_change_pct
+        latest_up = changes[-1] > 0
+        steady = positive * 2 >= len(changes) + 1          # a majority of the intervals added OI
+        other_changes = [b - a for a, b in zip(other_series, other_series[1:])]
+        other_pct = other_net / other_series[0] * 100 if other_series[0] > 0 else None
+        # Opposite writers covering: their OI fell over the window and is not rising again now.
+        covering = other_pct is not None and other_pct <= -config.opposite_min_cover_pct and other_changes[-1] <= 0
+        outpacing = net > other_net
+        passed = building and latest_up and steady and outpacing and (covering or not config.require_opposite_covering)
+        minutes = (samples[-1][0] - samples[0][0]).total_seconds() / 60
+        if early:
+            started = other_changes[-1] < 0 and other_net <= 0
+            return {**base, "status": "OK", "passed": started, "net_change": _r(net, 0), "change_pct": _r(pct, 3), "opposite_change": _r(other_net, 0),
+                    "opposite_change_pct": _r(other_pct, 3), "opposite_interval_changes": [_r(c, 0) for c in other_changes], "opposite_covering": started,
+                    "strikes": near, "samples": len(samples), "as_of": samples[-1][0].isoformat(),
+                    "reason": f"early read for a reversal: {opposite} OI {other_changes[-1]:+,.0f} in the latest interval, {other_net:+,.0f} over {minutes:.0f} min "
+                              f"({'started covering' if started else 'not covering yet'}); {who} {net:+,.0f} (not required at the turn)"}
+        parts = [f"{who} OI {net:+,.0f} ({pct:+.2f}%) over {minutes:.0f} min near ATM" if pct is not None else f"{who} OI unavailable",
+                 f"{positive}/{len(changes)} intervals adding" + ("" if steady else " (not a steady build)"),
+                 f"latest interval {changes[-1]:+,.0f}" + ("" if latest_up else " (build has stalled)"),
+                 (f"{opposite} OI {other_net:+,.0f} ({other_pct:+.2f}%)" if other_pct is not None else f"{opposite} OI unavailable")
+                 + (", covering" if covering else f", not covering (needs a fall of {config.opposite_min_cover_pct}%+ and no fresh adding)" if other_changes[-1] <= 0 else f", adding again in the latest interval ({other_changes[-1]:+,.0f})")]
+        if pct is not None and not building:
+            parts.append(f"needs +{config.writer_oi_min_change_pct}%")
+        if passed:
+            parts.append(f"strong {'CALL' if side == 'CE' else 'PUT'} move: {who} adding while {opposite} cover")
+        return {**base, "status": "OK", "passed": passed, "net_change": _r(net, 0), "change_pct": _r(pct, 3), "interval_changes": [_r(c, 0) for c in changes],
+                "opposite_change": _r(other_net, 0), "opposite_change_pct": _r(other_pct, 3), "opposite_interval_changes": [_r(c, 0) for c in other_changes],
+                "opposite_covering": covering, "strikes": near, "samples": len(samples), "as_of": samples[-1][0].isoformat(),
+                "reason": "; ".join(parts)}
+    rows = (flow or {}).get("strikes") or []
+    changes5 = [(float(r.get("strike") or 0), _num(r.get(f"{writer}_oi_change")), _num(r.get(f"{other}_oi_change"))) for r in rows]
+    changes5 = [item for item in changes5 if item[1] is not None]
+    if (flow or {}).get("available", True) and changes5:
+        near = set(_near_strikes([item[0] for item in changes5], spot, config.writer_oi_strikes))
+        net = sum(item[1] for item in changes5 if item[0] in near)
+        other_net = sum(item[2] or 0.0 for item in changes5 if item[0] in near)
+        covering = other_net < 0
+        passed = covering if early else net > 0 and net > other_net and (covering or not config.require_opposite_covering)
+        verdict = f"strong move: {who} adding while {opposite} cover" if passed else f"{who} not adding" if net <= 0 else f"{opposite} not covering" if not covering else f"{who} not adding faster"
+        return {**base, "status": "SNAPSHOT", "passed": passed, "net_change": _r(net, 0), "opposite_change": _r(other_net, 0), "opposite_covering": covering,
+                "reason": f"{who} OI {net:+,.0f}, {opposite} OI {other_net:+,.0f} in the last 5 min near ATM "
+                          f"({verdict}; single 5-min reading, the 3-minute OI history is not available yet)"}
+    return {**base, "status": "UNAVAILABLE", "reason": f"{who}' OI change unavailable (no stored OI samples and no 5-minute OI change yet)"}
+
+
+def _realised_vol(closes: list[float], periods_per_year: float) -> float | None:
+    returns = [math.log(b / a) for a, b in zip(closes, closes[1:]) if a > 0 and b > 0]
+    if len(returns) < 2:
+        return None
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    return math.sqrt(variance * periods_per_year) * 100.0
+
+
+def iv_check(feas: dict | None, selected: dict | None, daily_candles: list | None, bars5: list[Bar], vix: dict | None, now: datetime, config: SniperConfig) -> dict:
+    """Is the option's implied volatility rich against what NIFTY is actually moving?
+
+    Buying an option whose IV is far above realised volatility pays for movement the market is not
+    delivering, and IV crush can lose the trade even when the direction is right. Realised vol is
+    the higher of the last ``rv_daily_lookback`` daily closes and today's 5-minute bars (so a fast
+    day is not mistaken for a quiet one). Above ``max_iv_rv_ratio`` blocks; between
+    ``rich_iv_rv_ratio`` and that it passes as RICH. Without realised vol it falls back to India
+    VIX (HIGH or EXTREME blocks); with neither it is UNAVAILABLE and blocks.
+    """
+    base = {"key": "iv", "passed": False}
+    iv = _num(((feas or {}).get("greeks") or {}).get("iv")) or _num((selected or {}).get("iv"))
+    daily = [b for b in to_bars(daily_candles, 24 * 60) if b.start.astimezone(IST).date() < now.date()]
+    rv_daily = _realised_vol([b.close for b in daily[-(config.rv_daily_lookback + 1):]], 252.0) if len(daily) >= 3 else None
+    today = [b for b in bars5 if b.start.date() == now.date()]
+    rv_today = _realised_vol([b.close for b in today], 75.0 * 252.0) if len(today) >= config.rv_intraday_min_bars else None
+    rv = max([v for v in (rv_daily, rv_today) if v], default=None)
+    features = {"iv": _r(iv), "rv_daily": _r(rv_daily), "rv_today": _r(rv_today), "rv": _r(rv)}
+    if iv and rv:
+        ratio = iv / rv
+        rich = ratio > config.rich_iv_rv_ratio
+        passed = ratio <= config.max_iv_rv_ratio
+        verdict = "too rich to buy (IV crush risk)" if not passed else "rich: allowed, scored lower" if rich else "fair to cheap"
+        return {**base, "status": "OK", "passed": passed, "rich": rich, "ratio": _r(ratio), **features,
+                "reason": f"IV {iv:.1f}% vs realised {rv:.1f}% ({'today' if rv == rv_today else f'{config.rv_daily_lookback}-day'}): {ratio:.2f}x, {verdict} (max {config.max_iv_rv_ratio}x)"}
+    regime = (vix or {}).get("regime")
+    if regime:
+        passed = regime not in ("HIGH", "EXTREME")
+        return {**base, "status": "VIX_ONLY", "passed": passed, "rich": not passed, **features,
+                "reason": f"realised volatility unavailable; India VIX {regime.lower()}" + ("" if passed else ": options expensive, not buying")}
+    return {**base, "status": "UNAVAILABLE", **features, "reason": "IV check unavailable (no option IV / realised volatility and no India VIX)"}
 
 
 # ------------------------------------------------------------------------------- scoring
@@ -840,7 +1084,7 @@ def band_for(score: float) -> tuple[str, str]:
 
 
 def score_setup(setup: dict, bars5: list[Bar], bars1: list[Bar], atr5: float, vwap: float | None, vwap_ok: bool, flow: dict | None, vix: dict | None,
-                selected: dict | None, feas: dict | None, spot: float, config: SniperConfig) -> list[dict]:
+                selected: dict | None, feas: dict | None, spot: float, config: SniperConfig, premium_flow: dict | None = None, iv_read: dict | None = None) -> list[dict]:
     w = config.weights
     d = setup["direction"]
     side = "CE" if d > 0 else "PE"
@@ -911,10 +1155,14 @@ def score_setup(setup: dict, bars5: list[Bar], bars1: list[Bar], atr5: float, vw
         parts.append("5m EMA9/EMA20 not aligned")
     comps.append(_component("vwap_ema", pts, w["vwap_ema"], "OK" if vwap_ok else "PARTIAL", "; ".join(parts), {"vwap": _r(vwap), "ema9_5m": _r(ema9), "ema20_5m": _r(ema20), "price": _r(last)}, stamp1))
 
-    # Volume
+    # Volume: the selected option's own premium volume first (index candles carry none), else futures.
     key = setup.get("key_index")
     rvol = relative_volume(bars5, key) if key is not None and 0 <= key < len(bars5) else None
-    if rvol is None:
+    if premium_flow and premium_flow.get("status") == "OK":
+        pf = premium_flow
+        pts = w["volume"] if pf["passed"] else w["volume"] * 0.5 if (pf.get("relative_volume") or 0) >= config.premium_volume_min_ratio else 0
+        comps.append(_component("volume", pts, w["volume"], "OK", pf["reason"], {k: pf.get(k) for k in ("symbol", "relative_volume", "buy_share", "price_change", "accelerating")}, pf.get("as_of")))
+    elif rvol is None:
         comps.append(_component("volume", 0, w["volume"], "UNAVAILABLE", "relative volume unavailable (index has no volume; futures volume missing)", {}, stamp5))
     else:
         pts = w["volume"] if rvol >= 1.5 else w["volume"] * 0.6 if rvol >= 1.2 else 0
@@ -931,7 +1179,12 @@ def score_setup(setup: dict, bars5: list[Bar], bars1: list[Bar], atr5: float, vw
             parts.append(f"delta {selected['delta']:.2f} outside the preferred band")
         regime = (vix or {}).get("regime")
         value = _num((vix or {}).get("value"))
-        if regime in ("LOW", "NORMAL", "HIGH") and (value is None or 10 <= value <= 24):
+        if iv_read and iv_read.get("status") == "OK":
+            # IV against realised volatility: fair or cheap scores; rich (or too rich) does not.
+            if not iv_read.get("rich"):
+                pts += w["option_suitability"] * 0.4
+            parts.append(f"IV/RV {iv_read['ratio']}x{' (rich)' if iv_read.get('rich') else ''}")
+        elif regime in ("LOW", "NORMAL", "HIGH") and (value is None or 10 <= value <= 24):
             pts += w["option_suitability"] * 0.4
             parts.append(f"India VIX {value if value is not None else ''} {regime.lower()}")
         else:
@@ -958,7 +1211,9 @@ def config_for(context: dict) -> SniperConfig:
     loss = _num(context.get("max_loss_per_trade"))
     lots = _num(context.get("max_lots"))
     slip = _num(context.get("slippage_pct"))
+    fixed = _num(context.get("sniper_lots"))
     return SniperConfig(
+        fixed_lots=min(10, max(1, int(fixed))) if fixed and fixed >= 1 else 0,
         max_loss_per_trade=loss if loss and loss > 0 else base.max_loss_per_trade,
         max_lots=max(1, int(lots)) if lots and lots >= 1 else base.max_lots,
         slippage_pct=slip if slip is not None and 0 <= slip < 0.05 else base.slippage_pct,
@@ -991,8 +1246,8 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
     if SESSION_OPEN_MIN + 2 <= minute < 15 * 60 + 30 and lag > config.max_feed_lag_seconds:
         return done("DATA_INVALID", "DATA_INVALID", f"1m feed is stale: last candle closed {lag:.0f}s ago (max {config.max_feed_lag_seconds}s)")
     today5 = [b for b in bars5 if b.start.date() == today]
-    if len(today5) < 3:
-        return done("WAIT_FOR_CONFIRMATION", "WATCH", f"Need 3 completed 5m candles today (have {len(today5)})")
+    if len(today5) < config.min_session_bars_5m:
+        return done("WAIT_FOR_CONFIRMATION", "WATCH", f"Need {config.min_session_bars_5m} completed 5m candle(s) today (have {len(today5)})")
 
     atrs = atr_series(bars5, config.atr_period)
     atr5 = atrs[-1] or 0.0
@@ -1027,6 +1282,8 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
     spot = float((context.get("option_chain") or {}).get("spot") or bars1[-1].close)
     flow = context.get("options_flow") or None
     vix = context.get("vix") or None
+    premium = context.get("premium_candles") or None
+    oi_history = context.get("oi_history") or None
     sniper["vix"] = {"value": _num((vix or {}).get("value")), "regime": (vix or {}).get("regime")} if vix else None
     scored = []
     for setup in found:
@@ -1034,13 +1291,23 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         ranked, rejected = select_contracts(chain, side, config)
         selected = ranked[0] if ranked else None
         feas = feasibility(selected, spot, atr5, now, symbol, config) if selected else None
-        comps = score_setup(setup, bars5, bars1, atr5, vwap, vwap_ok, flow, vix, selected, feas, spot, config)
+        early = setup["family"] in config.early_flow_families
+        pflow = premium_volume_flow(premium, selected, side, now, config, early)
+        wflow = writer_oi_flow(oi_history, flow, side, spot, now, config, early)
+        ivc = iv_check(feas, selected, context.get("daily_candles"), bars5, vix, now, config)
+        comps = score_setup(setup, bars5, bars1, atr5, vwap, vwap_ok, flow, vix, selected, feas, spot, config, pflow, ivc)
         total = round(sum(c["score"] for c in comps) / sum(c["max_score"] for c in comps) * 100.0, 2)
-        scored.append({"setup": setup, "selected": selected, "ranked": ranked, "rejected": rejected, "feas": feas, "components": comps, "total": total})
+        scored.append({"setup": setup, "selected": selected, "ranked": ranked, "rejected": rejected, "feas": feas, "components": comps, "total": total, "premium_flow": pflow, "writer_flow": wflow, "iv": ivc})
     # Prefer a confirmed setup, then the higher score; a breakout is never relabelled a reversal.
     scored.sort(key=lambda item: (item["setup"]["state"] == "CONFIRMED", item["total"]), reverse=True)
     best = scored[0]
     setup, selected, feas, comps, total = best["setup"], best["selected"], best["feas"], best["components"], best["total"]
+    pflow, wflow, ivc = best["premium_flow"], best["writer_flow"], best["iv"]
+    sniper["order_flow"] = {"premium_volume": pflow, "writer_oi": wflow, "mode": "EARLY" if setup["family"] in config.early_flow_families else "CONFIRMED"}
+    sniper["iv_check"] = ivc
+    # Pass 1 picks the contract; the caller then fetches its own 1m candles for the volume check.
+    if selected and (not premium or str(premium.get("symbol") or "").upper() != str(selected["symbol"]).upper()):
+        base["needs_premium_candles"] = selected["symbol"]
     d = setup["direction"]
     side = "CE" if d > 0 else "PE"
     band, action = band_for(total)
@@ -1070,6 +1337,9 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         ("SPREAD_OK", selected is not None and (selected["spread_pct"] is None or selected["spread_pct"] <= config.max_spread_percent), f"spread {selected.get('spread_pct') if selected else 'n/a'}% ({selected.get('spread_source') if selected else 'n/a'})"),
         ("FEASIBILITY_2X", bool(feas and feas.get("valid")), (feas or {}).get("reason") or "feasible within the heuristic gate"),
         ("OI_AVAILABLE", (not config.require_oi) or oi_comp["status"] != "UNAVAILABLE", "OI required by configuration" if config.require_oi else "OI optional (scored 0 when missing)"),
+        ("PREMIUM_VOLUME_RISING", (not config.require_premium_volume) or pflow["passed"], pflow["reason"]),
+        ("WRITER_OI_RISING", (not config.require_writer_oi) or wflow["passed"], wflow["reason"]),
+        ("IV_NOT_RICH", (not config.require_iv_check) or ivc["passed"], ivc["reason"]),
         ("SCORE_MINIMUM", total >= config.minimum_sniper_score, f"score {total} / 100 (needs {config.minimum_sniper_score:g}, band {band})"),
     ]
     sniper["hard_filters"] = [{"code": code, "passed": bool(ok), "detail": detail} for code, ok, detail in filters]

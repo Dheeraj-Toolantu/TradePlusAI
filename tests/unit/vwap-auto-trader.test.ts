@@ -30,7 +30,9 @@ describe("one VWAP-EMA trade at a time", () => {
     const bank = contract("BANKNIFTY26N1054000CE", 54000);
     const scalper = new SmartScalper({ now: at("10:05"), hydrate: false });
     await scalper.place("BANKNIFTY", plan(bank), [bank], { setupId: "x" });
-    expect((await scalper.snapshot("NIFTY")).positions).toHaveLength(0); // the desk's NIFTY view
+    // The desk's NIFTY view still lists the open BANKNIFTY trade (every open position shows on the
+    // right panel); its closed trades stay per index.
+    expect((await scalper.snapshot("NIFTY")).positions.map((position) => position.underlying)).toEqual(["BANKNIFTY"]);
     const all = await scalper.snapshot();
     expect(all.positions).toHaveLength(1);
     expect(all.positions[0]).toMatchObject({ underlying: "BANKNIFTY", stop: 114.1, target: 133.95, trail: { stage: "INITIAL" } });

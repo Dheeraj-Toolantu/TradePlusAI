@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { collection, getDocs, query, where } from "firebase/firestore";
-import { db } from "../../../lib/firebase";
-import { OI_STRIKES, istDate, istTime, strikeCache, strikeKey } from "../../../lib/sentiment-history";
+import { istDate, istTime } from "../../../lib/sentiment-history";
+import { storedStrikeSamples } from "../../../lib/oi-strike-samples";
 import { analyzeOi, type StrikeSample } from "../../../lib/oi-analysis";
 import { readOiTotals } from "../../../lib/oi-history";
 import { GrowwAdapter, createGrowwTransport } from "../../../../../adapters/groww/src/groww-adapter";
@@ -14,17 +13,7 @@ const withTimeout = <T,>(work: Promise<T>, ms = READ_TIMEOUT_MS) => Promise.race
 
 /** The day's stored 3-minute strike samples, plus a live chain reading when today's are stale or missing. */
 async function samplesFor(symbol: string, date: string, notes: string[]): Promise<StrikeSample[]> {
-  const key = strikeKey(symbol, date);
-  const cache = strikeCache();
-  let cached = cache.get(key) as StrikeSample[] | undefined;
-  if (!cached) {
-    // Read the day from Firestore once per process; the sampler appends to it from then on.
-    const read = await withTimeout(getDocs(query(collection(db, OI_STRIKES), where("key", "==", key))))
-      .then((result) => result.docs.map((item) => item.data() as StrikeSample & { recordedAt?: string }).map((row) => ({ ...row, at: row.at ?? row.recordedAt ?? "" })))
-      .catch((error: unknown) => { notes.push(`Stored OI unavailable for ${symbol}: ${error instanceof Error ? error.message : "read failed"}`); return null; });
-    if (read) { read.sort((a, b) => a.at.localeCompare(b.at)); cache.set(key, read as never); cached = read; }
-  }
-  const stored: StrikeSample[] = [...(cached ?? [])].sort((a, b) => a.at.localeCompare(b.at));
+  const stored = await storedStrikeSamples(symbol, date, notes);
   const today = istDate(new Date());
   const newest = stored.at(-1);
   if (date === today && (!newest || Date.now() - Date.parse(newest.at) > STALE_MS)) {

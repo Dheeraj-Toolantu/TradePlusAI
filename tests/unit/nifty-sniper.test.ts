@@ -141,3 +141,70 @@ describe("sniper journal", () => {
     expect(record.id).toBe("202611170451-NIFTY-WATCH");
   });
 });
+
+
+describe("NIFTY Sniper partial booking at 1.5x", () => {
+  afterEach(() => { clock = at("10:21"); });
+  const twoLots = (item: ScalperContract) => sniperPlan(item, { lots: 2, quantity: 130, risk: { maxEntry: 31.7, maxTarget: 0, minRiskReward: 3.88, stopGap: 0.78, feesAtStopPerLot: 45, lotSize: 65, premiumMultiples: { stop: 0.75, target: 2, partial: 1.5 } } });
+
+  it("books half the lots at 1.5x the fill and lets the rest trail", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    const placed = await book.place("NIFTY", twoLots(live), [live], { setupId: "p1", settings: { maxLossPerTrade: 5000, lots: 2 } });
+    expect(placed.placed).toBe(true);
+    expect(placed.position!.partial).toEqual({ price: 47.25, quantity: 65, done: false, multiple: 1.5 }); // 1.5 × the 31.5 fill
+    let out = await book.manage({ symbol: "NIFTY", spot: 24020, bars: [], contracts: [contract(46)] });
+    expect(out.exited).toHaveLength(0);
+    out = await book.manage({ symbol: "NIFTY", spot: 24030, bars: [], contracts: [contract(47.5)] });
+    expect(out.exited).toHaveLength(1);
+    expect(out.exited[0]).toMatchObject({ exitReason: "PARTIAL_1_5X", quantity: 65 });
+    expect(out.exited[0].realizedPnl).toBeGreaterThan(0);
+    expect(out.positions[0]).toMatchObject({ quantity: 65, partial: { done: true }, status: "OPEN" });
+    // Booked once only, and the strategy's own entry count is unchanged (one trade).
+    out = await book.manage({ symbol: "NIFTY", spot: 24030, bars: [], contracts: [contract(48)] });
+    expect(out.exited).toHaveLength(0);
+    expect((await book.ruleStats("SNIPER")).trades).toBe(1);
+  });
+
+  it("does not split a single lot", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    const plan = sniperPlan(live, { risk: { maxEntry: 31.7, maxTarget: 0, minRiskReward: 3.88, stopGap: 0.78, feesAtStopPerLot: 45, lotSize: 65, premiumMultiples: { stop: 0.75, target: 2, partial: 1.5 } } });
+    const placed = await book.place("NIFTY", plan, [live], { setupId: "p2", settings: { maxLossPerTrade: 1500 } });
+    expect(placed.position!.partial).toMatchObject({ quantity: 0 });
+    const out = await book.manage({ symbol: "NIFTY", spot: 24030, bars: [], contracts: [contract(48)] });
+    expect(out.exited).toHaveLength(0);
+    expect(out.positions[0].stop).toBeGreaterThanOrEqual(37.8); // the trail locks 1.2x instead
+  });
+});
+
+describe("NIFTY Sniper chosen lots (1-10)", () => {
+  afterEach(() => { clock = at("10:21"); });
+  const chosen = (item: ScalperContract, lots: number) => sniperPlan(item, { lots, quantity: lots * 65, risk: { maxEntry: 31.7, maxTarget: 0, minRiskReward: 3.88, stopGap: 0.78, feesAtStopPerLot: 45, lotSize: 65, premiumMultiples: { stop: 0.75, target: 2, partial: 1.5 }, fixedLots: lots } });
+
+  it("places exactly the chosen lots even above the single-trade budget, and books half at 1.5x", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    const placed = await book.place("NIFTY", chosen(live, 5), [live], { setupId: "l5", settings: { maxLossPerTrade: 500 } });
+    expect(placed.placed).toBe(true);
+    expect(placed.position).toMatchObject({ quantity: 325, partial: { quantity: 130, price: 47.25 } }); // 5 lots, book 2
+    expect(placed.position!.maxLoss).toBeGreaterThan(500);
+    // A dip that would breach the ₹500 desk budget does not close it: its own stop and max loss do.
+    const out = await book.manage({ symbol: "NIFTY", spot: 24000, bars: [], contracts: [contract(29)] });
+    expect(out.exited).toHaveLength(0);
+  });
+
+  it("clamps the setting to 1-10 lots", () => {
+    expect(SmartScalper.settings({ sniperLots: 0 }).sniperLots).toBe(1);
+    expect(SmartScalper.settings({ sniperLots: 25 }).sniperLots).toBe(10);
+    expect(SmartScalper.settings({}).sniperLots).toBe(1);
+  });
+
+  it("lists an open trade on another index in the desk's positions", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    await book.place("NIFTY", chosen(live, 2), [live], { setupId: "x1" });
+    const desk = await book.snapshot("BANKNIFTY");
+    expect(desk.positions.map((position: PositionView) => position.underlying)).toEqual(["NIFTY"]);
+  });
+});
