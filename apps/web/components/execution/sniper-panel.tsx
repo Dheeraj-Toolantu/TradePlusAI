@@ -15,7 +15,8 @@ type Filter = { code: string; passed: boolean; detail: string };
 type Contract = { symbol: string; strike: number; type: "CE" | "PE"; premium: number; delta: number; iv?: number | null; open_interest: number; volume: number; spread_pct?: number | null; spread_source?: string; rank_score?: number };
 type Feasibility = {
   entry: number; stop_loss: number; target: number; partial_target: number; lot_size: number; lots: number; quantity: number; max_loss: number; planned_max_loss: number;
-  index_move_needed: { "1_5x": number | null; "2x": number | null }; expected_move: number | null; feasibility_ratio: number | null; cost_share: number | null; hold_minutes: number;
+  index_move_needed: { "1_5x": number | null; "2x": number | null };
+  scenarios?: Record<string, { iv_change_vol_pts: number; index_move_2x: number | null; index_move_1_5x: number | null; ratio: number | null }>; expected_move: number | null; feasibility_ratio: number | null; cost_share: number | null; hold_minutes: number;
   greeks?: { delta: number; gamma: number; theta_per_day: number | null; iv: number | null; source: string };
   probability?: Record<string, string>; model?: string; valid: boolean; reason: string;
 };
@@ -34,6 +35,8 @@ export type SniperRead = {
   order_flow?: { premium_volume?: FlowCheck; writer_oi?: FlowCheck; mode?: "EARLY" | "CONFIRMED" };
   /** The option's implied volatility against NIFTY's realised volatility. */
   iv_check?: FlowCheck & { ratio?: number | null };
+  /** V2: A / B grade, machine-readable rejection reasons, setup letter, breakout entry mode, config hash. */
+  grade?: string; reason_codes?: string[]; setup_type?: string; entry_mode?: string | null; config_hash?: string;
 };
 type FlowCheck = { status: string; passed: boolean; reason: string; who?: string };
 
@@ -43,7 +46,7 @@ const LABELS: Record<string, string> = {
 };
 const FILTERS: Record<string, string> = {
   SETUP_CONFIRMED: "setup confirmed", SIGNAL_FRESH: "signal fresh", ENTRY_TRIGGER: "1m trigger", NOT_CHASING: "not chasing", ENTRY_WINDOW: "entry window",
-  REGIME_TRADABLE: "regime", CONTRACT_SELECTED: "contract", SPREAD_OK: "spread", FEASIBILITY_2X: "2x feasibility", OI_AVAILABLE: "OI", SCORE_MINIMUM: "score ≥ 85",
+  REGIME_TRADABLE: "regime", REGIME_PERMITS: "regime permits", SETUP_ENABLED: "setup on", POSITION_SIZE: "size ≥ 1 lot", OI_NOT_AGAINST: "OI not against", CONTRACT_SELECTED: "contract", SPREAD_OK: "spread", FEASIBILITY_2X: "2x feasibility", OI_AVAILABLE: "OI", SCORE_MINIMUM: "score ≥ 85",
   PREMIUM_VOLUME_RISING: "premium buying volume", WRITER_OI_RISING: "writer OI (add / cover)", IV_NOT_RICH: "IV not rich",
 };
 const title = (value: string | undefined) => (value ?? "").replaceAll("_", " ").toLowerCase().replace(/^./, (c) => c.toUpperCase());
@@ -104,6 +107,13 @@ export const SniperPanel = memo(function SniperPanel({ sniper, decision }: { sni
 
       {sniper.hard_filters?.length ? (
         <>
+          <p className="mi-note">
+            {sniper.setup_type ? <>Setup <b>{sniper.setup_type}</b>{sniper.entry_mode ? ` (${sniper.entry_mode.replaceAll("_", " ").toLowerCase()})` : ""} · </> : null}
+            {sniper.grade ? <>grade <b>{sniper.grade.replace("_", " ")}</b>{sniper.grade === "B_GRADE" ? " (journal only, no order)" : ""} · </> : null}
+            {sniper.reason_codes?.length ? <>blocked: <b>{sniper.reason_codes.join(", ")}</b> · </> : null}
+            {sniper.feasibility?.scenarios ? <>2x needs {Object.entries(sniper.feasibility.scenarios).map(([name, value]) => `${name.toLowerCase()} ${value.index_move_2x ?? "n/a"} pts`).join(" / ")} · </> : null}
+            {sniper.config_hash ? <span title="Configuration hash stored with every decision">cfg {sniper.config_hash}</span> : null}
+          </p>
           <p className="mi-note"><b>Hard filters {sniper.hard_filters.filter((f) => f.passed).length}/{sniper.hard_filters.length}</b>: every one must pass — a high score never overrides them. {decision === "CONFIRMED" ? "" : "No order is placed while any is red."}</p>
           <div className="exec-gates">{sniper.hard_filters.map((f) => <span key={f.code} className={f.passed ? "pass" : "fail"} title={f.detail}>{f.passed ? "✓" : "✗"} {FILTERS[f.code] ?? f.code.toLowerCase()}</span>)}</div>
           {sniper.order_flow ? (

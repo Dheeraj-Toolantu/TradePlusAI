@@ -357,6 +357,8 @@
 .exec-score span.fail { border-color: #6b4a1d; }
 .exec-premium-chart { margin: 8px 0; padding: 6px 8px 8px; border: 1px solid #173a47; border-radius: 6px; background: #081c26; }
 @media (max-width: 640px) { .exec-strategy-controls { justify-content: flex-start; } .exec-premium-chart { padding: 4px; } }
+.scalper-setups { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+.scalper-setups label { display: inline-flex; align-items: center; gap: 3px; color: var(--text); }
 .scalper-strategy { padding: 5px 8px; color: var(--text); border: 1px solid #25505f; border-radius: 5px; background: #0d2a37; font: 600 12px "Manrope", sans-serif; }
 .scalper-oi-pick { margin-left: 4px; padding: 1px 6px; color: #0b1a20 !important; border-radius: 4px; background: #f0c36b; font-style: normal; font-weight: 700; font-size: 10px; }
 .pos-card { display: grid; gap: 7px; padding: 10px; border: 1px solid #1f2b30; border-left: 3px solid #2d3b40; border-radius: 8px; background: #111a1d; font-size: 12px; }

@@ -25,7 +25,8 @@ export function sniperJournalRecord(input: SniperJournalInput, now = new Date())
   const id = `${minute.replace(/[^0-9]/g, "")}-${input.underlying}-${input.placed ? "PLACED" : String(sniper.state ?? input.analysis.decision ?? "NA")}`;
   return {
     id, at: now.toISOString(), underlying: input.underlying, origin: input.origin, placed: input.placed, reasons: input.reasons,
-    strategy: "NIFTY_SNIPER", configVersion: sniper.config_version ?? null,
+    strategy: "NIFTY_SNIPER", configVersion: sniper.config_version ?? null, configHash: sniper.config_hash ?? null,
+    setupType: sniper.setup_type ?? null, entryMode: sniper.entry_mode ?? null, grade: sniper.grade ?? null, reasonCodes: clean(sniper.reason_codes ?? []), orderFlow: clean(sniper.order_flow ?? null), ivCheck: clean(sniper.iv_check ?? null),
     state: sniper.state ?? null, family: sniper.family ?? null, direction: sniper.direction ?? null,
     score: clean(sniper.score), components: clean(sniper.components), hardFilters: clean(sniper.hard_filters), lifecycle: clean(sniper.lifecycle),
     regime: clean(sniper.regime), trigger: clean(sniper.trigger), selected: clean(sniper.selected), feasibility: clean(sniper.feasibility),

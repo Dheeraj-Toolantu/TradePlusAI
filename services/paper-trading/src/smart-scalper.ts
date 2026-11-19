@@ -54,8 +54,12 @@ export type ScalperSettings = {
   smartTrail: boolean;
   /** Smart trail: on the target, lock most of the move and let the trade run instead of closing it. */
   runPastTarget: boolean;
-  /** NIFTY Sniper: lots per trade (1-10), taken as chosen; half are booked at 1.5x with 2+ lots. */
+  /** NIFTY Sniper: the most lots per trade (1-10); half are booked at 1.5x with 2+ lots. */
   sniperLots: number;
+  /** NIFTY Sniper V2 sizing: from the ₹ risk budget capped by sniperLots (RISK_BUDGET), or exactly sniperLots (FIXED_LOTS). */
+  sniperSizing: "RISK_BUDGET" | "FIXED_LOTS";
+  /** NIFTY Sniper setups switched on: A reversal, B breakout, C continuation (e.g. "ABC"). */
+  sniperSetups: string;
 };
 export type Level = { price: number; touches: number; sources: string[] };
 export type ExtraZone = { side: "DEMAND" | "SUPPLY"; low: number; high: number; sources?: string[] };
@@ -164,7 +168,9 @@ export type ScalperPosition = {
   exitValue?: number;
   realizedPnl?: number;
 };
-export type PositionView = ScalperPosition & { quantity: number; value: number; pnl: number; label: string };
+/** Position-management state (NIFTY Sniper V2 spec 14.4), derived from the stop's stage and the partial booking. */
+export type PositionState = "OPEN_INITIAL" | "BREAKEVEN_PROTECTED" | "PARTIAL_BOOKED" | "PROFIT_LOCKED" | "TRAILING" | "CLOSED";
+export type PositionView = ScalperPosition & { quantity: number; value: number; pnl: number; label: string; state: PositionState };
 /**
  * The trader's risk controls on an open position, changeable at any time (modify): the trailing
  * mode, the fixed trail distance, whether the smart trail runs past the target, and where the
@@ -231,7 +237,7 @@ export type ScanInput = {
   entryBlockedReason?: string;
 };
 
-export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1 };
+export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC" };
 const STAGE_ORDER: TrailStage[] = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
 const higherStage = (a: TrailStage, b: TrailStage) => (STAGE_ORDER.indexOf(a) >= STAGE_ORDER.indexOf(b) ? a : b);
 /** Round-trip charges per unit when the plan gave none: ~₹40 brokerage per order pair plus ~0.2% of premium (STT, exchange, GST). */
@@ -565,6 +571,8 @@ export class SmartScalper {
       smartTrail: flag(value.smartTrail, DEFAULT_SCALPER_SETTINGS.smartTrail),
       runPastTarget: flag(value.runPastTarget, DEFAULT_SCALPER_SETTINGS.runPastTarget),
       sniperLots: clamp(Math.floor(Number(value.sniperLots) || DEFAULT_SCALPER_SETTINGS.sniperLots), 1, 10),
+      sniperSizing: value.sniperSizing === "FIXED_LOTS" ? "FIXED_LOTS" : "RISK_BUDGET",
+      sniperSetups: ["A", "B", "C"].filter((letter) => String(value.sniperSetups ?? "ABC").toUpperCase().includes(letter)).join("") || "ABC",
     };
   }
 
@@ -906,7 +914,11 @@ export class SmartScalper {
     };
     // Every engine trade starts on the smart auto trail (unless switched off in the settings); the
     // trader can change the SL, target and trailing on the position at any time (modify).
-    position.controls = { mode: settings.smartTrail ? "SMART" : "RULE", points: null, runPastTarget: settings.smartTrail && settings.runPastTarget, resumeAbove: null, stage: "INITIAL", risk: position.initialRisk && position.initialRisk > 0 ? position.initialRisk : round2(entry * FALLBACK_RISK_PCT), targetRuns: 0 };
+    // NIFTY Sniper V2 (spec 14.4 / 14.5): one deterministic trail (its own staged rule) and the 2x
+    // target closes the remainder; no smart trail or runner unless the trader switches it on the trade.
+    const deterministic = plan.trail?.rule === "SNIPER";
+    const smart = settings.smartTrail && !deterministic;
+    position.controls = { mode: smart ? "SMART" : "RULE", points: null, runPastTarget: smart && settings.runPastTarget, resumeAbove: null, stage: "INITIAL", risk: position.initialRisk && position.initialRisk > 0 ? position.initialRisk : round2(entry * FALLBACK_RISK_PCT), targetRuns: 0 };
     this.positions.push(position);
     this.tradesToday += 1;
     this.persist(position);
@@ -1224,7 +1236,9 @@ export class SmartScalper {
     const quantity = this.quantity(position);
     const value = position.status === "OPEN" ? this.netValue(position) : position.exitValue ?? this.netValue(position);
     const label = position.legs.length === 1 ? position.legs[0].symbol : `${position.side === "CE" ? "Bull call" : "Bear put"} ${position.legs.map((leg) => leg.strike).join("/")}`;
-    return { ...position, legs: position.legs.map((leg) => ({ ...leg })), quantity, value, pnl: position.status === "OPEN" ? round2((value - position.entry) * quantity) : position.realizedPnl ?? 0, label };
+    const stage = this.stageOf(position);
+    const state: PositionState = position.status === "EXITED" ? "CLOSED" : stage === "TRAILING" ? "TRAILING" : stage === "LOCKED" ? "PROFIT_LOCKED" : position.partial?.done ? "PARTIAL_BOOKED" : stage === "BREAKEVEN" ? "BREAKEVEN_PROTECTED" : "OPEN_INITIAL";
+    return { ...position, legs: position.legs.map((leg) => ({ ...leg })), quantity, value, pnl: position.status === "OPEN" ? round2((value - position.entry) * quantity) : position.realizedPnl ?? 0, label, state };
   }
 
   state(underlying?: string) {

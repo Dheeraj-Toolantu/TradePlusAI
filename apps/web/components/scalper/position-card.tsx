@@ -159,6 +159,7 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
         <span>{position.kind}{position.trail ? (position.trail.rule === "SNIPER" ? " · NIFTY Sniper" : " · VWAP-EMA") : ""}</span>
         <span title={closed ? "Time in trade" : "Time in trade (live)"}>⏱ {clock(held)}</span>
         {timeLeft !== null && !reachedHalfR ? <span className={timeLeft < 120_000 ? "warn" : ""} title={sniper ? "Closed at 90 min unless the premium reaches 1.25x" : `Closed at ${maxHoldMinutes} min unless the premium reaches +0.5R`}>time stop {timeLeft > 0 ? clock(timeLeft) : "due"}</span> : null}
+        {!closed && position.state ? <span title="Position-management state">{position.state.replaceAll("_", " ").toLowerCase()}</span> : null}
         <span>in {ist(position.openedAt)}{closed && position.exitAt ? ` · out ${ist(position.exitAt)}` : ""}</span>
       </div>
 

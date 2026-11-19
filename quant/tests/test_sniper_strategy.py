@@ -212,13 +212,15 @@ def test_confirmed_reversal_produces_an_explainable_call_setup():
 
 
 def test_missing_oi_scores_zero_and_is_never_favourable():
-    result = run(options_flow=None)
+    result = run(options_flow=None, oi_history=None)
     oi = next(c for c in result["sniper"]["components"] if c["key"] == "oi")
     assert oi["score"] == 0 and oi["status"] == "UNAVAILABLE"
     full = run()
     assert result["sniper"]["score"]["total"] < full["sniper"]["score"]["total"]
-    # Without OI the 85 bar is out of reach here: the system returns no trade, not a guess.
-    assert result["decision"] != "CONFIRMED"
+    # V2: OI is context, not a mandatory gate. Unknown OI never counts as supportive (scored 0) and is
+    # labelled UNKNOWN, but only an OPPOSING read blocks.
+    assert result["sniper"]["order_flow"]["writer_oi"]["verdict"] == "UNKNOWN"
+    assert {f["code"]: f["passed"] for f in result["sniper"]["hard_filters"]}["OI_NOT_AGAINST"] is True
 
 
 def test_stale_feed_is_data_invalid():
@@ -256,7 +258,7 @@ def test_position_size_never_rounds_up_beyond_the_risk_budget():
 
 
 def test_score_bands():
-    assert sn.band_for(90)[0] == "SNIPER_CANDIDATE" and sn.band_for(80)[0] == "STRONG" and sn.band_for(70)[0] == "WATCHLIST" and sn.band_for(10)[0] == "WEAK"
+    assert sn.band_for(90)[0] == "A_GRADE" and sn.band_for(82)[0] == "B_GRADE" and sn.band_for(79.9)[0] == "NO_TRADE"
 
 
 def test_engine_pipeline_wires_the_sniper_evidence(monkeypatch):
@@ -288,11 +290,11 @@ def test_engine_pipeline_wires_the_sniper_evidence(monkeypatch):
 
 # ---------------------------------------------------------------- entry window, order flow in the selected option
 
-def test_entry_window_is_open_from_0915_to_1515():
+def test_entry_window_is_open_from_0920_to_1515():
     config = sn.SniperConfig()
-    assert (config.entry_start_min, config.entry_cutoff_min) == (9 * 60 + 15, 15 * 60 + 15)
+    assert (config.entry_start_min, config.entry_cutoff_min) == (9 * 60 + 20, 15 * 60 + 15)
     session = engine.SNIPER_SESSION_CONFIG().trading_windows
-    assert session["entry_start"] == 9 * 60 + 15 and session["entry_end"] == 15 * 60 + 15
+    assert session["entry_start"] == 9 * 60 + 20 and session["entry_end"] == 15 * 60 + 15
     afternoon = TODAY.replace(hour=14, minute=50, second=30)
     result = run(now=afternoon, premium_candles=premium_candles(end=afternoon), oi_history=oi_history(end=afternoon))
     filters = {f["code"]: f["passed"] for f in result["sniper"]["hard_filters"]}
@@ -371,7 +373,10 @@ def test_writer_oi_falls_back_to_the_five_minute_change_then_fails_closed():
     assert not sn.writer_oi_flow(None, calls_adding, "CE", 24004.0, NOW, sn.SniperConfig())["passed"]
     none = sn.writer_oi_flow(None, None, "CE", 24004.0, NOW, sn.SniperConfig())
     assert none["status"] == "UNAVAILABLE" and not none["passed"]
-    assert run(oi_history=None, options_flow={**FLOW})["decision"] != "CONFIRMED"
+    unknown = run(oi_history=None, options_flow={**FLOW})["sniper"]
+    assert unknown["order_flow"]["writer_oi"]["verdict"] == "UNKNOWN"
+    against = sn.writer_oi_flow(None, {"available": True, "strikes": [{"strike": 24000, "pe_oi_change": -30000, "ce_oi_change": 25000}]}, "CE", 24004.0, NOW, sn.SniperConfig())
+    assert against["verdict"] == "AGAINST"
 
 
 # ---------------------------------------------------------------- family-based flow, IV check
@@ -413,17 +418,78 @@ def test_iv_against_realised_volatility():
 
 
 def test_iv_check_falls_back_to_vix_then_fails_closed():
+    # V2: India VIX is context, never a substitute for the contract's IV; it cannot approve.
     vix_only = sn.iv_check({"greeks": {"iv": 14.0}}, None, None, [], {"regime": "NORMAL"}, NOW, sn.SniperConfig())
-    assert vix_only["status"] == "VIX_ONLY" and vix_only["passed"]
+    assert vix_only["status"] == "VIX_ONLY" and not vix_only["passed"]
     assert not sn.iv_check({"greeks": {"iv": 14.0}}, None, None, [], {"regime": "HIGH"}, NOW, sn.SniperConfig())["passed"]
     none = sn.iv_check(None, None, None, [], None, NOW, sn.SniperConfig())
     assert none["status"] == "UNAVAILABLE" and not none["passed"]
 
 
-def test_chosen_lots_are_used_as_they_are():
-    # Budget sizing would give 0 lots at ₹300; the trader's 4 lots are taken, with the real risk shown.
-    result = run(max_loss_per_trade=300, sniper_lots=4)
-    feas = result["sniper"]["feasibility"]
-    assert feas["lots"] == 4 and feas["quantity"] == 260 and feas["max_loss"] > 300
-    assert result["decision"] == "CONFIRMED" and result["setup"]["lots"] == 4
-    assert sn.config_for({"sniper_lots": 25}).fixed_lots == 10 and sn.config_for({}).fixed_lots == 0
+def test_v2_sizing_from_the_rupee_risk_budget_capped_by_the_chosen_lots():
+    # A ₹300 budget cannot carry one lot: no trade (RISK_LIMIT), whatever lots were chosen.
+    small = run(max_loss_per_trade=300, sniper_lots=4)
+    assert small["sniper"]["feasibility"]["lots"] == 0 and small["decision"] != "CONFIRMED"
+    assert "RISK_LIMIT" in small["sniper"]["reason_codes"]
+    # A large budget is capped by the chosen 4 lots.
+    big = run(max_loss_per_trade=100000, sniper_lots=4)
+    assert big["sniper"]["feasibility"]["lots"] == 4 and big["decision"] == "CONFIRMED" and big["setup"]["lots"] == 4
+    # V1 fixed-lot sizing stays available explicitly.
+    fixed = run(max_loss_per_trade=300, sniper_lots=4, sniper_sizing="FIXED_LOTS")
+    assert fixed["sniper"]["feasibility"]["lots"] == 4
+    assert sn.config_for({"sniper_lots": 25}).max_chosen_lots == 10 and sn.config_for({}).max_chosen_lots == 0
+
+
+# ---------------------------------------------------------------- V2 specification
+
+def bars15(closes, spread=6.0):
+    out, start = [], TODAY.replace(hour=9, minute=15) - timedelta(days=1)
+    for i, close in enumerate(closes):
+        o = closes[i - 1] if i else close
+        out.append(sn.Bar(start + timedelta(minutes=15 * i), 15, o, max(o, close) + spread, min(o, close) - spread, close, 0.0))
+    return out
+
+
+def test_v2_regime_splits_high_volatility_into_orderly_and_disorderly():
+    config = sn.SniperConfig()
+    calm = [24000 + (i % 2) * 4 for i in range(30)]
+    trend = calm + [24000 + 60 * k for k in range(1, 5)]
+    whipsaw = calm + [24000 + (80 if k % 2 else -80) for k in range(1, 5)]
+    orderly = sn.classify_regime(bars15(trend), None, config)
+    disorderly = sn.classify_regime(bars15(whipsaw), None, config)
+    assert orderly["regime"] == "HIGH_VOL_ORDERLY", orderly
+    assert disorderly["regime"] == "HIGH_VOL_DISORDERLY", disorderly
+    assert sn.classify_regime(bars15([24000, 24010]), None, config)["regime"] == "UNKNOWN"
+    assert not any(sn.REGIME_PERMISSIONS["HIGH_VOL_DISORDERLY"].values()) and not any(sn.REGIME_PERMISSIONS["UNKNOWN"].values())
+    assert sn.REGIME_PERMISSIONS["RANGE"]["C"] is False
+
+
+def test_v2_setups_switch_on_and_off():
+    off = run(sniper_setups="BC")
+    filters = {f["code"]: f["passed"] for f in off["sniper"]["hard_filters"]}
+    assert filters["SETUP_ENABLED"] is False and "SETUP_DISABLED" in off["sniper"]["reason_codes"] and off["decision"] != "CONFIRMED"
+    assert run()["sniper"]["setup_type"] == "A"
+
+
+def test_v2_scenario_repricing_reports_ranges_not_probabilities():
+    feas = run()["sniper"]["feasibility"]
+    sc = feas["scenarios"]
+    assert set(sc) == {"CONSERVATIVE", "BASE", "FAVOURABLE"} and feas["gate_scenario"] == "BASE"
+    assert sc["CONSERVATIVE"]["index_move_2x"] > sc["BASE"]["index_move_2x"] > sc["FAVOURABLE"]["index_move_2x"]
+    assert feas["index_move_needed"]["2x"] == sc["BASE"]["index_move_2x"]
+    assert feas["probability"]["reach_2x_before_stop"] == "UNAVAILABLE"
+
+
+def test_v2_score_has_nine_components_and_grades():
+    result = run()
+    assert {c["key"] for c in result["sniper"]["components"]} == set(sn.SniperConfig().weights) and sum(sn.SniperConfig().weights.values()) == 100
+    assert result["sniper"]["grade"] == result["sniper"]["score"]["band"]
+    assert result["setup"]["config_hash"] == sn.config_hash(sn.config_for(context())) and len(result["setup"]["config_hash"]) == 12
+
+
+def test_v2_reason_codes_are_machine_readable():
+    blocked = run(daily_candles=daily_candles(0.3))
+    assert "IV_TOO_HIGH" in blocked["sniper"]["reason_codes"]
+    rows = {f["code"]: f for f in blocked["sniper"]["hard_filters"]}
+    assert rows["IV_NOT_RICH"]["reason_code"] == "IV_TOO_HIGH" and rows["ENTRY_WINDOW"]["reason_code"] is None
+    assert "PREMIUM_DATA_UNAVAILABLE" in run(premium_candles=None)["sniper"]["reason_codes"]

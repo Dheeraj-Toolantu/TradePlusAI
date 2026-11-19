@@ -36,6 +36,8 @@ option-level historical samples with walk-forward validation, exists (spec 12.4)
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -46,7 +48,7 @@ from .option_selection import years_to_expiry
 
 STRATEGY_ID = "NIFTY_SNIPER"
 STRATEGY_NAME = "NIFTY Sniper AI"
-CONFIG_VERSION = "sniper-1.0.0"
+CONFIG_VERSION = "sniper-2.0.0"
 SUPPORTED_UNDERLYINGS = ("NIFTY",)
 FAMILIES = ("LIQUIDITY_REVERSAL", "BREAKOUT_EXPANSION", "TREND_CONTINUATION")
 IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
@@ -117,14 +119,19 @@ class SniperConfig:
     regime_ema_fast: int = 9
     regime_ema_slow: int = 20
     regime_min_bars: int = 4
-    high_vol_ratio: float = 1.8              # 15m Wilder ATR vs the median 15m bar range
+    high_vol_ratio: float = 1.8              # 15m ATR vs the median true range of the last regime_baseline_bars
     low_vol_ratio: float = 0.6
+    regime_baseline_bars: int = 26           # rolling baseline: ~one session of completed 15m bars
+    regime_persist_bars: int = 2             # trend conditions must hold on this many completed 15m bars
+    orderly_efficiency: float = 0.4          # high vol is ORDERLY when |net move| / path length >= this
+    efficiency_bars: int = 4                 # ... over the last 4 completed 15m bars
+    high_vol_risk_multiplier: float = 0.5    # HIGH_VOL_ORDERLY: half the rupee risk budget
     # --- 1m trigger -------------------------------------------------------------------------
     trigger_ema: int = 9
     signal_expiry_seconds: int = 180         # the 1m trigger must be this fresh
     max_feed_lag_seconds: int = 150          # last completed 1m candle must have closed this recently
     # --- session ----------------------------------------------------------------------------
-    entry_start_min: int = 9 * 60 + 15       # entries from the 09:15 open ...
+    entry_start_min: int = 9 * 60 + 20       # entries from 09:20 (first completed 5m candle) ...
     entry_cutoff_min: int = 15 * 60 + 15     # ... to the 15:15 square-off; feasibility scales to the time left
     min_session_bars_5m: int = 1             # completed 5m candles today before a setup is read (09:20)
     min_minutes_to_square_off: int = 5       # never enter in the last few minutes before 15:15
@@ -182,19 +189,47 @@ class SniperConfig:
     # --- risk -------------------------------------------------------------------------------
     max_loss_per_trade: float = 1000.0       # 1% of a ₹1,00,000 reference capital
     max_lots: int = 1
-    fixed_lots: int = 0                      # the trader's chosen sniper lots (1-10); 0 = size to the ₹ budget
+    fixed_lots: int = 0                      # V1 only: the trader's chosen lots taken as they are
+    max_chosen_lots: int = 0                 # V2: the trader's chosen lots are a CAP; the ₹ risk budget sizes the trade
+    enabled_setups: tuple = ("A", "B", "C")  # A reversal, B breakout, C continuation (each switchable)
+    feasibility_scenarios: tuple = (("CONSERVATIVE", -2.0), ("BASE", 0.0), ("FAVOURABLE", 1.0))  # IV change, vol points
+    feasibility_gate_scenario: str = "BASE"
+    oi_blocks_when_against: bool = True      # OI is context: only an opposing read blocks; neutral / unknown score lower
     # --- scoring ----------------------------------------------------------------------------
-    minimum_sniper_score: float = 85.0
+    minimum_sniper_score: float = 85.0       # A grade trades; 80-84 is B grade (journal only, no order)
+    b_grade_score: float = 80.0
     require_oi: bool = False
     weights: dict = field(default_factory=lambda: {
-        "liquidity": 20, "structure": 15, "displacement_fvg": 15, "oi": 15,
-        "vwap_ema": 10, "volume": 10, "option_suitability": 5, "feasibility": 10,
+        "liquidity": 15, "structure": 15, "displacement_fvg": 15, "htf_alignment": 10,
+        "volume": 10, "oi": 10, "option_suitability": 10, "feasibility": 10, "entry_timing": 5,
     })
     tick: float = 0.05
 
 
-SCORE_BANDS = ((85, "SNIPER_CANDIDATE", "Eligible for further checks"), (75, "STRONG", "Alert / paper evaluation"),
-               (65, "WATCHLIST", "Monitor"), (0, "WEAK", "Reject"))
+SCORE_BANDS = ((85, "A_GRADE", "Tradable when every hard gate passes"), (80, "B_GRADE", "Research / journal only: no order"),
+               (0, "NO_TRADE", "Reject"))
+
+# Machine-readable rejection reasons (spec V2 section 17) for each hard gate.
+REASON_CODES = {
+    "SETUP_CONFIRMED": "NO_VALID_SETUP", "SIGNAL_FRESH": "STALE_DATA", "ENTRY_TRIGGER": "NO_ENTRY_TRIGGER", "NOT_CHASING": "CHASE_LIMIT",
+    "ENTRY_WINDOW": "SESSION_CLOSED", "REGIME_PERMITS": "REGIME_BLOCKED", "SETUP_ENABLED": "SETUP_DISABLED", "CONTRACT_SELECTED": "NO_CONTRACT",
+    "SPREAD_OK": "SPREAD_TOO_WIDE", "FEASIBILITY_2X": "FEASIBILITY_FAILED", "POSITION_SIZE": "RISK_LIMIT", "OI_AVAILABLE": "OI_UNKNOWN",
+    "PREMIUM_VOLUME_RISING": "PREMIUM_MOMENTUM_WEAK", "WRITER_OI_RISING": "OI_AGAINST", "IV_NOT_RICH": "IV_TOO_HIGH", "SCORE_MINIMUM": "SCORE_BELOW_A_GRADE",
+}
+
+# Regime permissions (spec V2 5.4): which setups each 15m regime allows, and the risk multiplier.
+REGIME_PERMISSIONS = {
+    "TREND_UP": {"A": True, "B": True, "C": True}, "TREND_DOWN": {"A": True, "B": True, "C": True},
+    "RANGE": {"A": True, "B": True, "C": False}, "LOW_VOL_COMPRESSION": {"A": True, "B": True, "C": False},
+    "HIGH_VOL_ORDERLY": {"A": True, "B": True, "C": True}, "HIGH_VOL_DISORDERLY": {"A": False, "B": False, "C": False},
+    "UNKNOWN": {"A": False, "B": False, "C": False},
+}
+SETUP_LETTER = {"LIQUIDITY_REVERSAL": "A", "BREAKOUT_EXPANSION": "B", "TREND_CONTINUATION": "C"}
+
+
+def config_hash(config: "SniperConfig") -> str:
+    """Short hash of every threshold, stored with each decision and trade (spec V2 19)."""
+    return hashlib.sha256(json.dumps(asdict(config), sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 # ------------------------------------------------------------------------------- helpers
@@ -447,34 +482,51 @@ def structure_state(pivots: list[Pivot], upto: int) -> dict:
 
 
 def classify_regime(bars15: list[Bar], vwap: float | None, config: SniperConfig) -> dict:
-    """Explicit regime rules on completed 15m bars (spec 8)."""
-    out: dict = {"regime": "UNCLASSIFIED", "bars": len(bars15)}
-    if len(bars15) < config.regime_min_bars:
-        out["reason"] = f"Need {config.regime_min_bars} completed 15m bars (have {len(bars15)})"
+    """15m regime (spec V2 section 5): one label plus the measurements behind it.
+
+    The volatility baseline is the median true range of the last ``regime_baseline_bars`` completed
+    15m bars. High volatility is split by directional efficiency (|net move| / path length over the
+    last ``efficiency_bars``): ORDERLY expansion vs DISORDERLY whipsaw. A trend needs its conditions
+    on the last ``regime_persist_bars`` completed bars. Too little data is UNKNOWN.
+    """
+    out: dict = {"regime": "UNKNOWN", "bars": len(bars15), "confidence": 0.0}
+    if len(bars15) < max(config.regime_min_bars, config.regime_persist_bars + 3):
+        out["reason"] = f"Need {max(config.regime_min_bars, config.regime_persist_bars + 3)} completed 15m bars (have {len(bars15)})"
         return out
     closes = [bar.close for bar in bars15]
     fast = ema_series(closes, config.regime_ema_fast)
     slow = ema_series(closes, config.regime_ema_slow)
     atrs = atr_series(bars15, min(config.atr_period, max(2, len(bars15) - 1)))
-    ranges = sorted(bar.high - bar.low for bar in bars15)
-    median_range = ranges[len(ranges) // 2] if ranges else 0.0
+    trs = [max(b.high - b.low, abs(b.high - bars15[i - 1].close), abs(b.low - bars15[i - 1].close)) if i else b.high - b.low for i, b in enumerate(bars15)]
+    baseline = sorted(trs[-config.regime_baseline_bars:])
+    median_range = baseline[len(baseline) // 2] if baseline else 0.0
     atr = atrs[-1] or 0.0
     vol_ratio = atr / median_range if median_range > 0 and atr > 0 else None
-    slope = slow[-1] - slow[-4] if len(slow) >= 4 else 0.0
+    path = closes[-(config.efficiency_bars + 1):]
+    travel = sum(abs(b - a) for a, b in zip(path, path[1:]))
+    efficiency = abs(path[-1] - path[0]) / travel if travel > 0 else 0.0
     close = closes[-1]
-    out.update(ema_fast=_r(fast[-1]), ema_slow=_r(slow[-1]), slope=_r(slope), atr=_r(atr), vol_ratio=_r(vol_ratio), close=_r(close))
-    if vol_ratio is not None and vol_ratio >= config.high_vol_ratio:
-        out["regime"] = "HIGH_VOLATILITY"
-    elif vol_ratio is not None and vol_ratio <= config.low_vol_ratio and abs(fast[-1] - slow[-1]) < 0.25 * atr:
-        out["regime"] = "LOW_VOLATILITY"
-    elif fast[-1] > slow[-1] and slope > 0 and (vwap is None or close > vwap):
-        out["regime"] = "TREND_UP"
-    elif fast[-1] < slow[-1] and slope < 0 and (vwap is None or close < vwap):
-        out["regime"] = "TREND_DOWN"
-    else:
-        out["regime"] = "RANGE"
-    return out
 
+    def trend(i: int, d: int) -> bool:
+        slope = slow[i] - slow[i - 3] if i >= 3 else 0.0
+        return (fast[i] - slow[i]) * d > 0 and slope * d > 0 and (vwap is None or (closes[i] - vwap) * d > 0 or i < len(closes) - 1)
+
+    persists = {d: all(trend(len(closes) - 1 - k, d) for k in range(config.regime_persist_bars)) for d in (1, -1)}
+    out.update(ema_fast=_r(fast[-1]), ema_slow=_r(slow[-1]), slope=_r(slow[-1] - slow[-4]), atr=_r(atr), baseline_range=_r(median_range),
+               vol_ratio=_r(vol_ratio), efficiency=_r(efficiency, 3), close=_r(close))
+    if vol_ratio is not None and vol_ratio >= config.high_vol_ratio:
+        orderly = efficiency >= config.orderly_efficiency
+        out["regime"] = "HIGH_VOL_ORDERLY" if orderly else "HIGH_VOL_DISORDERLY"
+        out["confidence"] = _r(min(1.0, efficiency / config.orderly_efficiency) if orderly else 1.0 - efficiency, 2)
+    elif vol_ratio is not None and vol_ratio <= config.low_vol_ratio and abs(fast[-1] - slow[-1]) < 0.25 * atr:
+        out["regime"], out["confidence"] = "LOW_VOL_COMPRESSION", 0.7
+    elif persists[1]:
+        out["regime"], out["confidence"] = "TREND_UP", _r(min(1.0, 0.5 + efficiency), 2)
+    elif persists[-1]:
+        out["regime"], out["confidence"] = "TREND_DOWN", _r(min(1.0, 0.5 + efficiency), 2)
+    else:
+        out["regime"], out["confidence"] = "RANGE", _r(1.0 - efficiency, 2)
+    return out
 
 def daily_reference(bars5: list[Bar], daily_candles: list[CandleLike] | None, today) -> dict:
     """PDH / PDL / PDC from the exchange daily bar when available, else from the prior 5m session."""
@@ -642,8 +694,11 @@ def detect_breakout(bars: list[Bar], pivots: list[Pivot], atrs: list[float | Non
             missing.append("price closed back inside the range (failed breakout, not a reversal setup)")
         if htf_against:
             missing.append(f"15m regime is {regime.get('regime')}")
+        # Entry mode (spec V2 7.2): a later bar that came back to the broken boundary and held is a retest.
+        retest = any(((x.low if direction > 0 else x.high) - boundary) * direction <= config.zone_tolerance_atr * atr for x in bars[b + 1:last + 1])
+        out["entry_mode"] = "RETEST_BREAKOUT" if retest else "MOMENTUM_BREAKOUT"
         out["state"] = "CONFIRMED" if not missing else "WATCH"
-        out["reason"] = f"{'Bull' if direction > 0 else 'Bear'} close beyond the {n}-bar range {'high' if direction > 0 else 'low'} {boundary:.2f} at {bars[b].time[11:16]}" + (f"; {', '.join(missing)}" if missing else "")
+        out["reason"] = f"{'Retest' if retest else 'Momentum'} breakout: {'bull' if direction > 0 else 'bear'} close beyond the {n}-bar range {'high' if direction > 0 else 'low'} {boundary:.2f} at {bars[b].time[11:16]}" + (f"; {', '.join(missing)}" if missing else "")
         return out
     out["reason"] = f"No completed close beyond a tight {n}-bar range in the last {config.signal_max_age_bars} 5m bars"
     return out
@@ -693,6 +748,16 @@ def detect_continuation(bars: list[Bar], pivots: list[Pivot], atrs: list[float |
                invalidation=_r(protected - direction * config.sweep_buffer_atr * atr), structure_confirmed=True, displacement_ok=disp is not None, fresh=True)
     if not zones:
         out.update(state="WATCH", reason=f"Trend intact; waiting for a pullback into an FVG, order block, VWAP or EMA20 (pullback extreme {extreme:.2f})")
+        return out
+    # A touch of a zone is not an entry (spec V2 7.3): the last completed 5m candle must show the
+    # trend side returning: a candle in the trade direction closing in its outer 40%.
+    lastbar = bars[last]
+    rng = lastbar.high - lastbar.low
+    location = ((lastbar.close - lastbar.low) / rng if direction > 0 else (lastbar.high - lastbar.close) / rng) if rng > 0 else 0.0
+    returning = (lastbar.close - lastbar.open) * direction > 0 and location >= 0.6
+    out["rejection"] = {"time": lastbar.time, "close_location": _r(location, 3), "ok": returning}
+    if not returning:
+        out.update(state="WATCH", reason=f"Pullback into {', '.join(name for name, _ in zones)} held; waiting for {'buyers' if direction > 0 else 'sellers'} to return (a 5m {'bull' if direction > 0 else 'bear'} rejection candle)")
         return out
     out.update(state="CONFIRMED", reason=f"{wanted} regime, 5m {'HH/HL' if direction > 0 else 'LH/LL'}; pullback to {', '.join(name for name, _ in zones)} held the protected swing {protected}")
     return out
@@ -749,8 +814,8 @@ def select_contracts(chain: list[dict], side: str, config: SniperConfig) -> tupl
     return sorted(ranked, key=lambda item: item["rank_score"], reverse=True), rejected
 
 
-def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol: str, config: SniperConfig) -> dict:
-    """Heuristic 1.5x / 2x feasibility: index move needed (delta+gamma+theta+costs) vs expected move."""
+def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol: str, config: SniperConfig, risk_multiplier: float = 1.0) -> dict:
+    """1.5x / 2x feasibility by scenario repricing (index move needed vs the move ATR delivers) and V2 sizing."""
     side = selected["type"]
     market = float(selected["premium"])
     ask = selected["ask"] if selected.get("ask") and selected["ask"] > market * 0.9 else market
@@ -788,15 +853,59 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
             return gain / delta if delta > 0 else None
         return (-delta + math.sqrt(delta * delta + 2.0 * gamma * gain)) / gamma
 
-    need_2x, need_15x = move_for(target), move_for(partial)
+    # Scenario repricing (spec V2 11): reprice the option with the model at the market-implied vol,
+    # after the hold has elapsed, under an IV change per scenario, and solve for the index move that
+    # gets the exit (net of charges and exit slippage) to the level. The delta-gamma estimate above
+    # is kept only as a diagnostic / fallback when the option cannot be modelled.
+    d = 1 if side == "CE" else -1
+    model_sigma = premium_math.implied_vol(market, spot, selected["strike"], years, side) if years else None
+    model_sigma = model_sigma or sigma
+    years_after = max((years or 0.0) - (hold / 375.0) / 365.0, 1e-6)
+
+    def reprice_move(level: float, iv_shift: float) -> float | None:
+        if not years or not model_sigma or model_sigma <= 0:
+            return None
+        vol = max(model_sigma + iv_shift / 100.0, 0.01)
+        needed = level + cost_target / lot
+        value = lambda m: premium_math.bs_price(spot + d * m, selected["strike"], years_after, vol, side)
+        high = spot * 0.05
+        if value(0.0) >= needed:
+            return 0.0
+        if value(high) < needed:
+            return None
+        low = 0.0
+        for _ in range(60):
+            mid = (low + high) / 2.0
+            if value(mid) >= needed:
+                high = mid
+            else:
+                low = mid
+        return high
+
     expected = config.expected_move_atr_multiple * atr5 * math.sqrt(max(hold / 5.0, 1.0)) if atr5 > 0 else None
+    scenarios = {}
+    for name, shift in config.feasibility_scenarios:
+        need = reprice_move(target, shift)
+        scenarios[name] = {"iv_change_vol_pts": shift, "index_move_2x": _r(need), "index_move_1_5x": _r(reprice_move(partial, shift)),
+                           "ratio": _r(need / expected, 3) if need is not None and expected else None}
+    gate = scenarios.get(config.feasibility_gate_scenario) or {}
+    modelled = gate.get("index_move_2x") is not None
+    need_2x = gate["index_move_2x"] if modelled else move_for(target)
+    need_15x = gate.get("index_move_1_5x") if modelled else move_for(partial)
     ratio = (need_2x / expected) if need_2x is not None and expected else None
     risk_unit = entry - stop
     planned_lot = risk_unit * lot + cost_stop
     stressed_lot = planned_lot + max(2 * tick, 0.10 * risk_unit) * lot
     # The trader's chosen lots are taken as they are (the max loss shown is what they risk); otherwise
     # size to the per-trade budget, never rounded up.
-    lots = config.fixed_lots if config.fixed_lots > 0 else min(config.max_lots, int(config.max_loss_per_trade // stressed_lot)) if stressed_lot > 0 else 0
+    # V2 sizing (spec 14.1): lots = floor(rupee risk budget / stressed risk per lot), capped by the
+    # trader's chosen lots; below one lot there is no trade. V1's fixed lots stay available.
+    budget = config.max_loss_per_trade * risk_multiplier
+    if config.fixed_lots > 0:
+        lots = config.fixed_lots
+    else:
+        cap = config.max_chosen_lots if config.max_chosen_lots > 0 else config.max_lots
+        lots = min(cap, int(budget // stressed_lot)) if stressed_lot > 0 else 0
     cost_share = cost_target / ((target - entry) * lot) if target > entry else 1.0
     out = {
         "market_premium": _r(market), "entry": entry, "stop_loss": stop, "target": target, "partial_target": partial, "lot_size": lot,
@@ -805,6 +914,8 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
                    "time_to_expiry_years": _r(years, 6), "source": "CHAIN_DELTA + BLACK_SCHOLES_GAMMA" if greeks else "CHAIN_DELTA_ONLY"},
         "theta_drag": _r(drag), "costs_per_lot": {"at_target": _r(cost_target), "at_stop": _r(cost_stop)}, "cost_share": _r(cost_share, 3),
         "index_move_needed": {"1_5x": _r(need_15x), "2x": _r(need_2x)}, "expected_move": _r(expected), "feasibility_ratio": _r(ratio, 3),
+        "scenarios": scenarios, "gate_scenario": config.feasibility_gate_scenario if modelled else "DELTA_GAMMA_FALLBACK",
+        "diagnostic_delta_gamma_2x": _r(move_for(target)), "risk_budget": _r(budget), "risk_multiplier": risk_multiplier,
         "hold_minutes": round(hold), "minutes_to_square_off": minutes_left,
         "risk_per_lot": _r(planned_lot), "stressed_risk_per_lot": _r(stressed_lot), "lots": lots, "quantity": lots * lot,
         "planned_max_loss": _r(planned_lot * lots), "max_loss": _r(stressed_lot * lots), "risk_reward": _r((target - entry) / risk_unit) if risk_unit > 0 else None,
@@ -813,7 +924,7 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
         # Spec 12.4: no calibrated model exists yet, so no probability is claimed.
         "probability": {"reach_1_5x_before_stop": "UNAVAILABLE", "reach_2x_before_stop": "UNAVAILABLE", "stop_first": "UNAVAILABLE",
                         "expected_time_to_2x": "UNAVAILABLE", "reason": "No calibrated model: requires option-level historical samples and walk-forward validation"},
-        "model": "HEURISTIC_DELTA_GAMMA_THETA_VS_ATR (not a probability)",
+        "model": "BLACK_SCHOLES_SCENARIO_REPRICING_VS_ATR (scenario ranges, not a probability)" if modelled else "HEURISTIC_DELTA_GAMMA_THETA_VS_ATR (not a probability)",
         "valid": True, "reason": "",
     }
     problems = []
@@ -825,8 +936,9 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
         problems.append(f"charges take {cost_share * 100:.0f}% of the 2x reward (max {config.max_cost_share * 100:.0f}%)")
     if minutes_left < config.min_minutes_to_square_off:
         problems.append(f"only {minutes_left} min to the 15:15 square-off")
-    if lots < 1:
-        problems.append(f"one lot risks ₹{stressed_lot:.0f} stressed, above the ₹{config.max_loss_per_trade:.0f} per-trade budget")
+    out["sizing"] = {"lots": lots, "budget": _r(budget), "stressed_risk_per_lot": _r(stressed_lot), "cap": config.fixed_lots or config.max_chosen_lots or config.max_lots,
+                     "mode": "FIXED_LOTS" if config.fixed_lots > 0 else "RISK_BUDGET",
+                     "reason": (f"{lots} lot(s): ₹{budget:.0f} budget / ₹{stressed_lot:.0f} stressed risk per lot" if lots >= 1 else f"one lot risks ₹{stressed_lot:.0f} stressed, above the ₹{budget:.0f} per-trade risk budget")}
     if problems:
         out.update(valid=False, reason="; ".join(problems))
     return out
@@ -951,7 +1063,8 @@ def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spo
         minutes = (samples[-1][0] - samples[0][0]).total_seconds() / 60
         if early:
             started = other_changes[-1] < 0 and other_net <= 0
-            return {**base, "status": "OK", "passed": started, "net_change": _r(net, 0), "change_pct": _r(pct, 3), "opposite_change": _r(other_net, 0),
+            against_early = other_changes[-1] > 0 and other_net > 0
+            return {**base, "status": "OK", "passed": started, "verdict": "SUPPORTIVE" if started else "AGAINST" if against_early else "NEUTRAL", "net_change": _r(net, 0), "change_pct": _r(pct, 3), "opposite_change": _r(other_net, 0),
                     "opposite_change_pct": _r(other_pct, 3), "opposite_interval_changes": [_r(c, 0) for c in other_changes], "opposite_covering": started,
                     "strikes": near, "samples": len(samples), "as_of": samples[-1][0].isoformat(),
                     "reason": f"early read for a reversal: {opposite} OI {other_changes[-1]:+,.0f} in the latest interval, {other_net:+,.0f} over {minutes:.0f} min "
@@ -965,7 +1078,9 @@ def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spo
             parts.append(f"needs +{config.writer_oi_min_change_pct}%")
         if passed:
             parts.append(f"strong {'CALL' if side == 'CE' else 'PUT'} move: {who} adding while {opposite} cover")
-        return {**base, "status": "OK", "passed": passed, "net_change": _r(net, 0), "change_pct": _r(pct, 3), "interval_changes": [_r(c, 0) for c in changes],
+        against = net < 0 and other_net > 0 and other_changes[-1] > 0
+        return {**base, "status": "OK", "passed": passed, "verdict": "SUPPORTIVE" if passed else "AGAINST" if against else "NEUTRAL",
+                "net_change": _r(net, 0), "change_pct": _r(pct, 3), "interval_changes": [_r(c, 0) for c in changes],
                 "opposite_change": _r(other_net, 0), "opposite_change_pct": _r(other_pct, 3), "opposite_interval_changes": [_r(c, 0) for c in other_changes],
                 "opposite_covering": covering, "strikes": near, "samples": len(samples), "as_of": samples[-1][0].isoformat(),
                 "reason": "; ".join(parts)}
@@ -979,10 +1094,12 @@ def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spo
         covering = other_net < 0
         passed = covering if early else net > 0 and net > other_net and (covering or not config.require_opposite_covering)
         verdict = f"strong move: {who} adding while {opposite} cover" if passed else f"{who} not adding" if net <= 0 else f"{opposite} not covering" if not covering else f"{who} not adding faster"
-        return {**base, "status": "SNAPSHOT", "passed": passed, "net_change": _r(net, 0), "opposite_change": _r(other_net, 0), "opposite_covering": covering,
+        against = other_net > 0 and (early or net < 0)
+        return {**base, "status": "SNAPSHOT", "passed": passed, "verdict": "SUPPORTIVE" if passed else "AGAINST" if against else "NEUTRAL",
+                "net_change": _r(net, 0), "opposite_change": _r(other_net, 0), "opposite_covering": covering,
                 "reason": f"{who} OI {net:+,.0f}, {opposite} OI {other_net:+,.0f} in the last 5 min near ATM "
                           f"({verdict}; single 5-min reading, the 3-minute OI history is not available yet)"}
-    return {**base, "status": "UNAVAILABLE", "reason": f"{who}' OI change unavailable (no stored OI samples and no 5-minute OI change yet)"}
+    return {**base, "status": "UNAVAILABLE", "verdict": "UNKNOWN", "reason": f"{who}' OI change unavailable (no stored OI samples and no 5-minute OI change yet)"}
 
 
 def _realised_vol(closes: list[float], periods_per_year: float) -> float | None:
@@ -1021,9 +1138,10 @@ def iv_check(feas: dict | None, selected: dict | None, daily_candles: list | Non
                 "reason": f"IV {iv:.1f}% vs realised {rv:.1f}% ({'today' if rv == rv_today else f'{config.rv_daily_lookback}-day'}): {ratio:.2f}x, {verdict} (max {config.max_iv_rv_ratio}x)"}
     regime = (vix or {}).get("regime")
     if regime:
-        passed = regime not in ("HIGH", "EXTREME")
-        return {**base, "status": "VIX_ONLY", "passed": passed, "rich": not passed, **features,
-                "reason": f"realised volatility unavailable; India VIX {regime.lower()}" + ("" if passed else ": options expensive, not buying")}
+        # India VIX is market context, not the selected contract's IV (spec V2 11.4): it can block
+        # (HIGH / EXTREME) but cannot approve on its own.
+        return {**base, "status": "VIX_ONLY", "passed": False, "rich": regime in ("HIGH", "EXTREME"), **features,
+                "reason": f"contract IV vs realised volatility unavailable; India VIX {regime.lower()} is context only and cannot approve the IV"}
     return {**base, "status": "UNAVAILABLE", **features, "reason": "IV check unavailable (no option IV / realised volatility and no India VIX)"}
 
 
@@ -1084,7 +1202,8 @@ def band_for(score: float) -> tuple[str, str]:
 
 
 def score_setup(setup: dict, bars5: list[Bar], bars1: list[Bar], atr5: float, vwap: float | None, vwap_ok: bool, flow: dict | None, vix: dict | None,
-                selected: dict | None, feas: dict | None, spot: float, config: SniperConfig, premium_flow: dict | None = None, iv_read: dict | None = None) -> list[dict]:
+                selected: dict | None, feas: dict | None, spot: float, config: SniperConfig, premium_flow: dict | None = None, iv_read: dict | None = None,
+                writer_flow: dict | None = None, regime: dict | None = None, trigger: dict | None = None, extension: float | None = None) -> list[dict]:
     w = config.weights
     d = setup["direction"]
     side = "CE" if d > 0 else "PE"
@@ -1132,28 +1251,31 @@ def score_setup(setup: dict, bars5: list[Bar], bars1: list[Bar], atr5: float, vw
 
     # OI
     need = (feas or {}).get("index_move_needed", {}).get("2x") if feas else None
-    comps.append(score_oi(flow, side, spot, need, w["oi"]))
+    # OI context (spec V2 10): half the points from the chain picture, half from the writer read
+    # (SUPPORTIVE full, NEUTRAL half, AGAINST / UNKNOWN none). Interpretations are heuristics.
+    chain_part = score_oi(flow, side, spot, need, w["oi"] / 2)
+    verdict = (writer_flow or {}).get("verdict", "UNKNOWN")
+    writer_pts = w["oi"] / 2 * {"SUPPORTIVE": 1.0, "NEUTRAL": 0.5}.get(verdict, 0.0)
+    comps.append(_component("oi", chain_part["score"] + writer_pts, w["oi"], "UNAVAILABLE" if chain_part["status"] == "UNAVAILABLE" and verdict == "UNKNOWN" else "OK",
+                            f"{chain_part['reason']}; writer read {verdict.lower()} (heuristic)", {**chain_part["features"], "writer_verdict": verdict}, chain_part["source_timestamp"]))
 
-    # VWAP / EMA
-    closes5 = [b.close for b in bars5]
-    ema9, ema20 = (ema_series(closes5, 9)[-1], ema_series(closes5, 20)[-1]) if closes5 else (None, None)
+    # Higher-timeframe alignment (spec V2 13.1): the 15m regime agrees with the trade, plus the price
+    # on the right side of VWAP. EMA alignment is part of the regime, so it is not counted twice.
+    label = (regime or {}).get("regime", "UNKNOWN")
+    aligned = label == ("TREND_UP" if d > 0 else "TREND_DOWN")
+    neutral = label in ("RANGE", "LOW_VOL_COMPRESSION", "HIGH_VOL_ORDERLY")
     last = bars1[-1].close if bars1 else (bars5[-1].close if bars5 else None)
-    pts = 0.0
-    parts = []
+    pts = w["htf_alignment"] * (0.7 if aligned else 0.35 if neutral else 0.0)
+    parts = [f"15m regime {label.lower()}" + (" aligned" if aligned else " neutral" if neutral else " opposing / unknown")]
     if vwap_ok and vwap is not None and last is not None:
         if (last - vwap) * d > 0:
-            pts += w["vwap_ema"] / 2
+            pts += w["htf_alignment"] * 0.3
             parts.append(f"price {'above' if d > 0 else 'below'} VWAP {vwap:.2f}")
         else:
             parts.append(f"price on the wrong side of VWAP {vwap:.2f}")
     else:
         parts.append("VWAP unavailable (no volume)")
-    if ema9 is not None and (ema9 - ema20) * d > 0:
-        pts += w["vwap_ema"] / 2
-        parts.append("5m EMA9/EMA20 aligned")
-    else:
-        parts.append("5m EMA9/EMA20 not aligned")
-    comps.append(_component("vwap_ema", pts, w["vwap_ema"], "OK" if vwap_ok else "PARTIAL", "; ".join(parts), {"vwap": _r(vwap), "ema9_5m": _r(ema9), "ema20_5m": _r(ema20), "price": _r(last)}, stamp1))
+    comps.append(_component("htf_alignment", pts, w["htf_alignment"], "OK" if label != "UNKNOWN" else "UNAVAILABLE", "; ".join(parts), {"regime": label, "vwap": _r(vwap), "price": _r(last)}, stamp1))
 
     # Volume: the selected option's own premium volume first (index candles carry none), else futures.
     key = setup.get("key_index")
@@ -1201,6 +1323,11 @@ def score_setup(setup: dict, bars5: list[Bar], bars1: list[Bar], atr5: float, vw
                                 {k: feas[k] for k in ("index_move_needed", "expected_move", "feasibility_ratio", "probability")}, stamp1))
     else:
         comps.append(_component("feasibility", 0, w["feasibility"], "UNAVAILABLE", "2x feasibility not estimable", {}, stamp1))
+
+    # Entry timing / execution quality (spec V2 13.1): the 1m trigger, and how close to the trigger level.
+    pts = (w["entry_timing"] * 0.6 if (trigger or {}).get("ok") else 0.0) + (w["entry_timing"] * 0.4 if extension is not None and extension <= config.max_extension_atr / 2 else w["entry_timing"] * 0.2 if extension is not None and extension <= config.max_extension_atr else 0.0)
+    comps.append(_component("entry_timing", pts, w["entry_timing"], "OK" if trigger else "UNAVAILABLE",
+                            f"1m trigger {'ok' if (trigger or {}).get('ok') else 'not yet'}; {extension:.2f} ATR from the trigger level" if extension is not None else "no trigger level", {"extension_atr": _r(extension)}, stamp1))
     return comps
 
 
@@ -1211,9 +1338,14 @@ def config_for(context: dict) -> SniperConfig:
     loss = _num(context.get("max_loss_per_trade"))
     lots = _num(context.get("max_lots"))
     slip = _num(context.get("slippage_pct"))
-    fixed = _num(context.get("sniper_lots"))
+    chosen = _num(context.get("sniper_lots"))
+    chosen_lots = min(10, max(1, int(chosen))) if chosen and chosen >= 1 else 0
+    fixed_mode = str(context.get("sniper_sizing") or "").upper() == "FIXED_LOTS"
+    setups = tuple(letter for letter in "ABC" if letter in str(context.get("sniper_setups") or "ABC").upper()) or ("A", "B", "C")
     return SniperConfig(
-        fixed_lots=min(10, max(1, int(fixed))) if fixed and fixed >= 1 else 0,
+        fixed_lots=chosen_lots if fixed_mode else 0,
+        max_chosen_lots=0 if fixed_mode else chosen_lots,
+        enabled_setups=setups,
         max_loss_per_trade=loss if loss and loss > 0 else base.max_loss_per_trade,
         max_lots=max(1, int(lots)) if lots and lots >= 1 else base.max_lots,
         slippage_pct=slip if slip is not None and 0 <= slip < 0.05 else base.slippage_pct,
@@ -1286,16 +1418,24 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
     oi_history = context.get("oi_history") or None
     sniper["vix"] = {"value": _num((vix or {}).get("value")), "regime": (vix or {}).get("regime")} if vix else None
     scored = []
+    risk_multiplier = config.high_vol_risk_multiplier if regime.get("regime") == "HIGH_VOL_ORDERLY" else 1.0
     for setup in found:
         side = "CE" if setup["direction"] > 0 else "PE"
         ranked, rejected = select_contracts(chain, side, config)
-        selected = ranked[0] if ranked else None
-        feas = feasibility(selected, spot, atr5, now, symbol, config) if selected else None
+        # Compare the best few strikes (spec V2 9.3): the feasible one with the smallest move needed in
+        # the gate scenario wins, not automatically the top-ranked or the cheapest.
+        trials = [(item, feasibility(item, spot, atr5, now, symbol, config, risk_multiplier)) for item in ranked[:3]]
+        for item, trial in trials:
+            item["feasibility_ratio"] = trial.get("feasibility_ratio")
+        viable = [pair for pair in trials if pair[1].get("valid") and pair[1].get("feasibility_ratio") is not None]
+        selected, feas = (min(viable, key=lambda pair: (pair[1]["feasibility_ratio"], -pair[0]["rank_score"])) if viable else trials[0]) if trials else (None, None)
         early = setup["family"] in config.early_flow_families
         pflow = premium_volume_flow(premium, selected, side, now, config, early)
         wflow = writer_oi_flow(oi_history, flow, side, spot, now, config, early)
         ivc = iv_check(feas, selected, context.get("daily_candles"), bars5, vix, now, config)
-        comps = score_setup(setup, bars5, bars1, atr5, vwap, vwap_ok, flow, vix, selected, feas, spot, config, pflow, ivc)
+        trig = one_minute_trigger(bars1, setup["direction"], now, config)
+        ext = abs(bars1[-1].close - setup["trigger_level"]) / atr5 if setup.get("trigger_level") is not None else None
+        comps = score_setup(setup, bars5, bars1, atr5, vwap, vwap_ok, flow, vix, selected, feas, spot, config, pflow, ivc, wflow, regime, trig, ext)
         total = round(sum(c["score"] for c in comps) / sum(c["max_score"] for c in comps) * 100.0, 2)
         scored.append({"setup": setup, "selected": selected, "ranked": ranked, "rejected": rejected, "feas": feas, "components": comps, "total": total, "premium_flow": pflow, "writer_flow": wflow, "iv": ivc})
     # Prefer a confirmed setup, then the higher score; a breakout is never relabelled a reversal.
@@ -1310,9 +1450,10 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         base["needs_premium_candles"] = selected["symbol"]
     d = setup["direction"]
     side = "CE" if d > 0 else "PE"
+    letter = SETUP_LETTER.get(setup["family"], "?")
     band, action = band_for(total)
     sniper.update(components=comps, selected=selected, candidates=best["ranked"][:4], rejected_contracts=best["rejected"][:8], feasibility=feas,
-                  family=setup["family"], direction="CALL" if d > 0 else "PUT",
+                  family=setup["family"], setup_type=letter, entry_mode=setup.get("entry_mode"), direction="CALL" if d > 0 else "PUT", config_hash=config_hash(config),
                   score={"total": total, "minimum": config.minimum_sniper_score, "maximum": 100.0, "band": band, "default_action": action},
                   alternatives=[{"family": item["setup"]["family"], "direction": "CALL" if item["setup"]["direction"] > 0 else "PUT", "state": item["setup"]["state"], "score": item["total"]} for item in scored[1:4]])
     sniper["lifecycle"].append({"state": "DETECTED", "at": now.isoformat(), "reason": setup.get("reason", "")})
@@ -1332,20 +1473,31 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         ("ENTRY_TRIGGER", trigger["ok"], trigger["reason"]),
         ("NOT_CHASING", extension is not None and extension <= config.max_extension_atr, f"{extension:.2f} ATR from the trigger level (max {config.max_extension_atr})" if extension is not None else "no trigger level"),
         ("ENTRY_WINDOW", config.entry_start_min <= minute < config.entry_cutoff_min, f"entries {config.entry_start_min // 60:02d}:{config.entry_start_min % 60:02d}-{config.entry_cutoff_min // 60:02d}:{config.entry_cutoff_min % 60:02d} IST"),
-        ("REGIME_TRADABLE", regime.get("regime") not in ("HIGH_VOLATILITY",) and not (setup["family"] == "TREND_CONTINUATION" and regime.get("regime") == "RANGE"), f"15m regime {regime.get('regime')}"),
+        ("REGIME_PERMITS", REGIME_PERMISSIONS.get(regime.get("regime"), {}).get(letter, False), f"15m regime {regime.get('regime')} {'permits' if REGIME_PERMISSIONS.get(regime.get('regime'), {}).get(letter) else 'does not permit'} setup {letter}" + (" (half risk)" if regime.get("regime") == "HIGH_VOL_ORDERLY" else "")),
+        ("SETUP_ENABLED", letter in config.enabled_setups, f"setup {letter} {'enabled' if letter in config.enabled_setups else 'switched off'}"),
         ("CONTRACT_SELECTED", selected is not None, f"{selected['symbol']} Δ{selected['delta']}" if selected else (f"no contract passed: {best['rejected'][0]['reasons'][0]}" if best["rejected"] else "option chain unavailable")),
         ("SPREAD_OK", selected is not None and (selected["spread_pct"] is None or selected["spread_pct"] <= config.max_spread_percent), f"spread {selected.get('spread_pct') if selected else 'n/a'}% ({selected.get('spread_source') if selected else 'n/a'})"),
-        ("FEASIBILITY_2X", bool(feas and feas.get("valid")), (feas or {}).get("reason") or "feasible within the heuristic gate"),
+        ("FEASIBILITY_2X", bool(feas and feas.get("valid")), (feas or {}).get("reason") or f"feasible in the {(feas or {}).get('gate_scenario', 'BASE').lower()} scenario"),
+        ("POSITION_SIZE", bool(feas and feas.get("lots", 0) >= 1), ((feas or {}).get("sizing") or {}).get("reason", "no contract to size")),
         ("OI_AVAILABLE", (not config.require_oi) or oi_comp["status"] != "UNAVAILABLE", "OI required by configuration" if config.require_oi else "OI optional (scored 0 when missing)"),
-        ("PREMIUM_VOLUME_RISING", (not config.require_premium_volume) or pflow["passed"], pflow["reason"]),
-        ("WRITER_OI_RISING", (not config.require_writer_oi) or wflow["passed"], wflow["reason"]),
+        ("PREMIUM_VOLUME_RISING", (not config.require_premium_volume) or pflow["passed"], ("price/volume momentum: " + pflow["reason"])),
+        # OI is context (spec V2 10.4): only an opposing read blocks; neutral or unknown OI scores lower.
+        ("OI_NOT_AGAINST", not (config.oi_blocks_when_against and wflow.get("verdict") == "AGAINST"), f"OI {wflow.get('verdict', 'UNKNOWN').lower()} (heuristic): {wflow['reason']}"),
         ("IV_NOT_RICH", (not config.require_iv_check) or ivc["passed"], ivc["reason"]),
-        ("SCORE_MINIMUM", total >= config.minimum_sniper_score, f"score {total} / 100 (needs {config.minimum_sniper_score:g}, band {band})"),
+        ("SCORE_MINIMUM", total >= config.minimum_sniper_score, f"score {total} / 100 (A grade needs {config.minimum_sniper_score:g}; {band.replace('_', ' ').lower()}" + (": journal only, no order" if band == "B_GRADE" else "") + ")"),
     ]
-    sniper["hard_filters"] = [{"code": code, "passed": bool(ok), "detail": detail} for code, ok, detail in filters]
+    if not pflow["passed"] and pflow.get("status") == "UNAVAILABLE":
+        REASON_CODES_LOCAL = {**REASON_CODES, "PREMIUM_VOLUME_RISING": "PREMIUM_DATA_UNAVAILABLE"}
+    else:
+        REASON_CODES_LOCAL = REASON_CODES
+    if ivc.get("status") in ("VIX_ONLY", "UNAVAILABLE"):
+        REASON_CODES_LOCAL = {**REASON_CODES_LOCAL, "IV_NOT_RICH": "IV_UNKNOWN"}
+    sniper["hard_filters"] = [{"code": code, "passed": bool(ok), "detail": detail, "reason_code": None if ok else REASON_CODES_LOCAL.get(code, code)} for code, ok, detail in filters]
     failed = [code for code, ok, _ in filters if not ok]
+    sniper["reason_codes"] = [REASON_CODES_LOCAL.get(code, code) for code in failed]
+    sniper["grade"] = band
     if failed:
-        state = "EXPIRED" if setup["state"] == "EXPIRED" else "REJECTED" if setup["state"] == "CONFIRMED" and band == "WEAK" else "CONFIRMED" if setup["state"] == "CONFIRMED" else "WATCH"
+        state = "EXPIRED" if setup["state"] == "EXPIRED" else "REJECTED" if setup["state"] == "CONFIRMED" and band == "NO_TRADE" else "CONFIRMED" if setup["state"] == "CONFIRMED" else "WATCH"
         decision = "WAIT_FOR_CONFIRMATION" if state in ("WATCH", "CONFIRMED") else "NO_TRADE"
         return done(decision, state, f"{setup['family'].replace('_', ' ').title()} {'CALL' if d > 0 else 'PUT'} · score {total} ({band}) · blocked by {', '.join(failed)}", side=result_side)
 
@@ -1363,7 +1515,8 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         "stop_percent": config.stop_percent, "target_multiple": config.target_multiple,
         "cost_per_unit": round((feas["costs_per_lot"]["at_target"] or 0) / feas["lot_size"], 2),
         "max_entry": feas["max_entry"], "stop_gap": feas["stop_gap"], "fees_at_stop_per_lot": feas["fees_at_stop_per_lot"],
-        "probability": feas["probability"], "config_version": config.version,
+        "probability": feas["probability"], "config_version": config.version, "config_hash": config_hash(config),
+        "setup_type": letter, "entry_mode": setup.get("entry_mode"), "regime": regime.get("regime"), "scenarios": feas.get("scenarios"), "grade": band,
         "setup_id": f"{STRATEGY_ID}:{symbol}:{setup['family']}:{side}:{(setup.get('mss') or setup.get('breakout') or {}).get('time') or trigger_time}",
         "stop_method": f"PREMIUM_{config.stop_percent:g}PCT_FROM_FILL + INDEX_INVALIDATION", "target_method": f"PREMIUM_{config.target_multiple:g}X_FROM_FILL",
     }
