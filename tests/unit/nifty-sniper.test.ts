@@ -208,3 +208,27 @@ describe("NIFTY Sniper chosen lots (1-10)", () => {
     expect(desk.positions.map((position: PositionView) => position.underlying)).toEqual(["NIFTY"]);
   });
 });
+
+describe("NIFTY Sniper V2 position management", () => {
+  afterEach(() => { clock = at("10:21"); });
+
+  it("uses one deterministic trail and closes at 2x by default (no smart runner)", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    const placed = await book.place("NIFTY", sniperPlan(live), [live], { setupId: "v2a" });
+    expect(placed.position!.controls).toMatchObject({ mode: "RULE", runPastTarget: false });
+    expect(placed.position!.state).toBe("OPEN_INITIAL");
+    let out = await book.manage({ symbol: "NIFTY", spot: 24020, bars: [], contracts: [contract(40)] });
+    expect(out.positions[0].state).toBe("BREAKEVEN_PROTECTED"); // 1.27x
+    out = await book.manage({ symbol: "NIFTY", spot: 24030, bars: [], contracts: [contract(48)] });
+    expect(out.positions[0].state).toBe("PROFIT_LOCKED"); // 1.52x
+    out = await book.manage({ symbol: "NIFTY", spot: 24040, bars: [], contracts: [contract(63.5)] });
+    expect(out.exited[0]).toMatchObject({ exitReason: "TARGET_2X", state: "CLOSED" });
+  });
+
+  it("parses the V2 sizing and setup settings", () => {
+    expect(SmartScalper.settings({})).toMatchObject({ sniperSizing: "RISK_BUDGET", sniperSetups: "ABC" });
+    expect(SmartScalper.settings({ sniperSizing: "FIXED_LOTS", sniperSetups: "ca" })).toMatchObject({ sniperSizing: "FIXED_LOTS", sniperSetups: "AC" });
+    expect(SmartScalper.settings({ sniperSetups: "xyz" }).sniperSetups).toBe("ABC");
+  });
+});

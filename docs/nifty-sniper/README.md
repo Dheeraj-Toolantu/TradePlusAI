@@ -142,3 +142,42 @@ npx vitest run tests/unit/nifty-sniper.test.ts tests/unit/vwap-auto-trader.test.
   (`sniperSignals`) like the rest of this app.
 * No live broker path for the sniper (by design until gates G2–G4 pass), no BANKNIFTY / SENSEX.
 * Chart overlays (sweep / MSS / FVG markers on the chart) are listed as text, not drawn.
+
+## V2.0 (config `sniper-2.0.0`) — what is implemented from the V2 specification
+
+* **Regime (spec 5):** TREND_UP / TREND_DOWN (conditions held on the last 2 completed 15m bars),
+  RANGE, LOW_VOL_COMPRESSION, HIGH_VOL_ORDERLY / HIGH_VOL_DISORDERLY (15m ATR ≥ 1.8x the median
+  true range of the last 26 bars, split by directional efficiency ≥ 0.4 over 4 bars), UNKNOWN.
+  A permission table decides which setups each regime allows; orderly high vol halves the ₹ risk
+  budget; disorderly or unknown disables everything.
+* **Setups (spec 7):** A / B / C can each be switched off (desk: *Setups*). Breakouts are tagged
+  MOMENTUM_BREAKOUT or RETEST_BREAKOUT. Continuation needs a 5m rejection candle (the trend side
+  returning), not a zone touch alone.
+* **Contract (spec 9.3):** the best three ranked strikes are each repriced; the feasible one needing
+  the smallest move wins.
+* **Feasibility (spec 11):** Black-Scholes scenario repricing at the market-implied vol after the
+  hold, for CONSERVATIVE (−2 vol pts), BASE and FAVOURABLE (+1) IV paths; the BASE scenario gates.
+  Ranges only — no probability is claimed (uncalibrated). Delta-gamma kept as a diagnostic.
+* **OI (spec 10):** context, not a mandatory gate. Writer read is SUPPORTIVE / NEUTRAL / AGAINST /
+  UNKNOWN (heuristic labels); only AGAINST blocks (`OI_NOT_AGAINST`); unknown scores 0.
+* **IV (spec 11.4):** India VIX can no longer approve the IV on its own (context only).
+* **Premium momentum (spec 12):** labelled price/volume momentum, not buyer flow; missing data is
+  `PREMIUM_DATA_UNAVAILABLE`.
+* **Score (spec 13):** 9 components (15/15/15/10/10/10/10/10/5); ≥ 85 A grade (tradable), 80–84
+  B grade (journal only, no order), < 80 no trade. VWAP/EMA folded into higher-timeframe alignment
+  to avoid double counting.
+* **Sizing (spec 14.1):** lots = floor(₹ risk budget ÷ stressed risk per lot), capped by *Sniper
+  lots*; below one lot no trade (`RISK_LIMIT`). *Fixed lots* stays available as an explicit option.
+* **Position management (spec 14.4–14.6):** sniper trades use only their own staged trail and close
+  the remainder at 2x (no smart trail / runner unless switched on for the trade); positions carry a
+  state: OPEN_INITIAL, BREAKEVEN_PROTECTED, PARTIAL_BOOKED, PROFIT_LOCKED, TRAILING, CLOSED.
+* **Explainability (spec 17, 19):** every hard gate has a machine-readable reason code; each
+  decision and trade stores the config version and a config hash; the journal records grade,
+  setup type, entry mode, order flow and IV read.
+* **Session (spec 4.1):** entries 09:20–15:15 IST (15:00 on expiry day).
+
+**Not implemented (needs data or infrastructure this repo does not have):** point-in-time historical
+option bid/ask and OI for a real backtest and walk-forward validation (spec 16), calibrated
+probabilities, IV percentile/rank (no IV history is stored), live broker order lifecycle,
+partial-fill handling and reconciliation (spec 15 — the sniper is paper only), aggressive 1m
+entries, and a same-time-of-day volatility baseline.
