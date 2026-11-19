@@ -95,7 +95,7 @@ const RR_CHOICES: Array<{ id: RiskReward; name: string }> = [
 const SCALPER_SETTINGS_KEY = "tradepulse.scalper.settings";
 const STRATEGY_PREFS_KEY = "tradepulse.scalp.prefs";
 type AutoTrader = ReturnType<typeof vwapAutoTraderStatus>;
-type ScalperLimits = { maxTrades?: number; maxLossPerTrade?: number; maxDailyLoss?: number; lots?: number; minRiskReward?: number; mode?: string; maxHoldMinutes?: number };
+type ScalperLimits = { maxTrades?: number; maxLossPerTrade?: number; maxDailyLoss?: number; lots?: number; minRiskReward?: number; mode?: string; maxHoldMinutes?: number; sniperLots?: number };
 function readLocal<T>(key: string, fallback: T): T {
   try { const raw = window.localStorage.getItem(key); return raw ? { ...fallback, ...JSON.parse(raw) } : fallback; } catch { return fallback; }
 }
@@ -194,7 +194,7 @@ export default function ExecutionPage() {
     try {
       // The scalper sizes to the Smart Scalper desk's own limits (max loss per trade, lots).
       const limits = readLocal<ScalperLimits>(SCALPER_SETTINGS_KEY, {});
-      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&rr=${encodeURIComponent(riskReward)}${limits.maxLossPerTrade ? `&maxLoss=${limits.maxLossPerTrade}` : ""}${limits.lots ? `&lots=${limits.lots}` : ""}`, { cache: "no-store" }).then((response) => response.json());
+      const data = await fetch(`/api/algo-trading?symbol=${symbol}&provider=groww&strategy=${strategy.id}&rr=${encodeURIComponent(riskReward)}${limits.maxLossPerTrade ? `&maxLoss=${limits.maxLossPerTrade}` : ""}${limits.lots ? `&lots=${limits.lots}` : ""}${limits.sniperLots ? `&sniperLots=${limits.sniperLots}` : ""}`, { cache: "no-store" }).then((response) => response.json());
       setAnalysis(data.analysis ?? null);
       if (data.autoTrader) setAutoTrader(data.autoTrader as AutoTrader);
       setAccount(data.account ?? null);
@@ -660,6 +660,19 @@ export default function ExecutionPage() {
       log(`[Auto-execute] ${text}`, "info");
     } catch { setMessage("Auto-execute update failed"); }
   }, [log, riskReward, sniperSelected, strategy.name, strategyId, symbol]);
+  // The desk's limits changed while the server auto-executes this strategy: hand it the new ones
+  // (lots, max loss...) so the next placement uses them, then re-read the analysis with them.
+  const autoOnRef = useRef(autoOn);
+  autoOnRef.current = autoOn;
+  const onDeskSettings = useCallback(async (settings: ScalperLimits) => {
+    void refresh(true);
+    if (!autoOnRef.current) return;
+    try {
+      const response = await fetch("/api/algo-trading", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "AUTO_TRADER", underlying: symbol, enabled: true, riskReward, strategy: strategyId, settings }) });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.autoTrader) { setAutoTrader(data.autoTrader as AutoTrader); log(`[Auto-execute] Settings updated on the server${settings.sniperLots ? ` (sniper ${settings.sniperLots} lot${settings.sniperLots > 1 ? "s" : ""})` : ""}`, "info"); }
+    } catch { /* the next toggle sends them again */ }
+  }, [log, refresh, riskReward, strategyId, symbol]);
   const autoStatus = !autoTrader ? "" : autoTrader.openTrade
     ? `Trade open: BUY ${autoTrader.openTrade.label} on ${autoTrader.openTrade.underlying} · SL ₹${money(autoTrader.openTrade.stop)} · T ₹${money(autoTrader.openTrade.target)}${autoTrader.openTrade.stage ? ` (${autoTrader.openTrade.stage.toLowerCase()})` : ""} — no new trade until it exits at its target, SL or trailing SL`
     : autoOn ? (autoTrader.lastByIndex[symbol]?.text ?? "Watching: checks a few seconds after every 1-minute close") : "";
@@ -942,7 +955,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} onSettingsChange={(settings) => void onDeskSettings(settings)} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

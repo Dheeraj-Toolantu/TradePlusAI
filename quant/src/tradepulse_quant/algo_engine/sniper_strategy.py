@@ -182,6 +182,7 @@ class SniperConfig:
     # --- risk -------------------------------------------------------------------------------
     max_loss_per_trade: float = 1000.0       # 1% of a ₹1,00,000 reference capital
     max_lots: int = 1
+    fixed_lots: int = 0                      # the trader's chosen sniper lots (1-10); 0 = size to the ₹ budget
     # --- scoring ----------------------------------------------------------------------------
     minimum_sniper_score: float = 85.0
     require_oi: bool = False
@@ -793,7 +794,9 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
     risk_unit = entry - stop
     planned_lot = risk_unit * lot + cost_stop
     stressed_lot = planned_lot + max(2 * tick, 0.10 * risk_unit) * lot
-    lots = min(config.max_lots, int(config.max_loss_per_trade // stressed_lot)) if stressed_lot > 0 else 0
+    # The trader's chosen lots are taken as they are (the max loss shown is what they risk); otherwise
+    # size to the per-trade budget, never rounded up.
+    lots = config.fixed_lots if config.fixed_lots > 0 else min(config.max_lots, int(config.max_loss_per_trade // stressed_lot)) if stressed_lot > 0 else 0
     cost_share = cost_target / ((target - entry) * lot) if target > entry else 1.0
     out = {
         "market_premium": _r(market), "entry": entry, "stop_loss": stop, "target": target, "partial_target": partial, "lot_size": lot,
@@ -1208,7 +1211,9 @@ def config_for(context: dict) -> SniperConfig:
     loss = _num(context.get("max_loss_per_trade"))
     lots = _num(context.get("max_lots"))
     slip = _num(context.get("slippage_pct"))
+    fixed = _num(context.get("sniper_lots"))
     return SniperConfig(
+        fixed_lots=min(10, max(1, int(fixed))) if fixed and fixed >= 1 else 0,
         max_loss_per_trade=loss if loss and loss > 0 else base.max_loss_per_trade,
         max_lots=max(1, int(lots)) if lots and lots >= 1 else base.max_lots,
         slippage_pct=slip if slip is not None and 0 <= slip < 0.05 else base.slippage_pct,

@@ -177,3 +177,34 @@ describe("NIFTY Sniper partial booking at 1.5x", () => {
     expect(out.positions[0].stop).toBeGreaterThanOrEqual(37.8); // the trail locks 1.2x instead
   });
 });
+
+describe("NIFTY Sniper chosen lots (1-10)", () => {
+  afterEach(() => { clock = at("10:21"); });
+  const chosen = (item: ScalperContract, lots: number) => sniperPlan(item, { lots, quantity: lots * 65, risk: { maxEntry: 31.7, maxTarget: 0, minRiskReward: 3.88, stopGap: 0.78, feesAtStopPerLot: 45, lotSize: 65, premiumMultiples: { stop: 0.75, target: 2, partial: 1.5 }, fixedLots: lots } });
+
+  it("places exactly the chosen lots even above the single-trade budget, and books half at 1.5x", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    const placed = await book.place("NIFTY", chosen(live, 5), [live], { setupId: "l5", settings: { maxLossPerTrade: 500 } });
+    expect(placed.placed).toBe(true);
+    expect(placed.position).toMatchObject({ quantity: 325, partial: { quantity: 130, price: 47.25 } }); // 5 lots, book 2
+    expect(placed.position!.maxLoss).toBeGreaterThan(500);
+    // A dip that would breach the ₹500 desk budget does not close it: its own stop and max loss do.
+    const out = await book.manage({ symbol: "NIFTY", spot: 24000, bars: [], contracts: [contract(29)] });
+    expect(out.exited).toHaveLength(0);
+  });
+
+  it("clamps the setting to 1-10 lots", () => {
+    expect(SmartScalper.settings({ sniperLots: 0 }).sniperLots).toBe(1);
+    expect(SmartScalper.settings({ sniperLots: 25 }).sniperLots).toBe(10);
+    expect(SmartScalper.settings({}).sniperLots).toBe(1);
+  });
+
+  it("lists an open trade on another index in the desk's positions", async () => {
+    const book = scalper();
+    const live = contract(31.4);
+    await book.place("NIFTY", chosen(live, 2), [live], { setupId: "x1" });
+    const desk = await book.snapshot("BANKNIFTY");
+    expect(desk.positions.map((position: PositionView) => position.underlying)).toEqual(["NIFTY"]);
+  });
+});

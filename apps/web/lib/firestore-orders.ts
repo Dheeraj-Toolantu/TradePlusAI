@@ -73,6 +73,8 @@ export type OrderRecord = {
   partialQuantity?: number;
   partialDone?: boolean;
   partialMultiple?: number;
+  /** The trade's own hard max-loss exit (₹), when the trader chose the lots. */
+  maxLoss?: number;
   charges?: number;
   exitError?: string;
   reconcileWarning?: string;

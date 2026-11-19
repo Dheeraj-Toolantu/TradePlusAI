@@ -54,6 +54,8 @@ export type ScalperSettings = {
   smartTrail: boolean;
   /** Smart trail: on the target, lock most of the move and let the trade run instead of closing it. */
   runPastTarget: boolean;
+  /** NIFTY Sniper: lots per trade (1-10), taken as chosen; half are booked at 1.5x with 2+ lots. */
+  sniperLots: number;
 };
 export type Level = { price: number; touches: number; sources: string[] };
 export type ExtraZone = { side: "DEMAND" | "SUPPLY"; low: number; high: number; sources?: string[] };
@@ -107,6 +109,8 @@ export type ScalperPlan = {
      * e.g. { stop: 0.75, target: 2.0 }; they replace the structural stop and the k·R target.
      */
     premiumMultiples?: { stop: number; target: number; partial?: number };
+    /** The trader chose the lots (NIFTY Sniper): place exactly this many, not sized down to the ₹ max loss. */
+    fixedLots?: number;
   };
 };
 /** Systematic trailing rules: the VWAP-EMA scalper's R-based trail, NIFTY Sniper AI's premium-multiple trail. */
@@ -152,6 +156,8 @@ export type ScalperPosition = {
    * `price`; the rest keeps trailing. Options trade in whole lots, so a 1-lot trade has quantity 0.
    */
   partial?: { price: number; quantity: number; done: boolean; multiple?: number };
+  /** This trade's hard max-loss exit (₹); defaults to the desk's max loss per trade. */
+  maxLoss?: number;
   status: "OPEN" | "EXITED";
   exitAt?: string;
   exitReason?: string;
@@ -225,7 +231,7 @@ export type ScanInput = {
   entryBlockedReason?: string;
 };
 
-export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true };
+export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1 };
 const STAGE_ORDER: TrailStage[] = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
 const higherStage = (a: TrailStage, b: TrailStage) => (STAGE_ORDER.indexOf(a) >= STAGE_ORDER.indexOf(b) ? a : b);
 /** Round-trip charges per unit when the plan gave none: ~₹40 brokerage per order pair plus ~0.2% of premium (STT, exchange, GST). */
@@ -558,6 +564,7 @@ export class SmartScalper {
       maxHoldMinutes: clamp(Math.floor(Number(value.maxHoldMinutes) || DEFAULT_SCALPER_SETTINGS.maxHoldMinutes), 2, 120),
       smartTrail: flag(value.smartTrail, DEFAULT_SCALPER_SETTINGS.smartTrail),
       runPastTarget: flag(value.runPastTarget, DEFAULT_SCALPER_SETTINGS.runPastTarget),
+      sniperLots: clamp(Math.floor(Number(value.sniperLots) || DEFAULT_SCALPER_SETTINGS.sniperLots), 1, 10),
     };
   }
 
@@ -604,7 +611,7 @@ export class SmartScalper {
         targetRuns: Number(single?.targetRuns ?? 0) || 0,
       };
       const partial = Number(single?.partialPrice) > 0 ? { price: Number(single!.partialPrice), quantity: Number(single!.partialQuantity ?? 0), done: Boolean(single!.partialDone), multiple: Number(single!.partialMultiple) || undefined } : undefined;
-      this.positions.push({ ...(partial ? { partial } : {}), controls, id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), lowWater: Math.min(entry, Number(single?.lowWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL") || controls.stage !== "INITIAL", spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}), ...(single?.entrySignal ? { signal: single.entrySignal } : {}) });
+      this.positions.push({ ...(partial ? { partial } : {}), ...(Number(single?.maxLoss) > 0 ? { maxLoss: Number(single!.maxLoss) } : {}), controls, id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), lowWater: Math.min(entry, Number(single?.lowWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL") || controls.stage !== "INITIAL", spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}), ...(single?.entrySignal ? { signal: single.entrySignal } : {}) });
     }
   }
 
@@ -760,6 +767,7 @@ export class SmartScalper {
       let sized = plan;
       let fill: ScalperPosition["fill"];
       let partial: ScalperPosition["partial"];
+      let maxLoss: number | undefined;
       if (plan.risk) {
         // Re-plan on the ACTUAL fill (live ask + slippage), with the stop and target left at their
         // structural prices, and refuse when the fill has drifted or the risk no longer fits.
@@ -785,7 +793,8 @@ export class SmartScalper {
         const exitSlip = stopPrice * this.slippagePct;
         const plannedLot = riskUnit * lot + r.feesAtStopPerLot + exitSlip * lot;
         const stressedLot = plannedLot + r.stopGap * lot;
-        const lots = Math.min(plan.lots, Math.floor(settings.maxLossPerTrade / stressedLot));
+        const lots = r.fixedLots && r.fixedLots >= 1 ? Math.floor(r.fixedLots) : Math.min(plan.lots, Math.floor(settings.maxLossPerTrade / stressedLot));
+        if (r.fixedLots) maxLoss = Math.max(settings.maxLossPerTrade, Math.round(stressedLot * lots * 1.25));
         if (lots < 1) return { ...this.state(underlying), placed: false, error: `At the ₹${actual} fill one lot risks ₹${Math.round(stressedLot)} stressed (gap + slippage), more than the ₹${settings.maxLossPerTrade} max loss per trade.` };
         sized = { ...plan, lots, quantity: lots * lot, riskReward, target, stop: stopPrice };
         if (multiples?.partial && multiples.partial > 1) {
@@ -797,7 +806,10 @@ export class SmartScalper {
       this.consumedSetups.add(input.setupId);
       const position = this.open(underlying, { ...sized, legs }, contracts, Boolean(plan.risk), settings);
       if (partial) position.partial = partial;
-      if (fill || partial) { if (fill) position.fill = fill; this.persist(position); }
+      // Chosen lots: the hard max-loss exit scales with this trade's own stressed risk (+25% for gaps),
+      // so a multi-lot trade is closed by its stop, not by the single-lot ₹ budget.
+      if (maxLoss) position.maxLoss = maxLoss;
+      if (fill || partial || maxLoss) { if (fill) position.fill = fill; this.persist(position); }
       return { ...this.state(underlying), placed: true, position: this.view(position), summary: `${position.kind} placed on the scalper: BUY ${position.legs[0].symbol} × ${position.legs[0].quantity} @ ${position.entry}${fill ? ` (planned ${fill.planned}, ${fill.deviation >= 0 ? "+" : ""}${fill.deviation})` : ""} · SL ${position.stop} · T ${position.target}${fill ? ` · ${fill.riskReward}R at the fill · max loss ₹${fill.stressedLoss} stressed` : ""}` };
     });
   }
@@ -922,7 +934,7 @@ export class SmartScalper {
       let reason: string | null = null;
       // Each position squares off at its own market's time (15:15 index options, 23:00 MCX).
       if (minutes >= squareOffOf(position.underlying)) reason = `SQUARE_OFF_${hhmm(squareOffOf(position.underlying)).replace(":", "_")}`;
-      else if (pnl <= -settings.maxLossPerTrade) reason = "MAX_LOSS_PER_TRADE";
+      else if (pnl <= -(position.maxLoss ?? settings.maxLossPerTrade)) reason = "MAX_LOSS_PER_TRADE";
       if (!reason && position.underlying === input.symbol) {
         const risk = position.initialRisk ?? 0;
         position.highWater = Math.max(position.highWater, value);
@@ -1131,6 +1143,7 @@ export class SmartScalper {
         ...(position.legs.length === 1 && position.stop !== null ? { stopLoss: position.stop, target: position.target ?? undefined, trailingStop: position.trailing ? position.stop : undefined } : {}),
         ...(position.trail ? { trailRule: position.trail.rule, trailStage: position.trail.stage, trailCostPerUnit: position.trail.costPerUnit, initialStopLoss: round2(position.entry - position.trail.risk), highWaterMark: position.highWater } : {}),
         ...(position.lowWater !== undefined ? { lowWaterMark: position.lowWater } : {}),
+        ...(position.maxLoss ? { maxLoss: position.maxLoss } : {}),
         ...(position.partial ? { partialPrice: position.partial.price, partialQuantity: position.partial.quantity, partialDone: position.partial.done, partialMultiple: position.partial.multiple } : {}),
         ...(position.controls ? { trailMode: position.controls.mode, trailPoints: position.controls.points ?? undefined, runPastTarget: position.controls.runPastTarget, trailResumeAbove: position.controls.resumeAbove ?? undefined, smartStage: position.controls.stage, smartRisk: position.controls.risk, targetRuns: position.controls.targetRuns, highWaterMark: position.highWater } : {}),
         ...(position.signal ? { entrySignal: position.signal } : {}),
@@ -1215,7 +1228,9 @@ export class SmartScalper {
   }
 
   state(underlying?: string) {
-    const views = this.positions.filter((position) => !underlying || position.underlying === underlying || position.underlying === "").map((position) => this.view(position));
+    // Every OPEN position is listed whatever index the desk shows (an auto-placed NIFTY sniper trade must
+    // appear in the positions panel while the desk is on BANKNIFTY); closed trades stay per index.
+    const views = this.positions.filter((position) => position.status === "OPEN" || !underlying || position.underlying === underlying || position.underlying === "").map((position) => this.view(position));
     const open = views.filter((position) => position.status === "OPEN");
     const closed = views.filter((position) => position.status === "EXITED");
     return {

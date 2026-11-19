@@ -712,6 +712,7 @@ def analyze_payload(payload: dict) -> dict:
             "vix": payload.get("vix"),
             "max_loss_per_trade": payload.get("max_loss_per_trade"),
             "max_lots": payload.get("max_lots"),
+            "sniper_lots": payload.get("sniper_lots"),
             "slippage_pct": payload.get("slippage_pct"),
             # The selected option's own 1m candles (pass 2) and the stored 3-minute strike OI samples.
             "premium_candles": {"symbol": sniper_premium.get("symbol"), "candles": completed_candles(_candles_from(sniper_premium.get("candles")), now, 1)} if sniper_premium else None,

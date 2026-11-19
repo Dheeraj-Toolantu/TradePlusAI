@@ -101,8 +101,11 @@ npx vitest run tests/unit/nifty-sniper.test.ts tests/unit/vwap-auto-trader.test.
   SAFE_MODE).
 * **Execution (paper).** Stop = 0.75 × and target = 2.0 × the **actual fill** (re-derived in
   `SmartScalper.place`); a fill > 2% above the plan is refused; size = floor(per-trade budget /
-  stressed loss per lot), never rounded up. Partial booking: with 2+ lots, half (rounded down) is
-  sold at 1.5x the fill and the rest keeps trailing; a single lot is not split. Trail: breakeven + charges at 1.25x, 1.2x locked at
+  stressed loss per lot), never rounded up — unless the trader picks **Sniper lots** (1-10) on the
+  Scalper desk: then exactly that many lots are placed on every confirmed setup and the trade's own
+  hard max-loss exit is its stressed risk + 25% (never below the desk's max loss per trade). Partial
+  booking: with 2+ lots, half (rounded down) is sold at 1.5x the fill and the rest keeps trailing; a
+  single lot is not split. Trail: breakeven + charges at 1.25x, 1.2x locked at
   1.5x, 0.2 × entry under the best premium from 1.75x, exit at 2x. Also exits on the index
   invalidation (beyond the swept extreme / protected swing), after 90 min below 1.25x, on the
   per-trade max loss and at 15:15. Locks: 3 sniper entries and 2 consecutive sniper losses per

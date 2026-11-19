@@ -15,7 +15,7 @@ import { journalSniper } from "../../../lib/sniper-journal";
 import { storedStrikeSamples } from "../../../lib/oi-strike-samples";
 import { isCommodity } from "../../../lib/underlyings";
 import { contractBySymbol, derivativesIn } from "../../../lib/underlying-catalog";
-import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
+import { SmartScalper as ScalperBook, valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
 import {
   saveOrderToFirestore,
   updateOrderInFirestore,
@@ -49,7 +49,7 @@ const indexError = (strategy: string, symbol: string) =>
 const rrOf = (value: unknown) => (String(value ?? "").replace(/\s/g, "") === "1:1" ? "1:1" : "1:2");
 // Tick rounding may shave up to 3% off the chosen ratio on the premium (same as the engine).
 const scalpMinimumRr = (value: unknown) => (rrOf(value) === "1:1" ? 0.97 : 1.94);
-type ScalpOptions = { riskReward?: string; maxLossPerTrade?: number; maxLots?: number };
+type ScalpOptions = { riskReward?: string; maxLossPerTrade?: number; maxLots?: number; sniperLots?: number };
 // The Smart Scalper's fill slippage (per side). The scalper plans with the same number it fills with.
 const SCALPER_SLIPPAGE = Number(process.env.SCALPER_SLIPPAGE_PCT ?? 0.3) / 100;
 
@@ -185,7 +185,7 @@ async function runSniper(symbol: string, provider: string, origin: string, evide
     symbol, strategy: SNIPER, interval_minutes: 1, candles: one.body.candles ?? [], setup_candles: five.body.candles ?? [],
     daily_candles: Array.isArray(daily.body.candles) ? daily.body.candles : [], volume_source: five.body.volumeSource ?? null,
     risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence,
-    max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null, slippage_pct: SCALPER_SLIPPAGE,
+    max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null, sniper_lots: scalp.sniperLots ?? null, slippage_pct: SCALPER_SLIPPAGE,
     ...(await scalpInputs(origin, intel ?? { symbol })),
     oi_history: await sniperOiHistory(symbol),
   };
@@ -303,7 +303,7 @@ export async function GET(request: Request) {
   const provider = url.searchParams.get("provider") ?? "groww";
   const strategy = url.searchParams.get("strategy") ?? "ORB_RETEST";
   const historyOnly = url.searchParams.get("history") === "true";
-  const scalp: ScalpOptions = { riskReward: rrOf(url.searchParams.get("rr")), maxLossPerTrade: Number(url.searchParams.get("maxLoss")) || undefined, maxLots: Number(url.searchParams.get("lots")) || undefined };
+  const scalp: ScalpOptions = { riskReward: rrOf(url.searchParams.get("rr")), maxLossPerTrade: Number(url.searchParams.get("maxLoss")) || undefined, maxLots: Number(url.searchParams.get("lots")) || undefined, sniperLots: Number(url.searchParams.get("sniperLots")) || undefined };
   const config = readGrowwConfig();
 
   if (historyOnly) {
@@ -561,6 +561,7 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   } catch { brokerHealthy = false; }
   const analysis = await runEngine(underlying, "groww", origin, strategy, await operationalEvidence(underlying, brokerHealthy, safety), {
     riskReward: rrOf(body.riskReward), maxLossPerTrade: Number(settings.maxLossPerTrade) || undefined, maxLots: Number(settings.lots) || undefined,
+    sniperLots: sniper ? ScalperBook.settings(settings).sniperLots : undefined,
   }).catch((error: unknown) => ({ error: error instanceof Error ? error.message : "Strategy engine unavailable" }) as RecordValue);
   const pipeline = analysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
   const setup = analysis.setup as ScalpSetup | null | undefined;
@@ -577,7 +578,9 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   if (!live || !(live.premium > 0) || !(live.lotSize > 0)) return NextResponse.json({ placed: false, error: `${setup.contract.symbol} has no live premium and lot size in the chain yet.` }, { status: 409 });
   const lot = live.lotSize;
   if (sniper) {
-    const plan = sniperPlan(setup as SniperSetup, live, lot);
+    // Exactly the trader's chosen lots (1-10): never sized down to the ₹ budget, so a confirmed setup
+    // is placed; its max-loss exit scales with the trade's real risk.
+    const plan = sniperPlan({ ...(setup as SniperSetup), lots: ScalperBook.settings(settings).sniperLots }, live, lot);
     const result = await getScalper().place(underlying, plan, contracts, { setupId: setup.setup_id, settings, entryBlockedReason, ruleLimits: SNIPER_LIMITS });
     if (result.placed) ensureScalperMonitor(origin);
     void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: Boolean(result.placed), reasons: result.placed ? [] : [String((result as { error?: string }).error ?? "refused")], position: (result as { position?: unknown }).position });
@@ -620,7 +623,7 @@ function sniperPlan(setup: SniperSetup, live: ScalperContract, lot: number): Sca
     spot: { entry: setup.spot.entry, stop: setup.spot.stop, target: setup.spot.target },
     reason: `NIFTY Sniper AI · ${setup.family.replace(/_/g, " ").toLowerCase()} · score ${setup.score} (${setup.band}) · ${SNIPER_PREMIUM.target}x target / ${Math.round((1 - SNIPER_PREMIUM.stop) * 100)}% stop on the fill · index invalidation ${setup.spot.stop}`,
     trail: { rule: "SNIPER", costPerUnit: Number(setup.cost_per_unit) || 0 },
-    risk: { maxEntry: setup.max_entry, maxTarget: 0, minRiskReward: Math.round(rr * 0.97 * 100) / 100, stopGap: setup.stop_gap, feesAtStopPerLot: setup.fees_at_stop_per_lot, lotSize: lot, premiumMultiples: SNIPER_PREMIUM },
+    risk: { maxEntry: setup.max_entry, maxTarget: 0, minRiskReward: Math.round(rr * 0.97 * 100) / 100, stopGap: setup.stop_gap, feesAtStopPerLot: setup.fees_at_stop_per_lot, lotSize: lot, premiumMultiples: SNIPER_PREMIUM, fixedLots: setup.lots },
   };
 }
 

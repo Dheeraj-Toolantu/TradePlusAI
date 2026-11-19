@@ -418,3 +418,12 @@ def test_iv_check_falls_back_to_vix_then_fails_closed():
     assert not sn.iv_check({"greeks": {"iv": 14.0}}, None, None, [], {"regime": "HIGH"}, NOW, sn.SniperConfig())["passed"]
     none = sn.iv_check(None, None, None, [], None, NOW, sn.SniperConfig())
     assert none["status"] == "UNAVAILABLE" and not none["passed"]
+
+
+def test_chosen_lots_are_used_as_they_are():
+    # Budget sizing would give 0 lots at ₹300; the trader's 4 lots are taken, with the real risk shown.
+    result = run(max_loss_per_trade=300, sniper_lots=4)
+    feas = result["sniper"]["feasibility"]
+    assert feas["lots"] == 4 and feas["quantity"] == 260 and feas["max_loss"] > 300
+    assert result["decision"] == "CONFIRMED" and result["setup"]["lots"] == 4
+    assert sn.config_for({"sniper_lots": 25}).fixed_lots == 10 and sn.config_for({}).fixed_lots == 0

@@ -37,7 +37,7 @@ const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.p
 const TIMEFRAMES = [1, 3, 5] as const;
 const SETTINGS_KEY = "tradepulse.scalper.settings";
 const PREFS_KEY = "tradepulse.scalper.prefs";
-const DEFAULT_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true };
+const DEFAULT_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1 };
 const money = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits }));
 const signed = (value: number) => `${value >= 0 ? "+" : "-"} ₹${money(Math.abs(value))}`;
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -66,7 +66,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange, onSettingsChange }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -87,6 +87,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   /** The algo page's selected strategy; choosing one here selects it there too. */
   signalStrategy?: SignalStrategy;
   onSignalStrategyChange?: (next: SignalStrategy) => void;
+  /** The desk's limits changed (e.g. the sniper lots): the algo page passes them to the server auto-trader. */
+  onSettingsChange?: (settings: ScalperSettings) => void;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -128,6 +130,14 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
     setInstant(prefs.instant);
   }, []);
   useEffect(() => { save(SETTINGS_KEY, settings); }, [settings]);
+  const onSettingsRef = useRef(onSettingsChange);
+  onSettingsRef.current = onSettingsChange;
+  const firstSettings = useRef(true);
+  useEffect(() => {
+    if (firstSettings.current) { firstSettings.current = false; return; }
+    const timer = setTimeout(() => onSettingsRef.current?.(settings), 600);
+    return () => clearTimeout(timer);
+  }, [settings]);
   useEffect(() => { save(PREFS_KEY, { views, timeframe, instant, tradeMode, engineStrategy }); }, [views, timeframe, instant, tradeMode, engineStrategy]);
   useEffect(() => { onAutoChange?.(auto); }, [auto, onAutoChange]);
   // Keep the desk on the algo page's strategy (unless the level scalper is chosen here).
@@ -494,6 +504,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             <label>Max trades / day<select value={settings.maxTrades} onChange={(event) => setSettings((current) => ({ ...current, maxTrades: Number(event.target.value) }))}>{[1, 2, 3, 4, 5, 6, 8, 10].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
             <label>Max loss / trade<select value={settings.maxLossPerTrade} onChange={(event) => setSettings((current) => ({ ...current, maxLossPerTrade: Number(event.target.value) }))}>{[500, 1000, 1500, 2000, 2500, 5000].map((value) => <option key={value} value={value}>₹{value.toLocaleString("en-IN")}</option>)}</select></label>
             <label>Daily loss stop<select value={settings.maxDailyLoss} onChange={(event) => setSettings((current) => ({ ...current, maxDailyLoss: Number(event.target.value) }))}>{[1500, 3000, 4000, 5000, 7500, 10000].map((value) => <option key={value} value={value}>₹{value.toLocaleString("en-IN")}</option>)}</select></label>
+            {sniperMode ? <label title="NIFTY Sniper places exactly this many lots on every confirmed setup (not sized down to the max loss per trade). With 2+ lots, half (rounded down) is booked at 1.5x the fill and the rest trails.">Sniper lots<select value={settings.sniperLots} onChange={(event) => setSettings((current) => ({ ...current, sniperLots: Number(event.target.value) }))}>{[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((value) => <option key={value} value={value}>{value} lot{value > 1 ? "s" : ""}{value > 1 ? ` · book ${Math.floor(value / 2)} at 1.5x` : ""}</option>)}</select></label> : null}
             <label>Lots cap<select value={settings.lots} onChange={(event) => setSettings((current) => ({ ...current, lots: Number(event.target.value) }))}>{[1, 2, 3, 4, 5, 10].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
             <label>Min reward : risk<select value={settings.minRiskReward} onChange={(event) => setSettings((current) => ({ ...current, minRiskReward: Number(event.target.value) }))}>{[1.5, 2, 2.5, 3].map((value) => <option key={value} value={value}>{value} R</option>)}</select></label>
             <label title="New engine trades start on the smart auto trail: breakeven + charges at +0.75R, then it trails the best premium giving back 45% of the gain, less as the trade grows (20% from +4R), tighter in the last 15 minutes. You can change it on each trade.">Trailing SL<select value={settings.smartTrail ? "SMART" : "RULE"} onChange={(event) => setSettings((current) => ({ ...current, smartTrail: event.target.value === "SMART" }))}><option value="SMART">Smart auto trail</option><option value="RULE">Strategy rule only</option></select></label>
