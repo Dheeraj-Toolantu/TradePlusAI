@@ -12,6 +12,7 @@ import { getScalper } from "../../../lib/scalper-instance";
 import { ensureScalperMonitor } from "../../../lib/scalper-monitor";
 import { ensureVwapAutoTrader, setVwapAutoTrader, vwapAutoTraderStatus } from "../../../lib/vwap-auto-trader";
 import { journalSniper } from "../../../lib/sniper-journal";
+import { storedStrikeSamples } from "../../../lib/oi-strike-samples";
 import { isCommodity } from "../../../lib/underlyings";
 import { contractBySymbol, derivativesIn } from "../../../lib/underlying-catalog";
 import { valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
@@ -185,8 +186,28 @@ async function runSniper(symbol: string, provider: string, origin: string, evide
     risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence,
     max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null, slippage_pct: SCALPER_SLIPPAGE,
     ...(await scalpInputs(origin, intel ?? { symbol })),
+    oi_history: await sniperOiHistory(symbol),
   };
-  return runPythonEngine(payload);
+  // Pass 1 picks the contract; pass 2 adds that option's own 1-minute candles so the sniper can check
+  // that buying volume is rising in the premium it is about to buy (it fails closed without them).
+  const first = await runPythonEngine(payload);
+  const contract = typeof first.needs_premium_candles === "string" ? first.needs_premium_candles : null;
+  if (!contract) return first;
+  const premium = await fetch(`${origin}/api/market-data/option-history?symbol=${encodeURIComponent(contract)}&timeframe=1m`, { cache: "no-store" }).then((response) => response.json()).catch(() => null) as { candles?: unknown[] } | null;
+  if (!premium || !Array.isArray(premium.candles) || !premium.candles.length) return first;
+  return runPythonEngine({ ...payload, premium_candles: { symbol: contract, candles: premium.candles } });
+}
+
+/**
+ * The last stored 3-minute strike OI samples today (the OI analysis store), so the sniper can check
+ * that the supportive writers' OI change is rising: put writers for a CALL, call writers for a PUT.
+ * Empty when none are stored; the sniper then falls back to market-intel's 5-minute OI change.
+ */
+async function sniperOiHistory(symbol: string) {
+  try {
+    const samples = await storedStrikeSamples(symbol, istDate());
+    return samples.slice(-6).map((sample) => ({ at: sample.at, spot: sample.spot, strikes: sample.strikes.map((row) => ({ strike: row.strike, ce_oi: row.ce_oi, pe_oi: row.pe_oi })) }));
+  } catch { return []; }
 }
 
 async function runEngine(symbol: string, provider: string, origin: string, strategy: string, evidence: Record<string, unknown> = {}, scalp: ScalpOptions = {}) {

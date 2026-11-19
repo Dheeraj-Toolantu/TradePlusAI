@@ -676,6 +676,15 @@ def _sniper_evidence(result: dict, evidence: dict, calculations: dict, setup_can
 MCX_TRADING_WINDOWS = {"market_open": 9 * 60, "or_complete": 9 * 60 + 15, "entry_start": 9 * 60 + 20, "entry_end": 22 * 60 + 45, "mandatory_square_off": 23 * 60}
 
 
+# NIFTY Sniper AI trades the whole session: entries 09:15 to the 15:15 square-off (its own hard
+# filters stop late entries the 2x objective cannot reach). The configuration requires the open and
+# the opening range to come before the entry start, so they are set a minute or two earlier.
+def SNIPER_SESSION_CONFIG() -> StrategyConfiguration:
+    open_min = sniper_strategy.SniperConfig().entry_start_min
+    return StrategyConfiguration(trading_windows={"market_open": open_min - 2, "or_complete": open_min - 1, "entry_start": open_min,
+                                                  "entry_end": sniper_strategy.SniperConfig().entry_cutoff_min, "mandatory_square_off": sniper_strategy.SQUARE_OFF_MIN})
+
+
 def market_configuration(market: str) -> StrategyConfiguration:
     """Session windows for the market being evaluated (set by the engine, never by caller evidence)."""
     return StrategyConfiguration(trading_windows=dict(MCX_TRADING_WINDOWS)) if market == "MCX" else StrategyConfiguration()
@@ -695,6 +704,7 @@ def analyze_payload(payload: dict) -> dict:
     setup_candles: list[Candle] = []
     if strategy == sniper_strategy.STRATEGY_ID:
         setup_candles = completed_candles(_candles_from(payload.get("setup_candles")), now, 5)
+        sniper_premium = payload.get("premium_candles") if isinstance(payload.get("premium_candles"), dict) else {}
         context = {
             "setup_candles": setup_candles,
             "option_chain": payload.get("option_chain"),
@@ -703,6 +713,9 @@ def analyze_payload(payload: dict) -> dict:
             "max_loss_per_trade": payload.get("max_loss_per_trade"),
             "max_lots": payload.get("max_lots"),
             "slippage_pct": payload.get("slippage_pct"),
+            # The selected option's own 1m candles (pass 2) and the stored 3-minute strike OI samples.
+            "premium_candles": {"symbol": sniper_premium.get("symbol"), "candles": completed_candles(_candles_from(sniper_premium.get("candles")), now, 1)} if sniper_premium else None,
+            "oi_history": payload.get("oi_history") if isinstance(payload.get("oi_history"), list) else None,
         }
     if strategy == scalp_strategy.STRATEGY_ID:
         premium = payload.get("premium_candles") if isinstance(payload.get("premium_candles"), dict) else {}
@@ -724,7 +737,8 @@ def analyze_payload(payload: dict) -> dict:
     # such as broker health, SAFE_MODE, and kill-switch state. A caller can never overwrite
     # observed data-quality, session, regime, gap, breakout, or retest evidence with this merge.
     volume_source = payload.get("volume_source") if isinstance(payload.get("volume_source"), str) else None
-    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, market_configuration(market), now, option_evidence, daily_candles, volume_source)
+    session_config = SNIPER_SESSION_CONFIG() if strategy == sniper_strategy.STRATEGY_ID else market_configuration(market)
+    evidence, calculations, session_info = _observe(symbol, candles, strategy, result, session_config, now, option_evidence, daily_candles, volume_source)
     session_info["market"] = market
     if strategy == scalp_strategy.STRATEGY_ID:
         _scalp_evidence(result, evidence, calculations)
