@@ -1,5 +1,5 @@
 import { getActiveOrdersFromFirestore, saveOrderToFirestore, type OrderRecord } from "../../../apps/web/lib/firestore-orders";
-import { SNIPER_TRAIL, VWAP_EMA_TRAIL, sniperTrail } from "./scalper-trail";
+import { SNIPER_TRAIL, TRAIL_MODES, VWAP_EMA_TRAIL, smartTrail, sniperTrail, type TrailMode } from "./scalper-trail";
 import { isCommodity, sessionFor } from "../../../apps/web/lib/underlyings";
 
 /**
@@ -50,6 +50,10 @@ export type ScalperSettings = {
   mode: ScalperMode;
   /** Scalps that have not reached +0.5R after this many minutes are closed. */
   maxHoldMinutes: number;
+  /** New engine trades start on the smart auto trail (true) or only their strategy's own rule (false). */
+  smartTrail: boolean;
+  /** Smart trail: on the target, lock most of the move and let the trade run instead of closing it. */
+  runPastTarget: boolean;
 };
 export type Level = { price: number; touches: number; sources: string[] };
 export type ExtraZone = { side: "DEMAND" | "SUPPLY"; low: number; high: number; sources?: string[] };
@@ -142,6 +146,7 @@ export type ScalperPosition = {
   /** The planned entry versus the actual fill, and the risk at that fill (planned and stressed). */
   fill?: { planned: number; actual: number; deviation: number; riskReward: number; plannedLoss: number; stressedLoss: number };
   signal?: EntrySignal;
+  controls?: PositionControls;
   status: "OPEN" | "EXITED";
   exitAt?: string;
   exitReason?: string;
@@ -149,6 +154,28 @@ export type ScalperPosition = {
   realizedPnl?: number;
 };
 export type PositionView = ScalperPosition & { quantity: number; value: number; pnl: number; label: string };
+/**
+ * The trader's risk controls on an open position, changeable at any time (modify): the trailing
+ * mode, the fixed trail distance, whether the smart trail runs past the target, and where the
+ * trail resumes after the trader moved the stop by hand (only on a new best premium).
+ */
+export type PositionControls = {
+  mode: TrailMode;
+  /** FIXED mode: the stop trails the best premium by this many rupees. */
+  points: number | null;
+  runPastTarget: boolean;
+  /** After a manual SL edit the trail waits for a premium above this before it moves the stop again. */
+  resumeAbove: number | null;
+  /** The smart / fixed trail's own stage (the strategy rule keeps its stage in `trail`). */
+  stage: TrailStage;
+  /** R for the smart trail (premium per unit). */
+  risk: number;
+  /** How many times the smart trail pushed the target out (the trade ran past its target). */
+  targetRuns: number;
+  modifiedAt?: string;
+};
+export type ModifyRequest = { stop?: number | null; target?: number | null; trailMode?: TrailMode; trailPoints?: number | null; runPastTarget?: boolean };
+export { TRAIL_MODES, type TrailMode };
 export type TrailStage = "INITIAL" | "BREAKEVEN" | "LOCKED" | "TRAILING";
 
 /** The VWAP-EMA scalper's staged trail, in units of the initial premium risk R (see scalper-trail). */
@@ -193,7 +220,14 @@ export type ScanInput = {
   entryBlockedReason?: string;
 };
 
-export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12 };
+export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true };
+const STAGE_ORDER: TrailStage[] = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
+const higherStage = (a: TrailStage, b: TrailStage) => (STAGE_ORDER.indexOf(a) >= STAGE_ORDER.indexOf(b) ? a : b);
+/** Round-trip charges per unit when the plan gave none: ~₹40 brokerage per order pair plus ~0.2% of premium (STT, exchange, GST). */
+const estimatedCostPerUnit = (entry: number, quantity: number) => round2(40 / Math.max(quantity, 1) + entry * 0.002);
+/** R for a position with no planned stop: 15% of the premium. */
+const FALLBACK_RISK_PCT = 0.15;
+const flag = (value: unknown, fallback: boolean) => (value === undefined || value === null || value === "" ? fallback : value !== false && value !== "false" && value !== 0);
 const STRATEGY_ID = "SMART_SCALPER";
 const SCALP_WINDOW = [9 * 60 + 20, 14 * 60 + 55] as const;
 const HEDGE_WINDOW = [9 * 60 + 45, 14 * 60 + 30] as const;
@@ -517,6 +551,8 @@ export class SmartScalper {
       minRiskReward: clamp(Number(value.minRiskReward) || DEFAULT_SCALPER_SETTINGS.minRiskReward, 1, 10),
       mode: ["AUTO", "SCALP", "HEDGE"].includes(value.mode) ? value.mode : "AUTO",
       maxHoldMinutes: clamp(Math.floor(Number(value.maxHoldMinutes) || DEFAULT_SCALPER_SETTINGS.maxHoldMinutes), 2, 120),
+      smartTrail: flag(value.smartTrail, DEFAULT_SCALPER_SETTINGS.smartTrail),
+      runPastTarget: flag(value.runPastTarget, DEFAULT_SCALPER_SETTINGS.runPastTarget),
     };
   }
 
@@ -552,7 +588,17 @@ export class SmartScalper {
       const trail = (single?.trailRule === "VWAP_EMA" || single?.trailRule === "SNIPER") && single.initialStopLoss !== undefined
         ? { rule: single.trailRule as TrailRule, risk: round2(entry - single.initialStopLoss), costPerUnit: Number(single.trailCostPerUnit ?? 0), stage: (["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"].includes(String(single.trailStage)) ? single.trailStage : "INITIAL") as TrailStage }
         : undefined;
-      this.positions.push({ id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk: trail ? trail.risk : stop !== null ? entry - stop : null, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), lowWater: Math.min(entry, Number(single?.lowWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL"), spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}), ...(single?.entrySignal ? { signal: single.entrySignal } : {}) });
+      const initialRisk = trail ? trail.risk : stop !== null ? entry - stop : null;
+      const storedMode = TRAIL_MODES.includes(single?.trailMode as TrailMode) ? single!.trailMode as TrailMode : kind === "MANUAL" ? "OFF" : this.lastSettings.smartTrail ? "SMART" : "RULE";
+      const controls: PositionControls = {
+        mode: storedMode, points: Number(single?.trailPoints) > 0 ? Number(single!.trailPoints) : null,
+        runPastTarget: single?.runPastTarget ?? (kind !== "MANUAL" && this.lastSettings.runPastTarget),
+        resumeAbove: Number(single?.trailResumeAbove) > 0 ? Number(single!.trailResumeAbove) : null,
+        stage: (STAGE_ORDER.includes(single?.smartStage as TrailStage) ? single!.smartStage : "INITIAL") as TrailStage,
+        risk: Number(single?.smartRisk) > 0 ? Number(single!.smartRisk) : initialRisk && initialRisk > 0 ? round2(initialRisk) : round2(entry * FALLBACK_RISK_PCT),
+        targetRuns: Number(single?.targetRuns ?? 0) || 0,
+      };
+      this.positions.push({ controls, id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), lowWater: Math.min(entry, Number(single?.lowWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL") || controls.stage !== "INITIAL", spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}), ...(single?.entrySignal ? { signal: single.entrySignal } : {}) });
     }
   }
 
@@ -631,7 +677,7 @@ export class SmartScalper {
       else if (!input.autoEntries) summary = `Manual mode · signal ready: ${decision.plan.kind} ${decision.plan.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.price}`).join(" + ")} · SL ${decision.plan.stop} · T ${decision.plan.target} · ${decision.plan.riskReward}R. Press "Take trade" to enter.`;
       else {
         this.consumedSetups.add(key);
-        const position = this.open(input.symbol, decision.plan, input.contracts);
+        const position = this.open(input.symbol, decision.plan, input.contracts, false, settings);
         summary = `${position.kind} entered: ${position.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.entry}`).join(" + ")} · SL ${position.stop} · T ${position.target}`;
       }
       this.lastSignal = decision.plan && !block && !this.consumedSetups.has(key) ? { symbol: input.symbol, at: now.getTime(), key } : null;
@@ -668,7 +714,7 @@ export class SmartScalper {
       const legs = plan.legs.map((leg) => { const live = prices.get(norm(leg.symbol)); return live ? { ...leg, price: leg.side === "BUY" ? (live.ask || live.premium) : (live.bid || live.premium) } : leg; });
       this.consumedSetups.add(signal.key);
       this.lastSignal = null;
-      const position = this.open(symbol, { ...plan, legs }, contracts);
+      const position = this.open(symbol, { ...plan, legs }, contracts, false, settings);
       return { ...this.state(symbol), decision: this.lastDecision, signalReady: false, summary: `${position.kind} taken: ${position.legs.map((leg) => `${leg.side} ${leg.symbol} @ ${leg.entry}`).join(" + ")} · SL ${position.stop} · T ${position.target}` };
     });
   }
@@ -738,7 +784,7 @@ export class SmartScalper {
         fill = { planned: plan.entry, actual, deviation: round2(actual - plan.entry), riskReward, plannedLoss: round2(plannedLot * lots), stressedLoss: round2(stressedLot * lots) };
       }
       this.consumedSetups.add(input.setupId);
-      const position = this.open(underlying, { ...sized, legs }, contracts, Boolean(plan.risk));
+      const position = this.open(underlying, { ...sized, legs }, contracts, Boolean(plan.risk), settings);
       if (fill) { position.fill = fill; this.persist(position); }
       return { ...this.state(underlying), placed: true, position: this.view(position), summary: `${position.kind} placed on the scalper: BUY ${position.legs[0].symbol} × ${position.legs[0].quantity} @ ${position.entry}${fill ? ` (planned ${fill.planned}, ${fill.deviation >= 0 ? "+" : ""}${fill.deviation})` : ""} · SL ${position.stop} · T ${position.target}${fill ? ` · ${fill.riskReward}R at the fill · max loss ₹${fill.stressedLoss} stressed` : ""}` };
     });
@@ -813,7 +859,7 @@ export class SmartScalper {
    * widens the risk (re-checked by place()) instead of silently tightening the stop. Otherwise the
    * level engine's convention applies and the stop keeps its planned distance from the fill.
    */
-  private open(underlying: string, plan: ScalperPlan, contracts: ScalperContract[], anchorStop = false) {
+  private open(underlying: string, plan: ScalperPlan, contracts: ScalperContract[], anchorStop = false, settings: ScalperSettings = this.lastSettings) {
     const id = `scalper-${this.tradeDate}-${++this.sequence}-${Date.now().toString(36)}`;
     const timestamp = this.clock().toISOString();
     const legs: Leg[] = plan.legs.map((leg, index) => {
@@ -832,6 +878,9 @@ export class SmartScalper {
       // R for the staged trail is measured from the ACTUAL entry to the stop.
       ...(plan.trail ? { trail: { rule: plan.trail.rule, risk: round2((anchorStop ? entry : plan.entry) - plan.stop), costPerUnit: round2(plan.trail.costPerUnit), stage: "INITIAL" as TrailStage } } : {}),
     };
+    // Every engine trade starts on the smart auto trail (unless switched off in the settings); the
+    // trader can change the SL, target and trailing on the position at any time (modify).
+    position.controls = { mode: settings.smartTrail ? "SMART" : "RULE", points: null, runPastTarget: settings.smartTrail && settings.runPastTarget, resumeAbove: null, stage: "INITIAL", risk: position.initialRisk && position.initialRisk > 0 ? position.initialRisk : round2(entry * FALLBACK_RISK_PCT), targetRuns: 0 };
     this.positions.push(position);
     this.tradesToday += 1;
     this.persist(position);
@@ -860,45 +909,171 @@ export class SmartScalper {
       // Each position squares off at its own market's time (15:15 index options, 23:00 MCX).
       if (minutes >= squareOffOf(position.underlying)) reason = `SQUARE_OFF_${hhmm(squareOffOf(position.underlying)).replace(":", "_")}`;
       else if (pnl <= -settings.maxLossPerTrade) reason = "MAX_LOSS_PER_TRADE";
-      if (!reason && position.kind !== "MANUAL" && position.underlying === input.symbol) {
+      if (!reason && position.underlying === input.symbol) {
         const risk = position.initialRisk ?? 0;
         position.highWater = Math.max(position.highWater, value);
         position.lowWater = Math.min(position.lowWater ?? position.entry, value);
-        if (position.trail && position.stop !== null) {
-          // Staged, cost-covered trail: VWAP-EMA in units of R, NIFTY Sniper in multiples of the fill.
-          const next = position.trail.rule === "SNIPER"
-            ? sniperTrail({ entry: position.entry, stop: position.stop, highWater: position.highWater, trail: position.trail })
-            : vwapEmaTrail({ entry: position.entry, stop: position.stop, highWater: position.highWater, trail: position.trail });
-          if (next.stop > position.stop || next.stage !== position.trail.stage) {
-            position.stop = next.stop;
-            position.trail.stage = next.stage;
-            position.trailing = next.stage !== "INITIAL";
-            this.persist(position);
-          }
-        } else if (risk > 0 && position.stop !== null) {
-          // +1R → stop to breakeven; beyond 1.5R trail 0.75R behind the best value.
-          const gain = position.highWater - position.entry;
-          let stop = position.stop;
-          if (gain >= risk) stop = Math.max(stop, position.entry + Math.min(risk * 0.1, gain * 0.1));
-          if (gain >= risk * 1.5) stop = Math.max(stop, position.highWater - risk * 0.75);
-          if (stop > position.stop) { position.stop = round2(stop); position.trailing = true; this.persist(position); }
-        }
+        this.trailStop(position, value, squareOffOf(position.underlying) - minutes);
         const spotPrice = input.spot;
         const bull = position.side === "CE";
+        const manual = position.kind === "MANUAL";
         // The sniper manages the PREMIUM to its 2x target; the index level is only an invalidation.
         const sniper = position.trail?.rule === "SNIPER";
+        // Smart trail with run-past-target: the target never closes the trade, it moves the stop up and the target out.
+        const runner = position.controls?.mode === "SMART" && position.controls.runPastTarget;
         // Index levels only with a valid spot: a missing quote (0) must never read as a broken level.
         const spotKnown = Number.isFinite(spotPrice) && spotPrice > 0;
-        if (spotKnown && position.spot && (bull ? spotPrice <= position.spot.stop : spotPrice >= position.spot.stop)) reason = "SPOT_LEVEL_BROKEN";
-        else if (!sniper && spotKnown && position.spot && (bull ? spotPrice >= position.spot.target : spotPrice <= position.spot.target)) reason = "SPOT_TARGET";
-        else if (position.target !== null && value >= position.target) reason = sniper ? "TARGET_2X" : "TARGET";
-        else if (position.stop !== null && value <= position.stop) reason = position.trail ? (position.trail.stage === "INITIAL" ? "STOP_LOSS" : position.trail.stage === "BREAKEVEN" ? "BREAKEVEN_STOP" : position.trail.stage === "LOCKED" ? "LOCKED_PROFIT_STOP" : "TRAILING_STOP") : position.trailing ? "TRAILING_STOP" : "STOP_LOSS";
-        else if (!sniper && position.trail && position.trail.stage !== "INITIAL" && emaMomentumLost(input.bars, bull, now)) reason = "EMA9_LOST";
-        else if (sniper && now.getTime() - Date.parse(position.openedAt) >= SNIPER_MAX_HOLD_MINUTES * 60_000 && value < position.entry * SNIPER_TRAIL.breakevenAt) reason = "SNIPER_TIME_STOP";
-        else if (!sniper && position.kind === "SCALP" && risk > 0 && now.getTime() - Date.parse(position.openedAt) >= settings.maxHoldMinutes * 60_000 && value - position.entry < risk * 0.5) reason = "SCALP_TIME_STOP";
+        if (!manual && spotKnown && position.spot && (bull ? spotPrice <= position.spot.stop : spotPrice >= position.spot.stop)) reason = "SPOT_LEVEL_BROKEN";
+        else if (!manual && !sniper && !runner && spotKnown && position.spot && (bull ? spotPrice >= position.spot.target : spotPrice <= position.spot.target)) reason = "SPOT_TARGET";
+        else if (!runner && position.target !== null && value >= position.target) reason = sniper ? "TARGET_2X" : "TARGET";
+        else if (position.stop !== null && value <= position.stop) reason = this.stopReason(position);
+        else if (!manual && !sniper && position.trail && position.trail.stage !== "INITIAL" && emaMomentumLost(input.bars, bull, now)) reason = "EMA9_LOST";
+        else if (!manual && sniper && now.getTime() - Date.parse(position.openedAt) >= SNIPER_MAX_HOLD_MINUTES * 60_000 && value < position.entry * SNIPER_TRAIL.breakevenAt) reason = "SNIPER_TIME_STOP";
+        else if (!manual && !sniper && position.kind === "SCALP" && risk > 0 && now.getTime() - Date.parse(position.openedAt) >= settings.maxHoldMinutes * 60_000 && value - position.entry < risk * 0.5) reason = "SCALP_TIME_STOP";
       }
       if (reason) this.close(position, reason);
     }
+  }
+
+  /** The stage the stop is in: the strategy rule's or the smart / fixed trail's, whichever is further. */
+  private stageOf(position: ScalperPosition): TrailStage {
+    const rule = position.trail?.stage ?? (position.trailing && !position.controls ? "TRAILING" : "INITIAL");
+    return position.controls && position.controls.mode !== "RULE" ? higherStage(rule, position.controls.stage) : rule;
+  }
+
+  private stopReason(position: ScalperPosition) {
+    if (position.controls?.targetRuns) return "RUNNER_STOP";
+    const stage = this.stageOf(position);
+    if (stage === "INITIAL") return position.trailing && position.stop !== null && position.stop > position.entry ? "TRAILING_STOP" : "STOP_LOSS";
+    return stage === "BREAKEVEN" ? "BREAKEVEN_STOP" : stage === "LOCKED" ? "LOCKED_PROFIT_STOP" : "TRAILING_STOP";
+  }
+
+  /**
+   * Move the stop (only ever up) by the position's trailing mode:
+   *  RULE  — the strategy's own trail (VWAP-EMA, NIFTY Sniper, or the level engine's 1R / 1.5R trail);
+   *  SMART — the strategy rule (if any) AND the smart auto trail, the higher stop wins; may run past the target;
+   *  FIXED — the best premium minus the trader's distance;
+   *  OFF   — the stop stays where the trader put it.
+   * After a manual SL edit nothing moves the stop until the premium makes a new best (resumeAbove).
+   */
+  private trailStop(position: ScalperPosition, value: number, minutesToClose: number) {
+    const controls = position.controls;
+    const mode: TrailMode = controls?.mode ?? (position.kind === "MANUAL" ? "OFF" : "RULE");
+    if (mode === "OFF") return;
+    if (controls?.resumeAbove !== null && controls?.resumeAbove !== undefined) {
+      if (!(position.highWater > controls.resumeAbove)) return;
+      controls.resumeAbove = null;
+    }
+    const before = { stop: position.stop, target: position.target, stage: position.trail?.stage, smart: controls?.stage };
+    if ((mode === "RULE" || mode === "SMART") && position.stop !== null) {
+      if (position.trail) {
+        // Staged, cost-covered trail: VWAP-EMA in units of R, NIFTY Sniper in multiples of the fill.
+        const next = position.trail.rule === "SNIPER"
+          ? sniperTrail({ entry: position.entry, stop: position.stop, highWater: position.highWater, trail: position.trail })
+          : vwapEmaTrail({ entry: position.entry, stop: position.stop, highWater: position.highWater, trail: position.trail });
+        if (next.stop > position.stop) position.stop = next.stop;
+        position.trail.stage = next.stage;
+      } else if (position.kind !== "MANUAL" && (position.initialRisk ?? 0) > 0) {
+        // Level engine: +1R → stop to breakeven; beyond 1.5R trail 0.75R behind the best value.
+        const risk = position.initialRisk!;
+        const gain = position.highWater - position.entry;
+        let stop = position.stop;
+        if (gain >= risk) stop = Math.max(stop, position.entry + Math.min(risk * 0.1, gain * 0.1));
+        if (gain >= risk * 1.5) stop = Math.max(stop, position.highWater - risk * 0.75);
+        if (stop > position.stop) position.stop = round2(stop);
+      }
+    }
+    if (mode === "SMART" && controls) {
+      const next = smartTrail({
+        entry: position.entry, stop: position.stop, target: position.target, highWater: position.highWater, value,
+        risk: controls.risk, costPerUnit: position.trail?.costPerUnit ?? estimatedCostPerUnit(position.entry, this.quantity(position)),
+        tick: 0.05, minutesToClose, runPastTarget: controls.runPastTarget, stage: controls.stage,
+      });
+      position.stop = next.stop;
+      position.target = next.target;
+      controls.stage = next.stage;
+      if (next.extended) controls.targetRuns += 1;
+    }
+    if (mode === "FIXED" && controls?.points && controls.points > 0) {
+      const trailed = round2(Math.floor((position.highWater - controls.points) / 0.05 + 1e-6) * 0.05);
+      if (trailed > 0 && (position.stop === null || trailed > position.stop)) {
+        position.stop = trailed;
+        controls.stage = trailed > position.entry ? "TRAILING" : controls.stage;
+      }
+    }
+    const changed = before.stop !== position.stop || before.target !== position.target || before.stage !== position.trail?.stage || before.smart !== controls?.stage;
+    if (changed) {
+      position.trailing = this.stageOf(position) !== "INITIAL" || (position.stop !== null && before.stop !== null && position.stop > before.stop) || position.trailing;
+      this.persist(position);
+    }
+  }
+
+  /**
+   * Modify an open position's stop loss, target and trailing at any time (engine or manual trade).
+   * The SL must stay below and the target above the live premium (use Exit to close now). A stop
+   * moved by hand stays where it is put until the premium makes a new best; then the trail resumes.
+   */
+  modify(underlying: string, id: string, changes: ModifyRequest, contracts: ScalperContract[] = []) {
+    return this.serial(async () => {
+      await this.hydrate();
+      this.mark(contracts);
+      const position = this.positions.find((item) => item.id === id && item.status === "OPEN");
+      if (!position) return { ...this.state(underlying), modified: false, error: "That position is not open any more." };
+      const value = this.netValue(position);
+      const tick = 0.05;
+      const toTick = (price: number) => round2(Math.round(price / tick) * tick);
+      const controls: PositionControls = position.controls ?? { mode: position.kind === "MANUAL" ? "OFF" : "RULE", points: null, runPastTarget: false, resumeAbove: null, stage: "INITIAL", risk: position.initialRisk && position.initialRisk > 0 ? position.initialRisk : round2(position.entry * FALLBACK_RISK_PCT), targetRuns: 0 };
+      const fail = (error: string) => ({ ...this.state(underlying), modified: false, error });
+      const notes: string[] = [];
+      let stop = position.stop;
+      let target = position.target;
+      if (changes.stop !== undefined) {
+        if (changes.stop === null) stop = null;
+        else {
+          const next = toTick(Number(changes.stop));
+          if (!(next > 0)) return fail("The stop loss must be a positive premium.");
+          if (next >= value) return fail(`The stop loss ₹${next} must be below the live premium ₹${value}. Use Exit to close the trade now.`);
+          stop = next;
+        }
+      }
+      if (changes.target !== undefined) {
+        if (changes.target === null) target = null;
+        else {
+          const next = toTick(Number(changes.target));
+          if (!(next > value)) return fail(`The target ₹${next} must be above the live premium ₹${value}. Use Exit to book the profit now.`);
+          target = next;
+        }
+      }
+      const mode = changes.trailMode ?? controls.mode;
+      if (!TRAIL_MODES.includes(mode)) return fail(`Unknown trailing mode ${String(mode)}.`);
+      if (mode === "RULE" && position.kind === "MANUAL") return fail("A manual trade has no strategy rule: pick Smart, Fixed or Off.");
+      let points = controls.points;
+      if (changes.trailPoints !== undefined) points = changes.trailPoints === null ? null : round2(Number(changes.trailPoints));
+      if (mode === "FIXED" && !(points !== null && points > 0 && points < value)) return fail(`A fixed trail needs a distance in rupees between 0 and the premium ₹${value}.`);
+      const stopMoved = stop !== position.stop;
+      position.stop = stop;
+      position.target = target;
+      controls.points = points;
+      if (changes.runPastTarget !== undefined) controls.runPastTarget = Boolean(changes.runPastTarget);
+      if (mode !== controls.mode) {
+        controls.mode = mode;
+        // A trail switched on now measures R from where the stop is (or 15% of the premium).
+        if (mode === "SMART" && !(position.initialRisk && position.initialRisk > 0)) controls.risk = round2(stop !== null && stop < position.entry ? position.entry - stop : position.entry * FALLBACK_RISK_PCT);
+        if (!stopMoved) controls.resumeAbove = null;
+      }
+      // A manual SL edit is respected: the trail moves it again only on a new best premium.
+      if (stopMoved) controls.resumeAbove = mode === "OFF" ? null : position.highWater;
+      if (stopMoved && stop !== null && !(position.initialRisk && position.initialRisk > 0) && stop < position.entry && controls.risk <= 0) controls.risk = round2(position.entry - stop);
+      controls.modifiedAt = this.clock().toISOString();
+      position.controls = controls;
+      const qty = this.quantity(position);
+      const settings = this.lastSettings;
+      if (stop !== null && (position.entry - stop) * qty > settings.maxLossPerTrade) notes.push(`the ₹${settings.maxLossPerTrade} max loss per trade still closes it first`);
+      if (stop === null) notes.push("no stop loss: only the max loss per trade and the square-off protect it");
+      this.persist(position);
+      const modeText = mode === "SMART" ? `smart auto trail${controls.runPastTarget ? ", runs past target" : ""}` : mode === "FIXED" ? `trails ₹${points} under the best premium` : mode === "RULE" ? "strategy trail" : "trailing off";
+      return { ...this.state(underlying), modified: true, position: this.view(position), summary: `Modified ${this.view(position).label}: SL ${stop === null ? "none" : `₹${stop}`} · T ${target === null ? "none" : `₹${target}`} · ${modeText}${notes.length ? ` (${notes.join("; ")})` : ""}` };
+    });
   }
 
   private close(position: ScalperPosition, reason: string, quantity?: number) {
@@ -936,6 +1111,7 @@ export class SmartScalper {
         ...(position.legs.length === 1 && position.stop !== null ? { stopLoss: position.stop, target: position.target ?? undefined, trailingStop: position.trailing ? position.stop : undefined } : {}),
         ...(position.trail ? { trailRule: position.trail.rule, trailStage: position.trail.stage, trailCostPerUnit: position.trail.costPerUnit, initialStopLoss: round2(position.entry - position.trail.risk), highWaterMark: position.highWater } : {}),
         ...(position.lowWater !== undefined ? { lowWaterMark: position.lowWater } : {}),
+        ...(position.controls ? { trailMode: position.controls.mode, trailPoints: position.controls.points ?? undefined, runPastTarget: position.controls.runPastTarget, trailResumeAbove: position.controls.resumeAbove ?? undefined, smartStage: position.controls.stage, smartRisk: position.controls.risk, targetRuns: position.controls.targetRuns, highWaterMark: position.highWater } : {}),
         ...(position.signal ? { entrySignal: position.signal } : {}),
         status: position.status === "OPEN" ? "OPEN" : "EXITED", mode: "PAPER", source: position.reason, createdAt: position.openedAt, updatedAt: this.clock().toISOString(),
         ...(position.status === "EXITED" ? { exitPrice: exits?.[index], exitAt: position.exitAt, exitReason: position.exitReason, realizedPnl: round2(legPnl) } : {}),
@@ -961,12 +1137,14 @@ export class SmartScalper {
         leg.quantity += qty;
         leg.ltp = contract.premium;
         existing.entry = leg.entry;
+        existing.highWater = Math.max(existing.highWater, existing.entry);
         this.persist(existing);
         return { ...this.state(underlying), summary: `Added ${qty} ${contract.symbol} @ ${fill}; avg ${leg.entry}` };
       }
       const id = `scalper-${this.tradeDate}-${++this.sequence}-${Date.now().toString(36)}`;
       const position: ScalperPosition = {
         id, kind: "MANUAL", side: contract.contract === "CALL" ? "CE" : "PE", underlying, openedAt: this.clock().toISOString(), entry: fill, stop: null, target: null, initialRisk: null, highWater: fill, trailing: false, spot: null, reason: "Manual scalper order", status: "OPEN",
+        controls: { mode: "OFF", points: null, runPastTarget: false, resumeAbove: null, stage: "INITIAL", risk: round2(fill * FALLBACK_RISK_PCT), targetRuns: 0 },
         legs: [{ symbol: contract.symbol, contract: contract.contract, strike: contract.strike, expiry: contract.expiry, side: "BUY", quantity: qty, entry: fill, ltp: contract.premium, orderId: `${id}-L1` }],
       };
       this.positions.push(position);

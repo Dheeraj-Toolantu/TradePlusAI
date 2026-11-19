@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import type { ScalperBar, ScalperContract, ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
+import type { ModifyRequest, ScalperBar, ScalperContract, ScalperSettings, TrailMode } from "../../../../../services/paper-trading/src/smart-scalper";
 import { readSafeModeState } from "../../../../../services/execution/src/safe-mode";
 import { getMarketIntel, isIntelSymbol, type MarketIntel } from "../../../lib/market-intel";
 
@@ -58,6 +58,25 @@ export async function POST(request: Request) {
       const safety = readSafeModeState();
       const entryBlockedReason = safety.killSwitch ? `KILL_SWITCH_ACTIVE: ${safety.killSwitchReason}` : safety.safeMode ? `SAFE_MODE_ACTIVE: ${safety.safeModeReason}` : undefined;
       const result = await scalper.take(symbol, contracts, { entryBlockedReason, settings: (body.settings && typeof body.settings === "object" ? body.settings : {}) as Partial<ScalperSettings> });
+      return NextResponse.json(result, { status: "error" in result && result.error ? 409 : 200 });
+    }
+    if (action === "modify") {
+      // Change an open position's SL, target and trailing at any time. Only the fields sent change;
+      // null clears the SL or target.
+      const id = String(body.id ?? "");
+      if (!id) return NextResponse.json({ error: "A position id is required." }, { status: 400 });
+      const level = (value: unknown) => (value === null ? null : value === undefined || value === "" ? undefined : Number(value));
+      const changes: ModifyRequest = {};
+      if ("stop" in body) changes.stop = level(body.stop);
+      if ("target" in body) changes.target = level(body.target);
+      if ("trailPoints" in body) changes.trailPoints = level(body.trailPoints);
+      if (typeof body.trailMode === "string") changes.trailMode = body.trailMode.toUpperCase() as TrailMode;
+      if (typeof body.runPastTarget === "boolean") changes.runPastTarget = body.runPastTarget;
+      for (const key of ["stop", "target", "trailPoints"] as const) {
+        const value = changes[key];
+        if (value !== undefined && value !== null && !Number.isFinite(value)) return NextResponse.json({ error: `${key} must be a number.` }, { status: 400 });
+      }
+      const result = await scalper.modify(symbol, id, changes, contracts);
       return NextResponse.json(result, { status: "error" in result && result.error ? 409 : 200 });
     }
     if (action === "exit" || action === "exitAll") {

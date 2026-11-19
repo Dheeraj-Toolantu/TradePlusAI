@@ -58,7 +58,7 @@ describe("Smart Scalper: sniper placement and exits", () => {
   it("exits at 2x on the premium, not on an index 'target', and on the index invalidation", async () => {
     const book = scalper();
     const live = contract(31);
-    await book.place("NIFTY", sniperPlan(live), [live], { setupId: "s3" });
+    await book.place("NIFTY", sniperPlan(live), [live], { setupId: "s3", settings: { runPastTarget: false } });
     // The index passes the plan's spot target, the premium is short of 2x: still open.
     let out = await book.manage({ symbol: "NIFTY", spot: 24100, bars: [], contracts: [contract(50)] });
     expect(out.exited).toHaveLength(0);

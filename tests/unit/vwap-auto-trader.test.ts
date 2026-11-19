@@ -15,7 +15,7 @@ describe("one VWAP-EMA trade at a time", () => {
     const nifty = contract("NIFTY26N1024800CE", 24800);
     const bank = contract("BANKNIFTY26N1054000CE", 54000);
     const scalper = new SmartScalper({ now: at("10:05"), hydrate: false });
-    expect((await scalper.place("NIFTY", plan(nifty), [nifty], { setupId: "a" })).placed).toBe(true);
+    expect((await scalper.place("NIFTY", plan(nifty), [nifty], { setupId: "a", settings: { runPastTarget: false } })).placed).toBe(true);
     const blocked = await scalper.place("BANKNIFTY", plan(bank), [bank], { setupId: "b" });
     expect(blocked).toMatchObject({ placed: false, blockedByOpenTrade: true });
     expect(blocked.error).toMatch(/no new trade until it exits at its target, SL or trailing SL/);

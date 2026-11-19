@@ -123,9 +123,10 @@ describe("VWAP-EMA staged trail (systematic SL / target / trailing SL)", () => {
     expect(emaMomentumLost(bars(true), true, new Date(at10(4) * 1000 + 30_000))).toBe(false); // that candle is still forming
   });
 
+  // The strategy's own fixed target: these trades do not run past it (see the smart-trail tests).
   async function placed(clock: { now: Date }) {
     const scalper = new SmartScalper({ now: () => clock.now, hydrate: false });
-    await scalper.place("NIFTY", plan({ trail: { rule: "VWAP_EMA", costPerUnit: 2.15 } }), [contract], { setupId: "trail" });
+    await scalper.place("NIFTY", plan({ trail: { rule: "VWAP_EMA", costPerUnit: 2.15 } }), [contract], { setupId: "trail", settings: { runPastTarget: false } });
     return scalper;
   }
   const scanAt = (scalper: SmartScalper, premium: number, drop = false) => scalper.scan({ symbol: "NIFTY", spot: 24825, bars: bars(drop), contracts: [{ ...contract, premium, bid: premium, ask: premium }], autoEntries: false });
