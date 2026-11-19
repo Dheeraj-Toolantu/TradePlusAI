@@ -78,9 +78,12 @@ npx vitest run tests/unit/nifty-sniper.test.ts tests/unit/vwap-auto-trader.test.
     second engine pass) — the last 5 completed minutes average ≥ 1.2 × the 20 before them, ≥ 55% of
     that volume traded on rising-premium candles, and the premium is up over those 5 minutes. For
     a PUT the rising put premium is the index sellers in control.
-  * *Writer OI change rising*: CALL needs put writers, PUT needs call writers. Read from the
-    server's stored 3-minute strike OI samples (the last 4, ±3 strikes around ATM): net build ≥ 0.3%,
-    most intervals adding, the latest interval still adding, and faster than the opposite writers.
+  * *Writer OI change rising, opposite writers covering (strong move)*: CALL needs put writers
+    adding AND call writers covering; PUT needs call writers adding AND put writers covering. Read
+    from the server's stored 3-minute strike OI samples (the last 4, ±3 strikes around ATM): the
+    adding side's net build ≥ 0.3%, most intervals adding, the latest interval still adding; the
+    covering side's OI down ≥ 0.1% over the window and not rising in the latest interval
+    (`require_opposite_covering`, on by default).
     With fewer than 3 fresh samples it falls back to market-intel's single 5-minute OI change
     (labelled a 5-min reading); with neither it fails closed.
 * **Hard filters.** Setup confirmed, signal fresh, 1m trigger, not chasing, entry window

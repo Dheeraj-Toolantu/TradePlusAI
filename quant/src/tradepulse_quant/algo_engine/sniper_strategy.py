@@ -155,6 +155,10 @@ class SniperConfig:
     writer_oi_samples: int = 4               # the last 4 stored OI samples (3 intervals, ~9 min at 3 min)
     writer_oi_min_change_pct: float = 0.3    # net writer OI build over the window, % of the starting OI
     writer_oi_max_age_seconds: int = 600     # the newest stored OI sample must be this fresh
+    # Strong move: the opposite writers must be COVERING (OI decreasing) while the supportive ones add.
+    # CALL: call writers' OI falling near ATM; PUT: put writers' OI falling near ATM.
+    require_opposite_covering: bool = True
+    opposite_min_cover_pct: float = 0.1      # net fall over the window, % of their starting OI
     # --- feasibility / probability -----------------------------------------------------------
     target_multiple: float = 2.0
     partial_multiple: float = 1.5
@@ -876,16 +880,18 @@ def _near_strikes(strikes: list[float], spot: float, count: int) -> list[float]:
 
 
 def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spot: float, now: datetime, config: SniperConfig) -> dict:
-    """Is the supportive writers' OI change rising?
+    """Is the supportive writers' OI rising while the opposite writers cover (a strong move)?
 
-    CALL: put writers (PE OI near ATM) must be adding, interval after interval, and faster than call
-    writers. PUT: call writers (CE OI near ATM) the same, faster than put writers. Reads the server's
-    stored 3-minute strike OI samples (the last ``writer_oi_samples``); without enough of them it
-    falls back to market-intel's single 5-minute OI change (status SNAPSHOT). Neither: UNAVAILABLE.
+    CALL: put writers (PE OI near ATM) must be adding, interval after interval, AND call writers (CE
+    OI near ATM) must be covering: their OI falling over the window and not rising in the latest
+    interval. PUT: call writers adding AND put writers covering. Reads the server's stored 3-minute
+    strike OI samples (the last ``writer_oi_samples``); without enough of them it falls back to
+    market-intel's single 5-minute OI change (status SNAPSHOT). Neither: UNAVAILABLE.
     """
     writer, other = ("pe", "ce") if side == "CE" else ("ce", "pe")
     who = "put writers" if side == "CE" else "call writers"
-    base = {"key": "writer_oi", "side": side, "who": who, "passed": False}
+    opposite = "call writers" if side == "CE" else "put writers"
+    base = {"key": "writer_oi", "side": side, "who": who, "opposite": opposite, "passed": False}
     samples = []
     for row in history or []:
         stamp = _parse(row.get("at"))
@@ -910,17 +916,25 @@ def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spo
         building = pct is not None and pct >= config.writer_oi_min_change_pct
         latest_up = changes[-1] > 0
         steady = positive * 2 >= len(changes) + 1          # a majority of the intervals added OI
+        other_changes = [b - a for a, b in zip(other_series, other_series[1:])]
+        other_pct = other_net / other_series[0] * 100 if other_series[0] > 0 else None
+        # Opposite writers covering: their OI fell over the window and is not rising again now.
+        covering = other_pct is not None and other_pct <= -config.opposite_min_cover_pct and other_changes[-1] <= 0
         outpacing = net > other_net
-        passed = building and latest_up and steady and outpacing
+        passed = building and latest_up and steady and outpacing and (covering or not config.require_opposite_covering)
         minutes = (samples[-1][0] - samples[0][0]).total_seconds() / 60
         parts = [f"{who} OI {net:+,.0f} ({pct:+.2f}%) over {minutes:.0f} min near ATM" if pct is not None else f"{who} OI unavailable",
                  f"{positive}/{len(changes)} intervals adding" + ("" if steady else " (not a steady build)"),
                  f"latest interval {changes[-1]:+,.0f}" + ("" if latest_up else " (build has stalled)"),
-                 f"{'call' if other == 'ce' else 'put'} writers {other_net:+,.0f}" + ("" if outpacing else f" (outpacing the {who})")]
+                 (f"{opposite} OI {other_net:+,.0f} ({other_pct:+.2f}%)" if other_pct is not None else f"{opposite} OI unavailable")
+                 + (", covering" if covering else f", not covering (needs a fall of {config.opposite_min_cover_pct}%+ and no fresh adding)" if other_changes[-1] <= 0 else f", adding again in the latest interval ({other_changes[-1]:+,.0f})")]
         if pct is not None and not building:
             parts.append(f"needs +{config.writer_oi_min_change_pct}%")
+        if passed:
+            parts.append(f"strong {'CALL' if side == 'CE' else 'PUT'} move: {who} adding while {opposite} cover")
         return {**base, "status": "OK", "passed": passed, "net_change": _r(net, 0), "change_pct": _r(pct, 3), "interval_changes": [_r(c, 0) for c in changes],
-                "opposite_change": _r(other_net, 0), "strikes": near, "samples": len(samples), "as_of": samples[-1][0].isoformat(),
+                "opposite_change": _r(other_net, 0), "opposite_change_pct": _r(other_pct, 3), "opposite_interval_changes": [_r(c, 0) for c in other_changes],
+                "opposite_covering": covering, "strikes": near, "samples": len(samples), "as_of": samples[-1][0].isoformat(),
                 "reason": "; ".join(parts)}
     rows = (flow or {}).get("strikes") or []
     changes5 = [(float(r.get("strike") or 0), _num(r.get(f"{writer}_oi_change")), _num(r.get(f"{other}_oi_change"))) for r in rows]
@@ -929,10 +943,12 @@ def writer_oi_flow(history: list[dict] | None, flow: dict | None, side: str, spo
         near = set(_near_strikes([item[0] for item in changes5], spot, config.writer_oi_strikes))
         net = sum(item[1] for item in changes5 if item[0] in near)
         other_net = sum(item[2] or 0.0 for item in changes5 if item[0] in near)
-        passed = net > 0 and net > other_net
-        return {**base, "status": "SNAPSHOT", "passed": passed, "net_change": _r(net, 0), "opposite_change": _r(other_net, 0),
-                "reason": f"{who} OI {net:+,.0f} vs {'call' if other == 'ce' else 'put'} writers {other_net:+,.0f} in the last 5 min near ATM "
-                          f"({'adding faster' if passed else 'not adding faster'}; single 5-min reading, the 3-minute OI history is not available yet)"}
+        covering = other_net < 0
+        passed = net > 0 and net > other_net and (covering or not config.require_opposite_covering)
+        verdict = f"strong move: {who} adding while {opposite} cover" if passed else f"{who} not adding" if net <= 0 else f"{opposite} not covering" if not covering else f"{who} not adding faster"
+        return {**base, "status": "SNAPSHOT", "passed": passed, "net_change": _r(net, 0), "opposite_change": _r(other_net, 0), "opposite_covering": covering,
+                "reason": f"{who} OI {net:+,.0f}, {opposite} OI {other_net:+,.0f} in the last 5 min near ATM "
+                          f"({verdict}; single 5-min reading, the 3-minute OI history is not available yet)"}
     return {**base, "status": "UNAVAILABLE", "reason": f"{who}' OI change unavailable (no stored OI samples and no 5-minute OI change yet)"}
 
 

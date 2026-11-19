@@ -106,7 +106,7 @@ def premium_candles(symbol: str = SELECTED, end: datetime = NOW, recent_volume: 
     return {"symbol": symbol, "candles": out}
 
 
-def oi_history(pe_steps=(20000, 25000, 30000), ce_steps=(2000, -1000, 1000), end: datetime = NOW) -> list[dict]:
+def oi_history(pe_steps=(20000, 25000, 30000), ce_steps=(-6000, -5000, -4000), end: datetime = NOW) -> list[dict]:
     """Stored 3-minute strike OI samples; each step is added to every near-ATM strike."""
     samples, pe, ce = [], 1_000_000.0, 900_000.0
     for i in range(len(pe_steps) + 1):
@@ -321,17 +321,36 @@ def test_call_needs_put_writers_oi_change_rising_and_outpacing_call_writers():
     assert not calls_heavier["sniper"]["order_flow"]["writer_oi"]["passed"]
 
 
-def test_put_side_reads_call_writers():
-    rising_calls = oi_history(pe_steps=(1000, -2000, 500), ce_steps=(20000, 25000, 30000))
-    flow = sn.writer_oi_flow(rising_calls, None, "PE", 24004.0, NOW, sn.SniperConfig())
-    assert flow["who"] == "call writers" and flow["passed"]
+def test_strong_call_needs_call_writers_covering_too():
+    strong = run()["sniper"]["order_flow"]["writer_oi"]
+    assert strong["passed"] and strong["opposite_covering"] and "strong CALL move" in strong["reason"]
+    # Put writers adding but call writers also adding (a range, not a strong move): no trade.
+    both_adding = run(oi_history=oi_history(ce_steps=(3000, 2000, 1000)))
+    flow = both_adding["sniper"]["order_flow"]["writer_oi"]
+    assert not flow["passed"] and not flow["opposite_covering"] and both_adding["decision"] != "CONFIRMED"
+    # Call writers covered earlier but are adding again in the latest interval: not covering now.
+    resumed = run(oi_history=oi_history(ce_steps=(-9000, -6000, 2000)))["sniper"]["order_flow"]["writer_oi"]
+    assert not resumed["passed"] and "adding again" in resumed["reason"]
+    # The covering rule can be switched off: then put writers adding faster is enough.
+    relaxed = sn.writer_oi_flow(oi_history(ce_steps=(3000, 2000, 1000)), None, "CE", 24004.0, NOW, replace(sn.SniperConfig(), require_opposite_covering=False))
+    assert relaxed["passed"]
+
+
+def test_put_side_reads_call_writers_adding_and_put_writers_covering():
+    strong_put = oi_history(pe_steps=(-8000, -6000, -5000), ce_steps=(20000, 25000, 30000))
+    flow = sn.writer_oi_flow(strong_put, None, "PE", 24004.0, NOW, sn.SniperConfig())
+    assert flow["who"] == "call writers" and flow["opposite"] == "put writers" and flow["passed"] and "strong PUT move" in flow["reason"]
+    puts_holding = oi_history(pe_steps=(1000, -2000, 1500), ce_steps=(20000, 25000, 30000))
+    assert not sn.writer_oi_flow(puts_holding, None, "PE", 24004.0, NOW, sn.SniperConfig())["passed"]
     assert not sn.writer_oi_flow(oi_history(), None, "PE", 24004.0, NOW, sn.SniperConfig())["passed"]
 
 
 def test_writer_oi_falls_back_to_the_five_minute_change_then_fails_closed():
-    snapshot = {"available": True, "strikes": [{"strike": 24000, "pe_oi_change": 40000, "ce_oi_change": 5000}, {"strike": 24050, "pe_oi_change": 10000, "ce_oi_change": -2000}]}
+    snapshot = {"available": True, "strikes": [{"strike": 24000, "pe_oi_change": 40000, "ce_oi_change": -5000}, {"strike": 24050, "pe_oi_change": 10000, "ce_oi_change": -2000}]}
     flow = sn.writer_oi_flow(None, snapshot, "CE", 24004.0, NOW, sn.SniperConfig())
-    assert flow["status"] == "SNAPSHOT" and flow["passed"]
+    assert flow["status"] == "SNAPSHOT" and flow["passed"] and flow["opposite_covering"]
+    calls_adding = {"available": True, "strikes": [{"strike": 24000, "pe_oi_change": 40000, "ce_oi_change": 5000}]}
+    assert not sn.writer_oi_flow(None, calls_adding, "CE", 24004.0, NOW, sn.SniperConfig())["passed"]
     none = sn.writer_oi_flow(None, None, "CE", 24004.0, NOW, sn.SniperConfig())
     assert none["status"] == "UNAVAILABLE" and not none["passed"]
     assert run(oi_history=None, options_flow={**FLOW})["decision"] != "CONFIRMED"
