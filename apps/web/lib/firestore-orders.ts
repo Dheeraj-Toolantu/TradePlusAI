@@ -60,6 +60,14 @@ export type OrderRecord = {
   trailRule?: string;
   trailStage?: string;
   trailCostPerUnit?: number;
+  /** Smart Scalper risk controls the trader can change on an open position (SMART / RULE / FIXED / OFF). */
+  trailMode?: string;
+  trailPoints?: number;
+  runPastTarget?: boolean;
+  trailResumeAbove?: number;
+  smartStage?: string;
+  smartRisk?: number;
+  targetRuns?: number;
   charges?: number;
   exitError?: string;
   reconcileWarning?: string;

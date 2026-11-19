@@ -2,7 +2,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, type RiskRewardBox } from "./premium-chart";
-import type { PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
+import type { ModifyRequest, PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 import { PositionCard } from "./position-card";
 import { ALGO_UNDERLYINGS, entryWindowLabel, isCommodity, squareOffLabel, underlyingName } from "../../lib/underlyings";
 
@@ -37,7 +37,7 @@ const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.p
 const TIMEFRAMES = [1, 3, 5] as const;
 const SETTINGS_KEY = "tradepulse.scalper.settings";
 const PREFS_KEY = "tradepulse.scalper.prefs";
-const DEFAULT_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12 };
+const DEFAULT_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true };
 const money = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits }));
 const signed = (value: number) => `${value >= 0 ? "+" : "-"} ₹${money(Math.abs(value))}`;
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -119,7 +119,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   spotBarsRef.current = spotBars;
 
   useEffect(() => {
-    setSettings(load(SETTINGS_KEY, DEFAULT_SETTINGS));
+    setSettings({ ...DEFAULT_SETTINGS, ...load<Partial<ScalperSettings>>(SETTINGS_KEY, {}) });
     const prefs = load(PREFS_KEY, { views: ["CALL", "PUT"] as View[], timeframe: 1, instant: true, tradeMode: "MANUAL" as "AUTOMATIC" | "MANUAL", engineStrategy: "VWAP_EMA" as EngineStrategy });
     setTradeMode(prefs.tradeMode === "AUTOMATIC" ? "AUTOMATIC" : "MANUAL");
     setEngineStrategy(prefs.engineStrategy === "LEVELS" ? "LEVELS" : prefs.engineStrategy === "SNIPER" ? "SNIPER" : "VWAP_EMA");
@@ -305,6 +305,15 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
     if (data.summary) onLog?.(`[Scalper] ${data.summary}`, "exit");
   }, [apply, chain, instant, onLog, post]);
 
+  // Change a taken trade's SL, target and trailing at any time (the server re-checks every value).
+  const modify = useCallback(async (id: string, changes: ModifyRequest) => {
+    const { data } = await post({ action: "modify", id, ...changes, contracts: chain });
+    apply(data);
+    if (data.error) return data.error;
+    if (data.summary) onLog?.(`[Scalper] ${data.summary}`, "info");
+    return null;
+  }, [apply, chain, onLog, post]);
+
   // Shift+↑ buy call · Shift+← sell call · Shift+↓ buy put · Shift+→ sell put.
   const tradeRef = useRef({ trade, call, put, callLots, putLots });
   tradeRef.current = { trade, call, put, callLots, putLots };
@@ -487,6 +496,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             <label>Daily loss stop<select value={settings.maxDailyLoss} onChange={(event) => setSettings((current) => ({ ...current, maxDailyLoss: Number(event.target.value) }))}>{[1500, 3000, 4000, 5000, 7500, 10000].map((value) => <option key={value} value={value}>₹{value.toLocaleString("en-IN")}</option>)}</select></label>
             <label>Lots cap<select value={settings.lots} onChange={(event) => setSettings((current) => ({ ...current, lots: Number(event.target.value) }))}>{[1, 2, 3, 4, 5, 10].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
             <label>Min reward : risk<select value={settings.minRiskReward} onChange={(event) => setSettings((current) => ({ ...current, minRiskReward: Number(event.target.value) }))}>{[1.5, 2, 2.5, 3].map((value) => <option key={value} value={value}>{value} R</option>)}</select></label>
+            <label title="New engine trades start on the smart auto trail: breakeven + charges at +0.75R, then it trails the best premium giving back 45% of the gain, less as the trade grows (20% from +4R), tighter in the last 15 minutes. You can change it on each trade.">Trailing SL<select value={settings.smartTrail ? "SMART" : "RULE"} onChange={(event) => setSettings((current) => ({ ...current, smartTrail: event.target.value === "SMART" }))}><option value="SMART">Smart auto trail</option><option value="RULE">Strategy rule only</option></select></label>
+            <label title="Smart trail: when the target trades, lock 80% of the move and push the target out instead of closing, so a trend keeps paying.">At target<select value={settings.runPastTarget ? "RUN" : "EXIT"} disabled={!settings.smartTrail} onChange={(event) => setSettings((current) => ({ ...current, runPastTarget: event.target.value === "RUN" }))}><option value="RUN">Lock profit &amp; run</option><option value="EXIT">Exit at target</option></select></label>
             <label>Scalp time stop<select value={settings.maxHoldMinutes} onChange={(event) => setSettings((current) => ({ ...current, maxHoldMinutes: Number(event.target.value) }))}>{[5, 8, 12, 15, 20, 30].map((value) => <option key={value} value={value}>{value} min</option>)}</select></label>
           </div>
         )}
@@ -583,6 +594,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
               selected={selected.includes(position.id)}
               onSelect={(checked) => setSelected((current) => checked ? [...current, position.id] : current.filter((id) => id !== position.id))}
               onExit={() => void exit([position.id])}
+              onModify={(changes) => modify(position.id, changes)}
             />
           )) : <div className="algo-empty">{positionsTab === "OPEN" ? "No open scalper positions." : "No closed trades today."}</div>}
         </div>

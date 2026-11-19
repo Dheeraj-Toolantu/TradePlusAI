@@ -392,6 +392,22 @@
 .pos-next b, .pos-signal b { font-family: "DM Mono", monospace; }
 .pos-next { padding: 5px 7px; border-radius: 5px; background: #142024; color: #b9c8cc; }
 .scalper-positions { gap: 8px; max-height: 680px; }
+.pos-trail-mode { margin: 0; color: #8a9ba0; font-size: 11px; line-height: 1.4; }
+.pos-trail-mode b { color: #dfe8ea; font-family: "DM Mono", monospace; }
+.pos-controls-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.pos-modify { padding: 4px 10px; color: #0b1a20; border: 0; border-radius: 5px; background: #4fc3f7; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
+.pos-modify:hover { background: #7dd3fa; }
+.pos-modify:disabled { opacity: .6; cursor: default; }
+.pos-modify.ghost { color: #b9c8cc; border: 1px solid #2d3b40; background: transparent; }
+.pos-modify.ghost:hover { color: #f1f6f7; border-color: #4a5d63; }
+.pos-modify-error { margin: 0; color: #fa6b78; font-size: 11px; line-height: 1.4; }
+.pos-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 8px; padding: 8px; border: 1px solid #1f3a44; border-radius: 6px; background: #0d171a; }
+.pos-controls label { display: grid; gap: 2px; min-width: 0; color: #6f8287; font-size: 10px; text-transform: uppercase; letter-spacing: .3px; }
+.pos-controls input[type="number"], .pos-controls select { box-sizing: border-box; width: 100%; min-width: 0; padding: 4px 6px; color: #e4ecee; border: 1px solid #2d3b40; border-radius: 4px; background: #111a1d; font: 600 12px "DM Mono", monospace; }
+.pos-controls .pos-check { display: flex; align-items: center; gap: 6px; grid-column: 1 / -1; text-transform: none; letter-spacing: 0; color: #b9c8cc; font-size: 11px; }
+.pos-controls-hint, .pos-controls .pos-modify-error { grid-column: 1 / -1; margin: 0; color: #6f8287; font-size: 10px; line-height: 1.4; }
+.pos-controls .pos-modify-error { color: #fa6b78; }
+.pos-controls-actions { display: flex; gap: 6px; grid-column: 1 / -1; }
 .exec-auto { display: grid; gap: 4px; margin: 10px 0; padding: 10px 12px; border: 1px solid #1d2a2e; border-radius: 8px; background: #0f1719; }
 .exec-auto-switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .exec-auto-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }

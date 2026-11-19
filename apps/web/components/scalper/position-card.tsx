@@ -1,8 +1,8 @@
 "use client";
 
-import { memo } from "react";
-import type { PositionView } from "../../../../services/paper-trading/src/smart-scalper";
-import { nextSniperTrailStep, nextTrailStep } from "../../../../services/paper-trading/src/scalper-trail";
+import { memo, useState } from "react";
+import type { ModifyRequest, PositionView } from "../../../../services/paper-trading/src/smart-scalper";
+import { nextSmartTrailStep, nextSniperTrailStep, nextTrailStep, type TrailMode } from "../../../../services/paper-trading/src/scalper-trail";
 
 const money = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits }));
 const rupees = (value: number) => `${value >= 0 ? "+" : "−"}₹${money(Math.abs(value))}`;
@@ -14,8 +14,10 @@ export const STAGE_TEXT: Record<string, string> = { INITIAL: "Initial SL", BREAK
 const EXIT_TEXT: Record<string, string> = {
   TARGET: "Target hit", SPOT_TARGET: "Index target hit", STOP_LOSS: "Stop loss hit", BREAKEVEN_STOP: "Breakeven stop", LOCKED_PROFIT_STOP: "Locked-profit stop",
   TRAILING_STOP: "Trailing stop", EMA9_LOST: "Momentum lost (9 EMA)", SPOT_LEVEL_BROKEN: "Index level broken", SCALP_TIME_STOP: "Time stop",
-  MAX_LOSS_PER_TRADE: "Max loss per trade", SQUARE_OFF_15_15: "15:15 square-off", MANUAL: "Manual exit",
+  MAX_LOSS_PER_TRADE: "Max loss per trade", SQUARE_OFF_15_15: "15:15 square-off", MANUAL: "Manual exit", RUNNER_STOP: "Runner stop (ran past target)",
 };
+const STAGE_RANK = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
+const MODE_TEXT: Record<TrailMode, string> = { SMART: "Smart auto trail", RULE: "Strategy rule", FIXED: "Fixed distance", OFF: "Off" };
 
 type Props = {
   position: PositionView;
@@ -26,7 +28,73 @@ type Props = {
   selected?: boolean;
   onSelect?: (checked: boolean) => void;
   onExit?: () => void;
+  /** Change the SL, target and trailing of this open position; resolves to an error text or null. */
+  onModify?: (changes: ModifyRequest) => Promise<string | null>;
 };
+
+/**
+ * The trader's controls on a taken trade: stop loss, target and the trailing mode, changeable at any
+ * time. Only the fields the trader edits are sent, so a stop the trail moved meanwhile is not undone.
+ */
+function RiskControls({ position, onModify }: { position: PositionView; onModify: (changes: ModifyRequest) => Promise<string | null> }) {
+  const controls = position.controls;
+  const initial = () => ({
+    stop: position.stop === null ? "" : String(position.stop), target: position.target === null ? "" : String(position.target),
+    mode: (controls?.mode ?? (position.kind === "MANUAL" ? "OFF" : "RULE")) as TrailMode, points: controls?.points ? String(controls.points) : "", run: Boolean(controls?.runPastTarget),
+  });
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState(initial);
+  const [start, setStart] = useState(initial);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const modes: TrailMode[] = position.kind === "MANUAL" ? ["SMART", "FIXED", "OFF"] : ["SMART", "RULE", "FIXED", "OFF"];
+  const begin = () => { const next = initial(); setForm(next); setStart(next); setError(null); setOpen(true); };
+  const send = async (changes: ModifyRequest) => {
+    setSaving(true);
+    const result = await onModify(changes).catch(() => "Modify request failed");
+    setSaving(false);
+    setError(result);
+    if (!result) setOpen(false);
+  };
+  const save = () => {
+    const changes: ModifyRequest = {};
+    const level = (text: string) => (text.trim() === "" ? null : Number(text));
+    if (form.stop !== start.stop) changes.stop = level(form.stop);
+    if (form.target !== start.target) changes.target = level(form.target);
+    if (form.mode !== start.mode) changes.trailMode = form.mode;
+    if (form.points !== start.points || (form.mode === "FIXED" && form.mode !== start.mode)) changes.trailPoints = level(form.points);
+    if (form.run !== start.run) changes.runPastTarget = form.run;
+    if (!Object.keys(changes).length) { setOpen(false); return; }
+    void send(changes);
+  };
+  const breakeven = Math.ceil((position.entry + 0.05) * 20) / 20;
+  if (!open) {
+    return (
+      <div className="pos-controls-bar">
+        <button type="button" className="pos-modify" onClick={begin} title="Change the stop loss, target or trailing stop of this trade">Modify SL / target / trail</button>
+        {position.value > breakeven ? <button type="button" className="pos-modify ghost" disabled={saving} title={`Move the stop loss to ₹${money(breakeven)} (entry + one tick): this trade can no longer lose on the premium`} onClick={() => void send({ stop: breakeven })}>SL to cost</button> : null}
+        {error ? <span className="pos-modify-error" role="alert">{error}</span> : null}
+      </div>
+    );
+  }
+  return (
+    <form className="pos-controls" onSubmit={(event) => { event.preventDefault(); save(); }}>
+      <label>Stop loss ₹<input type="number" inputMode="decimal" step="0.05" min="0" value={form.stop} placeholder="none" onChange={(event) => setForm({ ...form, stop: event.target.value })} /></label>
+      <label>Target ₹<input type="number" inputMode="decimal" step="0.05" min="0" value={form.target} placeholder="none" onChange={(event) => setForm({ ...form, target: event.target.value })} /></label>
+      <label>Trailing SL<select value={form.mode} onChange={(event) => setForm({ ...form, mode: event.target.value as TrailMode })}>
+        {modes.map((mode) => <option key={mode} value={mode}>{mode === "RULE" && position.trail ? `Strategy rule (${position.trail.rule === "SNIPER" ? "NIFTY Sniper" : "VWAP-EMA"})` : MODE_TEXT[mode]}</option>)}
+      </select></label>
+      {form.mode === "FIXED" ? <label>Trail by ₹<input type="number" inputMode="decimal" step="0.05" min="0.05" value={form.points} placeholder="e.g. 5" onChange={(event) => setForm({ ...form, points: event.target.value })} /></label> : null}
+      {form.mode === "SMART" ? <label className="pos-check"><input type="checkbox" checked={form.run} onChange={(event) => setForm({ ...form, run: event.target.checked })} />Run past target (lock 80%, extend target)</label> : null}
+      <p className="pos-controls-hint">LTP ₹{money(position.value)}. SL must be below and target above it; leave blank for none. A stop you move stays put until the premium makes a new high, then the trail takes over again.</p>
+      {error ? <p className="pos-modify-error" role="alert">{error}</p> : null}
+      <div className="pos-controls-actions">
+        <button type="submit" className="pos-modify" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
+        <button type="button" className="pos-modify ghost" onClick={() => { setOpen(false); setError(null); }}>Cancel</button>
+      </div>
+    </form>
+  );
+}
 
 /**
  * One position the way a trading terminal shows it: live P&L in rupees, percent and R; a price
@@ -34,7 +102,7 @@ type Props = {
  * last price; the stop's stage and what moves it next; best and worst excursion; the index plan;
  * what confirmed the entry; and the clock (time in trade, time stop).
  */
-export const PositionCard = memo(function PositionCard({ position, closed = false, now, spot, maxHoldMinutes, selected, onSelect, onExit }: Props) {
+export const PositionCard = memo(function PositionCard({ position, closed = false, now, spot, maxHoldMinutes, selected, onSelect, onExit, onModify }: Props) {
   const qty = closed ? position.legs.reduce((sum, leg) => Math.max(sum, leg.quantity), 0) : position.quantity;
   const single = position.legs.length === 1;
   const ltp = closed ? position.exitValue ?? position.value : position.value;
@@ -47,12 +115,19 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
   const worst = Math.min(position.lowWater ?? position.entry, closed ? position.lowWater ?? position.entry : ltp);
   const atStop = position.stop !== null ? (position.stop - position.entry) * qty : null;
   const atTarget = position.target !== null ? (position.target - position.entry) * qty : null;
-  const stage = position.trail?.stage ?? (position.trailing ? "TRAILING" : "INITIAL");
-  const next = !closed && position.trail
+  const controls = position.controls;
+  const mode: TrailMode = controls?.mode ?? (position.kind === "MANUAL" ? "OFF" : "RULE");
+  const ruleStage = position.trail?.stage ?? (position.trailing ? "TRAILING" : "INITIAL");
+  const stage = controls && mode !== "RULE" && STAGE_RANK.indexOf(controls.stage) > STAGE_RANK.indexOf(ruleStage) ? controls.stage : ruleStage;
+  const ruleNext = position.trail
     ? position.trail.rule === "SNIPER"
       ? nextSniperTrailStep({ entry: position.entry, costPerUnit: position.trail.costPerUnit, stage: position.trail.stage, highWater: best })
       : nextTrailStep({ entry: position.entry, risk: position.trail.risk, costPerUnit: position.trail.costPerUnit, stage: position.trail.stage, highWater: best })
     : null;
+  const smartNext = controls && mode === "SMART" ? nextSmartTrailStep({ entry: position.entry, risk: controls.risk, costPerUnit: position.trail?.costPerUnit ?? 0, stage: controls.stage, highWater: best }) : null;
+  // Smart mode keeps the strategy rule too: show whichever step would put the stop higher.
+  const next = closed || mode === "OFF" || mode === "FIXED" ? null : mode === "SMART" && smartNext && (!ruleNext || smartNext.stopTo >= ruleNext.stopTo) ? smartNext : ruleNext;
+  const resumeAbove = controls?.resumeAbove ?? null;
   const opened = Date.parse(position.openedAt);
   const ended = closed && position.exitAt ? Date.parse(position.exitAt) : now;
   const held = Number.isFinite(opened) ? ended - opened : 0;
@@ -133,6 +208,16 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
           {next.trigger !== null ? <>Next: at ₹{money(next.trigger)} the SL moves to <b>₹{money(next.stopTo)}</b> ({next.label}).</> : <>SL {next.label}: <b>₹{money(next.stopTo)}</b> now (best ₹{money(best)}).</>}
         </p>
       ) : null}
+      {!closed && controls ? (
+        <p className="pos-trail-mode">
+          Trailing: <b>{MODE_TEXT[mode]}</b>
+          {mode === "SMART" ? (controls.runPastTarget ? ` · runs past target${controls.targetRuns ? ` (target moved out ${controls.targetRuns}×)` : ""}` : " · closes at target") : null}
+          {mode === "FIXED" && controls.points ? <> · ₹{money(controls.points)} under the best premium: SL <b>₹{money(Math.max(position.stop ?? 0, best - controls.points))}</b></> : null}
+          {mode === "OFF" ? " · the SL moves only when you move it" : null}
+          {resumeAbove !== null && mode !== "OFF" ? <> · your SL holds until the premium beats ₹{money(resumeAbove)}</> : null}
+        </p>
+      ) : null}
+      {!closed && onModify ? <RiskControls key={position.id} position={position} onModify={onModify} /> : null}
       {position.signal ? (
         <p className="pos-signal">Entry confirmed by ADX(14) <b className={position.signal.adx > 20 ? "gain" : "warning"}>{position.signal.adx.toFixed(1)}</b> on the {position.signal.triggerTime ? ist(position.signal.triggerTime) : "trigger"} candle · +DI {position.signal.plusDi.toFixed(1)} / −DI {position.signal.minusDi.toFixed(1)}{position.signal.rising === null ? "" : position.signal.rising ? " · rising" : " · falling"}</p>
       ) : null}

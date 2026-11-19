@@ -13,7 +13,7 @@ const holder = globalThis as typeof globalThis & { __tradepulseScalper?: SmartSc
 async function bookWithOpenScalp(clock: { now: Date }) {
   const scalper = new SmartScalper({ now: () => clock.now, hydrate: false });
   holder.__tradepulseScalper = scalper;
-  await scalper.place("NIFTY", plan, [contract], { setupId: "monitor" });
+  await scalper.place("NIFTY", plan, [contract], { setupId: "monitor", settings: { runPastTarget: false } });
   return scalper;
 }
 const deps = (premium: number | null, spot: number | null = 24825): MonitorDeps => ({ optionQuote: async () => premium, spot: async () => spot, bars: async () => [], now: () => Date.now() });
