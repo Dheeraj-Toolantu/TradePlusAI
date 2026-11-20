@@ -595,6 +595,8 @@ async function placeOnScalper(body: RecordValue, origin: string) {
       symbol: live.symbol, lots: liveArm.lots, stopLoss: setup.stop_loss, target: setup.target, strategy: liveArm.strategy, setupId: setup.setup_id,
       source: `AUTO ${sniper ? "NIFTY Sniper" : "VWAP-EMA"} ${underlying}`,
       ...(sniper ? { premiumMultiples: { stop: SNIPER_PREMIUM.stop, target: SNIPER_PREMIUM.target } } : {}),
+      // Book half the lots (2+ lots) once the premium reaches 1.5x the fill; the rest keeps running.
+      partialMultiple: SNIPER_PREMIUM.partial,
     });
     if (sniper) void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: result.ok, reasons: result.ok ? [] : [String(result.error ?? "refused")], position: result.ok ? result.order : undefined });
     const text = result.ok

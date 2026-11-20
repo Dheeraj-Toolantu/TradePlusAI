@@ -7,6 +7,7 @@ export type LivePositionView = {
   id: string; symbol: string; quantity: number; lotSize?: number; price: number; currentPrice?: number; pnl?: number; pnlPercent?: number;
   stopLoss?: number; initialStopLoss?: number; target?: number; brokerStopTrigger?: number; brokerStopOrderId?: string;
   trailResumeAbove?: number; reconcileWarning?: string; exitError?: string; createdAt: string; strategyName?: string;
+  partialPrice?: number; partialQuantity?: number; partialDone?: boolean; partialMultiple?: number;
 };
 
 const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
@@ -78,6 +79,11 @@ export const LivePositionCard = memo(function LivePositionCard({ order, pin, onM
         <div><dt>SL at Groww</dt><dd>{order.brokerStopOrderId ? `SL-M ₹${money(order.brokerStopTrigger)}` : <span className="loss">none</span>}</dd></div>
         {atStop !== null ? <div><dt>{atStop >= 0 ? "Locked if SL hits" : "Loss if SL hits"}</dt><dd className={atStop >= 0 ? "gain" : "loss"}>{signed(atStop)}</dd></div> : null}
       </dl>
+      {order.partialPrice ? (
+        <p className="pos-trail-mode">Partial booking: {order.partialQuantity
+          ? order.partialDone ? <>booked at {order.partialMultiple ?? 1.5}x; the rest keeps running</> : <>sells <b>{order.partialQuantity} qty</b> at ₹{money(order.partialPrice)} ({order.partialMultiple ?? 1.5}x the fill), the rest runs</>
+          : <>needs 2+ lots (a lot cannot be split)</>}</p>
+      ) : null}
       {order.trailResumeAbove ? <p className="pos-trail-mode">Your stop holds until the premium beats ₹{money(order.trailResumeAbove)}, then the trail resumes.</p> : null}
       {order.reconcileWarning ? <p className="pos-modify-error">⚠ {order.reconcileWarning}</p> : null}
       {order.exitError ? <p className="pos-modify-error">{order.exitError}</p> : null}
