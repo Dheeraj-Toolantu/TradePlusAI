@@ -77,7 +77,8 @@ type Contract = { symbol: string; growwSymbol: string; type: "CE" | "PE"; expiry
 type SearchResult = Contract & { exchange?: string };
 type RiskReward = "1:1" | "1:2";
 type NextDayPlan = NonNullable<NextDaySetup["plans"]>[number];
-type LiveStatus = { enabled: boolean; disabledReasons: string[]; limits?: { maxDailyLoss: number; maxTradesPerDay: number; maxLotsPerOrder: number; maxOrderValue: number; maxOpenPositions: number; minRewardRisk: number }; today?: { tradesToday: number; realizedPnl: number; openRisk: number; lossBudgetLeft: number }; positions: Order[]; monitor?: { running: boolean; lastTickAt: string | null; lastError: string | null } };
+type LiveAuto = { serverEnabled: boolean; armed: { strategy: string; lots: number; armedAt: string; date: string } | null; maxLotsPerOrder: number };
+type LiveStatus = { enabled: boolean; disabledReasons: string[]; auto?: LiveAuto; limits?: { maxDailyLoss: number; maxTradesPerDay: number; maxLotsPerOrder: number; maxOrderValue: number; maxOpenPositions: number; minRewardRisk: number }; today?: { tradesToday: number; realizedPnl: number; openRisk: number; lossBudgetLeft: number }; positions: Order[]; monitor?: { running: boolean; lastTickAt: string | null; lastError: string | null } };
 type Tab = "LIVE" | "PAPER" | "HISTORY" | "LOGS";
 type Log = { time: string; text: string; type: "entry" | "exit" | "info" };
 
@@ -175,6 +176,9 @@ export default function ExecutionPage() {
   const [live, setLive] = useState<LiveStatus | null>(null);
   const [liveDraft, setLiveDraft] = useState<LiveTicketDraft | null>(null);
   const [livePin, setLivePin] = useState("");
+  const [armLots, setArmLots] = useState(1);
+  const [armPin, setArmPin] = useState("");
+  const [arming, setArming] = useState(false);
 
   // Smart scalper desk (paper): it owns its engine; the page only needs to know whether it is on.
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -673,6 +677,20 @@ export default function ExecutionPage() {
       if (response.ok && data.autoTrader) { setAutoTrader(data.autoTrader as AutoTrader); log(`[Auto-execute] Settings updated on the server${settings.sniperLots ? ` (sniper ${settings.sniperLots} lot${settings.sniperLots > 1 ? "s" : ""})` : ""}`, "info"); }
     } catch { /* the next toggle sends them again */ }
   }, [log, refresh, riskReward, strategyId, symbol]);
+  // ---- real money: arm / disarm automatic live orders (server-checked; PIN to arm) -----------
+  const armLive = useCallback(async (arm: boolean) => {
+    if (arm && !window.confirm(`REAL MONEY: arm automatic LIVE orders for ${strategy.name} at exactly ${armLots} lot(s)?\n\nEvery confirmed setup today will be bought on Groww (intraday MIS) at ${armLots} lot(s) with a stop-loss at Groww, without asking again. A trade the server limits cannot carry at that size is refused, never resized.`)) return;
+    setArming(true);
+    try {
+      const response = await fetch("/api/live-orders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(arm ? { action: "arm_auto", strategy: strategyId, lots: armLots, pin: armPin } : { action: "disarm_auto" }) });
+      const data = await response.json().catch(() => ({}));
+      const text = response.ok ? (arm ? `LIVE auto-trading ARMED: ${strategy.name}, exactly ${armLots} lot(s), today only. Switch Auto-execute on for the strategy to let the server place trades.` : "LIVE auto-trading disarmed. Open live positions are still managed.") : `Live arming failed: ${data.error ?? "request failed"}`;
+      setMessage(text);
+      log(`[LIVE] ${text}`, "info");
+      setArmPin("");
+    } catch { setMessage("Live arming request failed"); }
+    finally { setArming(false); void refreshLive(); }
+  }, [armLots, armPin, log, refreshLive, strategy.name, strategyId]);
   const autoStatus = !autoTrader ? "" : autoTrader.openTrade
     ? `Trade open: BUY ${autoTrader.openTrade.label} on ${autoTrader.openTrade.underlying} · SL ₹${money(autoTrader.openTrade.stop)} · T ₹${money(autoTrader.openTrade.target)}${autoTrader.openTrade.stage ? ` (${autoTrader.openTrade.stage.toLowerCase()})` : ""} — no new trade until it exits at its target, SL or trailing SL`
     : autoOn ? (autoTrader.lastByIndex[symbol]?.text ?? "Watching: checks a few seconds after every 1-minute close") : "";
@@ -965,6 +983,20 @@ export default function ExecutionPage() {
 
           {tab === "LIVE" && (
             <>
+              <div className="exec-live-auto" role="region" aria-label="Live auto-trading">
+                <p className="mi-note"><b>Live auto-trading (real money)</b> · {live?.auto?.armed
+                  ? <><b className="loss">ARMED</b>: {live.auto.armed.strategy === "NIFTY_SNIPER" ? "NIFTY Sniper" : "VWAP-EMA"}, exactly <b>{live.auto.armed.lots} lot(s)</b> per trade, today only. Confirmed setups go to Groww (intraday MIS) with a stop-loss at Groww.</>
+                  : live?.auto?.serverEnabled ? "not armed: setups go to the paper book." : `off on the server: ${[...(live?.disabledReasons ?? []), ...(live?.enabled ? ["LIVE_AUTO_EXECUTION_ENABLED is not true"] : [])].join("; ") || "status unavailable"}.`}</p>
+                {live?.auto?.serverEnabled ? (
+                  <div className="exec-live-auto-row">
+                    {live.auto.armed ? <button type="button" className="algo-exit" disabled={arming} onClick={() => void armLive(false)}>Disarm live auto</button> : <>
+                      <label>Lots<select value={armLots} onChange={(event) => setArmLots(Number(event.target.value))}>{Array.from({ length: 10 }, (_, index) => index + 1).map((value) => <option key={value} value={value} disabled={value > (live.auto?.maxLotsPerOrder ?? 1)}>{value}{value > (live.auto?.maxLotsPerOrder ?? 1) ? " (above server max)" : ""}</option>)}</select></label>
+                      <label className="exec-pin">Trading PIN<input type="password" inputMode="numeric" autoComplete="off" value={armPin} onChange={(event) => setArmPin(event.target.value)} /></label>
+                      <button type="button" className="algo-exit" disabled={arming || armPin.length < 6} onClick={() => void armLive(true)}>Arm {strategy.name} · {armLots} lot(s)</button>
+                    </>}
+                  </div>
+                ) : null}
+              </div>
               {live?.today && <div className="mi-risk-row"><span>Trades today <b>{live.today.tradesToday}/{live.limits?.maxTradesPerDay}</b></span><span>Realised <b className={live.today.realizedPnl >= 0 ? "gain" : "loss"}>₹{money(live.today.realizedPnl)}</b></span><span>Open risk <b>₹{money(live.today.openRisk)}</b></span><span>Loss budget left <b>₹{money(live.today.lossBudgetLeft)}</b></span><span>Monitor <b className={live.monitor?.running ? "gain" : ""}>{live.monitor?.running ? "running" : "idle"}</b></span></div>}
               {live?.monitor?.lastError && <p className="loss mi-note">Monitor error: {live.monitor.lastError}</p>}
               {livePositions.length ? (

@@ -13,6 +13,9 @@ import { ensureScalperMonitor } from "../../../lib/scalper-monitor";
 import { ensureVwapAutoTrader, setVwapAutoTrader, vwapAutoTraderStatus } from "../../../lib/vwap-auto-trader";
 import { journalSniper } from "../../../lib/sniper-journal";
 import { storedStrikeSamples } from "../../../lib/oi-strike-samples";
+import { readLiveConfig } from "../../../lib/live/config";
+import { liveAutoArm } from "../../../lib/live/auto-arm";
+import { liveService } from "../../../lib/live/default-deps";
 import { isCommodity } from "../../../lib/underlyings";
 import { contractBySymbol, derivativesIn } from "../../../lib/underlying-catalog";
 import { SmartScalper as ScalperBook, valueOption, type ScalperContract, type ScalperPlan, type ScalperSettings } from "../../../../../services/paper-trading/src/smart-scalper";
@@ -559,7 +562,17 @@ async function placeOnScalper(body: RecordValue, origin: string) {
     const health = await withTimeout(new GrowwAdapter(createGrowwTransport()).healthCheck(), 5000, "Groww health check");
     brokerHealthy = Boolean(health && "value" in health && health.value.connected && health.value.authenticated);
   } catch { brokerHealthy = false; }
-  const analysis = await runEngine(underlying, "groww", origin, strategy, await operationalEvidence(underlying, brokerHealthy, safety), {
+  // Real money: when live auto-trading is armed for this strategy, a confirmed setup goes to Groww
+  // (intraday MIS) at EXACTLY the armed lots instead of the paper book. The engine is told those lots
+  // (fixed, not sized from the paper budget); the live service's own limits then accept or refuse
+  // that exact size. Nothing is resized.
+  const liveConfig = readLiveConfig();
+  const arm = liveConfig.enabled && liveConfig.autoEnabled ? liveAutoArm(Date.now()) : null;
+  const liveArm = arm && arm.strategy === strategy ? arm : null;
+  const analysis = await runEngine(underlying, "groww", origin, strategy, await operationalEvidence(underlying, brokerHealthy, safety), liveArm ? {
+    riskReward: rrOf(body.riskReward), maxLossPerTrade: liveConfig.limits.maxDailyLoss, maxLots: liveArm.lots,
+    ...(sniper ? { sniperLots: liveArm.lots, sniperSizing: "FIXED_LOTS", sniperSetups: ScalperBook.settings(settings).sniperSetups } : {}),
+  } : {
     riskReward: rrOf(body.riskReward), maxLossPerTrade: Number(settings.maxLossPerTrade) || undefined, maxLots: Number(settings.lots) || undefined,
     ...(sniper ? { sniperLots: ScalperBook.settings(settings).sniperLots, sniperSizing: ScalperBook.settings(settings).sniperSizing, sniperSetups: ScalperBook.settings(settings).sniperSetups } : {}),
   }).catch((error: unknown) => ({ error: error instanceof Error ? error.message : "Strategy engine unavailable" }) as RecordValue);
@@ -577,6 +590,18 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   const live = contracts.find((item) => item.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase() === setup.contract.symbol.replace(/[^a-zA-Z0-9]/g, "").toUpperCase());
   if (!live || !(live.premium > 0) || !(live.lotSize > 0)) return NextResponse.json({ placed: false, error: `${setup.contract.symbol} has no live premium and lot size in the chain yet.` }, { status: 409 });
   const lot = live.lotSize;
+  if (liveArm) {
+    const result = await liveService().autoPlace({
+      symbol: live.symbol, lots: liveArm.lots, stopLoss: setup.stop_loss, target: setup.target, strategy: liveArm.strategy, setupId: setup.setup_id,
+      source: `AUTO ${sniper ? "NIFTY Sniper" : "VWAP-EMA"} ${underlying}`,
+      ...(sniper ? { premiumMultiples: { stop: SNIPER_PREMIUM.stop, target: SNIPER_PREMIUM.target } } : {}),
+    });
+    if (sniper) void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: result.ok, reasons: result.ok ? [] : [String(result.error ?? "refused")], position: result.ok ? result.order : undefined });
+    const text = result.ok
+      ? `LIVE ${liveArm.lots} lot(s) BUY ${live.symbol} × ${result.order.quantity} @ ₹${result.order.price} (Groww MIS) · SL ₹${result.order.stopLoss} at Groww · T ₹${result.order.target}${result.partial ? ` · PARTIAL FILL: ${result.order.quantity} of ${liveArm.lots * lot} qty` : ""}`
+      : `LIVE order not placed: ${result.error}`;
+    return NextResponse.json({ placed: result.ok, live: true, error: result.ok ? undefined : result.error, summary: text, order: result.ok ? result.order : undefined, setup, strategy }, { status: result.ok ? 200 : result.status });
+  }
   if (sniper) {
     // V2 sizing: the engine's lots (rupee risk budget, capped by the chosen lots, halved in an orderly
     // high-vol regime); the scalper re-checks them at the actual fill. FIXED_LOTS places exactly the
