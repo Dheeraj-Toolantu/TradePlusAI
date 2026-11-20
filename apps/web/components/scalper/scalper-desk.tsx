@@ -4,6 +4,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PremiumChart, foldTick, regroupBars, type ChartBar, type ChartLevel, type RiskRewardBox } from "./premium-chart";
 import type { ModifyRequest, PositionView, ScalperDecision, ScalperSettings } from "../../../../services/paper-trading/src/smart-scalper";
 import { PositionCard } from "./position-card";
+import { LivePositionCard, type LivePositionView } from "./live-position-card";
 import { ALGO_UNDERLYINGS, entryWindowLabel, isCommodity, squareOffLabel, underlyingName } from "../../lib/underlyings";
 
 export type ScalperChainRow = { symbol: string; contract: "CALL" | "PUT"; expiry: string; strike: number; premium: number; bid: number; ask: number; openInterest: number; volume: number; iv: number; delta: number; theta?: number; lotSize?: number; tickSize?: number };
@@ -66,7 +67,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange, onSettingsChange }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange, onSettingsChange, realPositions = [], onLiveModify, onLiveExit }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -89,6 +90,10 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   onSignalStrategyChange?: (next: SignalStrategy) => void;
   /** The desk's limits changed (e.g. the sniper lots): the algo page passes them to the server auto-trader. */
   onSettingsChange?: (settings: ScalperSettings) => void;
+  /** REAL-MONEY Groww positions (the algo page's live status), shown first on the right panel. */
+  realPositions?: LivePositionView[];
+  onLiveModify?: (id: string, changes: { stopLoss?: number; target?: number }, pin: string) => Promise<string | null>;
+  onLiveExit?: (id: string, pin: string) => Promise<string | null>;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -111,6 +116,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   const [putLots, setPutLots] = useState(1);
   const [state, setState] = useState<ScalperState>({ positions: [], closed: [], unrealizedPnl: 0, realizedPnl: 0, tradesToday: 0 });
   const [notice, setNotice] = useState("Paper scalper. Start the engine and choose Automatic (engine trades) or Manual (you take its signals), or trade the cards directly.");
+  const [livePin, setLivePin] = useState("");
   const [positionsTab, setPositionsTab] = useState<"OPEN" | "CLOSED">("OPEN");
   const [selected, setSelected] = useState<string[]>([]);
   const [spotBars, setSpotBars] = useState<ChartBar[]>([]);
@@ -586,7 +592,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
 
       <aside className="scalper-side-panel">
         <div className="scalper-tabs">
-          <button type="button" className={positionsTab === "OPEN" ? "on" : ""} onClick={() => setPositionsTab("OPEN")}>Positions ({livePositions.length})</button>
+          <button type="button" className={positionsTab === "OPEN" ? "on" : ""} onClick={() => setPositionsTab("OPEN")}>Positions ({livePositions.length + realPositions.length}){realPositions.length ? <em className="scalper-live-count"> · {realPositions.length} real</em> : null}</button>
           <button type="button" className={positionsTab === "CLOSED" ? "on" : ""} onClick={() => setPositionsTab("CLOSED")}>Closed ({state.closed.length})</button>
         </div>
         <div className="scalper-pnl">
@@ -600,6 +606,16 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
           <span title="Stops, targets, the trail, time stops and the 15:15 square-off run on the server, with or without this page open"><small>Exit monitor (server)</small><em className={state.monitor?.running && !state.monitor.lastError ? "gain" : "loss"}>{state.monitor ? (state.monitor.running ? `${state.monitor.lastError ? "error" : "running"}${state.monitor.lastTickAt ? ` · ${new Date(state.monitor.lastTickAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })}` : ""}` : "stopped") : "--"}</em></span>
         </div>
         {positionsTab === "OPEN" && selected.length > 0 && <button type="button" className="scalper-exit-selected" onClick={() => void exit(selected)}>Exit selected ({selected.length})</button>}
+        {positionsTab === "OPEN" && realPositions.length ? (
+          <div className="scalper-live">
+            <div className="scalper-live-head"><b>LIVE · real money (Groww)</b><label>Trading PIN<input type="password" inputMode="numeric" autoComplete="off" value={livePin} onChange={(event) => setLivePin(event.target.value)} placeholder="for modify / exit" /></label></div>
+            {realPositions.map((order) => (
+              <LivePositionCard key={order.id} order={order} pin={livePin}
+                onModify={(changes) => onLiveModify ? onLiveModify(order.id, changes, livePin) : Promise.resolve("Live actions are unavailable here")}
+                onExit={() => onLiveExit ? onLiveExit(order.id, livePin) : Promise.resolve("Live actions are unavailable here")} />
+            ))}
+          </div>
+        ) : null}
         <div className="scalper-positions">
           {shownPositions.length ? shownPositions.map((position) => (
             <PositionCard

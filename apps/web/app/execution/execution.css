@@ -432,3 +432,10 @@
 .exec-live-auto-row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
 .exec-live-auto-row label { display: grid; gap: 2px; color: var(--muted); font-size: 11px; }
 .exec-live-auto-row select { padding: 4px 6px; color: var(--text); border: 1px solid #2d3b40; border-radius: 4px; background: #111a1d; }
+.scalper-live { display: grid; gap: 8px; margin-bottom: 8px; padding: 8px; border: 1px solid #5a2a30; border-radius: 8px; background: #1a1012; }
+.scalper-live-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; color: #f6a6ae; font-size: 11px; }
+.scalper-live-head label { display: inline-flex; align-items: center; gap: 6px; color: #8a9ba0; }
+.scalper-live-head input { width: 120px; padding: 3px 6px; color: #e4ecee; border: 1px solid #2d3b40; border-radius: 4px; background: #111a1d; }
+.scalper-live-count { color: #f6a6ae; font-style: normal; }
+.pos-card.pos-live { border-color: #5a2a30; }
+.pos-side.live { color: #fff; background: #c2434f; }

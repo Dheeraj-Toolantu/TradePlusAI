@@ -10,6 +10,7 @@ import type { TradePlan } from "../../components/market-intel/market-intel-panel
 import type { NextDaySetup } from "../../components/execution/next-day-panel";
 import type { ChartBar, ChartLevel, RiskRewardBox } from "../../components/scalper/premium-chart";
 import type { SignalStrategy, VwapScalpSignal } from "../../components/scalper/scalper-desk";
+import type { LivePositionView } from "../../components/scalper/live-position-card";
 import type { SniperRead } from "../../components/execution/sniper-panel";
 import type { vwapAutoTraderStatus } from "../../lib/vwap-auto-trader";
 import type { PositionView } from "../../../../services/paper-trading/src/smart-scalper";
@@ -677,6 +678,22 @@ export default function ExecutionPage() {
       if (response.ok && data.autoTrader) { setAutoTrader(data.autoTrader as AutoTrader); log(`[Auto-execute] Settings updated on the server${settings.sniperLots ? ` (sniper ${settings.sniperLots} lot${settings.sniperLots > 1 ? "s" : ""})` : ""}`, "info"); }
     } catch { /* the next toggle sends them again */ }
   }, [log, refresh, riskReward, strategyId, symbol]);
+  // ---- real money on the scalper's right panel: modify SL / target and exit (PIN each time) ------
+  const liveRequest = useCallback(async (body: Record<string, unknown>, what: string) => {
+    try {
+      const response = await fetch("/api/live-orders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) return String(data.error ?? `${what} failed`);
+      const order = data.order as Order | undefined;
+      const text = `LIVE ${what}: ${order?.symbol ?? ""}${order?.stopLoss !== undefined ? ` · SL ₹${money(order.stopLoss)}` : ""}${order?.target !== undefined ? ` · T ₹${money(order.target)}` : ""}${order?.realizedPnl !== undefined ? ` · P&L ₹${money(order.realizedPnl)}` : ""}`;
+      setMessage(text);
+      log(text, what === "exit" ? "exit" : "info");
+      return null;
+    } catch { return `${what} request failed`; }
+    finally { void refreshLive(); }
+  }, [log, refreshLive]);
+  const onLiveModify = useCallback((id: string, changes: { stopLoss?: number; target?: number }, pin: string) => liveRequest({ action: "modify", orderId: id, pin, ...changes }, "modify"), [liveRequest]);
+  const onLiveExit = useCallback((id: string, pin: string) => liveRequest({ action: "exit", orderId: id, pin }, "exit"), [liveRequest]);
   // ---- real money: arm / disarm automatic live orders (server-checked; PIN to arm) -----------
   const armLive = useCallback(async (arm: boolean) => {
     if (arm && !window.confirm(`REAL MONEY: arm automatic LIVE orders for ${strategy.name} at exactly ${armLots} lot(s)?\n\nEvery confirmed setup today will be bought on Groww (intraday MIS) at ${armLots} lot(s) with a stop-loss at Groww, without asking again. A trade the server limits cannot carry at that size is refused, never resized.`)) return;
@@ -973,7 +990,7 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} onSettingsChange={(settings) => void onDeskSettings(settings)} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} onSettingsChange={(settings) => void onDeskSettings(settings)} realPositions={livePositions as unknown as LivePositionView[]} onLiveModify={onLiveModify} onLiveExit={onLiveExit} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

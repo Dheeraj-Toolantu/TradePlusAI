@@ -36,6 +36,11 @@ Limits (refuse, never resize — set them so your chosen lots fit):
 2. Switch **Auto-execute** on for that strategy (or press *Take trade*). Every confirmed setup is
    then sent to Groww instead of the paper book.
 3. **Disarm** at any time (no PIN). Open live positions keep being managed.
+4. Live positions also show at the top of the **scalper desk's right panel** (red *LIVE · real money*
+   cards). Type the trading PIN once in that panel, then **Modify SL / target** or **Exit** a live
+   trade. A new stop-loss moves the Groww SL-M order: the old one is cancelled and confirmed first,
+   and if Groww refuses the new one the previous stop is put back. A stop you move by hand holds until
+   the premium makes a new high; then the trail resumes.
 
 ## 3. What each live order does
 

@@ -392,6 +392,60 @@ export class LiveTradingService {
     }
   }
 
+  /**
+   * Change a live position's stop-loss and/or target (PIN required). The stop must stay below and the
+   * target above the live premium. A new stop moves the Groww SL-M order (the old one is cancelled and
+   * confirmed first, so nothing can sell twice); a stop moved by hand holds until the premium makes a
+   * new best, then the trail resumes. The target is app-managed.
+   */
+  async modify(orderId: string, changes: { stopLoss?: unknown; target?: unknown }, pin: unknown) {
+    if (!pinMatches(pin, this.deps.env)) return { ok: false as const, status: 401, error: "Incorrect trading PIN" };
+    await this.hydrate();
+    const order = monitor.positions.get(orderId);
+    if (!order || !isOpen(order)) return { ok: false as const, status: 404, error: "No open live position with that id" };
+    if (monitor.exiting.has(orderId)) return { ok: false as const, status: 409, error: "An exit or another change is in progress" };
+    const hasStop = changes.stopLoss !== undefined && changes.stopLoss !== null && changes.stopLoss !== "";
+    const hasTarget = changes.target !== undefined && changes.target !== null && changes.target !== "";
+    if (!hasStop && !hasTarget) return { ok: false as const, status: 400, error: "Give a new stop-loss and/or target" };
+    const exchange = order.exchange === "BSE" ? "BSE" : "NSE";
+    const ltp = await this.deps.ltp(order.symbol, exchange).catch(() => null);
+    if (!ltp) return { ok: false as const, status: 503, error: "No live quote; try again" };
+    const instrument = await this.deps.instrument(order.symbol);
+    const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
+    const stop = hasStop ? tickDown(Number(changes.stopLoss), tick) : null;
+    const target = hasTarget ? tickUp(Number(changes.target), tick) : null;
+    if (stop !== null && !(stop > 0 && stop < ltp)) return { ok: false as const, status: 422, error: `The stop-loss ₹${stop} must be above 0 and below the live premium ₹${ltp}. Use Exit to close now.` };
+    if (target !== null && !(target > ltp)) return { ok: false as const, status: 422, error: `The target ₹${target} must be above the live premium ₹${ltp}. Use Exit to book now.` };
+    monitor.exiting.add(orderId);
+    try {
+      if (stop !== null && stop !== Number(order.stopLoss)) {
+        if (order.brokerStopOrderId) {
+          const previous = Number(order.brokerStopTrigger ?? order.stopLoss);
+          await this.moveBrokerStop(order, stop);
+          if (!monitor.positions.has(order.id)) return { ok: false as const, status: 409, error: "The Groww stop-loss had already executed; the position is closed", order };
+          if (!order.brokerStopOrderId) {
+            // The old stop was cancelled but Groww refused the new one: put the old stop back.
+            const restored = await this.placeProtectiveStop(order, previous);
+            order.exitError = restored.ok ? undefined : `Stop-loss NOT at Groww (new ₹${stop} and old ₹${previous} both refused); the app will exit on its own stop. Check the Groww app.`;
+            await this.deps.store.save(order);
+            return { ok: false as const, status: 502, error: restored.ok ? `Groww refused the new stop ₹${stop}; the previous stop ₹${previous} was restored` : order.exitError };
+          }
+          if (Number(order.brokerStopTrigger) !== stop) { await this.deps.store.save(order); return { ok: false as const, status: 502, error: order.exitError ?? "The Groww stop-loss could not be moved; nothing changed" }; }
+        } else {
+          const placed = await this.placeProtectiveStop(order, stop);
+          if (!placed.ok) return { ok: false as const, status: 502, error: `Groww rejected the stop-loss: ${placed.error}` };
+        }
+        Object.assign(order, { stopLoss: stop, trailingStop: stop, trailResumeAbove: Math.max(Number(order.highWaterMark ?? order.price), ltp) });
+      }
+      if (target !== null) order.target = target;
+      order.updatedAt = new Date(this.deps.now()).toISOString();
+      await this.deps.store.save(order);
+      return { ok: true as const, status: 200, order };
+    } finally {
+      monitor.exiting.delete(orderId);
+    }
+  }
+
   /** Operator action after a reconcile mismatch (e.g. position closed in the Groww app). */
   async markClosed(orderId: string, exitPrice: number, pin: unknown) {
     if (!pinMatches(pin, this.deps.env)) return { ok: false as const, status: 401, error: "Incorrect trading PIN" };
@@ -438,8 +492,12 @@ export class LiveTradingService {
         const highWater = Math.max(Number(order.highWaterMark ?? entry), ltp);
         let stop = Number(order.stopLoss);
         const breakeven = entry + estimateCharges(entry, entry, order.quantity, order.exchange === "BSE" ? "BSE" : "NSE") / order.quantity;
-        if (highWater >= entry + risk) stop = Math.max(stop, round2(breakeven));
-        if (highWater >= entry + 1.5 * risk) stop = Math.max(stop, round2(highWater - risk));
+        // A stop the trader moved by hand holds until the premium makes a new best; then the trail resumes.
+        const resumeAbove = Number(order.trailResumeAbove ?? 0);
+        const trailing = !(resumeAbove > 0 && highWater <= resumeAbove);
+        if (trailing && resumeAbove > 0) order.trailResumeAbove = undefined;
+        if (trailing && highWater >= entry + risk) stop = Math.max(stop, round2(breakeven));
+        if (trailing && highWater >= entry + 1.5 * risk) stop = Math.max(stop, round2(highWater - risk));
         if (order.brokerStopOrderId) {
           const state = await this.stopState(order);
           if (state.state === "FILLED") { await this.closeFromBrokerStop(order, state.averagePrice, stop > initialStop ? "BROKER_TRAILING_STOP" : "BROKER_STOP"); continue; }
