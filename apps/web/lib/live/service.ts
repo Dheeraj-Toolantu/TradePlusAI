@@ -33,6 +33,8 @@ export type AutoPlaceInput = PreviewInput & {
   setupId: string;
   /** Stop and target as multiples of the ACTUAL average fill (NIFTY Sniper: 0.75x / 2x). */
   premiumMultiples?: { stop: number; target: number };
+  /** Book half the lots (rounded down; needs 2+ lots) once the premium reaches this multiple of the fill, e.g. 1.5. */
+  partialMultiple?: number;
 };
 
 const FILLED = new Set(["EXECUTED", "COMPLETED", "COMPLETE", "FILLED"]);
@@ -71,7 +73,8 @@ export function dailyState(orders: OrderRecord[], nowMs: number): DailyState {
   const openPositions = live.filter(isOpen);
   return {
     date: today,
-    tradesToday: todays.filter((order) => order.status !== "CANCELLED").length,
+    // A partial-booking record (id ending -PARTIAL) is part of its parent trade, not a new trade.
+    tradesToday: todays.filter((order) => order.status !== "CANCELLED" && !order.id.endsWith("-PARTIAL")).length,
     realizedPnl: round2(todays.reduce((sum, order) => sum + (order.status === "EXITED" ? Number(order.realizedPnl ?? 0) : 0), 0)),
     openPositions,
     openRisk: round2(openPositions.reduce((sum, order) => sum + Math.max(order.price - Number(order.stopLoss ?? 0), 0) * order.quantity, 0)),
@@ -205,7 +208,7 @@ export class LiveTradingService {
     const failed = evaluation.checks.filter((check) => !check.passed);
     if (failed.length) return { ok: false as const, status: 403, error: `Live checks failed at ${arm.lots} lot(s): ${failed.map((check) => `${check.label} (${check.detail})`).join("; ")}`, checks: evaluation.checks };
     if (!claimLiveSetup(input.setupId, now)) return { ok: false as const, status: 409, error: "This setup was already sent to Groww" };
-    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId });
+    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId, partialMultiple: input.partialMultiple });
   }
 
   /** Arm automatic live orders for one strategy at an exact lot size, today only (PIN required). */
@@ -230,7 +233,7 @@ export class LiveTradingService {
     return { ok: true as const, status: 200, arm: null };
   }
 
-  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string }) {
+  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string; partialMultiple?: number }) {
     const reference = referenceId();
     const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: ticket.symbol, quantity: ticket.quantity, side: "BUY", orderType: "LIMIT", price: ticket.limitPrice, exchange: ticket.exchange, segment: "FNO", product: "MIS" });
     const createdAt = new Date(this.deps.now()).toISOString();
@@ -252,7 +255,12 @@ export class LiveTradingService {
     // Premium-multiple plans (NIFTY Sniper): the stop and target come from the ACTUAL average fill.
     const stopPrice = how.multiples ? tickDown(entry * how.multiples.stop, ticket.tickSize) : ticket.stopLoss;
     const targetPrice = how.multiples ? tickUp(entry * how.multiples.target, ticket.tickSize) : ticket.target;
-    const order: OrderRecord = { ...base, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
+    // Partial booking: with 2+ filled lots, half (rounded down) is sold once at partialMultiple x the fill.
+    const filledLots = ticket.lotSize > 0 ? Math.floor(fill.filled / ticket.lotSize) : 0;
+    const partial = how.partialMultiple && how.partialMultiple > 1
+      ? { partialPrice: tickUp(entry * how.partialMultiple, ticket.tickSize), partialQuantity: Math.floor(filledLots / 2) * ticket.lotSize, partialDone: false, partialMultiple: how.partialMultiple }
+      : {};
+    const order: OrderRecord = { ...base, ...partial, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
     monitor.positions.set(order.id, order);
     this.ensureMonitor();
     const stop = await this.placeProtectiveStop(order, stopPrice);
@@ -355,24 +363,9 @@ export class LiveTradingService {
       if (released.status === "ALREADY_EXITED") { await this.closeFromBrokerStop(order, released.averagePrice, "BROKER_STOP"); return { ok: true as const, status: 200, order }; }
       if (released.status === "BLOCKED") { order.exitError = released.error; await this.deps.store.save(order); return { ok: false as const, status: 502, error: released.error }; }
       const exchange = order.exchange === "BSE" ? "BSE" : "NSE";
-      const instrument = await this.deps.instrument(order.symbol);
-      const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
-      let remaining = order.quantity;
-      let proceeds = 0;
-      let lastError = "";
-      for (let attempt = 1; attempt <= 3 && remaining > 0; attempt += 1) {
-        const ltp = await this.deps.ltp(order.symbol, exchange).catch(() => null);
-        if (!ltp) { lastError = "No live quote for the exit"; await this.deps.sleep(POLL_MS); continue; }
-        const price = tickDown(ltp * (1 - (this.config().limitBufferPct * attempt) / 100), tick);
-        const reference = referenceId();
-        const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: order.symbol, quantity: remaining, side: "SELL", orderType: "LIMIT", price, exchange, segment: "FNO", product: "MIS" });
-        if ("error" in placed) { lastError = placed.error.message; continue; }
-        const fill = await this.awaitFill(reference, placed.value.brokerOrderId, remaining, EXIT_FILL_TIMEOUT_MS);
-        proceeds += fill.filled * (fill.averagePrice ?? price);
-        remaining -= fill.filled;
-        if (fill.filled === 0) lastError = fill.note;
-      }
-      const exitedQuantity = order.quantity - remaining;
+      const { sold, proceeds, lastError } = await this.sell(order, order.quantity);
+      const remaining = order.quantity - sold;
+      const exitedQuantity = sold;
       if (remaining > 0) {
         order.quantity = remaining;
         const reprotected = await this.placeProtectiveStop(order, Number(order.stopLoss));
@@ -389,6 +382,69 @@ export class LiveTradingService {
       return { ok: true as const, status: 200, order };
     } finally {
       monitor.exiting.delete(orderId);
+    }
+  }
+
+  /** SELL LIMIT with an escalating price buffer, up to 3 attempts; returns what actually filled. */
+  private async sell(order: OrderRecord, quantity: number) {
+    const exchange = order.exchange === "BSE" ? "BSE" : "NSE";
+    const instrument = await this.deps.instrument(order.symbol);
+    const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
+    let remaining = quantity;
+    let proceeds = 0;
+    let lastError = "";
+    for (let attempt = 1; attempt <= 3 && remaining > 0; attempt += 1) {
+      const ltp = await this.deps.ltp(order.symbol, exchange).catch(() => null);
+      if (!ltp) { lastError = "No live quote for the exit"; await this.deps.sleep(POLL_MS); continue; }
+      const price = tickDown(ltp * (1 - (this.config().limitBufferPct * attempt) / 100), tick);
+      const reference = referenceId();
+      const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: order.symbol, quantity: remaining, side: "SELL", orderType: "LIMIT", price, exchange, segment: "FNO", product: "MIS" });
+      if ("error" in placed) { lastError = placed.error.message; continue; }
+      const fill = await this.awaitFill(reference, placed.value.brokerOrderId, remaining, EXIT_FILL_TIMEOUT_MS);
+      proceeds += fill.filled * (fill.averagePrice ?? price);
+      remaining -= fill.filled;
+      if (fill.filled === 0) lastError = fill.note;
+    }
+    return { sold: quantity - remaining, proceeds, lastError };
+  }
+
+  /**
+   * Partial booking at the partial level (1.5x the fill): the Groww stop covers the whole quantity, so
+   * it is cancelled and confirmed first (if it already executed the position is closed instead), the
+   * partial quantity is sold, the sold slice is recorded as its own EXITED record (-PARTIAL), and a new
+   * Groww stop is placed for the rest. Attempted once; whatever does not sell stays in the position.
+   */
+  private async bookPartial(order: OrderRecord) {
+    if (monitor.exiting.has(order.id)) return;
+    monitor.exiting.add(order.id);
+    try {
+      const quantity = Math.min(Number(order.partialQuantity ?? 0), order.quantity - Number(order.lotSize ?? 1));
+      order.partialDone = true;
+      if (!(quantity > 0)) { await this.deps.store.save(order); return; }
+      const released = await this.releaseStop(order);
+      if (released.status === "ALREADY_EXITED") { await this.closeFromBrokerStop(order, released.averagePrice, "BROKER_STOP"); return; }
+      if (released.status === "BLOCKED") { order.exitError = `Partial booking skipped: ${released.error}`; await this.deps.store.save(order); return; }
+      const { sold, proceeds, lastError } = await this.sell(order, quantity);
+      const exchange = order.exchange === "BSE" ? "BSE" : "NSE";
+      const now = new Date(this.deps.now()).toISOString();
+      if (sold > 0) {
+        const exitPrice = round2(proceeds / sold);
+        const charges = estimateCharges(order.price, exitPrice, sold, exchange);
+        const slice: OrderRecord = {
+          ...order, id: `${order.id}-PARTIAL`, quantity: sold, status: "EXITED", exitPrice, exitAt: now, exitReason: `PARTIAL_${String(order.partialMultiple ?? 1.5).replace(".", "_")}X`, charges,
+          realizedPnl: round2((exitPrice - order.price) * sold - charges), realizedPnlPercent: round2((exitPrice - order.price) / order.price * 100),
+          brokerStopOrderId: undefined, stopReferenceId: undefined, exitError: undefined, reconcileWarning: undefined,
+        };
+        await this.deps.store.save(slice);
+        order.quantity -= sold;
+      }
+      const reprotected = await this.placeProtectiveStop(order, Number(order.stopLoss));
+      order.exitError = sold < quantity ? `Partial booking sold ${sold} of ${quantity} qty. ${lastError}`.trim() : undefined;
+      if (!reprotected.ok) order.exitError = `${order.exitError ? `${order.exitError} ` : ""}Groww stop-loss NOT re-placed for the remaining ${order.quantity} qty; the app will exit on its own stop. Check the Groww app.`;
+      order.updatedAt = now;
+      await this.deps.store.save(order);
+    } finally {
+      monitor.exiting.delete(order.id);
     }
   }
 
@@ -509,6 +565,11 @@ export class LiveTradingService {
         if (order.brokerStopOrderId && stop > Number(order.brokerStopTrigger ?? 0) + 0.049) await this.moveBrokerStop(order, stop);
         if (!monitor.positions.has(order.id)) continue;
         if (changed) await this.deps.store.save(order);
+        // Partial booking at 1.5x (once): half the lots, the rest keeps its stop, trail and target.
+        if (!order.partialDone && Number(order.partialQuantity ?? 0) > 0 && Number(order.partialPrice ?? 0) > 0 && ltp >= Number(order.partialPrice) && !config.killSwitch && clock.minute < config.squareOffMinute) {
+          await this.bookPartial(order);
+          if (!monitor.positions.has(order.id)) continue;
+        }
         // With a live broker stop, Groww executes the stop itself; the app only steps in if the
         // price has stayed through the stop for 3 checks (stop order stuck or rejected).
         const breach = ltp <= stop ? (stopBreaches.get(order.id) ?? 0) + 1 : 0;

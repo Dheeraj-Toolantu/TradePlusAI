@@ -59,7 +59,13 @@ Limits (refuse, never resize — set them so your chosen lots fit):
   Broker positions are reconciled; a mismatch is flagged, never silently closed.
 * Each setup is sent once. Kill switch or SAFE_MODE blocks arming and new orders.
 
+* Partial booking: with 2+ lots, half the lots (rounded down) are sold once when the premium
+  reaches **1.5× the fill**. The Groww stop covers the whole quantity, so it is cancelled and
+  confirmed first (if it already executed, the position is closed instead), the partial lots are
+  sold, the sold slice is recorded as its own closed trade (`-PARTIAL`, not counted as a new
+  trade), and a new Groww stop is placed for the remaining lots. A single lot is not split.
+
 ## 4. Not (yet) in live
 
-Partial booking at 1.5× and the sniper's own staged trail run on the paper book only; live uses the
-trail above. Test on paper first and start with 1 lot.
+The sniper's own staged trail runs on the paper book only; live uses the trail above. Test on
+paper first and start with 1 lot (2+ lots for partial booking).

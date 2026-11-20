@@ -368,3 +368,58 @@ describe("LiveTradingService modify SL / target", () => {
     expect((await service.status()).positions[0].stopLoss).toBeGreaterThan(98);
   });
 });
+
+describe("LiveTradingService partial booking at 1.5x", () => {
+  beforeEach(() => { resetLiveMonitor(); resetLiveAutoArm(); });
+  const AUTO_ENV = { ...ENABLED_ENV, LIVE_AUTO_EXECUTION_ENABLED: "true", LIVE_MAX_LOTS_PER_ORDER: "5", LIVE_MAX_ORDER_VALUE: "100000", LIVE_MAX_DAILY_LOSS: "20000" };
+  async function opened(lots: number) {
+    const h = harness(AUTO_ENV);
+    const service = new LiveTradingService(h.deps);
+    await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots });
+    const result = await service.autoPlace({ symbol: instrument.tradingSymbol, lots, stopLoss: 75, target: 200, strategy: "NIFTY_SNIPER", setupId: `P${lots}`, premiumMultiples: { stop: 0.75, target: 2 }, partialMultiple: 1.5 });
+    if (!result.ok) throw new Error(result.error);
+    return { h, service, order: result.order };
+  }
+
+  it("plans half the lots at 1.5x the fill", async () => {
+    const { order } = await opened(3);
+    expect(order).toMatchObject({ quantity: 195, partialPrice: 150.75, partialQuantity: 65, partialDone: false }); // 1.5 × 100.5; 3 lots → book 1
+  });
+
+  it("sells the partial lots on Groww, records the slice, and re-places the Groww stop for the rest", async () => {
+    const { h, service, order } = await opened(4);
+    h.setLtp(151);
+    await service.tick();
+    const sells = h.orders.filter((item) => item.side === "SELL" && item.orderType === "LIMIT");
+    expect(sells).toHaveLength(1);
+    expect(sells[0]).toMatchObject({ quantity: 130, product: "MIS" }); // 2 of 4 lots
+    const slice = h.saved.get(`${order.id}-PARTIAL`)!;
+    expect(slice).toMatchObject({ status: "EXITED", quantity: 130, exitReason: "PARTIAL_1_5X" });
+    expect(slice.realizedPnl).toBeGreaterThan(0);
+    const open = (await service.status()).positions[0];
+    expect(open).toMatchObject({ quantity: 130, partialDone: true });
+    expect(h.stopOrders().at(-1)).toMatchObject({ side: "SELL", orderType: "SL_M", quantity: 130 }); // new stop covers the rest only
+    // Booked once, and the slice is not counted as a new trade.
+    await service.tick();
+    expect(h.orders.filter((item) => item.side === "SELL" && item.orderType === "LIMIT")).toHaveLength(1);
+    expect((await service.status()).today.tradesToday).toBe(1);
+  });
+
+  it("does not split a single lot", async () => {
+    const { h, service, order } = await opened(1);
+    expect(order.partialQuantity).toBe(0);
+    h.setLtp(151);
+    await service.tick();
+    expect(h.orders.filter((item) => item.side === "SELL" && item.orderType === "LIMIT")).toHaveLength(0);
+    expect((await service.status()).positions[0].quantity).toBe(65);
+  });
+
+  it("closes instead of booking when the Groww stop already executed", async () => {
+    const { h, service } = await opened(2);
+    h.triggerStops(80);
+    h.setLtp(151);
+    await service.tick();
+    expect((await service.status()).positions).toHaveLength(0);
+    expect(h.orders.filter((item) => item.side === "SELL" && item.orderType === "LIMIT")).toHaveLength(0);
+  });
+});
