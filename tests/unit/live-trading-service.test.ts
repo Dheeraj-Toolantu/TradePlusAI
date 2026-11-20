@@ -308,3 +308,63 @@ describe("LiveTradingService automatic real-money orders", () => {
     expect((await service.status()).auto.armed).toBeNull();
   });
 });
+
+describe("LiveTradingService modify SL / target", () => {
+  beforeEach(() => { resetLiveMonitor(); resetLiveAutoArm(); });
+  async function opened() {
+    const h = harness();
+    const service = new LiveTradingService(h.deps);
+    const preview = await service.preview(ticket);
+    const confirmed = await service.confirm(preview.token, "482913");
+    if (!confirmed.ok) throw new Error(confirmed.error);
+    return { h, service, id: confirmed.order.id };
+  }
+
+  it("needs the PIN and keeps the stop below and the target above the live premium", async () => {
+    const { h, service, id } = await opened();
+    expect((await service.modify(id, { stopLoss: 90 }, "000000")).status).toBe(401);
+    h.setLtp(105);
+    expect((await service.modify(id, { stopLoss: 106 }, "482913")).error).toMatch(/below the live premium/);
+    expect((await service.modify(id, { target: 104 }, "482913")).error).toMatch(/above the live premium/);
+    expect((await service.modify("nope", { stopLoss: 90 }, "482913")).status).toBe(404);
+  });
+
+  it("moves the Groww stop-loss (old one cancelled first) and updates the target", async () => {
+    const { h, service, id } = await opened();
+    h.setLtp(110);
+    const result = await service.modify(id, { stopLoss: 95, target: 170 }, "482913");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.order).toMatchObject({ stopLoss: 95, target: 170, brokerStopTrigger: 95 });
+    expect(h.stopOrders()).toHaveLength(2);
+    expect(h.stopOrders()[1]).toMatchObject({ side: "SELL", orderType: "SL_M", triggerPrice: 95, quantity: 65 });
+    expect(h.cancels.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("restores the previous Groww stop if the new one is refused", async () => {
+    const { h, service, id } = await opened();
+    h.setLtp(110);
+    h.rejectStops = true;
+    const result = await service.modify(id, { stopLoss: 95 }, "482913");
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/NOT at Groww|restored/);
+    h.rejectStops = false;
+    const again = await service.modify(id, { stopLoss: 95 }, "482913");
+    expect(again.ok).toBe(true);
+  });
+
+  it("holds a hand-moved stop until the premium makes a new best, then the trail resumes", async () => {
+    const { h, service, id } = await opened();
+    h.setLtp(140);
+    await service.tick(); // +2R: trail raised the stop
+    const trailed = (await service.status()).positions[0].stopLoss!;
+    expect(trailed).toBeGreaterThan(100);
+    h.setLtp(135);
+    expect((await service.modify(id, { stopLoss: 98 }, "482913")).ok).toBe(true);
+    await service.tick();
+    expect((await service.status()).positions[0].stopLoss).toBe(98);
+    h.setLtp(145); // a new best below the 150 target
+    await service.tick();
+    expect((await service.status()).positions[0].stopLoss).toBeGreaterThan(98);
+  });
+});

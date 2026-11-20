@@ -31,6 +31,11 @@ export async function POST(request: Request) {
         const result = await service.exit(String(body.orderId ?? ""), "MANUAL_EXIT", body.pin);
         return NextResponse.json(result, { status: result.status });
       }
+      case "modify": {
+        // Change a live position's stop-loss (moves the Groww SL-M order) and/or target. PIN required.
+        const result = await service.modify(String(body.orderId ?? ""), { stopLoss: body.stopLoss, target: body.target }, body.pin);
+        return NextResponse.json(result, { status: result.status });
+      }
       case "arm_auto": {
         // Real-money AUTO execution for one strategy at an exact lot size, today only (PIN required).
         const result = await service.armAuto({ pin: body.pin, strategy: body.strategy, lots: body.lots });
@@ -44,7 +49,7 @@ export async function POST(request: Request) {
         return NextResponse.json(result, { status: result.status });
       }
       default:
-        return NextResponse.json({ error: "action must be preview, confirm, exit, arm_auto, disarm_auto or mark_closed" }, { status: 400 });
+        return NextResponse.json({ error: "action must be preview, confirm, exit, modify, arm_auto, disarm_auto or mark_closed" }, { status: 400 });
     }
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Live order request failed" }, { status: 500 });
