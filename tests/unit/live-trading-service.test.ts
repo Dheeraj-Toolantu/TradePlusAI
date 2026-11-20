@@ -3,6 +3,7 @@ import type { BrokerOrderRequest } from "../../packages/broker-contracts/src/bro
 import type { GrowwInstrument } from "../../adapters/groww/src/groww-instruments";
 import type { OrderRecord } from "../../apps/web/lib/firestore-orders";
 import { LiveTradingService, estimateCharges, resetLiveMonitor, type LiveDeps } from "../../apps/web/lib/live/service";
+import { resetLiveAutoArm } from "../../apps/web/lib/live/auto-arm";
 
 const MONDAY_1030_IST = Date.parse("2026-09-28T05:00:00Z");
 const ENABLED_ENV = { EXECUTION_MODE: "ALGO_LIVE", LIVE_EXECUTION_ENABLED: "true", LIVE_COMPLIANCE_APPROVED: "true", LIVE_TRADING_CONFIRMATION: "true", GROWW_ACCESS_TOKEN: "test-token", LIVE_TRADING_PIN: "482913", LIVE_CONFIRM_SECRET: "unit-test-secret-0123456789", LIVE_MAX_DAILY_LOSS: "5000", LIVE_MAX_LOTS_PER_ORDER: "2", LIVE_MAX_ORDER_VALUE: "50000" };
@@ -243,5 +244,67 @@ describe("LiveTradingService", () => {
     const [position] = (await service.status()).positions;
     expect(position.status).toBe("OPEN");
     expect(position.reconcileWarning).toContain("Groww shows 0 qty");
+  });
+});
+
+
+describe("LiveTradingService automatic real-money orders", () => {
+  beforeEach(() => { resetLiveMonitor(); resetLiveAutoArm(); });
+  const AUTO_ENV = { ...ENABLED_ENV, LIVE_AUTO_EXECUTION_ENABLED: "true", LIVE_MAX_LOTS_PER_ORDER: "5", LIVE_MAX_ORDER_VALUE: "100000", LIVE_MAX_DAILY_LOSS: "20000" };
+  const auto = (overrides = {}) => ({ symbol: instrument.tradingSymbol, lots: 3, stopLoss: 75, target: 200, strategy: "NIFTY_SNIPER" as const, setupId: "S1", source: "AUTO test", ...overrides });
+
+  it("refuses without the server auto switch, without arming, or with the wrong PIN", async () => {
+    const off = new LiveTradingService(harness().deps);
+    expect((await off.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 1 })).error).toMatch(/LIVE_AUTO_EXECUTION_ENABLED/);
+    const h = harness(AUTO_ENV);
+    const service = new LiveTradingService(h.deps);
+    expect((await service.autoPlace(auto())).error).toMatch(/not armed/);
+    expect((await service.armAuto({ pin: "000000", strategy: "NIFTY_SNIPER", lots: 3 })).status).toBe(401);
+    expect(h.orders).toHaveLength(0);
+  });
+
+  it("will not arm more lots than the server allows per order", async () => {
+    const service = new LiveTradingService(harness(AUTO_ENV).deps);
+    expect((await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 6 })).error).toMatch(/LIVE_MAX_LOTS_PER_ORDER \(5\)/);
+    expect((await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 11 })).status).toBe(400);
+  });
+
+  it("buys EXACTLY the armed lots as an intraday MIS LIMIT, with stop and target from the fill and a Groww stop", async () => {
+    const h = harness(AUTO_ENV);
+    const service = new LiveTradingService(h.deps);
+    expect((await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 3 })).ok).toBe(true);
+    const result = await service.autoPlace(auto({ premiumMultiples: { stop: 0.75, target: 2 } }));
+    expect(result.ok).toBe(true);
+    const entry = h.orders[0];
+    expect(entry).toMatchObject({ side: "BUY", orderType: "LIMIT", product: "MIS", segment: "FNO", quantity: 195 }); // 3 × 65
+    if (!result.ok) throw new Error("not placed");
+    expect(result.order).toMatchObject({ quantity: 195, price: 100.5, stopLoss: 75.35, target: 201, mode: "ALGO_LIVE", strategy: "LIVE_AUTO_NIFTY_SNIPER" });
+    expect(h.stopOrders()[0]).toMatchObject({ side: "SELL", orderType: "SL_M", product: "MIS", quantity: 195, triggerPrice: 75.35 });
+  });
+
+  it("refuses (never resizes) when a limit cannot carry the armed lots, and only for the armed strategy and lots", async () => {
+    const h = harness({ ...AUTO_ENV, LIVE_MAX_ORDER_VALUE: "15000" });
+    const service = new LiveTradingService(h.deps);
+    await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 3 });
+    const refused = await service.autoPlace(auto());
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/at 3 lot\(s\).*Order value/);
+    expect(h.orders).toHaveLength(0);
+    expect((await service.autoPlace(auto({ lots: 2 }))).error).toMatch(/differ from the armed 3/);
+    expect((await service.autoPlace(auto({ strategy: "VWAP_EMA_SCALP" }))).error).toMatch(/armed for NIFTY_SNIPER/);
+  });
+
+  it("sends a setup to Groww once, and stops after disarming or at the end of the day", async () => {
+    const h = harness(AUTO_ENV);
+    const service = new LiveTradingService(h.deps);
+    await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 1 });
+    expect((await service.autoPlace(auto({ lots: 1 }))).ok).toBe(true);
+    await service.exit(Array.from((await service.status()).positions)[0].id, "TEST", undefined, false);
+    expect((await service.autoPlace(auto({ lots: 1 }))).error).toMatch(/already sent/);
+    service.disarmAuto();
+    expect((await service.autoPlace(auto({ lots: 1, setupId: "S2" }))).error).toMatch(/not armed/);
+    await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 1 });
+    h.setClock(MONDAY_1030_IST + 24 * 3_600_000);
+    expect((await service.status()).auto.armed).toBeNull();
   });
 });

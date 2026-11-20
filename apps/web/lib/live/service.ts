@@ -4,6 +4,7 @@ import type { GrowwInstrument } from "../../../../adapters/groww/src/groww-instr
 import type { OrderRecord } from "../firestore-orders";
 import { confirmSecret, istClock, pinMatches, readLiveConfig, type LiveConfig } from "./config";
 import { consumeNonce, issueToken, verifyToken, type LiveTicket } from "./confirm-token";
+import { claimLiveSetup, liveAutoArm, setLiveAutoArm, type AutoStrategy } from "./auto-arm";
 
 // Real-money order lifecycle (manual confirmation per order, app-managed exits):
 //   preview  -> every gate evaluated, signed single-use token for the exact ticket
@@ -26,6 +27,13 @@ export type LiveDeps = {
 
 export type Check = { key: string; label: string; passed: boolean; detail: string };
 export type PreviewInput = { symbol: string; lots: number; stopLoss: number; target: number; source?: string };
+/** An automatic order from a confirmed strategy setup. */
+export type AutoPlaceInput = PreviewInput & {
+  strategy: AutoStrategy;
+  setupId: string;
+  /** Stop and target as multiples of the ACTUAL average fill (NIFTY Sniper: 0.75x / 2x). */
+  premiumMultiples?: { stop: number; target: number };
+};
 
 const FILLED = new Set(["EXECUTED", "COMPLETED", "COMPLETE", "FILLED"]);
 const DEAD = new Set(["REJECTED", "CANCELLED", "CANCELED", "FAILED", "EXPIRED"]);
@@ -171,14 +179,65 @@ export class LiveTradingService {
     const failed = evaluation.checks.filter((check) => !check.passed);
     if (failed.length) return { ok: false as const, status: 403, error: `Live checks failed: ${failed.map((check) => check.label).join("; ")}`, checks: evaluation.checks };
     if (!consumeNonce(verified.nonce, this.deps.now())) return { ok: false as const, status: 409, error: "This confirmation was already used" };
+    return this.execute(ticket, { strategy: "LIVE_CONFIRMED", label: "manual confirmation" });
+  }
 
+  /**
+   * Automatic real-money entry (no per-order PIN). Allowed only when every manual switch is on,
+   * LIVE_AUTO_EXECUTION_ENABLED=true, and the trader armed THIS strategy today with the PIN. The
+   * order is exactly the armed lots: if any limit (lots per order, order value, daily loss, trades,
+   * open positions, reward:risk) cannot carry that size, nothing is placed and nothing is resized.
+   */
+  async autoPlace(input: AutoPlaceInput) {
+    const config = this.config();
+    const now = this.deps.now();
+    if (!config.enabled) return { ok: false as const, status: 403, error: `Live trading is disabled on the server: ${config.disabledReasons.join("; ")}` };
+    if (!config.autoEnabled) return { ok: false as const, status: 403, error: "Automatic live orders are disabled on the server (LIVE_AUTO_EXECUTION_ENABLED is not true)" };
+    const arm = liveAutoArm(now);
+    if (!arm) return { ok: false as const, status: 403, error: "Live auto-trading is not armed today (arm it with your PIN)" };
+    if (arm.strategy !== input.strategy) return { ok: false as const, status: 403, error: `Live auto-trading is armed for ${arm.strategy}, not ${input.strategy}` };
+    if (Number(input.lots) !== arm.lots) return { ok: false as const, status: 409, error: `Order lots ${input.lots} differ from the armed ${arm.lots} lot(s); nothing placed` };
+    if (!input.setupId) return { ok: false as const, status: 400, error: "A setup id is required" };
+    const built = await this.buildTicket({ ...input, lots: arm.lots });
+    if (!built.ticket) return { ok: false as const, status: 422, error: built.error ?? "Invalid ticket" };
+    const [state, brokerHealthy] = await Promise.all([this.state(), this.healthy()]);
+    const evaluation = evaluateTicket(built.ticket, built.instrument, built.ltp, state, config, now, brokerHealthy);
+    const failed = evaluation.checks.filter((check) => !check.passed);
+    if (failed.length) return { ok: false as const, status: 403, error: `Live checks failed at ${arm.lots} lot(s): ${failed.map((check) => `${check.label} (${check.detail})`).join("; ")}`, checks: evaluation.checks };
+    if (!claimLiveSetup(input.setupId, now)) return { ok: false as const, status: 409, error: "This setup was already sent to Groww" };
+    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId });
+  }
+
+  /** Arm automatic live orders for one strategy at an exact lot size, today only (PIN required). */
+  async armAuto(input: { pin: unknown; strategy: unknown; lots: unknown }) {
+    if (!pinMatches(input.pin, this.deps.env)) return { ok: false as const, status: 401, error: "Incorrect trading PIN" };
+    const config = this.config();
+    if (!config.enabled) return { ok: false as const, status: 403, error: `Live trading is disabled on the server: ${config.disabledReasons.join("; ")}` };
+    if (!config.autoEnabled) return { ok: false as const, status: 403, error: "Set LIVE_AUTO_EXECUTION_ENABLED=true on the server to allow automatic live orders" };
+    const strategy = input.strategy === "VWAP_EMA_SCALP" ? "VWAP_EMA_SCALP" : input.strategy === "NIFTY_SNIPER" ? "NIFTY_SNIPER" : null;
+    if (!strategy) return { ok: false as const, status: 400, error: "Strategy must be NIFTY_SNIPER or VWAP_EMA_SCALP" };
+    const lots = Number(input.lots);
+    if (!Number.isInteger(lots) || lots < 1 || lots > 10) return { ok: false as const, status: 400, error: "Lots must be a whole number from 1 to 10" };
+    if (lots > config.limits.maxLotsPerOrder) return { ok: false as const, status: 403, error: `${lots} lots is above the server's LIVE_MAX_LOTS_PER_ORDER (${config.limits.maxLotsPerOrder}); raise it on the server or arm fewer lots` };
+    const now = this.deps.now();
+    setLiveAutoArm({ strategy, lots, armedAt: new Date(now).toISOString(), date: istClock(now).date });
+    return { ok: true as const, status: 200, arm: liveAutoArm(now) };
+  }
+
+  /** Disarm automatic live orders (no PIN: stopping must always be easy). Open positions stay managed. */
+  disarmAuto() {
+    setLiveAutoArm(null);
+    return { ok: true as const, status: 200, arm: null };
+  }
+
+  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string }) {
     const reference = referenceId();
     const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: ticket.symbol, quantity: ticket.quantity, side: "BUY", orderType: "LIMIT", price: ticket.limitPrice, exchange: ticket.exchange, segment: "FNO", product: "MIS" });
     const createdAt = new Date(this.deps.now()).toISOString();
     const base: OrderRecord = {
       id: `live-${reference}`, symbol: ticket.symbol, growwSymbol: ticket.symbol, expiry: ticket.expiry, strike: ticket.strike, underlying: ticket.underlying, exchange: ticket.exchange,
-      strategy: "LIVE_CONFIRMED", strategyName: `Live · ${ticket.source}`, side: "BUY", quantity: 0, lotSize: ticket.lotSize, price: ticket.limitPrice,
-      target: ticket.target, stopLoss: ticket.stopLoss, initialStopLoss: ticket.stopLoss, status: "CANCELLED", mode: "ALGO_LIVE", source: "Groww live (manual confirmation)", referenceId: reference, createdAt,
+      strategy: how.strategy, strategyName: `Live · ${ticket.source}`, side: "BUY", quantity: 0, lotSize: ticket.lotSize, price: ticket.limitPrice,
+      target: ticket.target, stopLoss: ticket.stopLoss, initialStopLoss: ticket.stopLoss, status: "CANCELLED", mode: "ALGO_LIVE", source: `Groww live (${how.label})${how.setupId ? ` · setup ${how.setupId}` : ""}`, referenceId: reference, createdAt,
     };
     if ("error" in placed) {
       await this.deps.store.save({ ...base, exitReason: "ORDER_REJECTED", exitError: placed.error.message });
@@ -190,10 +249,13 @@ export class LiveTradingService {
       return { ok: false as const, status: 408, error: `Entry not filled within ${ENTRY_FILL_TIMEOUT_MS / 1000}s at ₹${ticket.limitPrice}; the order was cancelled. ${fill.note}`.trim() };
     }
     const entry = fill.averagePrice ?? ticket.limitPrice;
-    const order: OrderRecord = { ...base, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
+    // Premium-multiple plans (NIFTY Sniper): the stop and target come from the ACTUAL average fill.
+    const stopPrice = how.multiples ? tickDown(entry * how.multiples.stop, ticket.tickSize) : ticket.stopLoss;
+    const targetPrice = how.multiples ? tickUp(entry * how.multiples.target, ticket.tickSize) : ticket.target;
+    const order: OrderRecord = { ...base, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
     monitor.positions.set(order.id, order);
     this.ensureMonitor();
-    const stop = await this.placeProtectiveStop(order, ticket.stopLoss);
+    const stop = await this.placeProtectiveStop(order, stopPrice);
     if (!stop.ok) {
       await this.deps.store.save(order);
       const closed = await this.exit(order.id, "PROTECTIVE_STOP_FAILED", undefined, false);
@@ -422,9 +484,11 @@ export class LiveTradingService {
     await this.hydrate();
     const config = this.config();
     const state = await this.state();
+    const arm = liveAutoArm(this.deps.now());
     return {
       enabled: config.enabled,
       disabledReasons: config.disabledReasons,
+      auto: { serverEnabled: config.enabled && config.autoEnabled, armed: arm, maxLotsPerOrder: config.limits.maxLotsPerOrder },
       limits: config.limits,
       entryWindow: config.entryWindow,
       squareOffMinute: config.squareOffMinute,

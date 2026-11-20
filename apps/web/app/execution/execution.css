@@ -427,3 +427,8 @@
 @media (max-width: 720px) { .hedge-scenarios { display: block; overflow-x: auto; } }
 .hedge-ranking tbody tr:hover { background: rgba(48, 212, 202, .06); }
 @media (max-width: 720px) { .hedge-ranking { display: block; overflow-x: auto; } }
+
+.exec-live-auto { display: grid; gap: 6px; margin: 0 0 10px; padding: 10px 12px; border: 1px solid #5a2a30; border-radius: 8px; background: #1a1012; }
+.exec-live-auto-row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.exec-live-auto-row label { display: grid; gap: 2px; color: var(--muted); font-size: 11px; }
+.exec-live-auto-row select { padding: 4px 6px; color: var(--text); border: 1px solid #2d3b40; border-radius: 4px; background: #111a1d; }

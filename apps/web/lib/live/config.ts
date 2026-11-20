@@ -21,6 +21,8 @@ export type LiveConfig = {
   confirmTtlSeconds: number;
   killSwitch: boolean;
   safeMode: boolean;
+  /** Server switch for AUTOMATIC real-money orders (LIVE_AUTO_EXECUTION_ENABLED=true), on top of every manual switch. */
+  autoEnabled: boolean;
 };
 
 const numberFrom = (value: string | undefined, fallback: number, min: number, max: number) => {
@@ -64,6 +66,7 @@ export function readLiveConfig(environment: NodeJS.ProcessEnv = process.env): Li
     confirmTtlSeconds: numberFrom(environment.LIVE_CONFIRM_TTL_SECONDS, 30, 10, 120),
     killSwitch: safety.killSwitch,
     safeMode: safety.safeMode,
+    autoEnabled: environment.LIVE_AUTO_EXECUTION_ENABLED === "true",
   };
 }
 
