@@ -423,3 +423,43 @@ describe("LiveTradingService partial booking at 1.5x", () => {
     expect(h.orders.filter((item) => item.side === "SELL" && item.orderType === "LIMIT")).toHaveLength(0);
   });
 });
+
+describe("LiveTradingService NIFTY Sniper staged trail", () => {
+  beforeEach(() => { resetLiveMonitor(); resetLiveAutoArm(); });
+  const AUTO_ENV = { ...ENABLED_ENV, LIVE_AUTO_EXECUTION_ENABLED: "true", LIVE_MAX_LOTS_PER_ORDER: "5", LIVE_MAX_ORDER_VALUE: "100000", LIVE_MAX_DAILY_LOSS: "20000" };
+  async function opened() {
+    const h = harness(AUTO_ENV);
+    const service = new LiveTradingService(h.deps);
+    await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 1 });
+    const result = await service.autoPlace({ symbol: instrument.tradingSymbol, lots: 1, stopLoss: 75, target: 200, strategy: "NIFTY_SNIPER", setupId: "T1", premiumMultiples: { stop: 0.75, target: 2 }, trailRule: "SNIPER" });
+    if (!result.ok) throw new Error(result.error);
+    return { h, service, order: result.order };
+  }
+  const position = async (service: LiveTradingService) => (await service.status()).positions[0];
+
+  it("steps the stop at 1.25x, 1.5x and 1.75x the fill and moves the Groww stop each time", async () => {
+    const { h, service, order } = await opened();
+    expect(order).toMatchObject({ trailRule: "SNIPER", trailStage: "INITIAL", price: 100.5 });
+    h.setLtp(124); await service.tick();
+    expect((await position(service)).trailStage).toBe("INITIAL"); // below 1.25x
+    h.setLtp(126); await service.tick(); // 1.25x = 125.6
+    let open = await position(service);
+    expect(open.trailStage).toBe("BREAKEVEN");
+    expect(open.stopLoss).toBeGreaterThan(100.5);
+    expect(h.stopOrders().at(-1)!.triggerPrice).toBe(open.stopLoss);
+    h.setLtp(151); await service.tick(); // 1.5x = 150.75 → lock 1.2x
+    open = await position(service);
+    expect(open).toMatchObject({ trailStage: "LOCKED", stopLoss: 120.6 });
+    h.setLtp(180); await service.tick(); // 1.75x+ → trail 0.2 × 100.5 under the best
+    open = await position(service);
+    expect(open.trailStage).toBe("TRAILING");
+    expect(open.stopLoss).toBe(159.9);
+    expect(h.stopOrders().at(-1)!.triggerPrice).toBe(159.9);
+  });
+
+  it("closes at 2x with the sniper exit reason", async () => {
+    const { h, service, order } = await opened();
+    h.setLtp(202); await service.tick();
+    expect(h.saved.get(order.id)).toMatchObject({ status: "EXITED", exitReason: "TARGET_2X" });
+  });
+});

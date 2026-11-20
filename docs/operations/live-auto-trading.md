@@ -65,7 +65,9 @@ Limits (refuse, never resize — set them so your chosen lots fit):
   sold, the sold slice is recorded as its own closed trade (`-PARTIAL`, not counted as a new
   trade), and a new Groww stop is placed for the remaining lots. A single lot is not split.
 
-## 4. Not (yet) in live
+* NIFTY Sniper live trades use the sniper's own staged trail instead of the R trail above: stop to
+  breakeven + charges at **1.25×** the fill, **1.2× locked at 1.5×**, then **0.2× the fill under the
+  best premium from 1.75×**, exit at **2×** (`TARGET_2X`). Each new stop is rounded down to the tick
+  and the Groww SL-M is moved to it. VWAP-EMA live trades keep the R trail.
 
-The sniper's own staged trail runs on the paper book only; live uses the trail above. Test on
-paper first and start with 1 lot (2+ lots for partial booking).
+Test on paper first and start with 1 lot (2+ lots for partial booking).

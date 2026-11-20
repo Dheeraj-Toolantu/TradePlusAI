@@ -5,6 +5,7 @@ import type { OrderRecord } from "../firestore-orders";
 import { confirmSecret, istClock, pinMatches, readLiveConfig, type LiveConfig } from "./config";
 import { consumeNonce, issueToken, verifyToken, type LiveTicket } from "./confirm-token";
 import { claimLiveSetup, liveAutoArm, setLiveAutoArm, type AutoStrategy } from "./auto-arm";
+import { sniperTrail, type TrailStageName } from "../../../../services/paper-trading/src/scalper-trail";
 
 // Real-money order lifecycle (manual confirmation per order, app-managed exits):
 //   preview  -> every gate evaluated, signed single-use token for the exact ticket
@@ -35,6 +36,8 @@ export type AutoPlaceInput = PreviewInput & {
   premiumMultiples?: { stop: number; target: number };
   /** Book half the lots (rounded down; needs 2+ lots) once the premium reaches this multiple of the fill, e.g. 1.5. */
   partialMultiple?: number;
+  /** NIFTY Sniper staged trail in multiples of the fill (1.25x breakeven + charges, 1.5x lock 1.2x, 1.75x trail 0.2x). */
+  trailRule?: "SNIPER";
 };
 
 const FILLED = new Set(["EXECUTED", "COMPLETED", "COMPLETE", "FILLED"]);
@@ -208,7 +211,7 @@ export class LiveTradingService {
     const failed = evaluation.checks.filter((check) => !check.passed);
     if (failed.length) return { ok: false as const, status: 403, error: `Live checks failed at ${arm.lots} lot(s): ${failed.map((check) => `${check.label} (${check.detail})`).join("; ")}`, checks: evaluation.checks };
     if (!claimLiveSetup(input.setupId, now)) return { ok: false as const, status: 409, error: "This setup was already sent to Groww" };
-    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId, partialMultiple: input.partialMultiple });
+    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId, partialMultiple: input.partialMultiple, trailRule: input.trailRule });
   }
 
   /** Arm automatic live orders for one strategy at an exact lot size, today only (PIN required). */
@@ -233,7 +236,7 @@ export class LiveTradingService {
     return { ok: true as const, status: 200, arm: null };
   }
 
-  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string; partialMultiple?: number }) {
+  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string; partialMultiple?: number; trailRule?: "SNIPER" }) {
     const reference = referenceId();
     const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: ticket.symbol, quantity: ticket.quantity, side: "BUY", orderType: "LIMIT", price: ticket.limitPrice, exchange: ticket.exchange, segment: "FNO", product: "MIS" });
     const createdAt = new Date(this.deps.now()).toISOString();
@@ -260,7 +263,11 @@ export class LiveTradingService {
     const partial = how.partialMultiple && how.partialMultiple > 1
       ? { partialPrice: tickUp(entry * how.partialMultiple, ticket.tickSize), partialQuantity: Math.floor(filledLots / 2) * ticket.lotSize, partialDone: false, partialMultiple: how.partialMultiple }
       : {};
-    const order: OrderRecord = { ...base, ...partial, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
+    // Sniper staged trail: breakeven = the fill + round-trip charges per unit.
+    const trail = how.trailRule === "SNIPER"
+      ? { trailRule: "SNIPER", trailStage: "INITIAL", trailCostPerUnit: round2(estimateCharges(entry, entry, fill.filled, ticket.exchange) / Math.max(fill.filled, 1)) }
+      : {};
+    const order: OrderRecord = { ...base, ...partial, ...trail, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
     monitor.positions.set(order.id, order);
     this.ensureMonitor();
     const stop = await this.placeProtectiveStop(order, stopPrice);
@@ -552,8 +559,22 @@ export class LiveTradingService {
         const resumeAbove = Number(order.trailResumeAbove ?? 0);
         const trailing = !(resumeAbove > 0 && highWater <= resumeAbove);
         if (trailing && resumeAbove > 0) order.trailResumeAbove = undefined;
-        if (trailing && highWater >= entry + risk) stop = Math.max(stop, round2(breakeven));
-        if (trailing && highWater >= entry + 1.5 * risk) stop = Math.max(stop, round2(highWater - risk));
+        if (order.trailRule === "SNIPER") {
+          // NIFTY Sniper staged trail in multiples of the fill (the paper scalper's rule).
+          if (trailing) {
+            const stage = (["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"].includes(String(order.trailStage)) ? order.trailStage : "INITIAL") as TrailStageName;
+            const next = sniperTrail({ entry, stop, highWater, trail: { costPerUnit: Number(order.trailCostPerUnit ?? 0), stage } });
+            // Groww triggers sit on the contract's tick: round the new stop DOWN to it, so the app's
+            // stop and the Groww SL-M trigger are always the same price.
+            const instrument = next.stop > stop ? await this.deps.instrument(order.symbol) : undefined;
+            const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
+            stop = Math.max(stop, tickDown(next.stop, tick));
+            if (next.stage !== order.trailStage) order.trailStage = next.stage;
+          }
+        } else {
+          if (trailing && highWater >= entry + risk) stop = Math.max(stop, round2(breakeven));
+          if (trailing && highWater >= entry + 1.5 * risk) stop = Math.max(stop, round2(highWater - risk));
+        }
         if (order.brokerStopOrderId) {
           const state = await this.stopState(order);
           if (state.state === "FILLED") { await this.closeFromBrokerStop(order, state.averagePrice, stop > initialStop ? "BROKER_TRAILING_STOP" : "BROKER_STOP"); continue; }
@@ -575,7 +596,10 @@ export class LiveTradingService {
         const breach = ltp <= stop ? (stopBreaches.get(order.id) ?? 0) + 1 : 0;
         stopBreaches.set(order.id, breach);
         const stopHit = order.brokerStopOrderId ? breach >= 3 : breach >= 1;
-        const reason = config.killSwitch ? "KILL_SWITCH" : clock.minute >= config.squareOffMinute ? "SQUARE_OFF_1515" : ltp >= Number(order.target) ? "TARGET" : stopHit ? (stop > initialStop ? "TRAILING_STOP" : "STOP_LOSS") : null;
+        const stopReason = order.trailRule === "SNIPER" && order.trailStage && order.trailStage !== "INITIAL"
+          ? (order.trailStage === "BREAKEVEN" ? "BREAKEVEN_STOP" : order.trailStage === "LOCKED" ? "LOCKED_PROFIT_STOP" : "TRAILING_STOP")
+          : stop > initialStop ? "TRAILING_STOP" : "STOP_LOSS";
+        const reason = config.killSwitch ? "KILL_SWITCH" : clock.minute >= config.squareOffMinute ? "SQUARE_OFF_1515" : ltp >= Number(order.target) ? (order.trailRule === "SNIPER" ? "TARGET_2X" : "TARGET") : stopHit ? stopReason : null;
         if (reason) await this.exit(order.id, reason, undefined, false);
       }
       if (monitor.ticks % RECONCILE_EVERY_TICKS === 0 && monitor.positions.size) await this.reconcile();
