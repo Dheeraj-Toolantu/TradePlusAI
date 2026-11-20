@@ -597,6 +597,8 @@ async function placeOnScalper(body: RecordValue, origin: string) {
       ...(sniper ? { premiumMultiples: { stop: SNIPER_PREMIUM.stop, target: SNIPER_PREMIUM.target } } : {}),
       // Book half the lots (2+ lots) once the premium reaches 1.5x the fill; the rest keeps running.
       partialMultiple: SNIPER_PREMIUM.partial,
+      // NIFTY Sniper live trades use the sniper's own staged trail (the Groww stop moves with it).
+      ...(sniper ? { trailRule: "SNIPER" as const } : {}),
     });
     if (sniper) void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: result.ok, reasons: result.ok ? [] : [String(result.error ?? "refused")], position: result.ok ? result.order : undefined });
     const text = result.ok

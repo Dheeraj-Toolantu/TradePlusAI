@@ -8,7 +8,9 @@ export type LivePositionView = {
   stopLoss?: number; initialStopLoss?: number; target?: number; brokerStopTrigger?: number; brokerStopOrderId?: string;
   trailResumeAbove?: number; reconcileWarning?: string; exitError?: string; createdAt: string; strategyName?: string;
   partialPrice?: number; partialQuantity?: number; partialDone?: boolean; partialMultiple?: number;
+  trailRule?: string; trailStage?: string;
 };
+const STAGE: Record<string, string> = { INITIAL: "initial stop", BREAKEVEN: "breakeven + charges (1.25x)", LOCKED: "1.2x locked (1.5x)", TRAILING: "trailing 0.2x under the best (1.75x+)" };
 
 const money = (value: number | null | undefined) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const signed = (value: number) => `${value >= 0 ? "+" : "−"}₹${money(Math.abs(value))}`;
@@ -79,6 +81,7 @@ export const LivePositionCard = memo(function LivePositionCard({ order, pin, onM
         <div><dt>SL at Groww</dt><dd>{order.brokerStopOrderId ? `SL-M ₹${money(order.brokerStopTrigger)}` : <span className="loss">none</span>}</dd></div>
         {atStop !== null ? <div><dt>{atStop >= 0 ? "Locked if SL hits" : "Loss if SL hits"}</dt><dd className={atStop >= 0 ? "gain" : "loss"}>{signed(atStop)}</dd></div> : null}
       </dl>
+      {order.trailRule === "SNIPER" ? <p className="pos-trail-mode">Sniper trail: <b>{STAGE[order.trailStage ?? "INITIAL"] ?? order.trailStage}</b> · breakeven at 1.25x, lock 1.2x at 1.5x, trail 0.2x from 1.75x, exit at 2x</p> : null}
       {order.partialPrice ? (
         <p className="pos-trail-mode">Partial booking: {order.partialQuantity
           ? order.partialDone ? <>booked at {order.partialMultiple ?? 1.5}x; the rest keeps running</> : <>sells <b>{order.partialQuantity} qty</b> at ₹{money(order.partialPrice)} ({order.partialMultiple ?? 1.5}x the fill), the rest runs</>
