@@ -30,7 +30,9 @@ Limits (refuse, never resize — set them so your chosen lots fit):
 
 ## 2. Daily use
 
-1. Algo page → **Live positions** tab → *Live auto-trading*: pick **Lots**, enter the PIN, **Arm**.
+1. Scalper desk header → **Money: Paper | Live** switch → **Live** → pick **Lots**, enter the PIN,
+   **Go live** (or: algo page → **Live positions** tab → *Live auto-trading* → **Arm**). **Paper**
+   switches new trades back to the paper book (open live trades stay open and managed).
    It is armed for the strategy selected on the page, today only (expires at the end of the IST
    day and on any server restart).
 2. Switch **Auto-execute** on for that strategy (or press *Take trade*). Every confirmed setup is

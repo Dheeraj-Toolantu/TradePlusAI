@@ -695,19 +695,26 @@ export default function ExecutionPage() {
   const onLiveModify = useCallback((id: string, changes: { stopLoss?: number; target?: number }, pin: string) => liveRequest({ action: "modify", orderId: id, pin, ...changes }, "modify"), [liveRequest]);
   const onLiveExit = useCallback((id: string, pin: string) => liveRequest({ action: "exit", orderId: id, pin }, "exit"), [liveRequest]);
   // ---- real money: arm / disarm automatic live orders (server-checked; PIN to arm) -----------
-  const armLive = useCallback(async (arm: boolean) => {
-    if (arm && !window.confirm(`REAL MONEY: arm automatic LIVE orders for ${strategy.name} at exactly ${armLots} lot(s)?\n\nEvery confirmed setup today will be bought on Groww (intraday MIS) at ${armLots} lot(s) with a stop-loss at Groww, without asking again. A trade the server limits cannot carry at that size is refused, never resized.`)) return;
+  /** Switch NEW trades between PAPER and LIVE (real money). LIVE arms today at exact lots with the PIN; PAPER disarms. */
+  const setLiveMode = useCallback(async (target: "LIVE" | "PAPER", lots = 1, pin = ""): Promise<string | null> => {
+    if (target === "LIVE" && !window.confirm(`REAL MONEY: switch ${strategy.name} to LIVE at exactly ${lots} lot(s)?\n\nEvery confirmed setup today will be bought on Groww (intraday MIS) at ${lots} lot(s) with a stop-loss at Groww, without asking again. A trade the server limits cannot carry at that size is refused, never resized.`)) return "Cancelled";
+    if (target === "PAPER" && !window.confirm("Switch new trades back to PAPER? Open live positions stay open and keep being managed (exit them from the LIVE cards).")) return "Cancelled";
     setArming(true);
     try {
-      const response = await fetch("/api/live-orders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(arm ? { action: "arm_auto", strategy: strategyId, lots: armLots, pin: armPin } : { action: "disarm_auto" }) });
+      const response = await fetch("/api/live-orders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(target === "LIVE" ? { action: "arm_auto", strategy: strategyId, lots, pin } : { action: "disarm_auto" }) });
       const data = await response.json().catch(() => ({}));
-      const text = response.ok ? (arm ? `LIVE auto-trading ARMED: ${strategy.name}, exactly ${armLots} lot(s), today only. Switch Auto-execute on for the strategy to let the server place trades.` : "LIVE auto-trading disarmed. Open live positions are still managed.") : `Live arming failed: ${data.error ?? "request failed"}`;
+      if (!response.ok) { const text = `Switch to ${target} failed: ${data.error ?? "request failed"}`; setMessage(text); return String(data.error ?? "request failed"); }
+      const text = target === "LIVE" ? `LIVE trading ON: ${strategy.name}, exactly ${lots} lot(s), today only. Confirmed setups now go to Groww (with Automatic on, the server places them).` : "PAPER trading: new setups go to the paper book. Open live positions are still managed.";
       setMessage(text);
-      log(`[LIVE] ${text}`, "info");
-      setArmPin("");
-    } catch { setMessage("Live arming request failed"); }
+      log(`[MODE] ${text}`, "info");
+      return null;
+    } catch { setMessage(`Switch to ${target} failed`); return "request failed"; }
     finally { setArming(false); void refreshLive(); }
-  }, [armLots, armPin, log, refreshLive, strategy.name, strategyId]);
+  }, [log, refreshLive, strategy.name, strategyId]);
+  const armLive = useCallback(async (arm: boolean) => {
+    const error = await setLiveMode(arm ? "LIVE" : "PAPER", armLots, armPin);
+    if (!error) setArmPin("");
+  }, [armLots, armPin, setLiveMode]);
   const autoStatus = !autoTrader ? "" : autoTrader.openTrade
     ? `Trade open: BUY ${autoTrader.openTrade.label} on ${autoTrader.openTrade.underlying} · SL ₹${money(autoTrader.openTrade.stop)} · T ₹${money(autoTrader.openTrade.target)}${autoTrader.openTrade.stage ? ` (${autoTrader.openTrade.stage.toLowerCase()})` : ""} — no new trade until it exits at its target, SL or trailing SL`
     : autoOn ? (autoTrader.lastByIndex[symbol]?.text ?? "Watching: checks a few seconds after every 1-minute close") : "";
@@ -990,7 +997,8 @@ export default function ExecutionPage() {
           </article>
         </div>
 
-        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} onSettingsChange={(settings) => void onDeskSettings(settings)} realPositions={livePositions as unknown as LivePositionView[]} onLiveModify={onLiveModify} onLiveExit={onLiveExit} />
+        <ScalperDesk symbol={symbol} onSymbolChange={switchIndex} chain={chain} expiry={chainExpiry} spot={quotes[symbol] ?? spot} onLog={log} onAutoChange={setAutoEnabled} refreshSignal={scalperRefresh} vwapScalp={vwapScalp} onPlaceVwapScalp={placeOnScalper} vwapAuto={autoTrader ? { enabled: autoOn, status: autoStatus, onChange: (enabled: boolean) => void toggleAutoTrader(enabled) } : null} pinnedElsewhere={pinnedElsewhere} signalStrategy={strategyId} onSignalStrategyChange={selectStrategy} onSettingsChange={(settings) => void onDeskSettings(settings)} realPositions={livePositions as unknown as LivePositionView[]} onLiveModify={onLiveModify} onLiveExit={onLiveExit}
+          liveMode={{ available: Boolean(live?.auto?.serverEnabled), reason: live?.auto?.serverEnabled ? "" : [...(live?.disabledReasons ?? []), ...(live?.enabled ? ["LIVE_AUTO_EXECUTION_ENABLED is not true"] : [])].join("; ") || "live status unavailable", armed: live?.auto?.armed ?? null, maxLots: live?.auto?.maxLotsPerOrder ?? 1, strategyId, busy: arming, onChange: setLiveMode }} />
 
         <article className="mi-card exec-orders">
           <div className="exec-tabs" role="tablist">

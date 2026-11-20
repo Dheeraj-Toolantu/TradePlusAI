@@ -67,7 +67,7 @@ function usePremiumBars(contract: ScalperChainRow | null, setBars: (value: Chart
   useEffect(() => { if (premium > 0) setBars((current) => foldTick(current, premium, 1)); }, [premium]);
 }
 
-function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange, onSettingsChange, realPositions = [], onLiveModify, onLiveExit }: {
+function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, onAutoChange, refreshSignal = 0, vwapScalp = null, onPlaceVwapScalp, vwapAuto = null, pinnedElsewhere = null, signalStrategy = "VWAP_EMA_SCALP", onSignalStrategyChange, onSettingsChange, realPositions = [], onLiveModify, onLiveExit, liveMode = null }: {
   symbol: string;
   onSymbolChange: (next: string) => void;
   chain: ScalperChainRow[];
@@ -94,6 +94,8 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   realPositions?: LivePositionView[];
   onLiveModify?: (id: string, changes: { stopLoss?: number; target?: number }, pin: string) => Promise<string | null>;
   onLiveExit?: (id: string, pin: string) => Promise<string | null>;
+  /** Paper / Live switch for NEW trades (the algo page arms live at exact lots with the PIN, or disarms). */
+  liveMode?: { available: boolean; reason: string; armed: { strategy: string; lots: number } | null; maxLots: number; strategyId: string; busy: boolean; onChange: (target: "LIVE" | "PAPER", lots?: number, pin?: string) => Promise<string | null> } | null;
 }) {
   const [settings, setSettings] = useState<ScalperSettings>(DEFAULT_SETTINGS);
   const [views, setViews] = useState<View[]>(["CALL", "PUT"]);
@@ -117,6 +119,10 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
   const [state, setState] = useState<ScalperState>({ positions: [], closed: [], unrealizedPnl: 0, realizedPnl: 0, tradesToday: 0 });
   const [notice, setNotice] = useState("Paper scalper. Start the engine and choose Automatic (engine trades) or Manual (you take its signals), or trade the cards directly.");
   const [livePin, setLivePin] = useState("");
+  const [goLive, setGoLive] = useState(false);
+  const [goLiveLots, setGoLiveLots] = useState(1);
+  const [goLivePin, setGoLivePin] = useState("");
+  const [goLiveError, setGoLiveError] = useState<string | null>(null);
   const [positionsTab, setPositionsTab] = useState<"OPEN" | "CLOSED">("OPEN");
   const [selected, setSelected] = useState<string[]>([]);
   const [spotBars, setSpotBars] = useState<ChartBar[]>([]);
@@ -500,6 +506,30 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
               }}>{value === "AUTOMATIC" ? "Automatic" : "Manual"}</button>
             ))}
           </span>
+          {liveMode ? (() => {
+            const isLive = Boolean(liveMode.armed);
+            const otherStrategy = isLive && liveMode.armed!.strategy !== liveMode.strategyId;
+            const canLive = liveMode.available && vwapMode;
+            const why = !vwapMode ? "Level scalper trades are paper only; pick VWAP-EMA or NIFTY Sniper to trade live" : liveMode.reason;
+            return (
+              <span className={`scalper-money-mode${isLive ? " live" : ""}`} role="radiogroup" aria-label="Paper or live trading">
+                <small>Money</small>
+                <button type="button" role="radio" aria-checked={!isLive} className={!isLive ? "on" : ""} disabled={liveMode.busy} onClick={() => { setGoLive(false); if (isLive) void liveMode.onChange("PAPER"); }} title="New trades go to the paper book">Paper</button>
+                <button type="button" role="radio" aria-checked={isLive} className={isLive ? "on live" : ""} disabled={liveMode.busy || (!isLive && !canLive)} title={isLive ? `Live: ${liveMode.armed!.lots} lot(s) per trade${otherStrategy ? ` (armed for ${liveMode.armed!.strategy === "NIFTY_SNIPER" ? "NIFTY Sniper" : "VWAP-EMA"})` : ""}` : canLive ? "Trade real money on Groww (lots + PIN)" : why} onClick={() => { if (!isLive) { setGoLiveError(null); setGoLiveLots(Math.min(goLiveLots, liveMode.maxLots)); setGoLive((value) => !value); } }}>
+                  {isLive ? `LIVE · ${liveMode.armed!.lots} lot${liveMode.armed!.lots > 1 ? "s" : ""}${otherStrategy ? " (other strategy)" : ""}` : "Live"}
+                </button>
+                {goLive && !isLive ? (
+                  <form className="scalper-go-live" onSubmit={(event) => { event.preventDefault(); void liveMode.onChange("LIVE", goLiveLots, goLivePin).then((error) => { if (!error) { setGoLive(false); setGoLivePin(""); } else if (error !== "Cancelled") setGoLiveError(error); }); }}>
+                    <label>Lots<select value={goLiveLots} onChange={(event) => setGoLiveLots(Number(event.target.value))}>{Array.from({ length: 10 }, (_, index) => index + 1).map((value) => <option key={value} value={value} disabled={value > liveMode.maxLots}>{value}{value > liveMode.maxLots ? " (above server max)" : ""}</option>)}</select></label>
+                    <label>PIN<input type="password" inputMode="numeric" autoComplete="off" value={goLivePin} onChange={(event) => setGoLivePin(event.target.value)} /></label>
+                    <button type="submit" disabled={liveMode.busy || goLivePin.length < 6}>Go live</button>
+                    <button type="button" className="ghost" onClick={() => setGoLive(false)}>Cancel</button>
+                    {goLiveError ? <span className="loss" role="alert">{goLiveError}</span> : null}
+                  </form>
+                ) : null}
+              </span>
+            );
+          })() : null}
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
           {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? `Place the confirmed ${signalName} trade (server re-checks every gate)` : sniperMode ? "Waiting for a score of 85+ with every hard filter passing" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>

@@ -439,3 +439,17 @@
 .scalper-live-count { color: #f6a6ae; font-style: normal; }
 .pos-card.pos-live { border-color: #5a2a30; }
 .pos-side.live { color: #fff; background: #c2434f; }
+
+.scalper-money-mode { position: relative; display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 4px; border: 1px solid #25505f; border-radius: 6px; }
+.scalper-money-mode small { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.scalper-money-mode > button { padding: 3px 9px; color: var(--text); border: 1px solid transparent; border-radius: 4px; background: transparent; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
+.scalper-money-mode > button.on { color: #0b1a20; background: #4fc3f7; }
+.scalper-money-mode > button.on.live, .scalper-money-mode.live { border-color: #c2434f; }
+.scalper-money-mode > button.on.live { color: #fff; background: #c2434f; }
+.scalper-money-mode > button:disabled { opacity: .5; cursor: not-allowed; }
+.scalper-go-live { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%; padding: 6px; border-top: 1px solid #5a2a30; font-size: 11px; }
+.scalper-go-live label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.scalper-go-live select, .scalper-go-live input { width: 90px; padding: 3px 6px; color: var(--text); border: 1px solid #2d3b40; border-radius: 4px; background: #111a1d; }
+.scalper-go-live button { padding: 3px 10px; color: #fff; border: 0; border-radius: 4px; background: #c2434f; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
+.scalper-go-live button.ghost { color: var(--text); border: 1px solid #2d3b40; background: transparent; }
+.scalper-go-live button:disabled { opacity: .5; cursor: not-allowed; }
