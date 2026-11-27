@@ -1,5 +1,5 @@
 import { getActiveOrdersFromFirestore, saveOrderToFirestore, type OrderRecord } from "../../../apps/web/lib/firestore-orders";
-import { SNIPER_TRAIL, TRAIL_MODES, VWAP_EMA_TRAIL, smartTrail, sniperTrail, type TrailMode } from "./scalper-trail";
+import { DEFAULT_MONEY_TRAIL, SNIPER_TRAIL, TRAIL_MODES, VWAP_EMA_TRAIL, moneyTrailError, moneyTrailPrices, smartTrail, sniperTrail, type MoneyTrailConfig, type TrailMode } from "./scalper-trail";
 import { isCommodity, sessionFor } from "../../../apps/web/lib/underlyings";
 
 /**
@@ -60,6 +60,8 @@ export type ScalperSettings = {
   sniperSizing: "RISK_BUDGET" | "FIXED_LOTS";
   /** NIFTY Sniper setups switched on: A reversal, B breakout, C continuation (e.g. "ABC"). */
   sniperSetups: string;
+  /** Rupee P&L stop and trail for new trades (e.g. −₹500 stop; at +₹500 to −₹200; +₹200 per ₹200; exit at the ₹ target). */
+  moneyTrail: MoneyTrailConfig & { enabled: boolean };
 };
 export type Level = { price: number; touches: number; sources: string[] };
 export type ExtraZone = { side: "DEMAND" | "SUPPLY"; low: number; high: number; sources?: string[] };
@@ -190,8 +192,18 @@ export type PositionControls = {
   /** How many times the smart trail pushed the target out (the trade ran past its target). */
   targetRuns: number;
   modifiedAt?: string;
+  /** MONEY mode: the rupee stop, trail trigger, first trailed stop, step and target. */
+  money?: MoneyTrailConfig;
 };
-export type ModifyRequest = { stop?: number | null; target?: number | null; trailMode?: TrailMode; trailPoints?: number | null; runPastTarget?: boolean };
+export type ModifyRequest = { stop?: number | null; target?: number | null; trailMode?: TrailMode; trailPoints?: number | null; runPastTarget?: boolean; money?: MoneyTrailConfig };
+
+/** Desk settings' money trail: numbers clamped to sane rupee ranges; invalid settings switch it off. */
+export function parseMoneyTrail(raw: unknown): MoneyTrailConfig & { enabled: boolean } {
+  const value = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const num = (key: keyof MoneyTrailConfig) => { const parsed = Number(value[key]); return Number.isFinite(parsed) ? Math.round(parsed) : DEFAULT_MONEY_TRAIL[key]; };
+  const config: MoneyTrailConfig = { stopLoss: num("stopLoss"), trigger: num("trigger"), firstStop: num("firstStop"), step: num("step"), target: Math.max(0, num("target")) };
+  return { ...config, enabled: value.enabled === true && moneyTrailError(config) === null };
+}
 export { TRAIL_MODES, type TrailMode };
 export type TrailStage = "INITIAL" | "BREAKEVEN" | "LOCKED" | "TRAILING";
 
@@ -237,7 +249,7 @@ export type ScanInput = {
   entryBlockedReason?: string;
 };
 
-export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC" };
+export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC", moneyTrail: { enabled: false, ...DEFAULT_MONEY_TRAIL } };
 const STAGE_ORDER: TrailStage[] = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
 const higherStage = (a: TrailStage, b: TrailStage) => (STAGE_ORDER.indexOf(a) >= STAGE_ORDER.indexOf(b) ? a : b);
 /** Round-trip charges per unit when the plan gave none: ~₹40 brokerage per order pair plus ~0.2% of premium (STT, exchange, GST). */
@@ -573,6 +585,7 @@ export class SmartScalper {
       sniperLots: clamp(Math.floor(Number(value.sniperLots) || DEFAULT_SCALPER_SETTINGS.sniperLots), 1, 10),
       sniperSizing: value.sniperSizing === "FIXED_LOTS" ? "FIXED_LOTS" : "RISK_BUDGET",
       sniperSetups: ["A", "B", "C"].filter((letter) => String(value.sniperSetups ?? "ABC").toUpperCase().includes(letter)).join("") || "ABC",
+      moneyTrail: parseMoneyTrail(value.moneyTrail),
     };
   }
 
@@ -617,6 +630,7 @@ export class SmartScalper {
         stage: (STAGE_ORDER.includes(single?.smartStage as TrailStage) ? single!.smartStage : "INITIAL") as TrailStage,
         risk: Number(single?.smartRisk) > 0 ? Number(single!.smartRisk) : initialRisk && initialRisk > 0 ? round2(initialRisk) : round2(entry * FALLBACK_RISK_PCT),
         targetRuns: Number(single?.targetRuns ?? 0) || 0,
+        ...(single?.moneyTrail && moneyTrailError(single.moneyTrail) === null ? { money: single.moneyTrail } : {}),
       };
       const partial = Number(single?.partialPrice) > 0 ? { price: Number(single!.partialPrice), quantity: Number(single!.partialQuantity ?? 0), done: Boolean(single!.partialDone), multiple: Number(single!.partialMultiple) || undefined } : undefined;
       this.positions.push({ ...(partial ? { partial } : {}), ...(Number(single?.maxLoss) > 0 ? { maxLoss: Number(single!.maxLoss) } : {}), controls, id, kind, side: legs[0].contract === "CALL" ? "CE" : "PE", underlying: orders[0].underlying ?? "", legs, openedAt: orders[0].createdAt, entry, stop, target: single?.target ?? null, initialRisk, highWater: Math.max(entry, Number(single?.highWaterMark ?? entry)), lowWater: Math.min(entry, Number(single?.lowWaterMark ?? entry)), trailing: Boolean(trail && trail.stage !== "INITIAL") || controls.stage !== "INITIAL", spot: null, reason: orders[0].source ?? "restored", status: "OPEN", ...(trail ? { trail } : {}), ...(single?.entrySignal ? { signal: single.entrySignal } : {}) });
@@ -919,6 +933,15 @@ export class SmartScalper {
     const deterministic = plan.trail?.rule === "SNIPER";
     const smart = settings.smartTrail && !deterministic;
     position.controls = { mode: smart ? "SMART" : "RULE", points: null, runPastTarget: smart && settings.runPastTarget, resumeAbove: null, stage: "INITIAL", risk: position.initialRisk && position.initialRisk > 0 ? position.initialRisk : round2(entry * FALLBACK_RISK_PCT), targetRuns: 0 };
+    // Money trail on (desk settings): the rupee P&L stop / trail / target replaces the strategy's.
+    if (settings.moneyTrail.enabled) {
+      const { enabled: _enabled, ...money } = settings.moneyTrail;
+      void _enabled;
+      const prices = moneyTrailPrices({ entry, quantity: plan.quantity, bestPnl: 0, config: money });
+      Object.assign(position.controls, { mode: "MONEY", money, runPastTarget: false });
+      position.stop = prices.stop;
+      if (prices.target !== null) position.target = prices.target;
+    }
     this.positions.push(position);
     this.tradesToday += 1;
     this.persist(position);
@@ -954,7 +977,7 @@ export class SmartScalper {
         this.trailStop(position, value, squareOffOf(position.underlying) - minutes);
         // Partial booking: sell the planned lots at the partial level once; the rest keeps trailing.
         const part = position.partial;
-        if (part && !part.done && part.quantity > 0 && part.quantity < this.quantity(position) && value >= part.price) {
+        if (part && !part.done && position.controls?.mode !== "MONEY" && part.quantity > 0 && part.quantity < this.quantity(position) && value >= part.price) {
           part.done = true;
           this.close(position, `PARTIAL_${String(part.multiple ?? "").replace(".", "_")}X`, part.quantity);
         }
@@ -969,7 +992,7 @@ export class SmartScalper {
         const spotKnown = Number.isFinite(spotPrice) && spotPrice > 0;
         if (!manual && spotKnown && position.spot && (bull ? spotPrice <= position.spot.stop : spotPrice >= position.spot.stop)) reason = "SPOT_LEVEL_BROKEN";
         else if (!manual && !sniper && !runner && spotKnown && position.spot && (bull ? spotPrice >= position.spot.target : spotPrice <= position.spot.target)) reason = "SPOT_TARGET";
-        else if (!runner && position.target !== null && value >= position.target) reason = sniper ? "TARGET_2X" : "TARGET";
+        else if (!runner && position.target !== null && value >= position.target) reason = position.controls?.mode === "MONEY" ? "MONEY_TARGET" : sniper ? "TARGET_2X" : "TARGET";
         else if (position.stop !== null && value <= position.stop) reason = this.stopReason(position);
         else if (!manual && !sniper && position.trail && position.trail.stage !== "INITIAL" && emaMomentumLost(input.bars, bull, now)) reason = "EMA9_LOST";
         else if (!manual && sniper && now.getTime() - Date.parse(position.openedAt) >= SNIPER_MAX_HOLD_MINUTES * 60_000 && value < position.entry * SNIPER_TRAIL.breakevenAt) reason = "SNIPER_TIME_STOP";
@@ -986,6 +1009,8 @@ export class SmartScalper {
   }
 
   private stopReason(position: ScalperPosition) {
+    // Money rule: the initial ₹ stop until the trail trigger is reached, the ₹ trail after it.
+    if (position.controls?.mode === "MONEY") return position.controls.stage === "TRAILING" ? "MONEY_TRAIL_STOP" : "MONEY_STOP_LOSS";
     if (position.controls?.targetRuns) return "RUNNER_STOP";
     const stage = this.stageOf(position);
     if (stage === "INITIAL") return position.trailing && position.stop !== null && position.stop > position.entry ? "TRAILING_STOP" : "STOP_LOSS";
@@ -1037,6 +1062,14 @@ export class SmartScalper {
       position.target = next.target;
       controls.stage = next.stage;
       if (next.extended) controls.targetRuns += 1;
+    }
+    if (mode === "MONEY" && controls?.money) {
+      // Rupee P&L stop and trail on the whole position: only ever raises the stop.
+      const qty = this.quantity(position);
+      const prices = moneyTrailPrices({ entry: position.entry, quantity: qty, bestPnl: (position.highWater - position.entry) * qty, config: controls.money });
+      if (position.stop === null || prices.stop > position.stop) position.stop = prices.stop;
+      if (prices.target !== null) position.target = prices.target;
+      if (prices.trailing) controls.stage = "TRAILING";
     }
     if (mode === "FIXED" && controls?.points && controls.points > 0) {
       const trailed = round2(Math.floor((position.highWater - controls.points) / 0.05 + 1e-6) * 0.05);
@@ -1094,6 +1127,19 @@ export class SmartScalper {
       let points = controls.points;
       if (changes.trailPoints !== undefined) points = changes.trailPoints === null ? null : round2(Number(changes.trailPoints));
       if (mode === "FIXED" && !(points !== null && points > 0 && points < value)) return fail(`A fixed trail needs a distance in rupees between 0 and the premium ₹${value}.`);
+      if (mode === "MONEY") {
+        // The rupee rule sets the stop and target from the best P&L so far.
+        const money = changes.money ?? controls.money ?? DEFAULT_MONEY_TRAIL;
+        const problem = moneyTrailError(money);
+        if (problem) return fail(problem);
+        const qty = this.quantity(position);
+        const prices = moneyTrailPrices({ entry: position.entry, quantity: qty, bestPnl: (Math.max(position.highWater, value) - position.entry) * qty, config: money });
+        if (!(prices.stop < value)) return fail(`At the best P&L so far the ₹ stop (₹${prices.stopPnl}) is at ₹${prices.stop}, not below the live premium ₹${value}: exit instead, or widen it.`);
+        controls.money = money;
+        stop = prices.stop;
+        if (prices.target !== null) target = prices.target;
+        controls.stage = prices.trailing ? "TRAILING" : "INITIAL";
+      }
       const stopMoved = stop !== position.stop;
       position.stop = stop;
       position.target = target;
@@ -1106,7 +1152,7 @@ export class SmartScalper {
         if (!stopMoved) controls.resumeAbove = null;
       }
       // A manual SL edit is respected: the trail moves it again only on a new best premium.
-      if (stopMoved) controls.resumeAbove = mode === "OFF" ? null : position.highWater;
+      if (stopMoved) controls.resumeAbove = mode === "OFF" || mode === "MONEY" ? null : position.highWater;
       if (stopMoved && stop !== null && !(position.initialRisk && position.initialRisk > 0) && stop < position.entry && controls.risk <= 0) controls.risk = round2(position.entry - stop);
       controls.modifiedAt = this.clock().toISOString();
       position.controls = controls;
@@ -1115,7 +1161,8 @@ export class SmartScalper {
       if (stop !== null && (position.entry - stop) * qty > settings.maxLossPerTrade) notes.push(`the ₹${settings.maxLossPerTrade} max loss per trade still closes it first`);
       if (stop === null) notes.push("no stop loss: only the max loss per trade and the square-off protect it");
       this.persist(position);
-      const modeText = mode === "SMART" ? `smart auto trail${controls.runPastTarget ? ", runs past target" : ""}` : mode === "FIXED" ? `trails ₹${points} under the best premium` : mode === "RULE" ? "strategy trail" : "trailing off";
+      const moneyText = mode === "MONEY" && controls.money ? `₹ stop −${controls.money.stopLoss}, at +${controls.money.trigger} to ${controls.money.firstStop >= 0 ? "+" : "−"}${Math.abs(controls.money.firstStop)}, +${controls.money.step} per ₹${controls.money.step}${controls.money.target ? `, target +${controls.money.target}` : ""}` : "";
+      const modeText = mode === "MONEY" ? moneyText : mode === "SMART" ? `smart auto trail${controls.runPastTarget ? ", runs past target" : ""}` : mode === "FIXED" ? `trails ₹${points} under the best premium` : mode === "RULE" ? "strategy trail" : "trailing off";
       return { ...this.state(underlying), modified: true, position: this.view(position), summary: `Modified ${this.view(position).label}: SL ${stop === null ? "none" : `₹${stop}`} · T ${target === null ? "none" : `₹${target}`} · ${modeText}${notes.length ? ` (${notes.join("; ")})` : ""}` };
     });
   }
@@ -1157,7 +1204,7 @@ export class SmartScalper {
         ...(position.lowWater !== undefined ? { lowWaterMark: position.lowWater } : {}),
         ...(position.maxLoss ? { maxLoss: position.maxLoss } : {}),
         ...(position.partial ? { partialPrice: position.partial.price, partialQuantity: position.partial.quantity, partialDone: position.partial.done, partialMultiple: position.partial.multiple } : {}),
-        ...(position.controls ? { trailMode: position.controls.mode, trailPoints: position.controls.points ?? undefined, runPastTarget: position.controls.runPastTarget, trailResumeAbove: position.controls.resumeAbove ?? undefined, smartStage: position.controls.stage, smartRisk: position.controls.risk, targetRuns: position.controls.targetRuns, highWaterMark: position.highWater } : {}),
+        ...(position.controls ? { trailMode: position.controls.mode, trailPoints: position.controls.points ?? undefined, runPastTarget: position.controls.runPastTarget, trailResumeAbove: position.controls.resumeAbove ?? undefined, smartStage: position.controls.stage, smartRisk: position.controls.risk, targetRuns: position.controls.targetRuns, highWaterMark: position.highWater, ...(position.controls.money ? { moneyTrail: position.controls.money } : {}) } : {}),
         ...(position.signal ? { entrySignal: position.signal } : {}),
         status: position.status === "OPEN" ? "OPEN" : "EXITED", mode: "PAPER", source: position.reason, createdAt: position.openedAt, updatedAt: this.clock().toISOString(),
         ...(position.status === "EXITED" ? { exitPrice: exits?.[index], exitAt: position.exitAt, exitReason: position.exitReason, realizedPnl: round2(legPnl) } : {}),

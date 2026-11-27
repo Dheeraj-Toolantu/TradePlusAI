@@ -38,7 +38,7 @@ const epochOf = (iso: string | null | undefined) => { const value = iso ? Date.p
 const TIMEFRAMES = [1, 3, 5] as const;
 const SETTINGS_KEY = "tradepulse.scalper.settings";
 const PREFS_KEY = "tradepulse.scalper.prefs";
-const DEFAULT_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC" };
+const DEFAULT_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC", moneyTrail: { enabled: false, stopLoss: 500, trigger: 500, firstStop: -200, step: 200, target: 0 } };
 const money = (value: number | null | undefined, digits = 2) => (value === null || value === undefined || !Number.isFinite(value) ? "--" : value.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits }));
 const signed = (value: number) => `${value >= 0 ? "+" : "-"} ₹${money(Math.abs(value))}`;
 const norm = (value: string | undefined | null) => String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -488,7 +488,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             setEngineStrategy(next);
             if (next !== "LEVELS") onSignalStrategyChange?.(next === "SNIPER" ? "NIFTY_SNIPER" : "VWAP_EMA_SCALP");
             setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 9 criteria (trend: VWAP + 9/21 EMA + ADX above 25; entry: VWAP + 5/9 EMA + ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically."
-              : next === "SNIPER" ? "NIFTY Sniper AI (NIFTY only): liquidity reversal, breakout expansion or trend continuation on 5m structure, 15m regime and a 1m trigger. Enters only on a score of 85+/100 with every hard filter and V5 gate passing; buys the CE/PE, stop 25% below the actual fill, 2x target, staged trail. Most sessions it returns NO TRADE — that is by design."
+              : next === "SNIPER" ? "NIFTY Sniper AI (NIFTY only): liquidity reversal, breakout expansion or trend continuation on 5m structure, 15m regime and a 1m trigger. Enters on a score of 60+/100 with every hard filter and V5 gate passing (including the premium sitting at a high-volume level); buys the CE/PE, stop 25% below the actual fill, 2x target, staged trail. Most sessions it returns NO TRADE — that is by design."
               : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape.");
           }}>
             <option value="VWAP_EMA">Strategy: VWAP-EMA scalper</option>
@@ -531,7 +531,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             );
           })() : null}
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
-          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? `Place the confirmed ${signalName} trade (server re-checks every gate)` : sniperMode ? "Waiting for a score of 85+ with every hard filter passing" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
+          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? `Place the confirmed ${signalName} trade (server re-checks every gate)` : sniperMode ? "Waiting for a score of 60+ with every hard filter passing" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (
@@ -547,6 +547,13 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             <label>Min reward : risk<select value={settings.minRiskReward} onChange={(event) => setSettings((current) => ({ ...current, minRiskReward: Number(event.target.value) }))}>{[1.5, 2, 2.5, 3].map((value) => <option key={value} value={value}>{value} R</option>)}</select></label>
             <label title="New engine trades start on the smart auto trail: breakeven + charges at +0.75R, then it trails the best premium giving back 45% of the gain, less as the trade grows (20% from +4R), tighter in the last 15 minutes. You can change it on each trade.">Trailing SL<select value={settings.smartTrail ? "SMART" : "RULE"} onChange={(event) => setSettings((current) => ({ ...current, smartTrail: event.target.value === "SMART" }))}><option value="SMART">Smart auto trail</option><option value="RULE">Strategy rule only</option></select></label>
             <label title="Smart trail: when the target trades, lock 80% of the move and push the target out instead of closing, so a trend keeps paying.">At target<select value={settings.runPastTarget ? "RUN" : "EXIT"} disabled={!settings.smartTrail} onChange={(event) => setSettings((current) => ({ ...current, runPastTarget: event.target.value === "RUN" }))}><option value="RUN">Lock profit &amp; run</option><option value="EXIT">Exit at target</option></select></label>
+            <fieldset className="scalper-money-trail" title="Rupee P&L stop and trail on the whole position, for NEW trades (paper and live). Each open trade can also be changed with Modify → Trailing SL → Money.">
+              <legend><label><input type="checkbox" checked={settings.moneyTrail.enabled} onChange={(event) => setSettings((current) => ({ ...current, moneyTrail: { ...current.moneyTrail, enabled: event.target.checked } }))} /> P&amp;L stop &amp; trail (₹)</label></legend>
+              {([["stopLoss", "Stop loss ₹", 1], ["trigger", "Trail at profit ₹", 1], ["firstStop", "Then SL to ₹", undefined], ["step", "Step ₹", 1], ["target", "Target ₹ (0 none)", 0]] as const).map(([key, label, min]) => (
+                <label key={key}>{label}<input type="number" step={key === "target" ? 100 : 50} min={min} disabled={!settings.moneyTrail.enabled} value={settings.moneyTrail[key]} onChange={(event) => setSettings((current) => ({ ...current, moneyTrail: { ...current.moneyTrail, [key]: Number(event.target.value) } }))} /></label>
+              ))}
+              {settings.moneyTrail.enabled ? <small>Exit at −₹{settings.moneyTrail.stopLoss}; at +₹{settings.moneyTrail.trigger} the SL moves to {settings.moneyTrail.firstStop >= 0 ? "+" : "−"}₹{Math.abs(settings.moneyTrail.firstStop)}, then +₹{settings.moneyTrail.step} for every further ₹{settings.moneyTrail.step}{settings.moneyTrail.target ? `; exit at +₹${settings.moneyTrail.target}` : ""}.{settings.moneyTrail.stopLoss > settings.maxLossPerTrade ? ` Note: the ₹${settings.maxLossPerTrade} max loss per trade still exits first.` : ""}</small> : null}
+            </fieldset>
             <label>Scalp time stop<select value={settings.maxHoldMinutes} onChange={(event) => setSettings((current) => ({ ...current, maxHoldMinutes: Number(event.target.value) }))}>{[5, 8, 12, 15, 20, 30].map((value) => <option key={value} value={value}>{value} min</option>)}</select></label>
           </div>
         )}

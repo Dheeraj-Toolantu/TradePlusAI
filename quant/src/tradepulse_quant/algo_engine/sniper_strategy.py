@@ -196,8 +196,15 @@ class SniperConfig:
     feasibility_gate_scenario: str = "BASE"
     oi_blocks_when_against: bool = True      # OI is context: only an opposing read blocks; neutral / unknown score lower
     # --- scoring ----------------------------------------------------------------------------
-    minimum_sniper_score: float = 85.0       # A grade trades; 80-84 is B grade (journal only, no order)
-    b_grade_score: float = 80.0
+    minimum_sniper_score: float = 60.0       # trades execute from a score of 60 (A >= 85, B 70-84, C 60-69)
+    b_grade_score: float = 70.0
+    # --- premium volume profile (where the option's own volume traded today) --------------
+    require_volume_level: bool = True
+    profile_min_bars: int = 15               # completed 1m premium candles today before the profile is trusted
+    profile_bins: int = 30                   # price bins across today's premium range
+    profile_hvn_quantile: float = 0.7        # a bin at or above the 70th percentile of volume is a high-volume node
+    profile_near_pct: float = 4.0            # "just above" a node: the premium within 4% above it ...
+    profile_near_bins: float = 2.0           # ... or within 2 bins of it, whichever is wider
     require_oi: bool = False
     weights: dict = field(default_factory=lambda: {
         "liquidity": 15, "structure": 15, "displacement_fvg": 15, "htf_alignment": 10,
@@ -206,15 +213,15 @@ class SniperConfig:
     tick: float = 0.05
 
 
-SCORE_BANDS = ((85, "A_GRADE", "Tradable when every hard gate passes"), (80, "B_GRADE", "Research / journal only: no order"),
-               (0, "NO_TRADE", "Reject"))
+SCORE_BANDS = ((85, "A_GRADE", "Tradable when every hard gate passes"), (70, "B_GRADE", "Tradable when every hard gate passes"),
+               (60, "C_GRADE", "Tradable when every hard gate passes (weakest band)"), (0, "NO_TRADE", "Reject"))
 
 # Machine-readable rejection reasons (spec V2 section 17) for each hard gate.
 REASON_CODES = {
     "SETUP_CONFIRMED": "NO_VALID_SETUP", "SIGNAL_FRESH": "STALE_DATA", "ENTRY_TRIGGER": "NO_ENTRY_TRIGGER", "NOT_CHASING": "CHASE_LIMIT",
     "ENTRY_WINDOW": "SESSION_CLOSED", "REGIME_PERMITS": "REGIME_BLOCKED", "SETUP_ENABLED": "SETUP_DISABLED", "CONTRACT_SELECTED": "NO_CONTRACT",
     "SPREAD_OK": "SPREAD_TOO_WIDE", "FEASIBILITY_2X": "FEASIBILITY_FAILED", "POSITION_SIZE": "RISK_LIMIT", "OI_AVAILABLE": "OI_UNKNOWN",
-    "PREMIUM_VOLUME_RISING": "PREMIUM_MOMENTUM_WEAK", "WRITER_OI_RISING": "OI_AGAINST", "IV_NOT_RICH": "IV_TOO_HIGH", "SCORE_MINIMUM": "SCORE_BELOW_A_GRADE",
+    "PREMIUM_VOLUME_RISING": "PREMIUM_MOMENTUM_WEAK", "WRITER_OI_RISING": "OI_AGAINST", "IV_NOT_RICH": "IV_TOO_HIGH", "SCORE_MINIMUM": "SCORE_BELOW_MINIMUM", "PREMIUM_AT_VOLUME_LEVEL": "PREMIUM_NOT_AT_VOLUME_LEVEL",
 }
 
 # Regime permissions (spec V2 5.4): which setups each 15m regime allows, and the risk multiplier.
@@ -946,6 +953,60 @@ def feasibility(selected: dict, spot: float, atr5: float, now: datetime, symbol:
 
 # ------------------------------------------------------------------------------- order flow
 
+def premium_volume_profile(premium: dict | None, selected: dict | None, now: datetime, config: SniperConfig) -> dict:
+    """Volume profile of the SELECTED option's premium today: buy only at or just above a high-volume level.
+
+    Each completed 1-minute premium candle's volume is spread evenly over the price bins its range
+    covers (``profile_bins`` across today's range). Bins at or above the ``profile_hvn_quantile`` of
+    volume are high-volume nodes (HVN); the busiest bin is the point of control (POC). The trade
+    passes when the latest premium sits at or within ``profile_near_pct`` % (or ``profile_near_bins``
+    bins) ABOVE an HVN: buyers defended that level, so it is support under the entry. The next HVN
+    above is reported as the likely resistance (context, not a gate). Missing, foreign or too few
+    candles are UNAVAILABLE (fail closed).
+    """
+    base = {"key": "volume_level", "symbol": (selected or {}).get("symbol"), "passed": False}
+    if not selected:
+        return {**base, "status": "UNAVAILABLE", "reason": "no contract selected"}
+    if not premium or not premium.get("candles") or str(premium.get("symbol") or "").upper() != str(selected.get("symbol") or "").upper():
+        return {**base, "status": "UNAVAILABLE", "reason": f"1m premium candles for {selected.get('symbol')} unavailable"}
+    bars = [b for b in to_bars(premium.get("candles"), 1) if b.start.date() == now.date() and b.end <= now]
+    if len(bars) < config.profile_min_bars or sum(b.volume for b in bars) <= 0:
+        return {**base, "status": "UNAVAILABLE", "reason": f"{selected['symbol']}: {len(bars)} completed 1m premium candles with volume today (needs {config.profile_min_bars})"}
+    low, high = min(b.low for b in bars), max(b.high for b in bars)
+    if not (high > low):
+        return {**base, "status": "UNAVAILABLE", "reason": "premium range too narrow for a profile"}
+    width = (high - low) / config.profile_bins
+    bins = [0.0] * config.profile_bins
+    for bar in bars:
+        first = min(int((bar.low - low) / width), config.profile_bins - 1)
+        last = min(int((bar.high - low) / width), config.profile_bins - 1)
+        share = bar.volume / (last - first + 1)
+        for index in range(first, last + 1):
+            bins[index] += share
+    ordered = sorted(bins)
+    cutoff = ordered[min(int(config.profile_hvn_quantile * len(ordered)), len(ordered) - 1)]
+    centre = lambda index: low + (index + 0.5) * width
+    nodes = [centre(i) for i, volume in enumerate(bins) if volume >= cutoff and volume > 0]
+    poc = centre(max(range(len(bins)), key=lambda i: bins[i]))
+    close = bars[-1].close
+    below = [node for node in nodes if node <= close + width / 2]
+    above = [node for node in nodes if node > close + width / 2]
+    support = max(below) if below else None
+    resistance = min(above) if above else None
+    near = max(close * config.profile_near_pct / 100.0, width * config.profile_near_bins)
+    distance = close - support if support is not None else None
+    passed = distance is not None and distance <= near
+    parts = [f"premium ₹{close:.2f}", f"POC ₹{poc:.2f}"]
+    if support is None:
+        parts.append("no high-volume level below the premium (buying into thin air)")
+    else:
+        parts.append(f"high-volume support ₹{support:.2f}, {distance:.2f} below ({'at / just above it' if passed else f'too far above it; needs within ₹{near:.2f}'})")
+    parts.append(f"next high-volume level above ₹{resistance:.2f} (likely resistance)" if resistance is not None else "no high-volume level overhead")
+    return {**base, "status": "OK", "passed": passed, "close": _r(close), "poc": _r(poc), "support": _r(support), "resistance": _r(resistance),
+            "distance": _r(distance), "near_limit": _r(near), "nodes": [_r(node) for node in nodes], "bin_width": _r(width, 3),
+            "as_of": bars[-1].end.isoformat(), "reason": f"{selected['symbol']} volume profile: " + "; ".join(parts)}
+
+
 def premium_volume_flow(premium: dict | None, selected: dict | None, side: str, now: datetime, config: SniperConfig, early: bool = False) -> dict:
     """Is buying volume rising in the SELECTED option's own premium?
 
@@ -1433,18 +1494,20 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         pflow = premium_volume_flow(premium, selected, side, now, config, early)
         wflow = writer_oi_flow(oi_history, flow, side, spot, now, config, early)
         ivc = iv_check(feas, selected, context.get("daily_candles"), bars5, vix, now, config)
+        vprof = premium_volume_profile(premium, selected, now, config)
         trig = one_minute_trigger(bars1, setup["direction"], now, config)
         ext = abs(bars1[-1].close - setup["trigger_level"]) / atr5 if setup.get("trigger_level") is not None else None
         comps = score_setup(setup, bars5, bars1, atr5, vwap, vwap_ok, flow, vix, selected, feas, spot, config, pflow, ivc, wflow, regime, trig, ext)
         total = round(sum(c["score"] for c in comps) / sum(c["max_score"] for c in comps) * 100.0, 2)
-        scored.append({"setup": setup, "selected": selected, "ranked": ranked, "rejected": rejected, "feas": feas, "components": comps, "total": total, "premium_flow": pflow, "writer_flow": wflow, "iv": ivc})
+        scored.append({"setup": setup, "selected": selected, "ranked": ranked, "rejected": rejected, "feas": feas, "components": comps, "total": total, "premium_flow": pflow, "writer_flow": wflow, "iv": ivc, "volume_level": vprof})
     # Prefer a confirmed setup, then the higher score; a breakout is never relabelled a reversal.
     scored.sort(key=lambda item: (item["setup"]["state"] == "CONFIRMED", item["total"]), reverse=True)
     best = scored[0]
     setup, selected, feas, comps, total = best["setup"], best["selected"], best["feas"], best["components"], best["total"]
-    pflow, wflow, ivc = best["premium_flow"], best["writer_flow"], best["iv"]
+    pflow, wflow, ivc, vprof = best["premium_flow"], best["writer_flow"], best["iv"], best["volume_level"]
     sniper["order_flow"] = {"premium_volume": pflow, "writer_oi": wflow, "mode": "EARLY" if setup["family"] in config.early_flow_families else "CONFIRMED"}
     sniper["iv_check"] = ivc
+    sniper["volume_level"] = vprof
     # Pass 1 picks the contract; the caller then fetches its own 1m candles for the volume check.
     if selected and (not premium or str(premium.get("symbol") or "").upper() != str(selected["symbol"]).upper()):
         base["needs_premium_candles"] = selected["symbol"]
@@ -1484,7 +1547,8 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         # OI is context (spec V2 10.4): only an opposing read blocks; neutral or unknown OI scores lower.
         ("OI_NOT_AGAINST", not (config.oi_blocks_when_against and wflow.get("verdict") == "AGAINST"), f"OI {wflow.get('verdict', 'UNKNOWN').lower()} (heuristic): {wflow['reason']}"),
         ("IV_NOT_RICH", (not config.require_iv_check) or ivc["passed"], ivc["reason"]),
-        ("SCORE_MINIMUM", total >= config.minimum_sniper_score, f"score {total} / 100 (A grade needs {config.minimum_sniper_score:g}; {band.replace('_', ' ').lower()}" + (": journal only, no order" if band == "B_GRADE" else "") + ")"),
+        ("PREMIUM_AT_VOLUME_LEVEL", (not config.require_volume_level) or vprof["passed"], vprof["reason"]),
+        ("SCORE_MINIMUM", total >= config.minimum_sniper_score, f"score {total} / 100 (trades from {config.minimum_sniper_score:g}; {band.replace('_', ' ').lower()})"),
     ]
     if not pflow["passed"] and pflow.get("status") == "UNAVAILABLE":
         REASON_CODES_LOCAL = {**REASON_CODES, "PREMIUM_VOLUME_RISING": "PREMIUM_DATA_UNAVAILABLE"}

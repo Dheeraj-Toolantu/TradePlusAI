@@ -5,7 +5,7 @@ import type { OrderRecord } from "../firestore-orders";
 import { confirmSecret, istClock, pinMatches, readLiveConfig, type LiveConfig } from "./config";
 import { consumeNonce, issueToken, verifyToken, type LiveTicket } from "./confirm-token";
 import { claimLiveSetup, liveAutoArm, setLiveAutoArm, type AutoStrategy } from "./auto-arm";
-import { sniperTrail, type TrailStageName } from "../../../../services/paper-trading/src/scalper-trail";
+import { moneyTrailError, moneyTrailPrices, sniperTrail, type MoneyTrailConfig, type TrailStageName } from "../../../../services/paper-trading/src/scalper-trail";
 
 // Real-money order lifecycle (manual confirmation per order, app-managed exits):
 //   preview  -> every gate evaluated, signed single-use token for the exact ticket
@@ -38,6 +38,8 @@ export type AutoPlaceInput = PreviewInput & {
   partialMultiple?: number;
   /** NIFTY Sniper staged trail in multiples of the fill (1.25x breakeven + charges, 1.5x lock 1.2x, 1.75x trail 0.2x). */
   trailRule?: "SNIPER";
+  /** Rupee P&L stop / trail / target on the whole position; replaces the trail rule and partial booking. */
+  moneyTrail?: MoneyTrailConfig;
 };
 
 const FILLED = new Set(["EXECUTED", "COMPLETED", "COMPLETE", "FILLED"]);
@@ -204,14 +206,20 @@ export class LiveTradingService {
     if (arm.strategy !== input.strategy) return { ok: false as const, status: 403, error: `Live auto-trading is armed for ${arm.strategy}, not ${input.strategy}` };
     if (Number(input.lots) !== arm.lots) return { ok: false as const, status: 409, error: `Order lots ${input.lots} differ from the armed ${arm.lots} lot(s); nothing placed` };
     if (!input.setupId) return { ok: false as const, status: 400, error: "A setup id is required" };
+    const money = input.moneyTrail && moneyTrailError(input.moneyTrail) === null ? input.moneyTrail : undefined;
     const built = await this.buildTicket({ ...input, lots: arm.lots });
     if (!built.ticket) return { ok: false as const, status: 422, error: built.error ?? "Invalid ticket" };
+    if (money && built.ticket.limitPrice > 0) {
+      // The ₹ rule's stop and target (at the limit price) are what the live checks (reward:risk, daily loss) see.
+      const prices = moneyTrailPrices({ entry: built.ticket.limitPrice, quantity: built.ticket.quantity, bestPnl: 0, config: money, tick: built.ticket.tickSize });
+      built.ticket = { ...built.ticket, stopLoss: prices.stop, ...(prices.target !== null ? { target: prices.target } : {}) };
+    }
     const [state, brokerHealthy] = await Promise.all([this.state(), this.healthy()]);
     const evaluation = evaluateTicket(built.ticket, built.instrument, built.ltp, state, config, now, brokerHealthy);
     const failed = evaluation.checks.filter((check) => !check.passed);
     if (failed.length) return { ok: false as const, status: 403, error: `Live checks failed at ${arm.lots} lot(s): ${failed.map((check) => `${check.label} (${check.detail})`).join("; ")}`, checks: evaluation.checks };
     if (!claimLiveSetup(input.setupId, now)) return { ok: false as const, status: 409, error: "This setup was already sent to Groww" };
-    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId, partialMultiple: input.partialMultiple, trailRule: input.trailRule });
+    return this.execute(built.ticket, { strategy: `LIVE_AUTO_${input.strategy}`, label: `auto · ${input.strategy}`, multiples: input.premiumMultiples, setupId: input.setupId, partialMultiple: money ? undefined : input.partialMultiple, trailRule: money ? undefined : input.trailRule, moneyTrail: money });
   }
 
   /** Arm automatic live orders for one strategy at an exact lot size, today only (PIN required). */
@@ -236,7 +244,7 @@ export class LiveTradingService {
     return { ok: true as const, status: 200, arm: null };
   }
 
-  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string; partialMultiple?: number; trailRule?: "SNIPER" }) {
+  private async execute(ticket: LiveTicket, how: { strategy: string; label: string; multiples?: { stop: number; target: number }; setupId?: string; partialMultiple?: number; trailRule?: "SNIPER"; moneyTrail?: MoneyTrailConfig }) {
     const reference = referenceId();
     const placed = await this.deps.broker.placeOrder({ referenceId: reference, symbol: ticket.symbol, quantity: ticket.quantity, side: "BUY", orderType: "LIMIT", price: ticket.limitPrice, exchange: ticket.exchange, segment: "FNO", product: "MIS" });
     const createdAt = new Date(this.deps.now()).toISOString();
@@ -256,8 +264,10 @@ export class LiveTradingService {
     }
     const entry = fill.averagePrice ?? ticket.limitPrice;
     // Premium-multiple plans (NIFTY Sniper): the stop and target come from the ACTUAL average fill.
-    const stopPrice = how.multiples ? tickDown(entry * how.multiples.stop, ticket.tickSize) : ticket.stopLoss;
-    const targetPrice = how.multiples ? tickUp(entry * how.multiples.target, ticket.tickSize) : ticket.target;
+    // Money rule: the ₹ stop and target from the ACTUAL fill and filled quantity.
+    const moneyPrices = how.moneyTrail ? moneyTrailPrices({ entry, quantity: fill.filled, bestPnl: 0, config: how.moneyTrail, tick: ticket.tickSize }) : null;
+    const stopPrice = moneyPrices ? moneyPrices.stop : how.multiples ? tickDown(entry * how.multiples.stop, ticket.tickSize) : ticket.stopLoss;
+    const targetPrice = moneyPrices?.target ?? (how.multiples ? tickUp(entry * how.multiples.target, ticket.tickSize) : ticket.target);
     // Partial booking: with 2+ filled lots, half (rounded down) is sold once at partialMultiple x the fill.
     const filledLots = ticket.lotSize > 0 ? Math.floor(fill.filled / ticket.lotSize) : 0;
     const partial = how.partialMultiple && how.partialMultiple > 1
@@ -267,7 +277,8 @@ export class LiveTradingService {
     const trail = how.trailRule === "SNIPER"
       ? { trailRule: "SNIPER", trailStage: "INITIAL", trailCostPerUnit: round2(estimateCharges(entry, entry, fill.filled, ticket.exchange) / Math.max(fill.filled, 1)) }
       : {};
-    const order: OrderRecord = { ...base, ...partial, ...trail, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
+    const money = how.moneyTrail ? { moneyTrail: how.moneyTrail, trailStage: "INITIAL" } : {};
+    const order: OrderRecord = { ...base, ...partial, ...trail, ...money, brokerOrderId: placed.value.brokerOrderId, status: "OPEN", quantity: fill.filled, price: entry, stopLoss: stopPrice, initialStopLoss: stopPrice, target: targetPrice, highWaterMark: entry, currentPrice: entry, pnl: 0, pnlPercent: 0, quoteSource: "Groww live fill" };
     monitor.positions.set(order.id, order);
     this.ensureMonitor();
     const stop = await this.placeProtectiveStop(order, stopPrice);
@@ -559,7 +570,16 @@ export class LiveTradingService {
         const resumeAbove = Number(order.trailResumeAbove ?? 0);
         const trailing = !(resumeAbove > 0 && highWater <= resumeAbove);
         if (trailing && resumeAbove > 0) order.trailResumeAbove = undefined;
-        if (order.trailRule === "SNIPER") {
+        if (order.moneyTrail) {
+          // Rupee P&L stop and trail on the whole position (the desk's P&L stop & trail).
+          if (trailing) {
+            const instrument = await this.deps.instrument(order.symbol);
+            const tick = Number(instrument?.tickSize) > 0 ? Number(instrument?.tickSize) : 0.05;
+            const prices = moneyTrailPrices({ entry, quantity: order.quantity, bestPnl: (highWater - entry) * order.quantity, config: order.moneyTrail, tick });
+            stop = Math.max(stop, prices.stop);
+            if (prices.trailing && order.trailStage !== "TRAILING") order.trailStage = "TRAILING";
+          }
+        } else if (order.trailRule === "SNIPER") {
           // NIFTY Sniper staged trail in multiples of the fill (the paper scalper's rule).
           if (trailing) {
             const stage = (["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"].includes(String(order.trailStage)) ? order.trailStage : "INITIAL") as TrailStageName;
@@ -596,10 +616,10 @@ export class LiveTradingService {
         const breach = ltp <= stop ? (stopBreaches.get(order.id) ?? 0) + 1 : 0;
         stopBreaches.set(order.id, breach);
         const stopHit = order.brokerStopOrderId ? breach >= 3 : breach >= 1;
-        const stopReason = order.trailRule === "SNIPER" && order.trailStage && order.trailStage !== "INITIAL"
+        const stopReason = order.moneyTrail ? (order.trailStage === "TRAILING" ? "MONEY_TRAIL_STOP" : "MONEY_STOP_LOSS") : order.trailRule === "SNIPER" && order.trailStage && order.trailStage !== "INITIAL"
           ? (order.trailStage === "BREAKEVEN" ? "BREAKEVEN_STOP" : order.trailStage === "LOCKED" ? "LOCKED_PROFIT_STOP" : "TRAILING_STOP")
           : stop > initialStop ? "TRAILING_STOP" : "STOP_LOSS";
-        const reason = config.killSwitch ? "KILL_SWITCH" : clock.minute >= config.squareOffMinute ? "SQUARE_OFF_1515" : ltp >= Number(order.target) ? (order.trailRule === "SNIPER" ? "TARGET_2X" : "TARGET") : stopHit ? stopReason : null;
+        const reason = config.killSwitch ? "KILL_SWITCH" : clock.minute >= config.squareOffMinute ? "SQUARE_OFF_1515" : ltp >= Number(order.target) ? (order.moneyTrail ? "MONEY_TARGET" : order.trailRule === "SNIPER" ? "TARGET_2X" : "TARGET") : stopHit ? stopReason : null;
         if (reason) await this.exit(order.id, reason, undefined, false);
       }
       if (monitor.ticks % RECONCILE_EVERY_TICKS === 0 && monitor.positions.size) await this.reconcile();

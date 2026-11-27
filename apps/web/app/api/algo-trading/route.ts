@@ -599,6 +599,8 @@ async function placeOnScalper(body: RecordValue, origin: string) {
       partialMultiple: SNIPER_PREMIUM.partial,
       // NIFTY Sniper live trades use the sniper's own staged trail (the Groww stop moves with it).
       ...(sniper ? { trailRule: "SNIPER" as const } : {}),
+      // The desk's P&L stop & trail (₹), when on, replaces the trail rule and partial booking.
+      ...(moneyTrailSetting(settings) ? { moneyTrail: moneyTrailSetting(settings)! } : {}),
     });
     if (sniper) void journalSniper({ underlying, origin: String(body.origin ?? "MANUAL"), analysis, placed: result.ok, reasons: result.ok ? [] : [String(result.error ?? "refused")], position: result.ok ? result.order : undefined });
     const text = result.ok
@@ -640,6 +642,12 @@ type SniperSetup = ScalpSetup & {
   family: string; score: number; band: string; partial_target: number; stop_percent: number; target_multiple: number;
   greeks?: { delta: number; gamma: number; theta_per_day: number; iv: number | null };
 };
+
+/** The desk's P&L stop & trail (₹) when switched on and valid, else null. */
+function moneyTrailSetting(settings: Partial<ScalperSettings>) {
+  const { enabled, ...money } = ScalperBook.settings(settings).moneyTrail;
+  return enabled ? money : null;
+}
 
 /** NIFTY Sniper AI plan: premium stop / 2x target re-derived from the ACTUAL fill by the scalper. */
 function sniperPlan(setup: SniperSetup, live: ScalperContract, lot: number, fixedLots = false): ScalperPlan {

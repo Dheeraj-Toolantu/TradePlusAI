@@ -453,3 +453,10 @@
 .scalper-go-live button { padding: 3px 10px; color: #fff; border: 0; border-radius: 4px; background: #c2434f; font: 700 11px "Manrope", sans-serif; cursor: pointer; }
 .scalper-go-live button.ghost { color: var(--text); border: 1px solid #2d3b40; background: transparent; }
 .scalper-go-live button:disabled { opacity: .5; cursor: not-allowed; }
+
+.scalper-money-trail { grid-column: 1 / -1; flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 0; padding: 6px 8px; border: 1px solid #25505f; border-radius: 6px; }
+.scalper-money-trail legend { padding: 0 4px; color: var(--text); font-size: 11px; font-weight: 700; }
+.scalper-money-trail legend label { display: inline-flex; align-items: center; gap: 4px; }
+.scalper-money-trail > label { display: grid; gap: 2px; color: var(--muted); font-size: 10px; }
+.scalper-money-trail input[type="number"] { width: 90px; padding: 3px 6px; color: var(--text); border: 1px solid #2d3b40; border-radius: 4px; background: #111a1d; }
+.scalper-money-trail small { width: 100%; color: var(--muted); font-size: 10px; }

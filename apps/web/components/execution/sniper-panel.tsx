@@ -35,6 +35,8 @@ export type SniperRead = {
   order_flow?: { premium_volume?: FlowCheck; writer_oi?: FlowCheck; mode?: "EARLY" | "CONFIRMED" };
   /** The option's implied volatility against NIFTY's realised volatility. */
   iv_check?: FlowCheck & { ratio?: number | null };
+  /** The selected premium's volume profile: support / resistance high-volume levels. */
+  volume_level?: FlowCheck & { support?: number | null; resistance?: number | null; poc?: number | null };
   /** V2: A / B grade, machine-readable rejection reasons, setup letter, breakout entry mode, config hash. */
   grade?: string; reason_codes?: string[]; setup_type?: string; entry_mode?: string | null; config_hash?: string;
 };
@@ -46,7 +48,7 @@ const LABELS: Record<string, string> = {
 };
 const FILTERS: Record<string, string> = {
   SETUP_CONFIRMED: "setup confirmed", SIGNAL_FRESH: "signal fresh", ENTRY_TRIGGER: "1m trigger", NOT_CHASING: "not chasing", ENTRY_WINDOW: "entry window",
-  REGIME_TRADABLE: "regime", REGIME_PERMITS: "regime permits", SETUP_ENABLED: "setup on", POSITION_SIZE: "size ≥ 1 lot", OI_NOT_AGAINST: "OI not against", CONTRACT_SELECTED: "contract", SPREAD_OK: "spread", FEASIBILITY_2X: "2x feasibility", OI_AVAILABLE: "OI", SCORE_MINIMUM: "score ≥ 85",
+  REGIME_TRADABLE: "regime", REGIME_PERMITS: "regime permits", SETUP_ENABLED: "setup on", POSITION_SIZE: "size ≥ 1 lot", OI_NOT_AGAINST: "OI not against", CONTRACT_SELECTED: "contract", SPREAD_OK: "spread", FEASIBILITY_2X: "2x feasibility", OI_AVAILABLE: "OI", SCORE_MINIMUM: "score ≥ 60", PREMIUM_AT_VOLUME_LEVEL: "at a volume level",
   PREMIUM_VOLUME_RISING: "premium buying volume", WRITER_OI_RISING: "writer OI (add / cover)", IV_NOT_RICH: "IV not rich",
 };
 const title = (value: string | undefined) => (value ?? "").replaceAll("_", " ").toLowerCase().replace(/^./, (c) => c.toUpperCase());
@@ -122,6 +124,7 @@ export const SniperPanel = memo(function SniperPanel({ sniper, decision }: { sni
               {([["Premium volume", sniper.order_flow.premium_volume], [sniper.direction === "PUT" ? "Call writers adding, put writers covering" : "Put writers adding, call writers covering", sniper.order_flow.writer_oi]] as Array<[string, FlowCheck | undefined]>).map(([label, check]) => check ? (
                 <li key={label}><b className={check.passed ? "gain" : "loss"}>{check.passed ? "✓" : "✗"}</b>{label}{check.status === "SNAPSHOT" ? " (5-min reading)" : check.status === "UNAVAILABLE" ? " (unavailable)" : ""}: {check.reason}</li>
               ) : null)}
+              {sniper.volume_level ? <li><b className={sniper.volume_level.passed ? "gain" : "loss"}>{sniper.volume_level.passed ? "✓" : "✗"}</b>Premium volume level: {sniper.volume_level.reason}</li> : null}
               {sniper.iv_check ? <li><b className={sniper.iv_check.passed ? "gain" : "loss"}>{sniper.iv_check.passed ? "✓" : "✗"}</b>IV vs realised: {sniper.iv_check.reason}</li> : null}
             </ul>
           ) : null}

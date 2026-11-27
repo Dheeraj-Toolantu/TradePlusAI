@@ -60,10 +60,11 @@ export function nextSniperTrailStep(input: { entry: number; costPerUnit: number;
  *  - SMART: the adaptive auto trail below (the default for engine trades).
  *  - RULE: only the position's built-in rule (VWAP-EMA, NIFTY Sniper or the level engine's trail).
  *  - FIXED: the stop follows the best premium a fixed number of rupees (points) behind it.
+ *  - MONEY: a rupee P&L stop and trail on the whole position (moneyTrailPrices below).
  *  - OFF: the stop stays where it is put; only the trader moves it.
  */
-export type TrailMode = "SMART" | "RULE" | "FIXED" | "OFF";
-export const TRAIL_MODES: TrailMode[] = ["SMART", "RULE", "FIXED", "OFF"];
+export type TrailMode = "SMART" | "RULE" | "FIXED" | "MONEY" | "OFF";
+export const TRAIL_MODES: TrailMode[] = ["SMART", "RULE", "FIXED", "MONEY", "OFF"];
 
 /**
  * Smart auto trail, in units of the position's initial premium risk R. It lets a winner run and
@@ -142,4 +143,47 @@ export function nextSmartTrailStep(input: { entry: number; risk: number; costPer
   const gain = highWater - entry;
   const keep = smartGiveback(gain / risk, input.minutesToClose);
   return { trigger: null, stopTo: Math.round((highWater - Math.max(gain * keep, risk * SMART_TRAIL.minGap)) * 100) / 100, label: `smart trail gives back ${Math.round(keep * 100)}% of the best gain` };
+}
+
+/**
+ * Money (₹ P&L) stop and trail, for the whole position:
+ *  - the stop sits at −stopLoss rupees (e.g. −₹500: a ₹500 loss exits);
+ *  - once the best P&L reaches +trigger (e.g. +₹500) the stop moves to firstStop (e.g. −₹200);
+ *  - after that, every further +step of best P&L (e.g. ₹200) raises the stop by step;
+ *  - the trade exits at +target rupees (0 = no money target).
+ * The stop only ever moves up. Prices are rounded UP to the tick, so a stop-out never loses more
+ * than the rupee amount and a target never books less (fills and charges aside).
+ */
+export type MoneyTrailConfig = { stopLoss: number; trigger: number; firstStop: number; step: number; target: number };
+export const DEFAULT_MONEY_TRAIL: MoneyTrailConfig = { stopLoss: 500, trigger: 500, firstStop: -200, step: 200, target: 0 };
+
+/** Valid when the stop is a loss, the trigger a profit, the first trailed stop between them and the step positive. */
+export function moneyTrailError(config: MoneyTrailConfig): string | null {
+  if (!(config.stopLoss > 0)) return "Stop loss (₹) must be above 0";
+  if (!(config.trigger > 0)) return "Trail trigger (₹) must be above 0";
+  if (!(config.firstStop > -config.stopLoss && config.firstStop < config.trigger)) return `The first trailed stop must be above −₹${config.stopLoss} and below +₹${config.trigger}`;
+  if (!(config.step > 0)) return "Trail step (₹) must be above 0";
+  if (config.target !== 0 && !(config.target > config.trigger)) return `Target (₹) must be above the ₹${config.trigger} trail trigger, or 0 for none`;
+  return null;
+}
+
+/** The rupee P&L the stop sits at, for a best (highest) P&L so far. */
+export function moneyStopPnl(bestPnl: number, config: MoneyTrailConfig): number {
+  if (bestPnl < config.trigger) return -config.stopLoss;
+  const steps = config.step > 0 ? Math.floor((bestPnl - config.trigger) / config.step + 1e-9) : 0;
+  return config.firstStop + steps * config.step;
+}
+
+/** Premium stop and target for a long position of `quantity` units bought at `entry`. */
+export function moneyTrailPrices(input: { entry: number; quantity: number; bestPnl: number; config: MoneyTrailConfig; tick?: number }) {
+  const tick = input.tick && input.tick > 0 ? input.tick : 0.05;
+  const up = (price: number) => Math.round(Math.ceil(price / tick - 1e-6) * tick * 100) / 100;
+  const quantity = Math.max(input.quantity, 1);
+  const stopPnl = moneyStopPnl(input.bestPnl, input.config);
+  return {
+    stopPnl,
+    stop: Math.max(up(input.entry + stopPnl / quantity), tick),
+    target: input.config.target > 0 ? up(input.entry + input.config.target / quantity) : null,
+    trailing: input.bestPnl >= input.config.trigger,
+  };
 }
