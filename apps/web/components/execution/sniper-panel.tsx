@@ -11,7 +11,7 @@ import { memo } from "react";
  */
 
 type Component = { key: string; score: number; max_score: number; status: string; reason: string; source_timestamp: string | null };
-type Filter = { code: string; passed: boolean; detail: string };
+type Filter = { code: string; passed: boolean; detail: string; blocking?: boolean; reason_code?: string | null };
 type Contract = { symbol: string; strike: number; type: "CE" | "PE"; premium: number; delta: number; iv?: number | null; open_interest: number; volume: number; spread_pct?: number | null; spread_source?: string; rank_score?: number };
 type Feasibility = {
   entry: number; stop_loss: number; target: number; partial_target: number; lot_size: number; lots: number; quantity: number; max_loss: number; planned_max_loss: number;
@@ -38,7 +38,7 @@ export type SniperRead = {
   /** The selected premium's volume profile: support / resistance high-volume levels. */
   volume_level?: FlowCheck & { support?: number | null; resistance?: number | null; poc?: number | null };
   /** V2: A / B grade, machine-readable rejection reasons, setup letter, breakout entry mode, config hash. */
-  grade?: string; reason_codes?: string[]; setup_type?: string; entry_mode?: string | null; config_hash?: string;
+  grade?: string; reason_codes?: string[]; entry_rule?: string; advisory?: string[]; setup_type?: string; entry_mode?: string | null; config_hash?: string;
 };
 type FlowCheck = { status: string; passed: boolean; reason: string; who?: string };
 
@@ -116,8 +116,9 @@ export const SniperPanel = memo(function SniperPanel({ sniper, decision }: { sni
             {sniper.feasibility?.scenarios ? <>2x needs {Object.entries(sniper.feasibility.scenarios).map(([name, value]) => `${name.toLowerCase()} ${value.index_move_2x ?? "n/a"} pts`).join(" / ")} · </> : null}
             {sniper.config_hash ? <span title="Configuration hash stored with every decision">cfg {sniper.config_hash}</span> : null}
           </p>
+          {sniper.entry_rule === "SCORE_ONLY" ? <p className="mi-note"><b>Entry rule: score ≥ 60.</b> A score of 60+ places the CALL / PUT (paper or live per the Money switch). Only safety checks block; <span className="warning">!</span> marks a failing check that is advisory.</p> : null}
           <p className="mi-note"><b>Hard filters {sniper.hard_filters.filter((f) => f.passed).length}/{sniper.hard_filters.length}</b>: every one must pass — a high score never overrides them. {decision === "CONFIRMED" ? "" : "No order is placed while any is red."}</p>
-          <div className="exec-gates">{sniper.hard_filters.map((f) => <span key={f.code} className={f.passed ? "pass" : "fail"} title={f.detail}>{f.passed ? "✓" : "✗"} {FILTERS[f.code] ?? f.code.toLowerCase()}</span>)}</div>
+          <div className="exec-gates">{sniper.hard_filters.map((f) => <span key={f.code} className={f.passed ? "pass" : f.blocking === false ? "warn" : "fail"} title={`${f.blocking === false ? "Advisory (score-only entry rule): shown, does not block. " : ""}${f.detail}`}>{f.passed ? "✓" : f.blocking === false ? "!" : "✗"} {FILTERS[f.code] ?? f.code.toLowerCase()}</span>)}</div>
           {sniper.order_flow ? (
             <ul className="exec-criteria" aria-label="Order flow in the selected option">
               <li>{sniper.order_flow.mode === "EARLY" ? "Reversal: early read (buyers stepping in, opposing writers starting to cover)" : "Breakout / continuation: confirmed read (volume and writer build sustained)"}</li>

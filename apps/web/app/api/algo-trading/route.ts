@@ -52,7 +52,7 @@ const indexError = (strategy: string, symbol: string) =>
 const rrOf = (value: unknown) => (String(value ?? "").replace(/\s/g, "") === "1:1" ? "1:1" : "1:2");
 // Tick rounding may shave up to 3% off the chosen ratio on the premium (same as the engine).
 const scalpMinimumRr = (value: unknown) => (rrOf(value) === "1:1" ? 0.97 : 1.94);
-type ScalpOptions = { riskReward?: string; maxLossPerTrade?: number; maxLots?: number; sniperLots?: number; sniperSizing?: string; sniperSetups?: string };
+type ScalpOptions = { riskReward?: string; maxLossPerTrade?: number; maxLots?: number; sniperLots?: number; sniperSizing?: string; sniperSetups?: string; sniperEntryRule?: string };
 // The Smart Scalper's fill slippage (per side). The scalper plans with the same number it fills with.
 const SCALPER_SLIPPAGE = Number(process.env.SCALPER_SLIPPAGE_PCT ?? 0.3) / 100;
 
@@ -188,7 +188,7 @@ async function runSniper(symbol: string, provider: string, origin: string, evide
     symbol, strategy: SNIPER, interval_minutes: 1, candles: one.body.candles ?? [], setup_candles: five.body.candles ?? [],
     daily_candles: Array.isArray(daily.body.candles) ? daily.body.candles : [], volume_source: five.body.volumeSource ?? null,
     risk_per_trade: PAPER_CAPITAL * DAILY_RISK_RULES.riskPerTradePct / 100, option_evidence: optionEvidence, pipeline: evidence,
-    max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null, sniper_lots: scalp.sniperLots ?? null, sniper_sizing: scalp.sniperSizing ?? null, sniper_setups: scalp.sniperSetups ?? null, slippage_pct: SCALPER_SLIPPAGE,
+    max_loss_per_trade: scalp.maxLossPerTrade ?? null, max_lots: scalp.maxLots ?? null, sniper_lots: scalp.sniperLots ?? null, sniper_sizing: scalp.sniperSizing ?? null, sniper_setups: scalp.sniperSetups ?? null, sniper_entry_rule: scalp.sniperEntryRule ?? null, slippage_pct: SCALPER_SLIPPAGE,
     ...(await scalpInputs(origin, intel ?? { symbol })),
     oi_history: await sniperOiHistory(symbol),
   };
@@ -306,7 +306,7 @@ export async function GET(request: Request) {
   const provider = url.searchParams.get("provider") ?? "groww";
   const strategy = url.searchParams.get("strategy") ?? "ORB_RETEST";
   const historyOnly = url.searchParams.get("history") === "true";
-  const scalp: ScalpOptions = { riskReward: rrOf(url.searchParams.get("rr")), maxLossPerTrade: Number(url.searchParams.get("maxLoss")) || undefined, maxLots: Number(url.searchParams.get("lots")) || undefined, sniperLots: Number(url.searchParams.get("sniperLots")) || undefined, sniperSizing: url.searchParams.get("sniperSizing") ?? undefined, sniperSetups: url.searchParams.get("sniperSetups") ?? undefined };
+  const scalp: ScalpOptions = { riskReward: rrOf(url.searchParams.get("rr")), maxLossPerTrade: Number(url.searchParams.get("maxLoss")) || undefined, maxLots: Number(url.searchParams.get("lots")) || undefined, sniperLots: Number(url.searchParams.get("sniperLots")) || undefined, sniperSizing: url.searchParams.get("sniperSizing") ?? undefined, sniperSetups: url.searchParams.get("sniperSetups") ?? undefined, sniperEntryRule: url.searchParams.get("sniperEntryRule") ?? undefined };
   const config = readGrowwConfig();
 
   if (historyOnly) {
@@ -571,10 +571,10 @@ async function placeOnScalper(body: RecordValue, origin: string) {
   const liveArm = arm && arm.strategy === strategy ? arm : null;
   const analysis = await runEngine(underlying, "groww", origin, strategy, await operationalEvidence(underlying, brokerHealthy, safety), liveArm ? {
     riskReward: rrOf(body.riskReward), maxLossPerTrade: liveConfig.limits.maxDailyLoss, maxLots: liveArm.lots,
-    ...(sniper ? { sniperLots: liveArm.lots, sniperSizing: "FIXED_LOTS", sniperSetups: ScalperBook.settings(settings).sniperSetups } : {}),
+    ...(sniper ? { sniperLots: liveArm.lots, sniperSizing: "FIXED_LOTS", sniperSetups: ScalperBook.settings(settings).sniperSetups, sniperEntryRule: ScalperBook.settings(settings).sniperEntryRule } : {}),
   } : {
     riskReward: rrOf(body.riskReward), maxLossPerTrade: Number(settings.maxLossPerTrade) || undefined, maxLots: Number(settings.lots) || undefined,
-    ...(sniper ? { sniperLots: ScalperBook.settings(settings).sniperLots, sniperSizing: ScalperBook.settings(settings).sniperSizing, sniperSetups: ScalperBook.settings(settings).sniperSetups } : {}),
+    ...(sniper ? { sniperLots: ScalperBook.settings(settings).sniperLots, sniperSizing: ScalperBook.settings(settings).sniperSizing, sniperSetups: ScalperBook.settings(settings).sniperSetups, sniperEntryRule: ScalperBook.settings(settings).sniperEntryRule } : {}),
   }).catch((error: unknown) => ({ error: error instanceof Error ? error.message : "Strategy engine unavailable" }) as RecordValue);
   const pipeline = analysis.pipeline as { decision?: string; reasons?: string[] } | undefined;
   const setup = analysis.setup as ScalpSetup | null | undefined;

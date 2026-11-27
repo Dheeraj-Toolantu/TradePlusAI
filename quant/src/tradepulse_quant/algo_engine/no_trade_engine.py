@@ -68,6 +68,8 @@ class PipelineEvidence:
     option_flow_gate: bool | None = True
     # Only the engine switches this off, for MCX commodities (India VIX does not describe them).
     vix_gate: bool | None = True
+    # Only the engine switches this off: NIFTY Sniper's score-only entry rule (the gap state is then context).
+    gap_gate: bool | None = True
 
 
 class NoTradeEngine:
@@ -129,12 +131,13 @@ class NoTradeEngine:
             elif not valid_regime:
                 reasons.append("REGIME_BLOCKED")
 
-        valid_gap = evidence.gap_state in {"NORMAL_DAY", "GAP_HOLD_CONFIRMED", "GAP_FILL_CONFIRMED"}
-        gates.append(GateEvidence("GAP_UNRESOLVED", valid_gap, "gap state must be normal or confirmed hold/fill"))
-        if evidence.gap_state is None:
-            reasons.append("MISSING_GAP_STATE")
-        elif not valid_gap:
-            reasons.append("GAP_UNRESOLVED")
+        if evidence.gap_gate is not False:
+            valid_gap = evidence.gap_state in {"NORMAL_DAY", "GAP_HOLD_CONFIRMED", "GAP_FILL_CONFIRMED"}
+            gates.append(GateEvidence("GAP_UNRESOLVED", valid_gap, "gap state must be normal or confirmed hold/fill"))
+            if evidence.gap_state is None:
+                reasons.append("MISSING_GAP_STATE")
+            elif not valid_gap:
+                reasons.append("GAP_UNRESOLVED")
 
         maximum_score = evidence.maximum_score if evidence.maximum_score is not None else 10.0
         valid_score = evidence.score is not None and evidence.score >= evidence.minimum_score and evidence.score <= maximum_score

@@ -131,7 +131,10 @@ def daily_candles(move_pct: float = 0.8, days: int = 15) -> list[C]:
 
 def context(**overrides) -> dict:
     base = {"setup_candles": previous_day() + today_five(), "option_chain": chain(), "options_flow": FLOW, "vix": VIX, "max_loss_per_trade": 1500,
-            "premium_candles": premium_candles(), "oi_history": oi_history(), "daily_candles": daily_candles()}
+            "premium_candles": premium_candles(), "oi_history": oi_history(), "daily_candles": daily_candles(),
+            # Most tests below check each strategy filter, so they use the strict rule; the
+            # score-only rule (the default) has its own tests at the end.
+            "sniper_entry_rule": "ALL_CHECKS"}
     return {**base, **overrides}
 
 
@@ -532,3 +535,54 @@ def test_volume_profile_reports_overhead_resistance_and_fails_closed():
     rows = {f["code"]: f for f in blocked["sniper"]["hard_filters"]}
     assert rows["PREMIUM_AT_VOLUME_LEVEL"]["passed"] is False and rows["PREMIUM_AT_VOLUME_LEVEL"]["reason_code"] == "PREMIUM_NOT_AT_VOLUME_LEVEL"
     assert blocked["decision"] != "CONFIRMED"
+
+
+# ---------------------------------------------------------------- score-only entry rule (the default)
+
+def test_default_entry_rule_is_score_only():
+    assert sn.SniperConfig().entry_rule == "SCORE_ONLY" and sn.config_for({}).entry_rule == "SCORE_ONLY"
+    assert sn.config_for({"sniper_entry_rule": "all_checks"}).entry_rule == "ALL_CHECKS"
+
+
+def test_score_only_places_the_trade_when_strategy_checks_fail():
+    # Rich IV blocks under the strict rule, but with a score of 60+ the score-only rule places the CALL.
+    strict = run(daily_candles=daily_candles(0.3))
+    assert strict["decision"] != "CONFIRMED"
+    score = run(daily_candles=daily_candles(0.3), sniper_entry_rule="SCORE_ONLY")
+    assert score["decision"] == "CONFIRMED", score["reason"]
+    assert score["setup"]["side"] == "BUY" and score["setup"]["contract"]["type"] == "CE"
+    assert score["sniper"]["entry_rule"] == "SCORE_ONLY" and score["sniper"]["confirmed_by"] == "SCORE"
+    assert "IV_NOT_RICH" in score["sniper"]["advisory"]
+    rows = {f["code"]: f for f in score["sniper"]["hard_filters"]}
+    assert rows["IV_NOT_RICH"]["passed"] is False and rows["IV_NOT_RICH"]["blocking"] is False
+    assert rows["SCORE_MINIMUM"]["blocking"] is True
+
+
+def test_score_only_still_blocks_on_safety_checks():
+    # Outside the entry window, or under one lot, nothing is placed whatever the score.
+    late_now = TODAY.replace(hour=15, minute=20, second=30)
+    late = run(now=late_now, premium_candles=premium_candles(end=late_now), oi_history=oi_history(end=late_now), sniper_entry_rule="SCORE_ONLY")
+    assert late["decision"] != "CONFIRMED" and "ENTRY_WINDOW" in late["reason"]
+    small = run(max_loss_per_trade=300, sniper_lots=4, sniper_entry_rule="SCORE_ONLY")
+    assert small["decision"] != "CONFIRMED" and "POSITION_SIZE" in small["reason"]
+
+
+def test_score_only_relaxes_the_v5_strategy_gates_but_not_safety(monkeypatch):
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+    monkeypatch.setattr(engine, "datetime", Frozen)
+    as_dict = lambda rows: [{"timestamp": r.timestamp, "open": r.open, "high": r.high, "low": r.low, "close": r.close, "volume": r.volume} for r in rows]
+    payload = {
+        "symbol": "NIFTY", "strategy": sn.STRATEGY_ID, "interval_minutes": 1, "candles": as_dict(one_minute(NOW.replace(second=0))),
+        "setup_candles": as_dict(previous_day() + today_five()), "option_chain": chain(), "options_flow": FLOW, "vix": VIX, "max_loss_per_trade": 1500,
+        "premium_candles": premium_candles(), "oi_history": oi_history(), "daily_candles": as_dict(daily_candles(0.3)), "sniper_entry_rule": "SCORE_ONLY",
+        "option_evidence": {"option_quote_fresh": True},
+        "pipeline": {"broker_healthy": True, "daily_risk_allowed": True, "contract_metadata_available": True, "reconciliation_ok": True, "execution_ready": True},
+    }
+    result = engine.analyze_payload(payload)
+    assert result["strategy_decision"] == "CONFIRMED", result["strategy_reason"]
+    assert result["pipeline"]["decision"] == "CONFIRMED", result["pipeline"]["reasons"]
+    payload["pipeline"]["kill_switch"] = True
+    assert engine.analyze_payload(payload)["decision"] == "NO_TRADE"

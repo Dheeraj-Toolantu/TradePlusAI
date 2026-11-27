@@ -230,5 +230,7 @@ describe("NIFTY Sniper V2 position management", () => {
     expect(SmartScalper.settings({})).toMatchObject({ sniperSizing: "RISK_BUDGET", sniperSetups: "ABC" });
     expect(SmartScalper.settings({ sniperSizing: "FIXED_LOTS", sniperSetups: "ca" })).toMatchObject({ sniperSizing: "FIXED_LOTS", sniperSetups: "AC" });
     expect(SmartScalper.settings({ sniperSetups: "xyz" }).sniperSetups).toBe("ABC");
+    expect(SmartScalper.settings({}).sniperEntryRule).toBe("SCORE_ONLY");
+    expect(SmartScalper.settings({ sniperEntryRule: "ALL_CHECKS" }).sniperEntryRule).toBe("ALL_CHECKS");
   });
 });
