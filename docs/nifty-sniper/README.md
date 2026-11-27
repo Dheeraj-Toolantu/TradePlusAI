@@ -181,3 +181,14 @@ option bid/ask and OI for a real backtest and walk-forward validation (spec 16),
 probabilities, IV percentile/rank (no IV history is stored), live broker order lifecycle,
 partial-fill handling and reconciliation (spec 15 — the sniper is paper only), aggressive 1m
 entries, and a same-time-of-day volatility baseline.
+
+## Score threshold 60 and the premium volume profile (latest)
+
+* Trades execute from a score of **60** (A ≥ 85, B 70–84, C 60–69); below 60 no trade. Every hard
+  filter and V5 gate still applies.
+* New hard filter **PREMIUM_AT_VOLUME_LEVEL**: today's 1m candles of the selected option build a
+  volume profile (30 price bins; a bin at or above the 70th percentile of volume is a high-volume
+  level). The entry must sit at or within 4% (or 2 bins) **above** a high-volume level, which acts as
+  support; the next high-volume level above is reported as likely resistance. Too few candles →
+  unavailable → no trade.
+

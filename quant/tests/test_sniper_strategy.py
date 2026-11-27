@@ -258,7 +258,8 @@ def test_position_size_never_rounds_up_beyond_the_risk_budget():
 
 
 def test_score_bands():
-    assert sn.band_for(90)[0] == "A_GRADE" and sn.band_for(82)[0] == "B_GRADE" and sn.band_for(79.9)[0] == "NO_TRADE"
+    assert sn.band_for(90)[0] == "A_GRADE" and sn.band_for(75)[0] == "B_GRADE" and sn.band_for(62)[0] == "C_GRADE" and sn.band_for(59.9)[0] == "NO_TRADE"
+    assert sn.SniperConfig().minimum_sniper_score == 60
 
 
 def test_engine_pipeline_wires_the_sniper_evidence(monkeypatch):
@@ -493,3 +494,41 @@ def test_v2_reason_codes_are_machine_readable():
     rows = {f["code"]: f for f in blocked["sniper"]["hard_filters"]}
     assert rows["IV_NOT_RICH"]["reason_code"] == "IV_TOO_HIGH" and rows["ENTRY_WINDOW"]["reason_code"] is None
     assert "PREMIUM_DATA_UNAVAILABLE" in run(premium_candles=None)["sniper"]["reason_codes"]
+
+
+# ---------------------------------------------------------------- premium volume profile
+
+def profile_candles(path, volumes, symbol=SELECTED, end=NOW):
+    """1m premium candles ending at `end`: closes from `path`, volume per candle from `volumes`."""
+    start = end.replace(second=0) - timedelta(minutes=len(path))
+    out, prev = [], path[0]
+    for i, (close, volume) in enumerate(zip(path, volumes)):
+        out.append({"timestamp": (start + timedelta(minutes=i)).isoformat(), "open": prev, "high": max(prev, close) + 0.1, "low": min(prev, close) - 0.1, "close": close, "volume": volume})
+        prev = close
+    return {"symbol": symbol, "candles": out}
+
+
+def test_volume_profile_buys_at_or_just_above_a_high_volume_level():
+    config = sn.SniperConfig()
+    # Heavy two-way trade around ₹30 for 20 minutes, then a lift to ₹31: at / just above the node.
+    base = [30 + (0.3 if i % 2 else -0.3) for i in range(20)]
+    near = sn.premium_volume_profile(profile_candles(base + [30.6, 31.0], [5000] * 20 + [800, 800]), SEL, NOW, config)
+    assert near["status"] == "OK" and near["passed"] and 29.5 <= near["support"] <= 30.5 and "support" in near["reason"]
+    # The same node, but the premium has run to ₹40 on thin volume: far above the last high-volume level.
+    far = sn.premium_volume_profile(profile_candles(base + [33, 36, 38, 40], [5000] * 20 + [300] * 4), SEL, NOW, config)
+    assert far["status"] == "OK" and not far["passed"] and "too far above" in far["reason"]
+
+
+def test_volume_profile_reports_overhead_resistance_and_fails_closed():
+    config = sn.SniperConfig()
+    lower = [30 + (0.3 if i % 2 else -0.3) for i in range(12)]
+    upper = [36 + (0.3 if i % 2 else -0.3) for i in range(12)]
+    # Traded heavily at ₹36, fell back to the ₹30 node: support ₹30, resistance overhead ₹36.
+    read = sn.premium_volume_profile(profile_candles(upper + lower, [6000] * 24), SEL, NOW, config)
+    assert read["passed"] and read["resistance"] is not None and read["resistance"] > read["support"]
+    assert sn.premium_volume_profile(None, SEL, NOW, config)["status"] == "UNAVAILABLE"
+    assert sn.premium_volume_profile(profile_candles([30, 31], [100, 100]), SEL, NOW, config)["status"] == "UNAVAILABLE"
+    blocked = run(premium_candles=profile_candles([30 + (0.3 if i % 2 else -0.3) for i in range(20)] + [33, 36, 38, 40], [5000] * 20 + [300] * 4))
+    rows = {f["code"]: f for f in blocked["sniper"]["hard_filters"]}
+    assert rows["PREMIUM_AT_VOLUME_LEVEL"]["passed"] is False and rows["PREMIUM_AT_VOLUME_LEVEL"]["reason_code"] == "PREMIUM_NOT_AT_VOLUME_LEVEL"
+    assert blocked["decision"] != "CONFIRMED"

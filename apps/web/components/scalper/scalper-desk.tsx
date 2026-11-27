@@ -488,7 +488,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             setEngineStrategy(next);
             if (next !== "LEVELS") onSignalStrategyChange?.(next === "SNIPER" ? "NIFTY_SNIPER" : "VWAP_EMA_SCALP");
             setNotice(next === "VWAP_EMA" ? "VWAP-EMA scalper: enters only when all 9 criteria (trend: VWAP + 9/21 EMA + ADX above 25; entry: VWAP + 5/9 EMA + ADX above 20 on the confirmation candle) and every V5 gate pass (the server re-checks). SL, target and a staged trail are set systematically."
-              : next === "SNIPER" ? "NIFTY Sniper AI (NIFTY only): liquidity reversal, breakout expansion or trend continuation on 5m structure, 15m regime and a 1m trigger. Enters only on a score of 85+/100 with every hard filter and V5 gate passing; buys the CE/PE, stop 25% below the actual fill, 2x target, staged trail. Most sessions it returns NO TRADE — that is by design."
+              : next === "SNIPER" ? "NIFTY Sniper AI (NIFTY only): liquidity reversal, breakout expansion or trend continuation on 5m structure, 15m regime and a 1m trigger. Enters on a score of 60+/100 with every hard filter and V5 gate passing (including the premium sitting at a high-volume level); buys the CE/PE, stop 25% below the actual fill, 2x target, staged trail. Most sessions it returns NO TRADE — that is by design."
               : "Level scalper: CE at support rejections, PE at resistance rejections; spreads in volatile tape.");
           }}>
             <option value="VWAP_EMA">Strategy: VWAP-EMA scalper</option>
@@ -531,7 +531,7 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
             );
           })() : null}
           {engineOn && tradeMode === "MANUAL" && !vwapMode ? <button type="button" className="scalper-take" disabled={!plan || !state.signalReady} onClick={() => void takeSignal()} title={plan && state.signalReady ? "Enter the engine's current signal" : "No signal yet"}>⚡ Take trade{plan && state.signalReady ? ` · ${plan.side} ${plan.kind.toLowerCase()} ${plan.riskReward}R` : ""}</button> : null}
-          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? `Place the confirmed ${signalName} trade (server re-checks every gate)` : sniperMode ? "Waiting for a score of 85+ with every hard filter passing" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
+          {engineOn && !vwapAutomatic && vwapMode ? <button type="button" className="scalper-take" disabled={!vwapReady || placing} onClick={() => void placeVwap("MANUAL")} title={vwapReady ? `Place the confirmed ${signalName} trade (server re-checks every gate)` : sniperMode ? "Waiting for a score of 60+ with every hard filter passing" : "Waiting for all 9 criteria"}>⚡ Take trade{vwapReady && vwapScalp?.selected ? ` · BUY ${vwapScalp.selected.strike} ${vwapScalp.selected.type} ${vwapScalp.plan?.rrChoice ?? ""}` : ""}</button> : null}
         </div>
 
         {showControls && (

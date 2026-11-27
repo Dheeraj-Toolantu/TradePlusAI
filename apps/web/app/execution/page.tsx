@@ -802,7 +802,7 @@ export default function ExecutionPage() {
   // Pipeline gate codes are shared with the other strategies; name them for this one.
   const sniperRead = analysis?.calculations?.sniper;
   const GATE_LABELS: Record<string, string> = sniperSelected
-    ? { BREAKOUT_INVALID: "setup", RETEST_NOT_CONFIRMED: "1m trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "2x feasibility", RR_BELOW_MINIMUM: "R:R", SCORE_BELOW_MINIMUM: "score ≥ 85" }
+    ? { BREAKOUT_INVALID: "setup", RETEST_NOT_CONFIRMED: "1m trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "2x feasibility", RR_BELOW_MINIMUM: "R:R", SCORE_BELOW_MINIMUM: "score ≥ 60" }
     : { BREAKOUT_INVALID: "VWAP", RETEST_NOT_CONFIRMED: "5/9 EMA trigger", STRATEGY_NOT_CONFIRMED: "strategy", PREMIUM_TARGET_UNREACHABLE: "charges vs reward", RR_BELOW_MINIMUM: `R:R ${scalp?.rr_choice ?? riskReward}` };
   // The risk-reward drawing on the selected premium: the confirmed setup, else the plan in progress.
   const rrBox: RiskRewardBox | null = useMemo(() => {
