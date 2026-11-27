@@ -406,7 +406,14 @@ function ScalperDeskView({ symbol, onSymbolChange, chain, expiry, spot, onLog, o
     const position = livePositions.find((item) => item.legs.length === 1 && norm(item.legs[0].symbol) === norm(contractSymbol) && item.stop !== null && item.target !== null);
     if (position) return { entry: position.entry, stop: position.stop!, target: position.target!, fromTime: epochOf(position.openedAt), quantity: position.quantity, label: `${position.kind} ${position.trail ? (position.trail.rule === "SNIPER" ? "NIFTY Sniper" : "VWAP-EMA") : ""}`.trim(), stopTitle: position.trail ? `SL · ${(position.trail.rule === "SNIPER" ? SNIPER_TRAIL_TEXT : TRAIL_TEXT)[position.trail.stage]}` : position.trailing ? "Trail SL" : "SL" };
     if (vwapMode && vwapScalp?.plan && vwapScalp.selected && norm(vwapScalp.selected.symbol) === norm(contractSymbol) && vwapScalp.plan.stop < vwapScalp.plan.entry && vwapScalp.plan.target > vwapScalp.plan.entry) {
-      return { entry: vwapScalp.plan.entry, stop: vwapScalp.plan.stop, target: vwapScalp.plan.target, fromTime: epochOf(vwapScalp.triggerTime), quantity: vwapScalp.plan.quantity, label: vwapScalp.confirmed ? `Signal ${vwapScalp.plan.rrChoice}` : `Plan ${vwapScalp.plan.rrChoice} (not confirmed)` };
+      // A confirmed signal is drawn solid; anything else is only a plan: faded, dashed and labelled
+      // NOT TAKEN with the checks it is still waiting on (no order is placed for it).
+      return {
+        entry: vwapScalp.plan.entry, stop: vwapScalp.plan.stop, target: vwapScalp.plan.target, fromTime: epochOf(vwapScalp.triggerTime), quantity: vwapScalp.plan.quantity,
+        label: vwapScalp.confirmed ? `Signal ${vwapScalp.plan.rrChoice}` : `Plan entry ${vwapScalp.plan.rrChoice}`,
+        pending: !vwapScalp.confirmed,
+        blockedBy: vwapScalp.confirmed ? undefined : (vwapScalp.waitingOn.length ? vwapScalp.waitingOn.slice(0, 3).join(", ") : vwapScalp.reason?.slice(0, 120)),
+      };
     }
     return null;
   }, [livePositions, vwapMode, vwapScalp]);

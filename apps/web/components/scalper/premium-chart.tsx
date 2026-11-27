@@ -6,7 +6,13 @@ import { CandlestickSeries, ColorType, CrosshairMode, LineStyle, createChart, ty
 export type ChartBar = { time: number; open: number; high: number; low: number; close: number };
 export type ChartLevel = { price: number; color: string; title: string; dashed?: boolean };
 /** A long-premium risk-reward drawing: reward zone (entry→target) over risk zone (entry→stop). */
-export type RiskRewardBox = { entry: number; stop: number; target: number; fromTime?: number | null; quantity?: number; label?: string; stopTitle?: string };
+export type RiskRewardBox = {
+  entry: number; stop: number; target: number; fromTime?: number | null; quantity?: number; label?: string; stopTitle?: string;
+  /** A plan only (not confirmed, no order): drawn faded and dashed with a NOT TAKEN banner. */
+  pending?: boolean;
+  /** Why it is not a trade yet (the failing checks), shown in the banner. */
+  blockedBy?: string;
+};
 type BoxLayout = { left: number; width: number; targetY: number; entryY: number; stopY: number };
 const RR_MIN_WIDTH = 190;
 const RR_RIGHT_OFFSET_BARS = 34; // room right of the last candle for the drawing (34 bars x 6 px > RR_MIN_WIDTH)
@@ -113,7 +119,12 @@ function PremiumChartView({ bars, levels, height = 300, riskReward = null }: { b
     <div className="rr-chart-wrap" style={{ position: "relative", height }}>
       <div ref={host} className="scalper-chart-canvas" style={{ height }} />
       {riskReward && layout ? (
-        <div className="rr-overlay" aria-label={`Risk reward ${ratio.toFixed(2)} to 1`} style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 3 }}>
+        <div className={`rr-overlay${riskReward.pending ? " rr-pending" : ""}`} aria-label={`${riskReward.pending ? "Plan, not taken: " : ""}Risk reward ${ratio.toFixed(2)} to 1`} style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 3, opacity: riskReward.pending ? 0.55 : 1 }}>
+          {riskReward.pending ? (
+            <div className="rr-banner" style={{ position: "absolute", left: layout.left, width: layout.width, top: Math.max(Math.min(layout.targetY, layout.entryY) - 22, 0), padding: "2px 6px", color: "#f0c36b", background: "rgba(17,26,29,.92)", border: "1px dashed #f0c36b", borderRadius: 4, fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={riskReward.blockedBy}>
+              NOT TAKEN{riskReward.blockedBy ? ` · waiting on: ${riskReward.blockedBy}` : " · plan only, no order"}
+            </div>
+          ) : null}
           <div className="rr-zone rr-reward" style={{ position: "absolute", left: layout.left, width: layout.width, top: Math.min(layout.targetY, layout.entryY), height: Math.abs(layout.entryY - layout.targetY), background: "rgba(34,213,155,.16)", borderTop: "1px solid #22d59b" }}>
             <span className="rr-label" style={{ position: "absolute", top: 2, left: 6, fontSize: 11, color: "#22d59b", whiteSpace: "nowrap" }}>Target {rupees(riskReward.target)} · +{rupees(reward)}{qty ? ` (${rupees(reward * qty)})` : ""}{risk > 0 ? ` · ${ratio.toFixed(2)}R` : ""}</span>
           </div>
