@@ -70,4 +70,12 @@ Limits (refuse, never resize — set them so your chosen lots fit):
   best premium from 1.75×**, exit at **2×** (`TARGET_2X`). Each new stop is rounded down to the tick
   and the Groww SL-M is moved to it. VWAP-EMA live trades keep the R trail.
 
+* **P&L stop & trail (₹)** (scalper desk ⚙ Controls; paper and live): when switched on it replaces
+  the strategy's stop, trail, target and partial booking for new trades. Example: stop loss ₹500,
+  trail at ₹500, then SL to −₹200, step ₹200, target ₹1,500 → exit at −₹500; once the trade is
+  +₹500 the stop moves to −₹200; every further +₹200 raises it by ₹200 (+₹700 → ₹0, +₹900 → +₹200 …);
+  exit at +₹1,500. Rupees are for the whole position; prices are rounded to the tick so a stop-out
+  never loses more than the amount (fills and charges aside). The Groww stop moves with each step.
+  An open trade can be switched with Modify → Trailing SL → Money (₹ P&L).
+
 Test on paper first and start with 1 lot (2+ lots for partial booking).

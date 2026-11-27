@@ -73,6 +73,8 @@ export type OrderRecord = {
   partialQuantity?: number;
   partialDone?: boolean;
   partialMultiple?: number;
+  /** Rupee P&L stop and trail (MONEY mode / live money trail): stop, trigger, first trailed stop, step, target. */
+  moneyTrail?: { stopLoss: number; trigger: number; firstStop: number; step: number; target: number };
   /** The trade's own hard max-loss exit (₹), when the trader chose the lots. */
   maxLoss?: number;
   charges?: number;

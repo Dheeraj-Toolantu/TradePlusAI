@@ -463,3 +463,37 @@ describe("LiveTradingService NIFTY Sniper staged trail", () => {
     expect(h.saved.get(order.id)).toMatchObject({ status: "EXITED", exitReason: "TARGET_2X" });
   });
 });
+
+describe("LiveTradingService money (₹ P&L) stop and trail", () => {
+  beforeEach(() => { resetLiveMonitor(); resetLiveAutoArm(); });
+  const AUTO_ENV = { ...ENABLED_ENV, LIVE_AUTO_EXECUTION_ENABLED: "true", LIVE_MAX_LOTS_PER_ORDER: "5", LIVE_MAX_ORDER_VALUE: "100000", LIVE_MAX_DAILY_LOSS: "20000" };
+  const money = { stopLoss: 500, trigger: 500, firstStop: -200, step: 200, target: 1500 };
+  async function opened() {
+    const h = harness(AUTO_ENV);
+    const service = new LiveTradingService(h.deps);
+    await service.armAuto({ pin: "482913", strategy: "NIFTY_SNIPER", lots: 1 });
+    const result = await service.autoPlace({ symbol: instrument.tradingSymbol, lots: 1, stopLoss: 75, target: 200, strategy: "NIFTY_SNIPER", setupId: "M1", premiumMultiples: { stop: 0.75, target: 2 }, trailRule: "SNIPER", partialMultiple: 1.5, moneyTrail: money });
+    if (!result.ok) throw new Error(result.error);
+    return { h, service, order: result.order };
+  }
+
+  it("sets the ₹ stop and target from the fill, with the Groww stop at the ₹ stop, replacing the sniper trail and partial", async () => {
+    const { h, order } = await opened();
+    // 65 qty filled at 100.5: −₹500 → 92.81 → 92.85; +₹1500 → 123.58 → 123.60.
+    expect(order).toMatchObject({ stopLoss: 92.85, target: 123.6, moneyTrail: money });
+    expect(order.trailRule).toBeUndefined();
+    expect(order.partialPrice).toBeUndefined();
+    expect(h.stopOrders()[0]).toMatchObject({ triggerPrice: 92.85, quantity: 65 });
+  });
+
+  it("trails the Groww stop in ₹ steps and exits at the ₹ target", async () => {
+    const { h, service, order } = await opened();
+    h.setLtp(108.2); await service.tick(); // +₹500.5 → SL −₹200
+    expect((await service.status()).positions[0]).toMatchObject({ stopLoss: 97.45, trailStage: "TRAILING" });
+    h.setLtp(111.6); await service.tick(); // +₹721.5 → SL ₹0
+    expect((await service.status()).positions[0].stopLoss).toBe(100.5);
+    expect(h.stopOrders().at(-1)!.triggerPrice).toBe(100.5);
+    h.setLtp(124); await service.tick();
+    expect(h.saved.get(order.id)).toMatchObject({ status: "EXITED", exitReason: "MONEY_TARGET" });
+  });
+});

@@ -17,7 +17,8 @@ const EXIT_TEXT: Record<string, string> = {
   MAX_LOSS_PER_TRADE: "Max loss per trade", SQUARE_OFF_15_15: "15:15 square-off", MANUAL: "Manual exit", RUNNER_STOP: "Runner stop (ran past target)", PARTIAL_1_5X: "Partial booked at 1.5x",
 };
 const STAGE_RANK = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
-const MODE_TEXT: Record<TrailMode, string> = { SMART: "Smart auto trail", RULE: "Strategy rule", FIXED: "Fixed distance", OFF: "Off" };
+const MODE_TEXT: Record<TrailMode, string> = { SMART: "Smart auto trail", RULE: "Strategy rule", FIXED: "Fixed distance", MONEY: "Money (₹ P&L)", OFF: "Off" };
+const rupee = (value: number) => `${value >= 0 ? "+" : "−"}₹${Math.abs(value).toLocaleString("en-IN")}`;
 
 type Props = {
   position: PositionView;
@@ -41,13 +42,14 @@ function RiskControls({ position, onModify }: { position: PositionView; onModify
   const initial = () => ({
     stop: position.stop === null ? "" : String(position.stop), target: position.target === null ? "" : String(position.target),
     mode: (controls?.mode ?? (position.kind === "MANUAL" ? "OFF" : "RULE")) as TrailMode, points: controls?.points ? String(controls.points) : "", run: Boolean(controls?.runPastTarget),
+    moneyStop: String(controls?.money?.stopLoss ?? 500), moneyTrigger: String(controls?.money?.trigger ?? 500), moneyFirst: String(controls?.money?.firstStop ?? -200), moneyStep: String(controls?.money?.step ?? 200), moneyTarget: String(controls?.money?.target ?? 0),
   });
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState(initial);
   const [start, setStart] = useState(initial);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const modes: TrailMode[] = position.kind === "MANUAL" ? ["SMART", "FIXED", "OFF"] : ["SMART", "RULE", "FIXED", "OFF"];
+  const modes: TrailMode[] = position.kind === "MANUAL" ? ["SMART", "FIXED", "MONEY", "OFF"] : ["SMART", "RULE", "FIXED", "MONEY", "OFF"];
   const begin = () => { const next = initial(); setForm(next); setStart(next); setError(null); setOpen(true); };
   const send = async (changes: ModifyRequest) => {
     setSaving(true);
@@ -64,6 +66,14 @@ function RiskControls({ position, onModify }: { position: PositionView; onModify
     if (form.mode !== start.mode) changes.trailMode = form.mode;
     if (form.points !== start.points || (form.mode === "FIXED" && form.mode !== start.mode)) changes.trailPoints = level(form.points);
     if (form.run !== start.run) changes.runPastTarget = form.run;
+    const moneyChanged = (["moneyStop", "moneyTrigger", "moneyFirst", "moneyStep", "moneyTarget"] as const).some((key) => form[key] !== start[key]);
+    if (form.mode === "MONEY" && (moneyChanged || form.mode !== start.mode)) {
+      changes.trailMode = "MONEY";
+      changes.money = { stopLoss: Number(form.moneyStop), trigger: Number(form.moneyTrigger), firstStop: Number(form.moneyFirst), step: Number(form.moneyStep), target: Number(form.moneyTarget) || 0 };
+      // The rupee rule sets the SL and target itself.
+      delete changes.stop;
+      delete changes.target;
+    }
     if (!Object.keys(changes).length) { setOpen(false); return; }
     void send(changes);
   };
@@ -85,6 +95,14 @@ function RiskControls({ position, onModify }: { position: PositionView; onModify
         {modes.map((mode) => <option key={mode} value={mode}>{mode === "RULE" && position.trail ? `Strategy rule (${position.trail.rule === "SNIPER" ? "NIFTY Sniper" : "VWAP-EMA"})` : MODE_TEXT[mode]}</option>)}
       </select></label>
       {form.mode === "FIXED" ? <label>Trail by ₹<input type="number" inputMode="decimal" step="0.05" min="0.05" value={form.points} placeholder="e.g. 5" onChange={(event) => setForm({ ...form, points: event.target.value })} /></label> : null}
+      {form.mode === "MONEY" ? <>
+        <label>Stop loss ₹<input type="number" inputMode="numeric" step="50" min="1" value={form.moneyStop} onChange={(event) => setForm({ ...form, moneyStop: event.target.value })} /></label>
+        <label>Trail at profit ₹<input type="number" inputMode="numeric" step="50" min="1" value={form.moneyTrigger} onChange={(event) => setForm({ ...form, moneyTrigger: event.target.value })} /></label>
+        <label>Then SL to ₹<input type="number" inputMode="numeric" step="50" value={form.moneyFirst} onChange={(event) => setForm({ ...form, moneyFirst: event.target.value })} /></label>
+        <label>Step ₹<input type="number" inputMode="numeric" step="50" min="1" value={form.moneyStep} onChange={(event) => setForm({ ...form, moneyStep: event.target.value })} /></label>
+        <label>Target profit ₹ (0 none)<input type="number" inputMode="numeric" step="100" min="0" value={form.moneyTarget} onChange={(event) => setForm({ ...form, moneyTarget: event.target.value })} /></label>
+        <p className="pos-controls-hint">Exit at −₹{form.moneyStop}; at +₹{form.moneyTrigger} the SL moves to ₹{form.moneyFirst}, then +₹{form.moneyStep} for every further ₹{form.moneyStep} of profit{Number(form.moneyTarget) > 0 ? `; exit at +₹${form.moneyTarget}` : ""}. The SL and target fields are set from this.</p>
+      </> : null}
       {form.mode === "SMART" ? <label className="pos-check"><input type="checkbox" checked={form.run} onChange={(event) => setForm({ ...form, run: event.target.checked })} />Run past target (lock 80%, extend target)</label> : null}
       <p className="pos-controls-hint">LTP ₹{money(position.value)}. SL must be below and target above it; leave blank for none. A stop you move stays put until the premium makes a new high, then the trail takes over again.</p>
       {error ? <p className="pos-modify-error" role="alert">{error}</p> : null}
@@ -215,6 +233,7 @@ export const PositionCard = memo(function PositionCard({ position, closed = fals
           {mode === "SMART" ? (controls.runPastTarget ? ` · runs past target${controls.targetRuns ? ` (target moved out ${controls.targetRuns}×)` : ""}` : " · closes at target") : null}
           {mode === "FIXED" && controls.points ? <> · ₹{money(controls.points)} under the best premium: SL <b>₹{money(Math.max(position.stop ?? 0, best - controls.points))}</b></> : null}
           {mode === "OFF" ? " · the SL moves only when you move it" : null}
+          {mode === "MONEY" && controls.money && position.stop !== null ? <> · SL at <b>{rupee(Math.round((position.stop - position.entry) * qty))}</b> (−₹{controls.money.stopLoss} → {rupee(controls.money.firstStop)} at +₹{controls.money.trigger}, +₹{controls.money.step} per ₹{controls.money.step}){controls.money.target ? <> · target +₹{controls.money.target}</> : null}</> : null}
           {resumeAbove !== null && mode !== "OFF" ? <> · your SL holds until the premium beats ₹{money(resumeAbove)}</> : null}
         </p>
       ) : null}
