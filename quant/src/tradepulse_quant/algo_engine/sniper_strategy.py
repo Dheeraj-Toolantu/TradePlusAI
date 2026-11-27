@@ -197,6 +197,10 @@ class SniperConfig:
     oi_blocks_when_against: bool = True      # OI is context: only an opposing read blocks; neutral / unknown score lower
     # --- scoring ----------------------------------------------------------------------------
     minimum_sniper_score: float = 60.0       # trades execute from a score of 60 (A >= 85, B 70-84, C 60-69)
+    # SCORE_ONLY: a score at or above the minimum places the CALL / PUT; only the safety checks below
+    # still block (data, window, contract, size, setup switch). Every other check is shown as advisory.
+    # ALL_CHECKS: every hard filter must also pass (the stricter rule).
+    entry_rule: str = "SCORE_ONLY"
     b_grade_score: float = 70.0
     # --- premium volume profile (where the option's own volume traded today) --------------
     require_volume_level: bool = True
@@ -221,8 +225,12 @@ REASON_CODES = {
     "SETUP_CONFIRMED": "NO_VALID_SETUP", "SIGNAL_FRESH": "STALE_DATA", "ENTRY_TRIGGER": "NO_ENTRY_TRIGGER", "NOT_CHASING": "CHASE_LIMIT",
     "ENTRY_WINDOW": "SESSION_CLOSED", "REGIME_PERMITS": "REGIME_BLOCKED", "SETUP_ENABLED": "SETUP_DISABLED", "CONTRACT_SELECTED": "NO_CONTRACT",
     "SPREAD_OK": "SPREAD_TOO_WIDE", "FEASIBILITY_2X": "FEASIBILITY_FAILED", "POSITION_SIZE": "RISK_LIMIT", "OI_AVAILABLE": "OI_UNKNOWN",
-    "PREMIUM_VOLUME_RISING": "PREMIUM_MOMENTUM_WEAK", "WRITER_OI_RISING": "OI_AGAINST", "IV_NOT_RICH": "IV_TOO_HIGH", "SCORE_MINIMUM": "SCORE_BELOW_MINIMUM", "PREMIUM_AT_VOLUME_LEVEL": "PREMIUM_NOT_AT_VOLUME_LEVEL",
+    "PREMIUM_VOLUME_RISING": "PREMIUM_MOMENTUM_WEAK", "INDEX_STOP": "NO_INDEX_STOP", "WRITER_OI_RISING": "OI_AGAINST", "IV_NOT_RICH": "IV_TOO_HIGH", "SCORE_MINIMUM": "SCORE_BELOW_MINIMUM", "PREMIUM_AT_VOLUME_LEVEL": "PREMIUM_NOT_AT_VOLUME_LEVEL",
 }
+
+# Checks that always block, whatever the entry rule: no trade without fresh data, an open window, a
+# switched-on setup, a tradable contract, at least one lot and the minimum score.
+SAFETY_FILTERS = frozenset({"SIGNAL_FRESH", "ENTRY_WINDOW", "SETUP_ENABLED", "CONTRACT_SELECTED", "POSITION_SIZE", "SCORE_MINIMUM"})
 
 # Regime permissions (spec V2 5.4): which setups each 15m regime allows, and the risk multiplier.
 REGIME_PERMISSIONS = {
@@ -1403,7 +1411,9 @@ def config_for(context: dict) -> SniperConfig:
     chosen_lots = min(10, max(1, int(chosen))) if chosen and chosen >= 1 else 0
     fixed_mode = str(context.get("sniper_sizing") or "").upper() == "FIXED_LOTS"
     setups = tuple(letter for letter in "ABC" if letter in str(context.get("sniper_setups") or "ABC").upper()) or ("A", "B", "C")
+    entry_rule = "ALL_CHECKS" if str(context.get("sniper_entry_rule") or "").upper() == "ALL_CHECKS" else "SCORE_ONLY"
     return SniperConfig(
+        entry_rule=entry_rule,
         fixed_lots=chosen_lots if fixed_mode else 0,
         max_chosen_lots=0 if fixed_mode else chosen_lots,
         enabled_setups=setups,
@@ -1556,20 +1566,32 @@ def analyze_sniper(symbol: str, candles_1m: list[CandleLike], context: dict, now
         REASON_CODES_LOCAL = REASON_CODES
     if ivc.get("status") in ("VIX_ONLY", "UNAVAILABLE"):
         REASON_CODES_LOCAL = {**REASON_CODES_LOCAL, "IV_NOT_RICH": "IV_UNKNOWN"}
-    sniper["hard_filters"] = [{"code": code, "passed": bool(ok), "detail": detail, "reason_code": None if ok else REASON_CODES_LOCAL.get(code, code)} for code, ok, detail in filters]
-    failed = [code for code, ok, _ in filters if not ok]
+    score_only = config.entry_rule != "ALL_CHECKS"
+    sniper["entry_rule"] = "SCORE_ONLY" if score_only else "ALL_CHECKS"
+    sniper["hard_filters"] = [{"code": code, "passed": bool(ok), "detail": detail, "reason_code": None if ok else REASON_CODES_LOCAL.get(code, code),
+                               "blocking": (not score_only) or code in SAFETY_FILTERS} for code, ok, detail in filters]
+    # Score-only rule: a failed strategy check is advisory (shown, not blocking); safety checks still block.
+    failed = [code for code, ok, _ in filters if not ok and ((not score_only) or code in SAFETY_FILTERS)]
+    sniper["advisory"] = [code for code, ok, _ in filters if not ok and score_only and code not in SAFETY_FILTERS]
     sniper["reason_codes"] = [REASON_CODES_LOCAL.get(code, code) for code in failed]
     sniper["grade"] = band
     if failed:
         state = "EXPIRED" if setup["state"] == "EXPIRED" else "REJECTED" if setup["state"] == "CONFIRMED" and band == "NO_TRADE" else "CONFIRMED" if setup["state"] == "CONFIRMED" else "WATCH"
         decision = "WAIT_FOR_CONFIRMATION" if state in ("WATCH", "CONFIRMED") else "NO_TRADE"
         return done(decision, state, f"{setup['family'].replace('_', ' ').title()} {'CALL' if d > 0 else 'PUT'} · score {total} ({band}) · blocked by {', '.join(failed)}", side=result_side)
+    if score_only:
+        # Placed on the score: mark it so the V5 gate treats the strategy rules as advisory too.
+        sniper["confirmed_by"] = "SCORE"
 
     sniper["lifecycle"].append({"state": "CONFIRMED", "at": now.isoformat(), "reason": setup.get("reason", "")})
     contract = {"symbol": selected["symbol"], "type": side, "strike": selected["strike"], "expiry": selected.get("expiry"),
                 "lot_size": selected.get("lot_size"), "tick_size": selected.get("tick_size"), "freeze_quantity": selected.get("freeze_quantity")}
     trigger_time = trigger.get("time")
+    # A setup confirmed by score alone may not have its structural invalidation yet: fall back to
+    # 1.5 x the 5m ATR beyond the current index price, so the index stop is never missing.
     invalidation = setup.get("invalidation")
+    if invalidation is None:
+        invalidation = _r(spot - d * 1.5 * atr5)
     setup_out = {
         "side": result_side, "instrument": "OPTION_PREMIUM", "family": setup["family"], "contract": contract,
         "entry": feas["entry"], "stop_loss": feas["stop_loss"], "target": feas["target"], "partial_target": feas["partial_target"],

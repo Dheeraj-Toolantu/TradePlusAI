@@ -192,3 +192,15 @@ entries, and a same-time-of-day volatility baseline.
   support; the next high-volume level above is reported as likely resistance. Too few candles →
   unavailable → no trade.
 
+## Entry rule: score ≥ 60 (default)
+
+* **Score ≥ 60** (desk: *Sniper entry*): a score of 60 or more places the CALL or PUT, on paper or
+  on Groww depending on the scalper desk's **Money: Paper | Live** switch. Only safety checks still
+  block: fresh data, the entry window, the setup switch, a tradable contract, at least one lot and
+  the score itself; and in the V5 gate: data quality, session, option quote, daily risk, broker,
+  contract master, reconciliation, VIX extreme, liquidity, SAFE_MODE and the kill switch. Every
+  other check (setup confirmation, 1m trigger, chase limit, regime, spread, 2x feasibility, premium
+  volume, writer OI, IV, premium volume level, gap state) is shown as **advisory** (`!`).
+* **Score + all checks**: the stricter rule; every check must pass.
+* If a setup has no structural index invalidation yet, the index stop falls back to 1.5 × the 5m ATR.
+

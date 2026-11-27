@@ -60,6 +60,8 @@ export type ScalperSettings = {
   sniperSizing: "RISK_BUDGET" | "FIXED_LOTS";
   /** NIFTY Sniper setups switched on: A reversal, B breakout, C continuation (e.g. "ABC"). */
   sniperSetups: string;
+  /** NIFTY Sniper entry rule: SCORE_ONLY (score >= 60 places the trade; safety checks still block) or ALL_CHECKS. */
+  sniperEntryRule: "SCORE_ONLY" | "ALL_CHECKS";
   /** Rupee P&L stop and trail for new trades (e.g. −₹500 stop; at +₹500 to −₹200; +₹200 per ₹200; exit at the ₹ target). */
   moneyTrail: MoneyTrailConfig & { enabled: boolean };
 };
@@ -249,7 +251,7 @@ export type ScanInput = {
   entryBlockedReason?: string;
 };
 
-export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC", moneyTrail: { enabled: false, ...DEFAULT_MONEY_TRAIL } };
+export const DEFAULT_SCALPER_SETTINGS: ScalperSettings = { maxTrades: 5, maxLossPerTrade: 1500, maxDailyLoss: 4000, lots: 1, minRiskReward: 2, mode: "AUTO", maxHoldMinutes: 12, smartTrail: true, runPastTarget: true, sniperLots: 1, sniperSizing: "RISK_BUDGET", sniperSetups: "ABC", sniperEntryRule: "SCORE_ONLY", moneyTrail: { enabled: false, ...DEFAULT_MONEY_TRAIL } };
 const STAGE_ORDER: TrailStage[] = ["INITIAL", "BREAKEVEN", "LOCKED", "TRAILING"];
 const higherStage = (a: TrailStage, b: TrailStage) => (STAGE_ORDER.indexOf(a) >= STAGE_ORDER.indexOf(b) ? a : b);
 /** Round-trip charges per unit when the plan gave none: ~₹40 brokerage per order pair plus ~0.2% of premium (STT, exchange, GST). */
@@ -585,6 +587,7 @@ export class SmartScalper {
       sniperLots: clamp(Math.floor(Number(value.sniperLots) || DEFAULT_SCALPER_SETTINGS.sniperLots), 1, 10),
       sniperSizing: value.sniperSizing === "FIXED_LOTS" ? "FIXED_LOTS" : "RISK_BUDGET",
       sniperSetups: ["A", "B", "C"].filter((letter) => String(value.sniperSetups ?? "ABC").toUpperCase().includes(letter)).join("") || "ABC",
+      sniperEntryRule: value.sniperEntryRule === "ALL_CHECKS" ? "ALL_CHECKS" : "SCORE_ONLY",
       moneyTrail: parseMoneyTrail(value.moneyTrail),
     };
   }

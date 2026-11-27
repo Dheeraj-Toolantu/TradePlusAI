@@ -347,6 +347,7 @@ def _observe(symbol: str, candles: list[Candle], strategy: str, result: dict, co
         # Observed, so a caller can never switch these off; only the scalper's own evidence does.
         "regime_gate": True,
         "option_flow_gate": True,
+        "gap_gate": True,
     }
     return evidence, calculations, session_info
 
@@ -665,6 +666,12 @@ def _sniper_evidence(result: dict, evidence: dict, calculations: dict, setup_can
     })
     if result.get("decision") == "DATA_INVALID":
         evidence["data_quality_ok"] = False
+    if sniper.get("confirmed_by") == "SCORE" and result.get("decision") == "CONFIRMED":
+        # Score-only entry rule: the strategy-structure gates (breakout / retest, 2x target, gap state)
+        # become context like the sniper's own advisory checks. Every operational and safety gate
+        # (data, session, quote, daily risk, broker, contract, reconciliation, VIX, liquidity,
+        # SAFE_MODE, kill switch) still applies.
+        evidence.update({"breakout_valid": True, "retest_confirmed": True, "premium_target_reachable": None, "gap_gate": False})
     calculations["score"] = {**calculations["score"], **{k: score.get(k) for k in ("total", "minimum", "maximum", "band")}, "card": sniper_strategy.STRATEGY_ID}
     calculations["sniper"] = sniper
     if gap:
@@ -714,6 +721,7 @@ def analyze_payload(payload: dict) -> dict:
             "max_lots": payload.get("max_lots"),
             "sniper_lots": payload.get("sniper_lots"),
             "sniper_setups": payload.get("sniper_setups"),
+            "sniper_entry_rule": payload.get("sniper_entry_rule"),
             "sniper_sizing": payload.get("sniper_sizing"),
             "slippage_pct": payload.get("slippage_pct"),
             # The selected option's own 1m candles (pass 2) and the stored 3-minute strike OI samples.
